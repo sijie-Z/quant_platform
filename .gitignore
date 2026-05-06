@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Cache
+.quant_cache/
+.sentiment_cache/
+.pytest_cache/
+
+# Results (generated)
+results/*.csv
+results/*.png
+results/*.pdf
+
+# Coverage
+.coverage
+htmlcov/
+.coverage.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (large)
+*.h5
+*.hdf5
+data/*.csv

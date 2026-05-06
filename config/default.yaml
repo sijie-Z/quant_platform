@@ -1,0 +1,94 @@
+# ============================================================================
+# Default Configuration for A-Share Multi-Factor Quant Platform
+# ============================================================================
+
+# --- Universe ---
+universe:
+  n_stocks: 500           # Number of stocks in universe (synthetic data)
+  exclude_st: true         # Exclude ST (Special Treatment) stocks
+  exclude_suspended: true  # Exclude suspended stocks
+
+# --- Data ---
+data:
+  start_date: "2021-01-01"
+  end_date: "2025-12-31"
+  frequency: "daily"       # daily, weekly, monthly
+
+# --- Factors ---
+factors:
+  # Technical factors to compute
+  technical:
+    momentum_1m: {enabled: true, params: {period: 21}}
+    momentum_3m: {enabled: true, params: {period: 63}}
+    momentum_6m: {enabled: true, params: {period: 126}}
+    momentum_12m: {enabled: true, params: {period: 252}, exclude_recent: 21}
+    volatility_20d: {enabled: true, params: {period: 20}}
+    volatility_60d: {enabled: true, params: {period: 60}}
+    turnover_20d: {enabled: true, params: {period: 20}}
+    rsi_14d: {enabled: true, params: {period: 14}}
+    amplitude_20d: {enabled: true, params: {period: 20}}
+
+  # Fundamental factors
+  fundamental:
+    log_market_cap: {enabled: true}
+    pb_ratio: {enabled: true}
+    pe_ratio: {enabled: true}
+    roe: {enabled: true}
+    asset_growth: {enabled: true}
+
+  # Factor processing
+  processing:
+    winsorize: {enabled: true, lower: 0.01, upper: 0.99}
+    standardize: {enabled: true, method: "zscore"}  # zscore or rank
+    neutralize: {enabled: true, by: ["sector", "log_market_cap"]}
+
+# --- Alpha Model ---
+alpha:
+  method: "icir_weighted"  # equal_weight, ic_weighted, icir_weighted
+  lookback: 252            # Days for IC/ICIR estimation
+  min_icir: 0.0            # Minimum ICIR to include factor
+
+# --- Portfolio ---
+portfolio:
+  optimizer: "mean_variance"  # equal_weight, mean_variance, risk_parity
+  constraints:
+    long_only: true
+    max_weight: 0.05           # 5% max per stock
+    max_sector_exposure: 0.30  # 30% max per sector
+    max_turnover: 0.30         # 30% max turnover per rebalance
+    lot_size: 100              # A-share lot size
+  covariance:
+    method: "ledoit_wolf"      # sample, ledoit_wolf, ewma
+    lookback: 252              # Days for covariance estimation
+    ewma_half_life: 63         # Half-life for EWMA (if used)
+  risk_aversion: 1.0           # Risk aversion for MVO
+
+# --- Backtest ---
+backtest:
+  rebalance_frequency: "monthly"  # daily, weekly, monthly
+  initial_capital: 10_000_000     # 10M CNY
+  benchmark: "equal_weight"       # equal_weight or market_cap_weight
+
+# --- Costs ---
+costs:
+  commission: 0.0003       # 0.03% per trade
+  stamp_tax: 0.001          # 0.1% on sell only (A-share)
+  slippage: 0.001           # 0.1% slippage
+  slippage_model: "fixed"   # fixed or proportional
+
+# --- Risk ---
+risk:
+  var:
+    confidence: 0.95
+    horizon: 1              # 1-day VaR
+    method: "historical"    # historical, parametric, monte_carlo
+  stress_scenarios:
+    - "2008_financial_crisis"
+    - "2015_ashare_crash"
+    - "2020_covid_crash"
+
+# --- Output ---
+output:
+  results_dir: "./results"
+  save_plots: true
+  plot_format: "png"       # png, pdf, svg
