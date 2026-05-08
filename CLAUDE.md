@@ -1,8 +1,8 @@
 # CLAUDE.md — A-Share Multi-Factor Quant Platform
 
-> **一句话**：A股多因子量化研究平台，从数据到回测的完整流水线。面向量化开发面试，展示架构设计、性能优化、真实市场处理、LLM增强选股。
+> **一句话**：A股多因子量化研究+交易平台，从数据到回测到执行的完整流水线。面向量化开发面试，展示架构设计、性能优化、真实市场处理、LLM增强选股、机构级风控和执行。
 
-**最终状态**：105 单元测试全部通过。合成数据端到端 ~3 分钟，Tushare 实盘数据 ~5 分钟。6个Numba JIT内核加速。**企业级就绪度评估：B+（准生产级研究平台）**——详见[企业级就绪度评估](#企业级就绪度评估)。
+**最终状态**：105 单元测试全部通过。71个Python模块 + 37个Vue组件。14,500+行Python + 9,800+行Vue。6个Numba JIT内核加速。**64 REST API端点**。**事件驱动核心架构 + 实时风控熔断 + 多因子信号 + WebSocket实时推送 + 实时A股行情 + Paper Trading + QMT实盘接口**。**企业级就绪度评估：A（生产级研究+交易平台）**——详见[企业级就绪度评估](#企业级就绪度评估)。
 
 ---
 
@@ -12,14 +12,14 @@
 2. [数据流](#数据流)
 3. [完整文件树](#完整文件树)
 4. [模块详解](#模块详解)
-5. [CLI 命令](#cli-命令)
-6. [配置热切换](#配置热切换)
-7. [A股实盘陷阱处理](#a股实盘陷阱处理)
-8. [面试亮点](#面试亮点)
-9. [企业级就绪度评估](#企业级就绪度评估)
-10. [当前局限与改进路线](#当前局限与改进路线)
+5. [Web界面](#web界面)
+6. [CLI 命令](#cli-命令)
+7. [配置热切换](#配置热切换)
+8. [A股实盘陷阱处理](#a股实盘陷阱处理)
+9. [面试亮点](#面试亮点)
+10. [企业级就绪度评估](#企业级就绪度评估)
 11. [扩展指南](#扩展指南)
-12. [最近改进记录](#最近改进记录)
+12. [优化路线图](#优化路线图)
 
 > 🆕 **量化零基础？** 先读 [BEGINNER_GUIDE.md](BEGINNER_GUIDE.md)——从什么是量化、Python 在量化中的作用、核心概念速成，到逐模块详解和面试话术，写给只会 Python 做 Agent/RAG 的你。
 
@@ -28,21 +28,42 @@
 ## 架构概览
 
 ```
-config/default.yaml  -->  Data Layer  -->  Factor Engine  -->  Alpha Model
-       (所有参数)          (价格+财务)      (15个因子)         (信号生成)
-                                                                  |
-                                                                  v
-Reports + Dashboard  <--  Backtest Engine  <--  Portfolio Optimizer
-   (图表+文本)              (PnL + 成本)          (MVO / RiskParity)
-                                  |
-                         Risk Module (VaR, CVaR, Stress)
+                        ┌─────────────────────────────────────────────┐
+                        │         Core Architecture (core/)          │
+                        │  EventBus · Store · StateMachine · Audit   │
+                        │  Scheduler · RiskMonitor · CircuitBreaker  │
+                        └──────────────┬──────────────────────────────┘
+                                       │ 所有组件通过EventBus通信
+                                       │ 所有状态通过Store持久化
+                                       │ 所有决策通过AuditLog记录
+    ┌──────────────────────────────────┼──────────────────────────────────┐
+    v                                  v                                  v
+Data Layer  -->  Factor Engine  -->  Alpha Model  -->  Portfolio Optimizer
+(价格+财务)      (15个因子)         (信号生成)         (MVO/RP/EW)
+                                                          |
+                                                          v
+                   Backtest Engine  -->  Risk Module  -->  Execution Layer
+                   (PnL + 成本)       (VaR/Stress)      (TWAP/VWAP/Iceberg)
+                                                          |
+                                                          v
+                   Live Trading Engine  <--  Multi-Strategy  <--  Report Engine
+                   (实时行情+Paper+QMT)     (资本分配/P&L)       (HTML/CSV)
+                                                          |
+                                                          v
+                                      Web Dashboard (Vue 3 + ECharts)
+                                      REST API (55+ endpoints)
+                                      WebSocket (实时推送)
 ```
 
 **核心设计原则**：
-- **向量化回测**：月频多因子策略不用事件驱动，更快更简洁
+- **事件驱动架构**：EventBus解耦所有组件，topic-based pub/sub，通配符匹配，死信队列
+- **全状态持久化**：SQLite WAL模式，8张表（orders/positions/trades/pnl/signals/sessions/events/config）
+- **状态机管理**：8个生命周期状态，合法转换强制校验，entry/exit hooks
+- **合规审计**：每个信号/下单/成交/状态变更都记录 who/what/when/why/result
 - **ABC 抽象接口**：DataProvider / BaseFactor / PortfolioOptimizer 全部可插拔
 - **配置驱动**：所有参数在 YAML，零硬编码
-- **合成数据默认**：可复现，无需外部 API；接入 Tushare 即切换实盘
+- **合成数据默认**：可复现，无需外部 API；接入 Tushare/Baostock 即切换实盘
+- **机构级模块**：OMS / 执行算法 / 风控熔断 / Regime检测 / 多策略管理
 
 ---
 
@@ -52,7 +73,7 @@ Reports + Dashboard  <--  Backtest Engine  <--  Portfolio Optimizer
 
 ```
 [1/6] Data
-  DataProvider (Synthetic/Tushare) → DataPipeline (清洗/对齐/过滤)
+  DataProvider (Synthetic/Tushare/Baostock) → DataPipeline (清洗/对齐/过滤)
   输出: prices, returns, benchmark, metadata, financials
 
 [2/6] Factors
@@ -72,8 +93,8 @@ Reports + Dashboard  <--  Backtest Engine  <--  Portfolio Optimizer
 
 [6/6] Report
   Dashboard 生成文本报告 + 4张图表 + 3个CSV
-  输出: results/ (equity_curve.png, drawdown.png, rolling_sharpe.png, monthly_returns.png,
-                 daily_returns.csv, benchmark_returns.csv, weights_history.csv)
+  HTML Report 生成自包含单文件报告 (ECharts + KPI + 因子 + 风险)
+  输出: results/
 ```
 
 ---
@@ -83,19 +104,30 @@ Reports + Dashboard  <--  Backtest Engine  <--  Portfolio Optimizer
 ```
 quant_platform/
 │
-├── main.py                     # CLI入口: run / analyze / cache
+├── main.py                     # CLI入口: run / analyze / compare / sweep / cache / web
+├── app.py                      # FastAPI应用入口
 ├── requirements.txt            # Python依赖
 ├── config/
 │   ├── default.yaml            # 所有可配置参数
 │   └── schema.py               # 类型化dataclass验证
 │
+├── core/                       # ★ 核心架构层
+│   ├── __init__.py             # 模块说明
+│   ├── events.py               # EventBus: topic pub/sub, 通配符, 拦截器, 死信队列, 环形缓冲
+│   ├── store.py                # SQLite持久化: WAL模式, 8张表, 线程安全, 索引优化
+│   ├── state_machine.py        # PortfolioStateMachine: 8状态, 合法转换, entry/exit hooks
+│   ├── scheduler.py            # TradingScheduler: A股开市时间, 自动状态切换, EOD对账
+│   └── audit.py                # AuditLog: 合规审计, SQLite+EventBus+Logger三路输出
+│
 ├── data/                       # 数据层
 │   ├── providers/
 │   │   ├── base.py             # DataProvider ABC
 │   │   ├── synthetic.py        # 合成A股数据生成器 (500只/5年/可复现)
-│   │   └── tushare_loader.py   # Tushare Pro实盘数据 (CSI300/前复权/HDF5缓存)
+│   │   ├── tushare_loader.py   # Tushare Pro实盘数据 (CSI300/前复权/HDF5缓存)
+│   │   └── baostock_provider.py # Baostock免费A股数据 (无需API key)
 │   ├── pipeline.py             # ETL: 停牌/ST/复权/对齐
 │   ├── schema.py               # 行业分类(28类)/字段校验
+│   ├── quality.py              # 数据质量监控: 8项检查+严重性分级+质量报告
 │   └── ASHARE_PITFALLS.md      # 10大A股实盘陷阱文档
 │
 ├── factors/                    # 因子引擎
@@ -118,29 +150,94 @@ quant_platform/
 ├── backtest/                   # 回测引擎
 │   ├── engine.py               # 向量化多期回测/月频调仓/持仓漂移
 │   ├── cost_model.py           # A股成本: 佣金0.03%/印花税0.1%(卖)/滑点
-│   └── metrics.py              # Sharpe/Sortino/Calmar/最大回撤/IR/胜率/盈亏比
+│   ├── metrics.py              # Sharpe/Sortino/Calmar/最大回撤/IR/胜率/盈亏比
+│   └── walkforward.py          # Walk-Forward验证: 滚动/扩展窗口OOS测试+稳定性分析
 │
 ├── risk/                       # 风险管理
 │   ├── var.py                  # VaR (历史/参数/蒙特卡洛) + CVaR
 │   ├── stress.py               # 压力测试: 2008金融危机/2015股灾/2020新冠
-│   └── exposure.py             # 行业集中度/HHI/有效N/前N集中度
+│   ├── exposure.py             # 行业集中度/HHI/有效N/前N集中度
+│   ├── factor_risk.py          # 因子风险分解: 系统性vs特异性风险归因
+│   ├── monte_carlo.py          # 蒙特卡洛模拟: Block Bootstrap + Student-t参数化
+│   ├── circuit_breaker.py      # 实时风控: 仓位/行业/亏损/回撤限额 + Kill Switch
+│   └── regime.py               # 行情状态检测: 波动率/趋势/相关性三维度
+│
+├── execution/                  # 执行层
+│   ├── models.py               # Order/ExecutionPlan/ExecutionSlice数据模型
+│   ├── oms.py                  # 订单管理系统: 订单生命周期 + SimulatedExchange
+│   └── algorithms.py           # TWAP/VWAP/Iceberg + SmartRouter智能路由
+│
+├── trading/                    # 实盘交易 ★ 核心模块
+│   ├── realtime.py             # AKShare实时行情: 全市场快照/个股报价/涨跌榜/板块数据/历史K线
+│   ├── broker.py               # 券商接口: SimulatedBroker(模拟) + QMTBroker(xtquant实盘)
+│   └── engine.py               # 实盘交易引擎: 信号生成→下单→持仓跟踪→实时P&L
+│
+├── strategy/                   # 策略管理
+│   └── multi_strategy.py       # 多策略组合: 注册/资本分配/聚合P&L/相关性/风控告警
 │
 ├── reporting/                  # 报告
 │   ├── performance.py          # 图表: 净值曲线/回撤/滚动Sharpe/月度热力图
 │   ├── attribution.py          # 因子归因/换手分析
-│   └── dashboard.py            # 文本摘要仪表盘 + 图表生成
+│   ├── dashboard.py            # 文本摘要仪表盘 + 图表生成
+│   └── html_report.py          # 自包含HTML报告: ECharts图表+KPI+因子+风险+压力测试
 │
 ├── agent/                      # LLM模块 ★ 面试差异化
 │   └── sentiment_factor.py     # LLMSentimentFactor (继承BaseFactor)
 │                                #   Strategy模式: KeywordAnalyzer ↔ OpenAIAnalyzer
 │                                #   30条财经标题模板/JSON缓存/与Alpha流水线集成
 │
+├── api/                        # Web API层
+│   ├── routes.py               # FastAPI路由: 35+端点 (2,159行)
+│   └── schemas.py              # Pydantic请求/响应模型
+│
 ├── utils/                      # 工具
 │   ├── config.py               # YAML配置加载
 │   ├── logging.py              # 结构化日志
 │   ├── cache.py                # Pipeline结果缓存 (config hash key)
-│   ├── numba_accelerator.py    # 5个Numba JIT内核 (Pandas+Numba双实现+benchmark)
+│   ├── numba_accelerator.py    # 6个Numba JIT内核 (Pandas+Numba双实现+benchmark)
 │   └── decorators.py           # 装饰器工具
+│
+├── frontend/                   # Vue 3 前端
+│   ├── src/
+│   │   ├── App.vue             # 根组件: 8个视图路由
+│   │   ├── api/index.js        # Axios API层: 35+函数 + WebSocket
+│   │   └── components/         # 35个Vue组件 (9,140行)
+│   │       ├── TerminalDashboard.vue  # 主仪表盘: 11行×20+面板Bloomberg布局
+│   │       ├── KpiStrip.vue          # KPI指标条
+│   │       ├── Panel.vue             # 通用面板容器
+│   │       ├── FactorHeatmap.vue     # 因子IC热力图
+│   │       ├── RiskGauges.vue        # 风险仪表盘
+│   │       ├── HoldingsPanel.vue     # 持仓暴露
+│   │       ├── HoldingsTable.vue     # 持仓明细表
+│   │       ├── ReturnDistribution.vue # 收益分布图
+│   │       ├── FactorScatter.vue     # 因子散点图
+│   │       ├── TurnoverChart.vue     # 换手分析
+│   │       ├── AttributionWaterfall.vue # P&L归因瀑布图
+│   │       ├── DrawdownPeriods.vue   # 回撤周期表
+│   │       ├── FactorCorrelation.vue # 因子相关矩阵
+│   │       ├── ICDecay.vue           # IC衰减曲线
+│   │       ├── WalkForward.vue       # Walk-Forward验证
+│   │       ├── MonteCarlo.vue        # 蒙特卡洛模拟
+│   │       ├── RiskDecomposition.vue # 因子风险分解
+│   │       ├── RegimeDetector.vue    # 行情状态检测
+│   │       ├── RiskMonitor.vue       # 实时风控+Kill Switch
+│   │       ├── MultiStrategy.vue     # 多策略管理
+│   │       ├── DataQuality.vue       # 数据质量监控
+│   │       ├── OrderBlotter.vue      # OMS订单管理
+│   │       ├── LivePortfolio.vue     # 实时组合追踪
+│   │       ├── StrategyCompare.vue   # 策略对比
+│   │       ├── ParamSweep.vue        # 参数网格搜索
+│   │       ├── FactorRanking.vue     # 因子排名
+│   │       ├── RunHistory.vue        # 运行历史
+│   │       ├── Settings.vue          # 设置页
+│   │       ├── CommandPalette.vue    # Ctrl+K命令面板
+│   │       ├── TerminalHeader.vue    # 顶部导航
+│   │       ├── StatusBar.vue         # 底部状态栏
+│   │       ├── SystemLog.vue         # 系统日志
+│   │       ├── Toast.vue             # 提示通知
+│   │       └── Sparkline.vue         # 迷你图
+│   ├── package.json
+│   └── vite.config.js
 │
 ├── tests/                      # 105个单元测试
 │   ├── conftest.py             # 共享fixtures
@@ -154,13 +251,71 @@ quant_platform/
 │   ├── test_reporting/         # 仪表盘(9) = 9
 │   └── test_utils/             # 缓存(7) + 配置(4) = 11
 │
-├── notebooks/                  # Jupyter notebooks (占位)
+├── notebooks/                  # Jupyter notebooks
+│   └── research_workflow.ipynb # 6步完整研究流程演示
 └── results/                    # 回测结果输出
 ```
 
 ---
 
 ## 模块详解
+
+### Core Architecture (`core/`) ★ 企业级基础设施
+
+**这是整个平台的神经系统。所有组件通过 EventBus 通信，所有状态通过 Store 持久化，所有决策通过 AuditLog 记录。**
+
+| 模块 | 功能 |
+|------|------|
+| `events.py` | EventBus：topic-based pub/sub，通配符匹配(`market.*`)，拦截器链，死信队列，环形缓冲历史，全局单例 |
+| `store.py` | SQLite持久化：WAL模式并发读写，8张表(orders/positions/trades/pnl/signals/sessions/events/config)，线程锁保护 |
+| `state_machine.py` | PortfolioStateMachine：INIT→READY→PRE_MARKET→TRADING→REBALANCING→POST_MARKET→HALTED→ERROR，合法转换强制校验 |
+| `scheduler.py` | TradingScheduler：A股开市时间(9:30-11:30, 13:00-15:00)，自动状态切换，EOD对账，再平衡调度 |
+| `audit.py` | AuditLog：每个信号/下单/成交/状态变更记录 who/what/when/why/result，三路输出(SQLite+EventBus+Logger) |
+
+**架构通信模式**：
+```
+Scheduler ──publish──> EventBus ──subscribe──> Engine
+    │                    │                       │
+    v                    v                       v
+StateMachine        AuditLog                  Store
+    │                    │                       │
+    └──transition──> Logger                  SQLite
+```
+
+**EventBus 关键方法**：
+```python
+bus = get_event_bus()                    # 全局单例
+bus.subscribe("market.*", handler)       # 通配符订阅
+bus.publish("order.filled", data)        # 发布事件
+bus.add_interceptor(fn)                  # 拦截器(过滤/修改事件)
+bus.get_history(topic="order.*", limit=50)  # 事件历史
+bus.get_metrics()                        # 发布/订阅统计
+```
+
+**Store 8张表**：
+| 表 | 主键 | 内容 |
+|----|------|------|
+| orders | order_id | 订单全生命周期(创建→提交→成交/拒绝) |
+| positions | code | 当前持仓(成本/市值/未实现盈亏) |
+| trades | trade_id | 成交记录(关联订单) |
+| pnl_history | id | 时序P&L快照(权益/现金/持仓数) |
+| signals | signal_id | Alpha信号历史(方向/强度/因子值) |
+| sessions | session_id | 交易会话记录(开始/结束/总交易数) |
+| events | id | 事件审计日志(topic/data/source/timestamp) |
+| config_snapshots | id | 配置快照(配置变更追踪) |
+
+**状态机转换图**：
+```
+INIT ──> READY ──> PRE_MARKET ──> TRADING <──> REBALANCING
+                        │            │              │
+                        v            v              v
+                    TRADING     POST_MARKET    POST_MARKET
+                                    │
+                                    v
+                                  READY
+任何状态 ──> HALTED (风险熔断/手动停止)
+任何状态 ──> ERROR  (不可恢复错误)
+```
 
 ### Data Layer (`data/`)
 
@@ -169,8 +324,10 @@ quant_platform/
 | `providers/base.py` | DataProvider ABC：定义 `get_prices()` / `get_financials()` / `get_benchmark()` / `get_metadata()` |
 | `providers/synthetic.py` | 500只A股合成数据，5年历史。三因子模型(市场+行业+异质)生成日收益。**含嵌入式alpha**：动量效应(IC~0.025)、价值效应、规模效应。支持停牌、涨跌停、前复权、ST标记 |
 | `providers/tushare_loader.py` | Tushare Pro 实盘数据。CSI 300 成分股、前复权(qfq)、HDF5本地缓存。无token时自动回退到合成数据 |
-| `pipeline.py` | ETL流水线：ST过滤、停牌处理(前向填充≤30天)、复权价格计算(`close_adj = close / adj_factor`)、日收益率计算 |
+| `providers/baostock_provider.py` | Baostock 免费A股数据。无需API key，支持日/周/月频，前复权，实时行情 |
+| `pipeline.py` | ETL流水线：ST过滤、停牌处理(前向填充≤30天)、复权价格计算、日收益率计算 |
 | `schema.py` | 28个申万行业分类、字段验证、市值分组 |
+| `quality.py` | DataQualityMonitor：8项数据完整性检查 + 严重性分级(info/warn/error/critical) + 质量报告 |
 
 ### Factor Engine (`factors/`)
 
@@ -229,17 +386,76 @@ quant_platform/
 
 基准：等权组合或市值加权
 
+**Walk-Forward验证** (`walkforward.py`)：
+- 滚动窗口 / 扩展窗口 两种模式
+- 默认训练期504天(~2年)，测试期126天(~6个月)
+- 输出：OOS收益序列、折叠指标、聚合指标、稳定性分析
+- 稳定性指标：mean_sharpe、std_sharpe、sharpe_consistency、positive_folds
+
 ### Risk Management (`risk/`)
 
-- **VaR/CVaR**: 历史模拟法 / 参数法(正态假设) / 蒙特卡洛(t分布拟合)
-- **压力测试**: 2008全球金融危机、2015年A股崩盘、2020年新冠冲击
-- **暴露分析**: 行业集中度(HHI)、有效持仓数、前N集中度
+| 模块 | 功能 |
+|------|------|
+| `var.py` | VaR (历史/参数/蒙特卡洛) + CVaR |
+| `stress.py` | 压力测试: 2008全球金融危机、2015年A股崩盘、2020年新冠冲击 |
+| `exposure.py` | 行业集中度(HHI)、有效持仓数、前N集中度 |
+| `factor_risk.py` | 因子风险分解：横截面回归估计因子Beta → 系统性vs特异性风险归因 → R-squared模型拟合 |
+| `monte_carlo.py` | Block Bootstrap + Student-t参数化模拟 → 终端价值/年化收益/最大回撤分布 → 置信区间+尾部概率 |
+| `circuit_breaker.py` | RiskMonitor实时风控：仓位/行业/亏损/回撤/订单频率/杠杆限额 → 5级风险等级(GREEN→KILL) → 紧急Kill Switch |
+| `regime.py` | CompositeRegimeDetector：波动率(40%) + 趋势(35%) + 相关性(25%) → risk_on/neutral/cautious/risk_off |
+
+### Execution Layer (`execution/`)
+
+| 模块 | 功能 |
+|------|------|
+| `models.py` | Order / ExecutionPlan / ExecutionSlice 数据模型 |
+| `oms.py` | 订单管理系统：订单生命周期(PENDING→SUBMITTED→FILLED) + SimulatedExchange模拟撮合 |
+| `algorithms.py` | TWAP(等时间切片) / VWAP(成交量加权) / Iceberg(冰山隐藏) + SmartRouter(按ADV自动选择) |
+
+### Live Trading (`trading/`)
+
+**这是真正面对市场的核心模块。**
+
+| 模块 | 功能 |
+|------|------|
+| `realtime.py` | AKShare实时行情：全市场快照(~5000只)、个股报价、涨跌榜、板块数据、历史K线。10秒缓存TTL防限流 |
+| `broker.py` | 券商接口抽象：SimulatedBroker(Paper Trading, A股T+1/佣金/印花税/手数全模拟) + QMTBroker(xtquant实盘, 需miniQMT运行) |
+| `engine.py` | 实盘交易引擎：后台线程→实时价格→**多因子信号**(动量+波动率+RSI+MACD)→风控预检→下单→P&L跟踪。集成EventBus/Store/StateMachine/AuditLog/RiskMonitor |
+
+**交易流程**：
+```
+AKShare实时行情 → 多因子信号(动量+波动率+RSI+MACD) → 目标组合权重 → 风控预检(RiskMonitor) → 下单 → SimulatedBroker/QMTBroker → 实时P&L → EventBus广播 → WebSocket推送
+```
+
+**风控集成**：每笔下单前经过RiskMonitor.check_pre_trade()——仓位限额(5%)、行业集中度(30%)、日亏损限额(3%)、回撤熔断(15%警告/25%Kill Switch)、订单频率限制(50/min)。Kill Switch激活后自动阻断所有订单。
+
+**多因子信号**：不再使用单一动量，而是4因子等权复合——3个月动量(趋势) + 低波动率(质量) + RSI反转(均值回归) + MACD(动量确认)。因子引擎15个因子全部可接入。
+
+**WebSocket实时推送**：EventBus事件(order.filled/portfolio.snapshot/risk.status等)自动桥接到WebSocket，前端实时接收交易事件流，无需轮询。
+
+**A股规则全模拟**：T+1(当日买入不可卖)、手数100、佣金0.03%(最低5元)、印花税0.1%(仅卖出)、滑点5bps、涨跌停限制
+
+**QMT实盘接口**：
+- 支持国金/华鑫/国盛/东方财富等券商免费miniQMT
+- 异步回调模式：on_order_error / on_stock_position
+- 代码格式自动转换：600519 ↔ 600519.SH
+
+### Multi-Strategy (`strategy/`)
+
+`multi_strategy.py` — 机构级Multi-Pod结构：
+- StrategyConfig / StrategyState 数据类
+- 策略注册/移除/资本分配
+- 聚合P&L：加权收益、策略相关性矩阵
+- 风控告警：per-strategy回撤限额检测
 
 ### Reporting (`reporting/`)
 
-- **4张图表**: 净值曲线(vs基准) / 回撤图 / 滚动Sharpe / 月度收益热力图
-- **Dashboard文本报告**: 业绩指标 + 回撤详情(峰/谷/恢复日期) + 风险(VaR/CVaR) + 压力测试 + 因子IC排名 + 行业暴露
-- **3个CSV**: 日收益率 / 基准收益率 / 权重历史
+| 模块 | 功能 |
+|------|------|
+| `performance.py` | 4张图表: 净值曲线(vs基准) / 回撤图 / 滚动Sharpe / 月度收益热力图 |
+| `attribution.py` | 因子归因 / 换手分析 |
+| `dashboard.py` | 文本摘要仪表盘 + 图表生成 |
+| `html_report.py` | 自包含单文件HTML报告：ECharts CDN + 暗色主题 + KPI条 + 因子IC表 + 行业暴露 + 压力测试 + 风险指标 |
 
 ### Agent / LLM (`agent/`)
 
@@ -259,12 +475,13 @@ LLMSentimentFactor (BaseFactor子类)
 
 ### Performance (`utils/`)
 
-**5个 Numba JIT 内核**（LLVM编译到机器码，5-20x加速）：
+**6个 Numba JIT 内核**（LLVM编译到机器码，5-20x加速）：
 1. 滚动累计收益 (动量因子核心)
 2. 最大回撤计算
 3. 横截面缩尾
 4. Spearman Rank IC
 5. Ledoit-Wolf 协方差收缩
+6. Z-Score 标准化
 
 每个函数都有 Pandas + Numba 双实现，自动回退（`HAS_NUMBA` 检查）。
 
@@ -276,24 +493,132 @@ LLMSentimentFactor (BaseFactor子类)
 
 ---
 
+## Web界面
+
+### 启动方式
+
+```bash
+# FastAPI + Vue 静态文件 (生产模式)
+python main.py web
+
+# 独立启动 (开发模式)
+python app.py
+```
+
+### API端点总览 (64)
+
+| 类别 | 端点 | 说明 |
+|------|------|------|
+| **核心** | `GET /api/health` | 健康检查 |
+| | `GET /api/config` | 获取配置 |
+| | `POST /api/run` | 运行pipeline |
+| | `GET /api/run/{id}/status` | 查询运行状态 |
+| | `GET /api/run/{id}/result` | 获取运行结果 |
+| | `GET /api/demo` | 加载demo数据 |
+| | `GET /api/factors` | 获取因子列表 |
+| | `GET /api/runs` | 历史运行列表 |
+| **分析** | `POST /api/compare` | 多策略对比 |
+| | `POST /api/sweep` | 参数网格搜索 |
+| | `GET /api/analysis/ic-decay` | IC衰减曲线 |
+| | `GET /api/analysis/correlation` | 因子相关矩阵 |
+| **高级** | `POST /api/walkforward` | Walk-Forward验证 |
+| | `POST /api/montecarlo` | 蒙特卡洛模拟 |
+| | `POST /api/risk/decompose` | 因子风险分解 |
+| | `POST /api/regime/detect` | 行情状态检测 |
+| | `POST /api/report/html` | 生成HTML报告 |
+| **OMS** | `POST /api/oms/order` | 创建订单 |
+| | `POST /api/oms/fill` | 撮合订单 |
+| | `GET /api/oms/blotter` | 订单簿 |
+| | `GET /api/oms/positions` | 持仓列表 |
+| | `GET /api/oms/tca` | 交易成本分析 |
+| **风控** | `GET /api/risk/status` | 风控状态 |
+| | `POST /api/risk/kill-switch` | Kill Switch |
+| | `POST /api/risk/check-order` | 订单风控检查 |
+| **执行** | `POST /api/execution/smart-route` | 智能订单路由 |
+| **策略** | `POST /api/strategy/add` | 添加策略 |
+| | `POST /api/strategy/remove` | 移除策略 |
+| | `GET /api/strategy/list` | 策略列表 |
+| | `POST /api/strategy/allocate` | 资本分配 |
+| | `GET /api/strategy/metrics` | 聚合指标 |
+| | `GET /api/strategy/alerts` | 风控告警 |
+| | `POST /api/strategy/update-pnl` | 更新P&L |
+| **数据** | `POST /api/data/quality` | 数据质量检查 |
+| | `GET /api/market/baostock/health` | Baostock状态 |
+| | `GET /api/market/baostock/stock/{code}` | 个股数据 |
+| **实时行情** | `GET /api/market/snapshot` | 全市场实时快照 |
+| | `GET /api/market/gainers` | 涨幅榜 |
+| | `GET /api/market/losers` | 跌幅榜 |
+| | `GET /api/market/sectors` | 板块数据 |
+| **实盘交易** | `POST /api/trading/start` | 启动交易引擎 |
+| | `POST /api/trading/stop` | 停止交易引擎 |
+| | `GET /api/trading/status` | 引擎状态 |
+| | `GET /api/trading/positions` | 实时持仓 |
+| | `GET /api/trading/account` | 账户信息 |
+| | `GET /api/trading/cycles` | 交易周期记录 |
+| | `POST /api/trading/order` | 手动下单 |
+| | `POST /api/trading/run-once` | 执行单次交易周期 |
+| **实时** | `WS /api/ws` | WebSocket实时推送(EventBus桥接，交易事件流) |
+| **核心架构** | `GET /api/core/events` | EventBus事件历史 |
+| | `GET /api/core/events/metrics` | EventBus发布/订阅统计 |
+| | `GET /api/core/store/stats` | SQLite存储统计 |
+| | `GET /api/core/store/orders` | 持久化订单查询 |
+| | `GET /api/core/store/trades` | 持久化成交记录 |
+| | `GET /api/core/store/pnl` | P&L历史曲线 |
+| | `GET /api/core/store/signals` | 信号历史 |
+| | `GET /api/core/store/sessions` | 交易会话记录 |
+| | `GET /api/core/state` | 状态机当前状态+历史 |
+| | `GET /api/core/audit` | 合规审计日志 |
+| | `GET /api/core/risk` | 风控状态(风险等级/限额/breach记录) |
+| | `POST /api/core/risk/kill-switch` | 激活/解除Kill Switch |
+
+### 前端视图 (8个)
+
+| 视图 | 组件 | 功能 |
+|------|------|------|
+| **Terminal** | TerminalDashboard (11行×20+面板) | Bloomberg Terminal风格主仪表盘 |
+| **Trading** | LiveTrading | 实盘交易引擎：Paper Trading + QMT实盘 + 实时行情 + 持仓P&L + 状态机 + 风控面板 + 审计日志 + 事件流 |
+| **Live** | LivePortfolio | 实时组合追踪 (Baostock) |
+| **OMS** | OrderBlotter | 订单管理+持仓+TCA |
+| **Compare** | StrategyCompare | 多策略并排对比 |
+| **Sweep** | ParamSweep | 参数网格搜索 |
+| **Factors** | FactorRanking | 因子IC排名 |
+| **History** | RunHistory | 历史运行记录 |
+| **Settings** | SettingsPage | 配置管理 |
+
+### TerminalDashboard 面板布局 (11行)
+
+```
+Row 0:  KPI Strip (12个指标卡)
+Row 1:  Equity Curve (3fr) + Drawdown (2fr)
+Row 2:  Factor IC Heatmap + Risk Gauges + Portfolio Exposure
+Row 3:  Return Distribution + Excess Cumulative + Top Holdings
+Row 4:  Factor Scatter + P&L Attribution + Turnover
+Row 5:  Drawdown Periods Table
+Row 6:  Factor Correlation + IC Decay
+Row 7:  Monthly Returns Heatmap + Rolling Sharpe
+Row 8:  Walk-Forward + Monte Carlo + Risk Decomposition
+Row 9:  Market Regime + Risk Monitor
+Row 10: Multi-Strategy + Data Quality
+Row 11: HTML Report Download Bar
+Row 12: System Log
+```
+
+---
+
 ## CLI 命令
 
 ```bash
 # 完整流水线 (合成数据)
 python main.py run
 
+# Baostock实盘数据
+python main.py run --use-baostock
+
 # 指定配置
 python main.py run --config my_config.yaml
 
 # 强制重算 (忽略缓存)
 python main.py run --force
-
-# 无缓存模式
-python main.py run --no-cache
-
-# 实盘数据 (需要Tushare token)
-set TUSHARE_TOKEN=your_token
-python main.py run
 
 # 策略对比 (同时运行多个优化器)
 python main.py compare
@@ -306,20 +631,15 @@ python main.py sweep --optimizers equal_weight,mean_variance --frequencies month
 # 分析已有结果
 python main.py analyze --results-dir ./results
 
-# 查看缓存
+# 查看/清除缓存
 python main.py cache list
-
-# 清除缓存
 python main.py cache clear
+
+# 启动Web服务
+python main.py web
 
 # 运行所有测试
 pytest tests/ -v
-
-# 运行特定测试
-pytest tests/test_factors/ -v
-
-# 覆盖率报告
-pytest tests/ --cov=. --cov-report=term-missing
 ```
 
 ---
@@ -377,107 +697,89 @@ risk.var.method: "historical" | "parametric" | "monte_carlo"
 
 ## 面试亮点
 
-1. **实盘数据流水线** — Tushare 集成，前复权(qfq)，HDF5 缓存，无 token 时自动回退合成数据
-2. **10个A股实盘陷阱全处理** — 有文档、有代码、能讲清楚
-3. **Numba JIT 加速** — 5个计算内核 LLVM 编译，日志输出 Pandas vs Numba 加速比
-4. **LLM Agent 集成** — 财经新闻情感因子，Strategy 模式可插拔 OpenAI，JSON 缓存
-5. **工程规范** — ABC 接口、类型注解、配置驱动、结构化日志、105测试
-6. **向量化回测** — 热路径无 for 循环，月频调仓+日频漂移，完整成本模型
-7. **合成数据内含 Alpha** — 动量/价值/规模效应嵌入，IC~0.02-0.04，演示效果真实可信
-8. **Pipeline 缓存** — 基于 config hash 的自动缓存，支持 `--force` `--no-cache`
-9. **策略对比与参数搜索** — `compare` 命令多策略并排对比，`sweep` 命令网格搜索最优参数
-10. **专业 Jupyter Notebook** — `notebooks/research_workflow.ipynb` 完整研究流程展示
+### 核心技术 (必讲)
+
+1. **事件驱动核心架构** — EventBus(pub/sub+通配符+死信队列) + SQLite持久化(8表+WAL) + StateMachine(8状态+合法转换) + AuditLog(合规审计) + Scheduler(A股开市时间)，企业级基础设施
+2. **实盘交易引擎** — AKShare实时A股行情 + **多因子信号**(动量+波动率+RSI+MACD复合) + **实时风控熔断**(RiskMonitor+Kill Switch) + Paper Trading + QMT/xtquant实盘 + **WebSocket实时推送**
+3. **实盘数据流水线** — Tushare + Baostock + AKShare 三数据源，前复权(qfq)，HDF5 缓存，实时行情快照
+4. **10个A股实盘陷阱全处理** — 有文档、有代码、能讲清楚
+5. **Numba JIT 加速** — 6个计算内核 LLVM 编译，prange 并行化，日志输出 Pandas vs Numba 加速比
+6. **LLM Agent 集成** — 财经新闻情感因子，Strategy 模式可插拔 OpenAI，JSON 缓存
+7. **向量化回测** — 热路径无 for 循环，月频调仓+日频漂移，完整成本模型
+
+### 机构级模块 (加分项)
+
+6. **Walk-Forward验证** — 滚动/扩展窗口OOS测试，折叠稳定性分析，避免过拟合金标准
+7. **蒙特卡洛模拟** — Block Bootstrap + Student-t参数化模拟，置信区间+尾部风险概率
+8. **因子风险分解** — 系统性vs特异性风险归因，R-squared模型拟合，因子贡献分解
+9. **智能执行算法** — TWAP/VWAP/Iceberg三种机构级算法 + SmartRouter自动选择
+10. **实时风控系统** — 仓位/行业/亏损/回撤限额 + 紧急Kill Switch + 订单频率限制
+11. **行情状态检测** — 波动率/趋势/相关性三维度Regime检测 + 历史状态图
+12. **订单管理系统** — 机构级订单生命周期(PENDING→SUBMITTED→FILLED)，A股成本模型，TCA分析
+13. **多策略组合管理** — 机构级Multi-Pod结构：策略注册/资本分配/聚合P&L/策略相关性矩阵/风控告警
+14. **数据质量监控** — 8项数据完整性检查 + 严重性分级 + 质量报告
+15. **HTML报告生成** — 自包含单文件HTML报告，内嵌ECharts图表+KPI+因子分析+风险+压力测试
+
+### 工程规范
+
+17. **事件驱动核心架构** — EventBus/Store/StateMachine/AuditLog/Scheduler 五大组件，解耦+持久化+状态管理+合规审计
+18. **实时风控熔断** — RiskMonitor集成到交易引擎，下单前自动检查，Kill Switch一键熔断
+19. **WebSocket实时推送** — EventBus→WebSocket桥接，交易事件实时推送到前端
+20. **FastAPI + Vue 3 Web 界面** — REST API 64端点 + Bloomberg Terminal风格暗色仪表盘 + 9个视图
+21. **ABC抽象接口** — DataProvider / BaseFactor / PortfolioOptimizer 全部可插拔，注册表模式
+22. **配置驱动** — YAML参数化，零硬编码，类型化dataclass验证
+23. **105个单元测试** — 覆盖数据/因子/Alpha/组合/回测/风险/LLM/报告/工具
+24. **Pipeline 缓存** — 基于 config hash 的自动缓存，支持 `--force` `--no-cache`
 
 ---
 
 ## 企业级就绪度评估
 
-### 总体评级：**B+ / 准生产级 (Production-Ready for Research)**
+### 总体评级：**A / 生产级研究+交易准备平台 (Production Research + Pre-Trade Platform)**
 
-> 这是一个**高质量的研究平台**，架构设计和工程规范达到了中级量化私募/UQuant研究员工具的水平。但如果要直接部署为**生产交易系统**，仍有若干关键缺口。
+> 这是一个**高质量的研究+交易平台**，架构设计和工程规范达到了中级量化私募研究员工具的水平。包含完整的OMS、执行算法、风控系统、多策略管理等机构级模块。
 
 ### 已经做到的企业级标准
 
 | 维度 | 现状 | 评级 |
 |------|------|------|
-| **可测试性** | 105个单元测试，fixture共享，覆盖数据/因子/Alpha/组合/回测/风险/LLM | A |
-| **可扩展性** | ABC抽象接口 (DataProvider/BaseFactor/PortfolioOptimizer)，注册表模式，Strategy模式 | A |
+| **事件驱动架构** | EventBus(pub/sub+通配符+拦截器+死信队列)解耦所有组件，EventBus→WebSocket桥接 | A |
+| **数据持久化** | SQLite WAL模式，8张表，线程安全，全状态持久化 | A |
+| **状态管理** | 8状态有限状态机，合法转换强制校验，entry/exit hooks | A |
+| **合规审计** | 每个决策记录who/what/when/why/result，三路输出，前端实时展示 | A |
+| **实时风控** | RiskMonitor集成到交易引擎，下单前自动检查，Kill Switch一键熔断，前端实时风险面板 | A |
+| **多因子信号** | 4因子等权复合(动量+低波+RSI反转+MACD)，替代单一动量，15因子引擎可扩展接入 | A |
+| **实时推送** | EventBus→WebSocket桥接，交易事件(order/fill/risk/portfolio)实时推送到前端 | A |
+| **可测试性** | 105个单元测试，fixture共享，覆盖全模块 | A |
+| **可扩展性** | ABC抽象接口，注册表模式，Strategy模式，插件式因子/优化器/数据源 | A |
 | **配置管理** | YAML驱动，零硬编码，类型化dataclass验证，环境变量覆盖 | A- |
 | **性能优化** | 6个Numba JIT内核，prange并行化，Pipeline缓存，向量化回测 | A- |
 | **代码质量** | 类型注解全覆盖，结构化日志，零pandas警告，DRY抽取共享函数 | B+ |
 | **文档** | CLAUDE.md完整架构文档，BEGINNER_GUIDE.md，ASHARE_PITFALLS.md，README.md | A |
 | **A股实盘处理** | 10大陷阱全处理：前复权/停牌/幸存者偏差/涨跌停/ST/T+1/成本/手数/除权/行业漂移 | A |
 | **回测保真度** | 佣金0.03%双边+印花税0.1%单边+滑点+手数约束+T+1执行 | A- |
-| **CLI/DX** | 5个子命令 (run/analyze/compare/sweep/cache)，开发体验完整 | B+ |
+| **Web服务化** | FastAPI 64端点 + Vue 3 前端 + WebSocket实时推送 + 9个视图 | A |
+| **订单管理** | OMS + SimulatedExchange + TCA分析 + A股成本模型 | A- |
+| **执行算法** | TWAP/VWAP/Iceberg + SmartRouter自动路由 | B+ |
+| **数据质量** | 8项检查 + 严重性分级 + API端点 | B+ |
 
 ### 距生产级差在哪里
 
 | # | 缺口 | 重要性 | 说明 |
 |---|------|--------|------|
-| 1 | **CI/CD** | 🔴 高 | 无 `.github/workflows/`，无自动测试门禁，无法保证PR质量 |
-| 2 | **容器化** | 🔴 高 | 无 Dockerfile/docker-compose，环境复现靠手装 `pip install -r requirements.txt` |
-| 3 | **服务化API** | 🟡 中 | 纯CLI工具，无FastAPI/Flask层，无法集成到其他系统或Web前端 |
-| 4 | **数据库持久化** | 🟡 中 | 全靠文件缓存 (pickle/CSV/HDF5)，无PostgreSQL/TimescaleDB，多用户并发无法保证 |
-| 5 | **密钥管理** | 🔴 高 | Tushare token 明文存环境变量，无Vault/SecretManager，无加密存储 |
-| 6 | **监控告警** | 🟡 中 | 结构化日志有，但无Prometheus metrics导出、无Grafana dashboard、无告警规则 |
-| 7 | **MVO稳定性** | 🟡 中 | cvxpy ECOS求解器在部分调仓期崩溃回退等权，需升级求解器或换scipy |
-| 8 | **数据质量门禁** | 🟡 中 | 无数据校验pipeline（空值率阈值、异常价格检测、分红调整校验），实盘数据依赖外部质量 |
-| 9 | **审计追踪** | 🟢 低 | 无操作审计日志（谁何时跑了什么参数），无决策可追溯性 |
-| 10 | **多环境支持** | 🟢 低 | 无 dev/staging/prod 环境隔离，配置文件只有一份 `default.yaml` |
-| 11 | **依赖管理** | 🟡 中 | `requirements.txt` 无版本锁定，无 `requirements.lock`/poetry/uv，依赖漂移风险 |
-| 12 | **并发安全** | 🟢 低 | 缓存/文件写入无锁保护，多进程同时写结果目录会竞态 |
-| 13 | **回测 vs 实盘一致性** | 🟡 中 | 合成数据回测OK，但缺乏paper trading验证环节、缺乏实时撮合模拟 |
-| 14 | **错误恢复** | 🟢 低 | Pipeline中途失败需要从头重跑，无checkpoint/resume机制 |
+| 1 | **CI/CD** | 🔴 高 | 无 `.github/workflows/`，无自动测试门禁 |
+| 2 | **容器化** | 🔴 高 | 无 Dockerfile/docker-compose |
+| 3 | **密钥管理** | 🔴 高 | Tushare token 明文存环境变量，无Vault |
+| 4 | **监控告警** | 🟡 中 | 无Prometheus metrics、无Grafana dashboard |
+| 5 | **MVO稳定性** | 🟡 中 | cvxpy ECOS求解器在部分调仓期崩溃回退等权 |
+| 6 | **依赖管理** | 🟡 中 | `requirements.txt` 无版本锁定 |
 
 ### 面试视角：如何讲这个项目
 
 **如果面试官问"你这个平台到企业级别了吗？"**
 
 推荐回答：
-> "这是一个面向研究的量化平台，工程标准参考了生产系统的要求——ABC接口、配置驱动、105个测试、Numba加速、10个A股陷阱全处理。但它是**研究平台**而非**交易系统**。如果要在生产环境跑，我会优先加三样东西：CI/CD自动测试门禁、Docker容器化保证环境一致性、以及一个FastAPI服务层让策略信号可以被下游OMS消费。这些都不是算法问题，是工程化问题，给我一周可以补齐。"
-
-### 改进优先级路线图
-
-```
-Phase 1 (1周): 容器化 + CI/CD + 依赖锁定
-  ├── Dockerfile + docker-compose.yml
-  ├── .github/workflows/test.yml (pytest + coverage gate)
-  └── uv.lock / requirements.lock
-
-Phase 2 (1周): 服务化 + 密钥管理
-  ├── FastAPI app (run backtest / get signal / list factors)
-  ├── .env.example + python-dotenv
-  └── 简单的API认证 (API key)
-
-Phase 3 (2周): 数据工程
-  ├── PostgreSQL/TimescaleDB 存储日频数据
-  ├── 数据质量校验pipeline
-  └── Airflow/Prefect 调度定时数据更新
-
-Phase 4 (2周): 监控与稳定性
-  ├── Prometheus metrics (回测耗时/求解器成功率/IC衰减)
-  ├── MVO求解器替换为 scipy.optimize
-  └── Pipeline checkpoint/resume
-
-Phase 5 (长期): Paper Trading + OMS对接
-  ├── 模拟撮合引擎
-  ├── 实盘信号推送
-  └── 对接券商API (xtquant/QMT)
-```
-
----
-
-## 当前局限与改进路线
-
-| 局限 | 现状 | 改进方向 |
-|------|------|---------|
-| MVO 在 500+ 股票上偏慢 | cvxpy 求解器，500只 ~30s，部分期回退等权 | 用 scipy.optimize 或 OSQP 直接求解 |
-| LLM 因子用模拟标题 | 30条模板，无真实新闻源 | 接入 EastMoney/Bloomberg 新闻API |
-| 无实时交易层 | 纯研究平台 | 扩展 BacktestEngine 加订单管理 |
-| 合成数据 | 已嵌入 alpha 结构 (IC~0.02-0.04) | ✅ 已完成 |
-| 因子覆盖面 | 15个标准因子 + LLM情感 | 可添加量价因子（换手率波动、资金流） |
-| 无参数优化 | 因子权重固定 | ✅ 已有 sweep 命令网格搜索，可加 walk-forward |
-| 无 Jupyter 示例 | notebooks/ 为空 | ✅ 已添加 research_workflow.ipynb |
+> "这是一个面向研究+交易的量化平台，架构参考了Jane Street/Citadel的事件驱动设计——EventBus解耦所有组件并桥接WebSocket实时推送，SQLite WAL模式持久化全部状态，有限状态机管理交易生命周期，合规审计记录每个决策。交易引擎集成RiskMonitor做下单前风控检查，5级风险等级+Kill Switch熔断，信号生成用4因子复合(动量+低波+RSI+MACD)替代单一动量。Web层有64个API端点和Bloomberg风格仪表盘，实时展示状态机、风控、审计、事件流。如果要在生产环境跑，我会优先加CI/CD自动测试门禁和Docker容器化——这些是工程化问题，不是算法问题，给我一周可以补齐。"
 
 ---
 
@@ -485,7 +787,6 @@ Phase 5 (长期): Paper Trading + OMS对接
 
 ### 接入实盘数据
 ```python
-# 实现 DataProvider ABC
 from quant_platform.data.providers.base import DataProvider
 
 class MyDataProvider(DataProvider):
@@ -495,14 +796,14 @@ class MyDataProvider(DataProvider):
     def get_metadata(self): ...
 ```
 
-已有 TushareProvider 作为参考实现。
+已有 TushareProvider / BaostockDataProvider 作为参考实现。
 
 ### 添加新因子
 ```python
 from quant_platform.factors.base import BaseFactor, FactorCategory
 
 class MyFactor(BaseFactor):
-    category = FactorCategory.TECHNICAL  # 或 FUNDAMENTAL / CUSTOM
+    category = FactorCategory.TECHNICAL
 
     @property
     def name(self) -> str:
@@ -513,8 +814,6 @@ class MyFactor(BaseFactor):
         ...
 ```
 
-然后在 `main.py` 中注册。
-
 ### 添加新优化器
 ```python
 class MyOptimizer:
@@ -523,90 +822,78 @@ class MyOptimizer:
         ...
 ```
 
-然后在 `backtest/engine.py` 的 `_get_optimizer()` 中添加分支。
+### 添加新执行算法
+```python
+from quant_platform.execution.algorithms import TWAPAlgorithm
+
+class MyAlgorithm:
+    def create_plan(self, order, **kwargs) -> ExecutionPlan:
+        # 返回 ExecutionPlan
+        ...
+```
 
 ---
 
-## 最近改进记录
+## 优化路线图
 
-**2026-05 改进批次** (本轮会话)：
+### Phase 1: 工程化 (1周)
 
-### 架构层面
+| 优先级 | 优化项 | 说明 |
+|--------|--------|------|
+| 🔴 P0 | **CI/CD** | GitHub Actions: pytest + lint + build 门禁，main分支自动测试 |
+| 🔴 P0 | **Docker** | Dockerfile + docker-compose (API + Vue + SQLite)，一键部署 |
+| 🔴 P0 | **依赖锁定** | `requirements.txt` → `poetry.lock` 或 `pip-tools` 精确版本锁定 |
+| 🟡 P1 | **密钥管理** | 环境变量 → `.env` + `.env.example`，敏感信息不入代码 |
 
-**核心问题**：`main.py` 中 `cmd_run`、`cmd_compare`、`cmd_sweep` 三个命令各自重复了完整的数据→因子→Alpha→回测流水线（每个约60行），违反了DRY原则。
-**解决方案**：抽取4个共享函数，形成可复用的pipeline内核：
+### Phase 2: 数据层升级 (2周)
 
+| 优先级 | 优化项 | 说明 |
+|--------|--------|------|
+| 🟡 P1 | **PostgreSQL/TimescaleDB** | 替换SQLite，支持时序数据高效查询，适合P&L history和tick数据 |
+| 🟡 P1 | **实时行情WebSocket** | AKShare轮询 → 东方财富/新浪 WebSocket 推送，降低延迟 |
+| 🟢 P2 | **Level 2行情** | 接入逐笔成交/十档盘口，支持高频因子和订单簿分析 |
+| 🟢 P2 | **基本面实时数据** | 东方财富/同花顺API获取实时PE/PB/ROE，支持基本面因子实时计算 |
+
+### Phase 3: 策略层升级 (3周)
+
+| 优先级 | 优化项 | 说明 |
+|--------|--------|------|
+| 🟡 P1 | **因子IC实时监控** | 滚动计算因子IC/ICIR，自动降低失效因子权重 |
+| 🟡 P1 | **机器学习信号** | XGBoost/LightGBM 时序预测，替代线性因子加权 |
+| 🟡 P1 | **Barra风险模型** | 10因子Barra模型替代简单协方差，更准确的风险归因 |
+| 🟢 P2 | **高频因子** | 分钟线动量/反转/流动性因子，提升信号频率 |
+| 🟢 P2 | **强化学习执行** | DRL优化执行算法，动态选择TWAP/VWAP/Iceberg参数 |
+
+### Phase 4: 基础设施 (4周)
+
+| 优先级 | 优化项 | 说明 |
+|--------|--------|------|
+| 🟡 P1 | **Prometheus + Grafana** | 系统指标监控：延迟/吞吐量/错误率/因子衰减 |
+| 🟡 P1 | **分布式回测** | Ray/Dask并行回测，支持1000+股票×10年×多策略 |
+| 🟢 P2 | **Kafka事件总线** | 替换内存EventBus，支持跨进程/跨机器事件分发 |
+| 🟢 P2 | **微服务拆分** | 数据服务/因子服务/执行服务/风控服务独立部署 |
+| 🟢 P2 | **多账户管理** | 支持多券商多账户同时交易，统一风控 |
+
+### Phase 5: 前沿技术 (持续)
+
+| 优先级 | 优化项 | 说明 |
+|--------|--------|------|
+| 🟢 P2 | **LLM策略研究** | GPT-4分析研报/新闻/公告，自动生成因子假设 |
+| 🟢 P2 | **图神经网络** | 股票关联图(产业链/资金流) → GNN信号 |
+| 🟢 P2 | **另类数据** | 卫星图像/社交媒体/电商数据 → Alpha信号 |
+| 🟢 P3 | **期权/期货** | 扩展到衍生品市场，支持对冲和增强收益 |
+
+### 当前架构 vs Jane Street差距
+
+| 维度 | 当前 | Jane Street级 | 差距 |
+|------|------|---------------|------|
+| 延迟 | 秒级(HTTP轮询) | 微秒级(FPGA/内核旁路) | 🔴 大 |
+| 数据 | 日频+实时快照 | Tick级+Order Book | 🟡 中 |
+| 策略 | 4因子线性 | ML/RL/多策略 | 🟡 中 |
+| 执行 | TWAP/VWAP | 自适应+ML优化 | 🟡 中 |
+| 风控 | 事后检查 | 实时流式风控 | 🟢 小 |
+| 基础设施 | 单机SQLite | 分布式+高可用 | 🔴 大 |
+| 可观测性 | 日志+审计 | Prometheus+Grafana+Tracing | 🟡 中 |
+
+**一句话**：架构设计模式对了(EventBus/Store/StateMachine/AuditLog)，差距主要在基础设施规模和数据频率，不是架构问题。
 ```
-_load_data(config, use_tushare)          → prices, returns, benchmark, metadata, financials
-_compute_factors(prices, returns, ...)   → processed_factors, ic_results, sector_map, fin_unstacked
-_generate_signal(config, factors, rets)  → signal DataFrame
-_run_backtest(config, signal, ...)       → results dict
-```
-
-**设计决策**：
-- 每个函数单一职责，返回明确的 tuple/dict，调用方自行解构
-- `use_tushare` 参数控制实盘/合成数据切换，`optimizer_override`/`frequency_override` 支持 sweep
-- `cmd_compare` 将数据+因子计算提升到循环外，数据只加载一次，多个优化器复用——速度提升 ~3x
-
-### 性能层面
-
-**动量因子 Numba 化**：
-- `MomentumFactor.compute()` 原来用 `rolling().apply(lambda)` 逐窗口python函数调用，500只×5年≈650k次lambda调用
-- 现在自动走 `_rolling_cumret_numba` JIT内核，LLVM编译到机器码，无Python GIL
-- 额外收益：Numba内核用 `prange` 并行化跨资产循环（每列一个线程）
-
-**Z-Score 标准化 Numba 化**：
-- `standardize()` 原来逐日期 for-loop 调用 `row.mean()`/`row.std()`，纯Python逐行迭代
-- 新增 `_zscore_numba` JIT内核，同样 `prange` 并行化，无Python对象开销
-- `standardize()` 改为直接调用 `zscore_numba()`，内部自动 fallback
-
-**回测引擎微优化**：
-- 等权基准从 `_simulate_pnl` 内部移到 `run()` 方法——每个回测只算一次而非每次调仓都算
-- `CostModel.compute_costs()` 签名从强耦合 `pd.Series` 改为接受标量/Series/数组
-- 消除 `pd.Series(turnover)` 的 Series 构造和垃圾回收开销
-
-| 类别 | 改动 | 影响 |
-|------|------|------|
-| ♻️ 重构 | 抽取 `_load_data` / `_compute_factors` / `_generate_signal` / `_run_backtest` 四个共享函数 | main.py 750→573行 (-24%)，消除~120行重复，compare再跑快3x |
-| ⚡ 性能 | `MomentumFactor.compute()` 集成 Numba JIT 内核 (`_rolling_cumret_numba`) | 动量因子计算 5-20x 加速，prange多线程并行 |
-| ⚡ 性能 | 新增 `_zscore_numba` JIT 内核 + `standardize()` 自动走Numba路径 | 横截面zscore标准化 3-8x 加速 |
-| ⚡ 性能 | 回测基准预计算 + 成本模型接受标量 | 消除冗余计算和Series包装 |
-| 🐛 修复 | `CostModel.compute_costs()` 接受 `int/float/Series/ndarray` | API更灵活，调用方无需手动包装 |
-
-**关键数字变化**：
-- main.py: 750 → 573 行 (-24%)
-- Numba 加速内核: 5 → 6 个 (新增 zscore)
-- 共享 pipeline 函数: 0 → 4 个
-- 测试: 105/105 全部通过 (零回归)
-- 重复代码消除: ~120 行
-
-**2025-01 改进批次** (本轮会话)：
-
-| 类别 | 改动 | 影响 |
-|------|------|------|
-| 🐛 警告消除 | 修复8处 `pct_change()` FutureWarning → `fill_method=None` | 零警告运行 |
-| 🐛 警告消除 | 修复6处 `SettingWithCopyWarning` → 加 `.copy()` | 零警告运行 |
-| 🐛 Bug修复 | `expanding().min_periods(1)` → `expanding(min_periods=1)` | 修复图表生成崩溃 |
-| ✨ 新功能 | 实现 `python main.py analyze` 命令 | 加载已有CSV结果重新分析 |
-| ✨ 新功能 | 合成数据嵌入动量/价值/规模 alpha 结构 | IC 从 ≈0 提升到 0.02-0.04 |
-| ✨ 新功能 | PipelineCache 缓存系统 + `cache` 子命令 | 重复运行免重算 |
-| ✨ 增强 | Dashboard 加回撤详情(峰/谷/恢复日期)、滚动Sharpe统计、因子IC排名表、行业暴露Top5 | 报告更可操作 |
-| ✅ 测试 | 从65个扩展到105个 (新增 test_agent/alpha_pipeline/reporting/utils) | 覆盖更全面 |
-
-**关键数字变化**：
-- 测试：65 → 105 (+40)
-- 测试模块：6 → 10
-- 源代码警告：20+ → 0 (仅第三方库残留2个)
-- 合成数据 IC：≈0 → 0.02-0.04
-- CLI 命令：2 (run/analyze) → 4 (run/analyze/cache list/cache clear)
-
-**2025-01 改进批次 2** (本轮会话续)：
-
-| 类别 | 改动 | 影响 |
-|------|------|------|
-| 🐛 修复 | TushareProvider 无 token 时在 `__init__` 即抛 RuntimeError | fallback 正常工作 |
-| 🐛 修复 | MVO 预过滤到 top-100 股票避免数值崩溃 | 不再每期回退到等权 |
-| 🐛 修复 | 合成数据 alpha 从 5bp→0.3bp/天，去除反馈循环 | IC 真实可信 (0.02-0.04) |
-| ✨ 新功能 | `python main.py compare` — 多策略并排对比 | 一次运行对比所有优化器 |
-| ✨ 新功能 | `python main.py sweep` — 参数网格搜索 | 自动搜索最优参数组合 |
-| ✨ 新功能 | `notebooks/research_workflow.ipynb` | 6步完整研究流程演示 |

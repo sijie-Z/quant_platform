@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from quant_platform.utils.config import load_config
 from quant_platform.utils.logging import setup_logging, get_logger
 
-logger = None  # Set after config load
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -37,14 +37,23 @@ def _resolve_config_path(config_path_arg) -> Path:
     return Path(__file__).resolve().parent / "config" / "default.yaml"
 
 
-def _load_data(config, use_tushare: bool = True):
+def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
     """Load and clean data. Returns (prices, returns, benchmark, metadata, financials)."""
     from quant_platform.data.providers.synthetic import SyntheticDataProvider
     from quant_platform.data.providers.tushare_loader import TushareProvider
+    from quant_platform.data.providers.baostock_provider import BaostockDataProvider
     from quant_platform.data.pipeline import DataPipeline
 
     provider = None
-    if use_tushare:
+
+    if use_baostock:
+        try:
+            provider = BaostockDataProvider()
+            logger.info("Using Baostock real data provider (free, no API key)")
+        except Exception as e:
+            logger.warning("Baostock unavailable (%s), trying Tushare...", e)
+
+    if provider is None and use_tushare:
         try:
             provider = TushareProvider(
                 start_date=config.data.start_date,
@@ -108,7 +117,7 @@ def _compute_factors(prices, returns, financials, metadata):
 
     logger.info("Computed %d factors: %s", len(raw_factors), list(raw_factors.keys()))
 
-    sector_map = metadata["sector"]
+    sector_map = metadata.get("sector", {}) if metadata else {}
     mcap = fin_unstacked["market_cap"] if fin_unstacked is not None else None
 
     processed_factors = {}
@@ -499,6 +508,26 @@ def cmd_cache(args) -> int:
     return 0
 
 
+def cmd_web(args) -> int:
+    """Start the web server (FastAPI + Vue frontend)."""
+    import uvicorn
+    from quant_platform.app import create_app
+
+    app = create_app(serve_frontend=not args.no_frontend)
+    mode = "API + Frontend" if not args.no_frontend else "API only"
+    print(f"Quant Platform Web Server starting...")
+    print(f"  Mode: {mode}")
+    print(f"  API:  http://{args.host}:{args.port}/api/docs")
+    if not args.no_frontend:
+        from quant_platform.app import _DIST_DIR
+        if _DIST_DIR.exists():
+            print(f"  UI:   http://{args.host}:{args.port}/")
+        else:
+            print(f"  UI:   Frontend not built. Run: cd frontend && npm run build")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="A-Share Multi-Factor Quant Platform",
@@ -544,6 +573,12 @@ def main() -> int:
     sweep_parser.add_argument("--cache-dir", type=str, default=".quant_cache",
                               help="Cache directory path")
 
+    # web
+    web_parser = subparsers.add_parser("web", help="Start web server (FastAPI + Vue)")
+    web_parser.add_argument("--port", "-p", type=int, default=8000, help="Server port")
+    web_parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
+    web_parser.add_argument("--no-frontend", action="store_true", help="API only mode")
+
     # cache
     cache_parser = subparsers.add_parser("cache", help="Manage pipeline cache")
     cache_sub = cache_parser.add_subparsers(dest="subcommand", help="Cache action")
@@ -564,6 +599,8 @@ def main() -> int:
         return cmd_sweep(args)
     elif args.command == "cache":
         return cmd_cache(args)
+    elif args.command == "web":
+        return cmd_web(args)
     else:
         parser.print_help()
         return 1
