@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quant Platform — Backtest Report</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0e17; color: #c9d1d9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 24px; }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #1e2a3a; }
+  .header h1 { font-size: 20px; color: #4da6ff; font-weight: 700; letter-spacing: 1px; }
+  .header .meta { font-size: 11px; color: #6b7a8d; }
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .kpi { background: #111827; border: 1px solid #1e2a3a; border-radius: 8px; padding: 12px; text-align: center; }
+  .kpi-label { font-size: 9px; font-weight: 700; color: #6b7a8d; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .kpi-value { font-size: 18px; font-weight: 700; font-family: 'SF Mono', 'Fira Code', monospace; color: #e6edf3; }
+  .kpi-value.pos { color: #22c55e; }
+  .kpi-value.neg { color: #ef4444; }
+  .kpi-value.accent { color: #4da6ff; }
+  .section { background: #111827; border: 1px solid #1e2a3a; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .section-title { font-size: 11px; font-weight: 700; color: #6b7a8d; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .section-title::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #4da6ff; }
+  .chart { width: 100%; height: 300px; }
+  .chart-sm { width: 100%; height: 200px; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th { padding: 6px 10px; font-size: 9px; font-weight: 700; color: #6b7a8d; text-transform: uppercase; letter-spacing: 0.6px; text-align: left; border-bottom: 1px solid #1e2a3a; background: #0d1117; }
+  td { padding: 5px 10px; border-bottom: 1px solid #161b22; color: #c9d1d9; }
+  tr:hover td { background: rgba(77,166,255,0.04); }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+  .badge { font-size: 9px; font-weight: 700; padding: 2px 8px; border-radius: 3px; letter-spacing: 0.3px; }
+  .badge-green { color: #22c55e; background: rgba(34,197,94,0.1); }
+  .badge-yellow { color: #fbbf24; background: rgba(251,191,36,0.1); }
+  .badge-red { color: #ef4444; background: rgba(239,68,68,0.1); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Quant Platform — Backtest Report</h1>
+  <div class="meta">
+    Generated: 2026-05-09 09:27:14<br>
+    Period: 2021-01-01 → 2021-01-02<br>
+    Optimizer: equal_weight
+  </div>
+</div>
+
+<!-- KPI Strip -->
+<div class="kpi-grid">
+  <div class="kpi"><div class="kpi-label">Total Return</div><div class="kpi-value pos">+45.00%</div></div>
+  <div class="kpi"><div class="kpi-label">Annual Return</div><div class="kpi-value pos">+8.00%</div></div>
+  <div class="kpi"><div class="kpi-label">Sharpe Ratio</div><div class="kpi-value accent">1.45</div></div>
+  <div class="kpi"><div class="kpi-label">Sortino Ratio</div><div class="kpi-value accent">--</div></div>
+  <div class="kpi"><div class="kpi-label">Max Drawdown</div><div class="kpi-value neg">-12.00%</div></div>
+  <div class="kpi"><div class="kpi-label">Calmar Ratio</div><div class="kpi-value">--</div></div>
+  <div class="kpi"><div class="kpi-label">Win Rate</div><div class="kpi-value">0.0%</div></div>
+  <div class="kpi"><div class="kpi-label">Information Ratio</div><div class="kpi-value accent">--</div></div>
+  <div class="kpi"><div class="kpi-label">Annual Vol</div><div class="kpi-value">--</div></div>
+  <div class="kpi"><div class="kpi-label">Rebalances</div><div class="kpi-value">0</div></div>
+  <div class="kpi"><div class="kpi-label">VaR (95%)</div><div class="kpi-value neg">--</div></div>
+  <div class="kpi"><div class="kpi-label">CVaR (95%)</div><div class="kpi-value neg">--</div></div>
+</div>
+
+<!-- Equity + Drawdown -->
+<div class="two-col">
+  <div class="section">
+    <div class="section-title">Equity Curve</div>
+    <div id="equityChart" class="chart"></div>
+  </div>
+  <div class="section">
+    <div class="section-title">Drawdown</div>
+    <div id="ddChart" class="chart"></div>
+  </div>
+</div>
+
+<!-- Rolling Sharpe + Monthly Returns -->
+<div class="two-col">
+  <div class="section">
+    <div class="section-title">Rolling Sharpe (252d)</div>
+    <div id="sharpeChart" class="chart-sm"></div>
+  </div>
+  <div class="section">
+    <div class="section-title">Monthly Returns</div>
+    <div id="monthlyChart" class="chart-sm"></div>
+  </div>
+</div>
+
+<!-- Factor IC Analysis -->
+<div class="section">
+  <div class="section-title">Factor IC Analysis</div>
+  <table>
+    <thead><tr><th>Factor</th><th>Mean IC</th><th>ICIR</th><th>IC+ Ratio</th><th>IC Std</th></tr></thead>
+    <tbody>
+        <tr>
+          <td style="font-weight:600;color:#4da6ff">momentum_1m</td>
+          <td style="font-family:monospace">0.0400</td>
+          <td style="font-family:monospace;color:#22c55e;font-weight:700">2.100</td>
+          <td style="font-family:monospace">65.0%</td>
+          <td style="font-family:monospace">0.0200</td>
+        </tr>
+        <tr>
+          <td style="font-weight:600;color:#4da6ff">rsi_14d</td>
+          <td style="font-family:monospace">0.0300</td>
+          <td style="font-family:monospace;color:#22c55e;font-weight:700">1.800</td>
+          <td style="font-family:monospace">60.0%</td>
+          <td style="font-family:monospace">0.0150</td>
+        </tr></tbody>
+  </table>
+</div>
+
+<!-- Sector Exposure -->
+<div class="two-col">
+  <div class="section">
+    <div class="section-title">Sector Exposure</div>
+    <table>
+      <thead><tr><th>Sector</th><th>Weight</th><th></th></tr></thead>
+      <tbody>
+        <tr>
+          <td>金融</td>
+          <td style="font-family:monospace">25.00%</td>
+          <td><div style="background:#4da6ff;height:6px;width:75.0%;border-radius:3px"></div></td>
+        </tr>
+        <tr>
+          <td>消费</td>
+          <td style="font-family:monospace">20.00%</td>
+          <td><div style="background:#4da6ff;height:6px;width:60.0%;border-radius:3px"></div></td>
+        </tr>
+        <tr>
+          <td>科技</td>
+          <td style="font-family:monospace">15.00%</td>
+          <td><div style="background:#4da6ff;height:6px;width:45.0%;border-radius:3px"></div></td>
+        </tr></tbody>
+    </table>
+  </div>
+  <div class="section">
+    <div class="section-title">Stress Tests</div>
+    <table>
+      <thead><tr><th>Scenario</th><th>Return</th><th>Max DD</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>2008 Crisis</td>
+          <td style="font-family:monospace;color:#ef4444">-8.00%</td>
+          <td style="font-family:monospace;color:#ef4444">-15.00%</td>
+        </tr>
+        <tr>
+          <td>2015 Crash</td>
+          <td style="font-family:monospace;color:#ef4444">-12.00%</td>
+          <td style="font-family:monospace;color:#ef4444">-18.00%</td>
+        </tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Risk Metrics -->
+<div class="section">
+  <div class="section-title">Risk Metrics</div>
+  <div class="kpi-grid">
+    <div class="kpi"><div class="kpi-label">Historical VaR</div><div class="kpi-value neg">--</div></div>
+    <div class="kpi"><div class="kpi-label">Parametric VaR</div><div class="kpi-value neg">--</div></div>
+    <div class="kpi"><div class="kpi-label">CVaR</div><div class="kpi-value neg">--</div></div>
+    <div class="kpi"><div class="kpi-label">Tracking Error</div><div class="kpi-value">--</div></div>
+    <div class="kpi"><div class="kpi-label">Excess Return</div><div class="kpi-value pos">--</div></div>
+    <div class="kpi"><div class="kpi-label">Effective N</div><div class="kpi-value accent">--</div></div>
+  </div>
+</div>
+
+<script>
+const dates = ["2021-01-01", "2021-01-02"];
+const equity = [1.0, 1.01];
+const benchmark = [1.0, 1.005];
+const drawdown = [0, -0.005];
+const rollingSharpe = [];
+const monthlyData = {};
+
+// Equity Chart
+const eqChart = echarts.init(document.getElementById('equityChart'));
+eqChart.setOption({
+  tooltip: { trigger: 'axis' },
+  legend: { data: ['Strategy', 'Benchmark'], textStyle: { color: '#6b7a8d', fontSize: 10 }, top: 0, right: 0 },
+  grid: { top: 30, right: 16, bottom: 28, left: 50 },
+  xAxis: { type: 'category', data: dates, axisLabel: { color: '#6b7a8d', fontSize: 9 }, axisLine: { lineStyle: { color: '#1e2a3a' } } },
+  yAxis: { type: 'value', axisLabel: { color: '#6b7a8d', fontSize: 9 }, splitLine: { lineStyle: { color: '#1e2a3a' } } },
+  series: [
+    { name: 'Strategy', type: 'line', data: equity, smooth: 0.2, symbol: 'none', lineStyle: { color: '#4da6ff', width: 2 },
+       areaStyle: { color: new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(77,166,255,0.2)'},{offset:1,color:'rgba(77,166,255,0.01)'}]) } },
+    { name: 'Benchmark', type: 'line', data: benchmark, smooth: 0.2, symbol: 'none', lineStyle: { color: '#6b7a8d', width: 1, type: 'dashed' } }
+  ]
+});
+
+// Drawdown Chart
+const ddChart = echarts.init(document.getElementById('ddChart'));
+ddChart.setOption({
+  tooltip: { trigger: 'axis', formatter: p => p[0].name + '<br/>DD: ' + (p[0].value*100).toFixed(2) + '%' },
+  grid: { top: 8, right: 16, bottom: 28, left: 50 },
+  xAxis: { type: 'category', data: dates, axisLabel: { color: '#6b7a8d', fontSize: 9 }, axisLine: { lineStyle: { color: '#1e2a3a' } } },
+  yAxis: { type: 'value', axisLabel: { color: '#6b7a8d', fontSize: 9, formatter: v => (v*100).toFixed(0)+'%' }, splitLine: { lineStyle: { color: '#1e2a3a' } } },
+  series: [{ type: 'line', data: drawdown, smooth: 0.2, symbol: 'none', lineStyle: { color: '#ef4444', width: 1 },
+    areaStyle: { color: new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(239,68,68,0.3)'},{offset:1,color:'rgba(239,68,68,0.01)'}]) } }]
+});
+
+// Rolling Sharpe
+const shChart = echarts.init(document.getElementById('sharpeChart'));
+shChart.setOption({
+  tooltip: { trigger: 'axis' },
+  grid: { top: 8, right: 16, bottom: 24, left: 40 },
+  xAxis: { type: 'category', data: dates.slice(-rollingSharpe.length), axisLabel: { color: '#6b7a8d', fontSize: 8 }, axisLine: { lineStyle: { color: '#1e2a3a' } } },
+  yAxis: { type: 'value', axisLabel: { color: '#6b7a8d', fontSize: 9 }, splitLine: { lineStyle: { color: '#1e2a3a' } } },
+  series: [{ type: 'line', data: rollingSharpe, smooth: 0.2, symbol: 'none', lineStyle: { color: '#fbbf24', width: 1.5 },
+    areaStyle: { color: new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(251,191,36,0.15)'},{offset:1,color:'rgba(251,191,36,0.01)'}]) } }]
+});
+
+// Monthly Heatmap
+const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const years = Object.keys(monthlyData).sort();
+const heatData = [];
+years.forEach((y, yi) => {
+  (monthlyData[y] || []).forEach((v, mi) => {
+    if (v !== null && v !== undefined) heatData.push([mi, yi, v]);
+  });
+});
+const mChart = echarts.init(document.getElementById('monthlyChart'));
+mChart.setOption({
+  tooltip: { formatter: p => months[p.data[0]] + ' ' + years[p.data[1]] + ': ' + (p.data[2]*100).toFixed(2) + '%' },
+  grid: { top: 8, right: 12, bottom: 24, left: 40 },
+  xAxis: { type: 'category', data: months, axisLabel: { color: '#6b7a8d', fontSize: 9 }, axisLine: { lineStyle: { color: '#1e2a3a' } } },
+  yAxis: { type: 'category', data: years, axisLabel: { color: '#6b7a8d', fontSize: 9 }, axisLine: { lineStyle: { color: '#1e2a3a' } } },
+  visualMap: { min: -0.1, max: 0.1, calculable: false, orient: 'horizontal', left: 'center', bottom: 0, show: false,
+    inRange: { color: ['#ef4444', '#111827', '#22c55e'] } },
+  series: [{ type: 'heatmap', data: heatData, label: { show: true, fontSize: 8, color: '#c9d1d9',
+    formatter: p => (p.data[2]*100).toFixed(1) + '%' } }]
+});
+
+window.addEventListener('resize', () => { eqChart.resize(); ddChart.resize(); shChart.resize(); mChart.resize(); });
+</script>
+
+<div style="text-align:center;padding:24px;color:#3a4a5e;font-size:10px">
+  Generated by A-Share Multi-Factor Quant Platform &bull; 2026-05-09 09:27:14
+</div>
+
+</body>
+</html>

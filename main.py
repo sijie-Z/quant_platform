@@ -528,6 +528,154 @@ def cmd_web(args) -> int:
     return 0
 
 
+def cmd_ml(args) -> int:
+    """ML alpha signal operations."""
+    config = load_config(_resolve_config_path(args.config))
+
+    if args.subcommand == "train":
+        from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
+
+        data_result = _load_data(config)
+        factors_result = _compute_factors(data_result, config)
+
+        ml_config = MLSignalConfig(
+            model_type=args.model,
+            n_splits=args.splits,
+        )
+        gen = MLSignalGenerator(config=ml_config)
+        perf = gen.train(factors_result.processed_factors, factors_result.forward_returns)
+
+        print("=" * 60)
+        print(f"  ML MODEL TRAINING — {args.model.upper()}")
+        print("=" * 60)
+        print(f"  Test IC:        {perf.test_ic:.4f}")
+        print(f"  Test ICIR:      {perf.test_icir:.4f}")
+        print(f"  Train IC:       {perf.train_ic:.4f}")
+        print(f"  Train samples:  {perf.n_train_samples}")
+        print(f"  Date:           {perf.date}")
+        print("-" * 60)
+        print("  Feature Importance:")
+        for name, imp in sorted(perf.feature_importance.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {name:<20} {imp:.4f}")
+        print("=" * 60)
+        return 0
+
+    elif args.subcommand == "signal":
+        from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
+
+        data_result = _load_data(config)
+        factors_result = _compute_factors(data_result, config)
+
+        ml_config = MLSignalConfig(model_type=args.model)
+        gen = MLSignalGenerator(config=ml_config)
+        signal = gen.generate(factors_result.processed_factors, factors_result.forward_returns)
+
+        # Show top/bottom 10 stocks by signal
+        last_signal = signal.iloc[-1].dropna().sort_values()
+        print("=" * 60)
+        print(f"  ML SIGNAL — {args.model.upper()} (last date)")
+        print("=" * 60)
+        print("  Top 10 (most bullish):")
+        for stock, val in last_signal.tail(10).items():
+            print(f"    {stock:<15} {val:+.4f}")
+        print("  Bottom 10 (most bearish):")
+        for stock, val in last_signal.head(10).items():
+            print(f"    {stock:<15} {val:+.4f}")
+        print("=" * 60)
+        return 0
+
+    else:
+        print("Usage: python main.py ml train [--model lightgbm|xgboost]")
+        print("       python main.py ml signal [--model lightgbm|xgboost]")
+        return 1
+
+
+def cmd_research(args) -> int:
+    """LLM research agent operations."""
+    if args.subcommand == "report":
+        import json
+        from pathlib import Path
+        from quant_platform.agent.research_agent import ResearchAgent
+
+        results_dir = Path(args.results_dir)
+        if not results_dir.exists():
+            print(f"Results directory not found: {results_dir}")
+            return 1
+
+        # Try to load backtest results
+        metrics_file = results_dir / "metrics.json"
+        if not metrics_file.exists():
+            print("No metrics.json found. Run 'python main.py run' first.")
+            return 1
+
+        metrics = json.loads(metrics_file.read_text())
+        agent = ResearchAgent(mode="keyword")
+
+        # Generate attribution summary
+        factor_contrib = metrics.get("factor_contributions", {})
+        if factor_contrib:
+            import pandas as pd
+            returns_data = metrics.get("daily_returns", [])
+            daily_returns = pd.Series(returns_data) if returns_data else None
+            summary = agent.summarize_attribution(factor_contrib, daily_returns)
+            print(summary)
+        else:
+            print("No factor contributions in results. Full metrics:")
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)):
+                    print(f"  {k}: {v}")
+
+        return 0
+
+    else:
+        print("Usage: python main.py research report [--results-dir ./results]")
+        return 1
+
+
+def cmd_profile(args) -> int:
+    """Profile pipeline performance — shows time per stage."""
+    import time
+
+    config = load_config(_resolve_config_path(args.config))
+
+    timings = {}
+    total_start = time.perf_counter()
+
+    # Stage 1: Data
+    t0 = time.perf_counter()
+    data_result = _load_data(config)
+    timings["1_data"] = time.perf_counter() - t0
+
+    # Stage 2: Factors
+    t0 = time.perf_counter()
+    factors_result = _compute_factors(data_result, config)
+    timings["2_factors"] = time.perf_counter() - t0
+
+    # Stage 3: Alpha
+    t0 = time.perf_counter()
+    signal = _generate_signal(factors_result, config)
+    timings["3_alpha"] = time.perf_counter() - t0
+
+    # Stage 4: Backtest
+    t0 = time.perf_counter()
+    _run_backtest(signal, data_result, config)
+    timings["4_backtest"] = time.perf_counter() - t0
+
+    total = time.perf_counter() - total_start
+
+    print("=" * 60)
+    print("  PIPELINE PERFORMANCE PROFILE")
+    print("=" * 60)
+    for stage, duration in timings.items():
+        pct = duration / total * 100
+        bar = "█" * int(pct / 2)
+        print(f"  {stage:<15} {duration:>6.2f}s  {pct:>5.1f}%  {bar}")
+    print("-" * 60)
+    print(f"  {'TOTAL':<15} {total:>6.2f}s")
+    print("=" * 60)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="A-Share Multi-Factor Quant Platform",
@@ -587,6 +735,31 @@ def main() -> int:
     cache_parser.add_argument("--cache-dir", type=str, default=".quant_cache",
                               help="Cache directory path")
 
+    # ml
+    ml_parser = subparsers.add_parser("ml", help="ML alpha signal operations")
+    ml_sub = ml_parser.add_subparsers(dest="subcommand", help="ML action")
+    ml_train = ml_sub.add_parser("train", help="Train ML model and show performance")
+    ml_train.add_argument("--model", type=str, default="lightgbm",
+                          choices=["xgboost", "lightgbm"], help="Model type")
+    ml_train.add_argument("--splits", type=int, default=5, help="CV splits")
+    ml_train.add_argument("--config", "-c", type=str, default=None, help="Config path")
+    ml_signal = ml_sub.add_parser("signal", help="Generate ML signals")
+    ml_signal.add_argument("--model", type=str, default="lightgbm",
+                           choices=["xgboost", "lightgbm"], help="Model type")
+    ml_signal.add_argument("--config", "-c", type=str, default=None, help="Config path")
+
+    # research
+    research_parser = subparsers.add_parser("research", help="LLM research agent")
+    research_sub = research_parser.add_subparsers(dest="subcommand", help="Research action")
+    research_analyze = research_sub.add_parser("report", help="Analyze backtest results with LLM")
+    research_analyze.add_argument("--results-dir", "-r", type=str, default="./results",
+                                  help="Results directory")
+
+    # profile
+    profile_parser = subparsers.add_parser("profile", help="Profile pipeline performance")
+    profile_parser.add_argument("--config", "-c", type=str, default=None, help="Config path")
+    profile_parser.add_argument("--force", "-f", action="store_true", help="Force recomputation")
+
     args = parser.parse_args()
 
     if args.command == "run":
@@ -601,6 +774,12 @@ def main() -> int:
         return cmd_cache(args)
     elif args.command == "web":
         return cmd_web(args)
+    elif args.command == "ml":
+        return cmd_ml(args)
+    elif args.command == "research":
+        return cmd_research(args)
+    elif args.command == "profile":
+        return cmd_profile(args)
     else:
         parser.print_help()
         return 1

@@ -12,6 +12,15 @@ from typing import Any
 
 import yaml
 
+try:
+    from dotenv import load_dotenv
+    # Auto-load .env from project root
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # python-dotenv is optional
+
 from quant_platform.config.schema import (
     AlphaConfig,
     BacktestConfig,

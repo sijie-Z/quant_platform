@@ -16,6 +16,9 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from quant_platform.api.schemas import (
     AttributionItem,
+    BarraCovarianceResponse,
+    BarraDecomposeRequest,
+    BarraRiskResponse,
     ChartData,
     CompareRequest,
     CompareResult,
@@ -23,9 +26,26 @@ from quant_platform.api.schemas import (
     DrawdownPeriod,
     ExposureInfo,
     FactorICItem,
+    FactorICStatsResponse,
     FactorScatterItem,
+    FundamentalMetricsResponse,
+    FundamentalRankRequest,
+    FundamentalRankResponse,
+    FundamentalScreenRequest,
+    FundamentalScreenResponse,
     HoldingItem,
+    ICMonitorRequest,
+    ICMonitorSummary,
+    Level2StatsResponse,
+    MLPerformanceResponse,
+    MLSignalResponse,
+    MLTrainRequest,
+    OrderBookResponse,
+    ParallelSweepRequest,
+    ParallelSweepResponse,
     PerformanceMetrics,
+    PostgresStoreStatsResponse,
+    RealtimeQuoteResponse,
     RiskMetrics,
     RunRequest,
     RunResult,
@@ -33,7 +53,11 @@ from quant_platform.api.schemas import (
     StressTestItem,
     SweepRequest,
     SweepResult,
+    TickDataResponse,
+    TradeFlowResponse,
     TurnoverItem,
+    VWAPResponse,
+    WebSocketStatsResponse,
 )
 from quant_platform.main import (
     _compute_factors,
@@ -2493,3 +2517,515 @@ async def core_risk_kill_switch(req: dict):
     else:
         _core_risk.deactivate_kill_switch()
     return {"kill_switch_active": _core_risk.kill_switch_active, "risk_level": _core_risk.risk_level.value}
+
+
+# ────────────────────────────────────────────────────────────────
+# ML Alpha Signal endpoints
+# ────────────────────────────────────────────────────────────────
+
+@router.post("/ml/train", response_model=MLPerformanceResponse)
+async def ml_train(req: MLTrainRequest):
+    """Train ML model for alpha signal generation."""
+    try:
+        from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
+        config = load_config()
+
+        data_result = _load_data(config)
+        factors_result = _compute_factors(data_result, config)
+
+        ml_config = MLSignalConfig(
+            model_type=req.model_type,
+            train_window=req.train_window,
+            n_splits=req.n_splits,
+            retrain_frequency=req.retrain_frequency,
+        )
+        generator = MLSignalGenerator(config=ml_config)
+        perf = generator.train(factors_result.processed_factors, factors_result.forward_returns)
+
+        return MLPerformanceResponse(
+            model_type=perf.model_type,
+            test_ic=round(perf.test_ic, 6),
+            test_icir=round(perf.test_icir, 4),
+            train_ic=round(perf.train_ic, 6),
+            feature_importance={k: round(v, 6) for k, v in perf.feature_importance.items()},
+            n_train_samples=perf.n_train_samples,
+            date=perf.date,
+        )
+    except Exception as e:
+        logger.error("ML train failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/ml/predict", response_model=MLSignalResponse)
+async def ml_predict(req: MLTrainRequest):
+    """Generate ML-based alpha signals."""
+    try:
+        from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
+        config = load_config()
+
+        data_result = _load_data(config)
+        factors_result = _compute_factors(data_result, config)
+
+        ml_config = MLSignalConfig(
+            model_type=req.model_type,
+            train_window=req.train_window,
+            n_splits=req.n_splits,
+        )
+        generator = MLSignalGenerator(config=ml_config)
+        signal = generator.generate(
+            factors_result.processed_factors,
+            factors_result.forward_returns,
+            force_retrain=req.force_retrain,
+        )
+
+        dates = [str(d) for d in signal.index]
+        assets = list(signal.columns)
+        signal_data = signal.values.tolist()
+
+        return MLSignalResponse(dates=dates, assets=assets, signal=signal_data)
+    except Exception as e:
+        logger.error("ML predict failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ────────────────────────────────────────────────────────────────
+# Factor IC Monitoring endpoints
+# ────────────────────────────────────────────────────────────────
+
+@router.post("/ic-monitor/compute", response_model=ICMonitorSummary)
+async def ic_monitor_compute(req: ICMonitorRequest):
+    """Compute IC statistics for all factors with decay detection."""
+    try:
+        from quant_platform.factors.ic_monitor import FactorICMonitor, ICMonitorConfig
+        config = load_config()
+
+        data_result = _load_data(config)
+        factors_result = _compute_factors(data_result, config)
+
+        mon_config = ICMonitorConfig(
+            rolling_window=req.rolling_window,
+            decay_window=req.decay_window,
+            significance_threshold=req.significance_threshold,
+        )
+        monitor = FactorICMonitor(config=mon_config)
+        all_stats = monitor.compute_all(
+            factors_result.processed_factors,
+            factors_result.forward_returns,
+        )
+
+        factor_stats = [
+            FactorICStatsResponse(
+                name=s.name,
+                current_ic=round(s.current_ic, 6),
+                rolling_icir=round(s.rolling_icir, 4),
+                ic_trend=round(s.ic_trend, 8),
+                ic_decay_rate=round(s.ic_decay_rate, 8),
+                half_life_days=s.half_life_days,
+                ic_positive_ratio=round(s.ic_positive_ratio, 4),
+                alert_level=s.alert_level,
+            )
+            for s in sorted(all_stats.values(), key=lambda x: abs(x.rolling_icir), reverse=True)
+        ]
+
+        alerts = monitor.get_alerts()
+        weights = monitor.get_adaptive_weights(
+            factors_result.processed_factors,
+            factors_result.forward_returns,
+        )
+
+        return ICMonitorSummary(factors=factor_stats, alerts=alerts, adaptive_weights=weights)
+    except Exception as e:
+        logger.error("IC monitor compute failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ic-monitor/alerts")
+async def ic_monitor_alerts():
+    """Get current IC decay alerts."""
+    try:
+        from quant_platform.factors.ic_monitor import FactorICMonitor
+        config = load_config()
+
+        data_result = _load_data(config)
+        factors_result = _compute_factors(data_result, config)
+
+        monitor = FactorICMonitor()
+        monitor.compute_all(factors_result.processed_factors, factors_result.forward_returns)
+        return {"alerts": monitor.get_alerts()}
+    except Exception as e:
+        logger.error("IC monitor alerts failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ────────────────────────────────────────────────────────────────
+# Barra Risk Model endpoints
+# ────────────────────────────────────────────────────────────────
+
+@router.post("/barra/decompose", response_model=BarraRiskResponse)
+async def barra_decompose(req: BarraDecomposeRequest):
+    """Decompose portfolio risk using Barra 10-factor model."""
+    try:
+        from quant_platform.risk.barra import BarraModel
+        config = load_config()
+
+        data_result = _load_data(config)
+        factors_result = _compute_factors(data_result, config)
+
+        # Use equal weight portfolio as default
+        assets = list(data_result.prices.columns)
+        n = len(assets)
+        weights = pd.Series(1.0 / n, index=assets)
+
+        model = BarraModel(
+            half_life=req.half_life,
+            shrinkage_target=req.shrinkage_target,
+        )
+        model.fit(factors_result.processed_factors, data_result.returns)
+
+        # Build factor_exposures dict for decompose_risk
+        factor_exposures = factors_result.processed_factors
+
+        result = model.decompose_risk(weights, factor_exposures, date=req.date)
+
+        return BarraRiskResponse(
+            total_risk=round(result.total_risk, 6),
+            factor_risk=round(result.factor_risk, 6),
+            specific_risk=round(result.specific_risk, 6),
+            r_squared=round(result.r_squared, 6),
+            factor_contributions={k: round(v, 6) for k, v in result.factor_contributions.items()},
+            factor_exposures={k: round(v, 6) for k, v in result.factor_exposures.items()},
+        )
+    except Exception as e:
+        logger.error("Barra decompose failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/barra/covariance", response_model=BarraCovarianceResponse)
+async def barra_covariance(req: BarraDecomposeRequest):
+    """Get Barra factor covariance matrix."""
+    try:
+        from quant_platform.risk.barra import BarraModel
+        config = load_config()
+
+        data_result = _load_data(config)
+        factors_result = _compute_factors(data_result, config)
+
+        model = BarraModel(
+            half_life=req.half_life,
+            shrinkage_target=req.shrinkage_target,
+        )
+        model.fit(factors_result.processed_factors, data_result.returns)
+
+        cov_df = model.get_factor_covariance_df()
+        return BarraCovarianceResponse(
+            factors=list(cov_df.columns),
+            covariance=cov_df.values.tolist(),
+        )
+    except Exception as e:
+        logger.error("Barra covariance failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ────────────────────────────────────────────────────────────────
+# Parallel Backtest endpoints
+# ────────────────────────────────────────────────────────────────
+
+@router.post("/parallel/sweep", response_model=ParallelSweepResponse)
+async def parallel_sweep(req: ParallelSweepRequest):
+    """Run parameter sweep in parallel using multiple processes."""
+    try:
+        from quant_platform.backtest.distributed import ParallelBacktester
+
+        bt = ParallelBacktester(max_workers=req.max_workers)
+        sweep = bt.run_sweep(
+            param_grid=req.param_grid,
+            base_config_overrides=req.base_overrides,
+            metric=req.metric,
+        )
+
+        return ParallelSweepResponse(
+            results=sweep.summary(),
+            best_params=sweep.best_params,
+            best_metric=sweep.best_metric,
+            total_duration=round(sweep.total_duration, 2),
+            n_success=sweep.n_success,
+            n_failed=sweep.n_failed,
+        )
+    except Exception as e:
+        logger.error("Parallel sweep failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ────────────────────────────────────────────────────────────────
+# Prometheus Metrics endpoint
+# ────────────────────────────────────────────────────────────────
+
+@router.get("/metrics")
+async def prometheus_metrics():
+    """Export system metrics in Prometheus text format."""
+    from quant_platform.utils.metrics import get_metrics
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(
+        content=get_metrics().export_text(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+@router.get("/metrics/json")
+async def prometheus_metrics_json():
+    """Export system metrics as JSON."""
+    from quant_platform.utils.metrics import get_metrics
+    return get_metrics().get_snapshot()
+
+
+# ──────────────────────────────────────────────
+# PostgreSQL Store
+# ──────────────────────────────────────────────
+
+@router.get("/postgres/stats", response_model=PostgresStoreStatsResponse)
+async def postgres_stats():
+    """Get PostgreSQL store statistics."""
+    from quant_platform.core.store import Store
+    store = Store()
+    stats = store.get_stats()
+    return PostgresStoreStatsResponse(
+        backend=stats.get("backend", "sqlite"),
+        orders=stats.get("orders", 0),
+        positions=stats.get("positions", 0),
+        trades=stats.get("trades", 0),
+        pnl_snapshots=stats.get("pnl_snapshots", 0),
+        signals=stats.get("signals", 0),
+    )
+
+
+# ──────────────────────────────────────────────
+# WebSocket Real-time Quotes
+# ──────────────────────────────────────────────
+
+# Global simulated provider instance for demo
+_ws_provider = None
+
+
+def _get_ws_provider():
+    global _ws_provider
+    if _ws_provider is None:
+        from quant_platform.data.providers.websocket_provider import SimulatedWebSocketProvider
+        _ws_provider = SimulatedWebSocketProvider(
+            codes=["600519", "000001", "300750", "601318", "000858"],
+            update_interval=1.0,
+        )
+    return _ws_provider
+
+
+@router.get("/ws-quotes/start")
+async def ws_quotes_start():
+    """Start WebSocket quote provider."""
+    provider = _get_ws_provider()
+    provider.start()
+    return {"status": "started", **provider.stats}
+
+
+@router.get("/ws-quotes/stop")
+async def ws_quotes_stop():
+    """Stop WebSocket quote provider."""
+    provider = _get_ws_provider()
+    provider.stop()
+    return {"status": "stopped", **provider.stats}
+
+
+@router.get("/ws-quotes/stats", response_model=WebSocketStatsResponse)
+async def ws_quotes_stats():
+    """Get WebSocket provider statistics."""
+    provider = _get_ws_provider()
+    stats = provider.stats
+    return WebSocketStatsResponse(**stats)
+
+
+@router.get("/ws-quotes/{code}", response_model=RealtimeQuoteResponse)
+async def ws_quote_by_code(code: str):
+    """Get real-time quote for a single stock."""
+    provider = _get_ws_provider()
+    if not provider.is_connected:
+        provider.start()
+        import time
+        time.sleep(0.5)
+    quote = provider.get_quote(code)
+    if not quote:
+        raise HTTPException(404, f"No quote for {code}")
+    return RealtimeQuoteResponse(**quote.to_dict())
+
+
+@router.get("/ws-quotes", response_model=list[RealtimeQuoteResponse])
+async def ws_all_quotes():
+    """Get all cached real-time quotes."""
+    provider = _get_ws_provider()
+    if not provider.is_connected:
+        provider.start()
+        import time
+        time.sleep(0.5)
+    quotes = provider.get_all_quotes()
+    return [RealtimeQuoteResponse(**q.to_dict()) for q in quotes.values()]
+
+
+# ──────────────────────────────────────────────
+# Level 2 Order Book
+# ──────────────────────────────────────────────
+
+_l2_provider = None
+
+
+def _get_l2_provider():
+    global _l2_provider
+    if _l2_provider is None:
+        from quant_platform.data.providers.level2_provider import Level2DataProvider
+        _l2_provider = Level2DataProvider(
+            codes=["600519", "000001", "300750", "601318", "000858"],
+        )
+    return _l2_provider
+
+
+@router.get("/l2/start")
+async def l2_start():
+    """Start Level 2 data provider."""
+    provider = _get_l2_provider()
+    provider.start()
+    return {"status": "started", **provider.stats}
+
+
+@router.get("/l2/stop")
+async def l2_stop():
+    """Stop Level 2 data provider."""
+    provider = _get_l2_provider()
+    provider.stop()
+    return {"status": "stopped"}
+
+
+@router.get("/l2/stats", response_model=Level2StatsResponse)
+async def l2_stats():
+    """Get Level 2 provider statistics."""
+    provider = _get_l2_provider()
+    return Level2StatsResponse(**provider.stats)
+
+
+@router.get("/l2/book/{code}", response_model=OrderBookResponse)
+async def l2_order_book(code: str):
+    """Get order book for a stock."""
+    provider = _get_l2_provider()
+    if not provider.is_running:
+        provider.start()
+        import time
+        time.sleep(0.3)
+    book = provider.get_order_book(code)
+    if not book:
+        raise HTTPException(404, f"No order book for {code}")
+    return OrderBookResponse(**book.to_dict())
+
+
+@router.get("/l2/ticks/{code}", response_model=list[TickDataResponse])
+async def l2_ticks(code: str, limit: int = 100):
+    """Get recent tick data for a stock."""
+    provider = _get_l2_provider()
+    if not provider.is_running:
+        provider.start()
+        import time
+        time.sleep(0.3)
+    ticks = provider.get_ticks(code, limit=limit)
+    return [TickDataResponse(**t.to_dict()) for t in ticks]
+
+
+@router.get("/l2/vwap/{code}", response_model=VWAPResponse)
+async def l2_vwap(code: str, n_ticks: int = 100):
+    """Compute VWAP from recent ticks."""
+    provider = _get_l2_provider()
+    if not provider.is_running:
+        provider.start()
+        import time
+        time.sleep(0.3)
+    vwap = provider.compute_vwap(code, n_ticks=n_ticks)
+    return VWAPResponse(code=code, vwap=round(vwap, 4), n_ticks=n_ticks)
+
+
+@router.get("/l2/flow/{code}", response_model=TradeFlowResponse)
+async def l2_trade_flow(code: str, n_ticks: int = 100):
+    """Compute buy/sell trade flow imbalance."""
+    provider = _get_l2_provider()
+    if not provider.is_running:
+        provider.start()
+        import time
+        time.sleep(0.3)
+    flow = provider.compute_trade_flow(code, n_ticks=n_ticks)
+    return TradeFlowResponse(code=code, **flow)
+
+
+# ──────────────────────────────────────────────
+# Real-time Fundamentals
+# ──────────────────────────────────────────────
+
+_fundamental_provider = None
+
+
+def _get_fundamental_provider():
+    global _fundamental_provider
+    if _fundamental_provider is None:
+        from quant_platform.data.providers.fundamental_realtime import FundamentalDataProvider
+        _fundamental_provider = FundamentalDataProvider()
+    return _fundamental_provider
+
+
+@router.get("/fundamentals/{code}", response_model=FundamentalMetricsResponse)
+async def get_fundamentals(code: str):
+    """Get real-time fundamental metrics for a stock."""
+    provider = _get_fundamental_provider()
+    metrics = provider.get_fundamentals(code)
+    return FundamentalMetricsResponse(**metrics.to_dict())
+
+
+@router.post("/fundamentals/bulk", response_model=list[FundamentalMetricsResponse])
+async def get_fundamentals_bulk(codes: list[str]):
+    """Get fundamentals for multiple stocks."""
+    provider = _get_fundamental_provider()
+    metrics = provider.get_bulk(codes)
+    return [FundamentalMetricsResponse(**m.to_dict()) for m in metrics.values()]
+
+
+@router.post("/fundamentals/screen", response_model=FundamentalScreenResponse)
+async def screen_fundamentals(req: FundamentalScreenRequest):
+    """Screen stocks by fundamental criteria."""
+    from quant_platform.data.providers.fundamental_realtime import FundamentalScreener
+    provider = _get_fundamental_provider()
+    screener = FundamentalScreener(provider)
+    passed = screener.screen(
+        req.codes,
+        pe_min=req.pe_min, pe_max=req.pe_max,
+        pb_min=req.pb_min, pb_max=req.pb_max,
+        roe_min=req.roe_min, roe_max=req.roe_max,
+        market_cap_min=req.market_cap_min,
+        dividend_yield_min=req.dividend_yield_min,
+        debt_ratio_max=req.debt_ratio_max,
+    )
+    return FundamentalScreenResponse(
+        total=len(req.codes), passed=len(passed), codes=passed,
+    )
+
+
+@router.post("/fundamentals/rank", response_model=FundamentalRankResponse)
+async def rank_fundamentals(req: FundamentalRankRequest):
+    """Rank stocks by a fundamental metric."""
+    from quant_platform.data.providers.fundamental_realtime import FundamentalScreener
+    provider = _get_fundamental_provider()
+    screener = FundamentalScreener(provider)
+    ranked = screener.rank_by(
+        req.codes, metric=req.metric,
+        ascending=req.ascending, top_n=req.top_n,
+    )
+    return FundamentalRankResponse(
+        metric=req.metric,
+        ranked=[{"code": code, "value": round(val, 4)} for code, val in ranked],
+    )
+
+
+@router.get("/fundamentals/stats")
+async def fundamental_stats():
+    """Get fundamental provider statistics."""
+    provider = _get_fundamental_provider()
+    return provider.stats

@@ -203,3 +203,229 @@ class SweepResult(BaseModel):
 class ConfigInfo(BaseModel):
     default_config: dict[str, Any]
     available_options: dict[str, list[str]]
+
+
+# --- ML Signal schemas ---
+
+class MLTrainRequest(BaseModel):
+    model_type: Literal["xgboost", "lightgbm", "ensemble"] = Field(
+        default="lightgbm", description="ML model type"
+    )
+    train_window: int = Field(default=504, ge=100, le=2000, description="Training window (days)")
+    n_splits: int = Field(default=5, ge=2, le=10, description="CV splits")
+    retrain_frequency: int = Field(default=63, ge=21, le=252, description="Retrain frequency (days)")
+    force_retrain: bool = Field(default=False, description="Force retrain even if model exists")
+
+
+class MLPerformanceResponse(BaseModel):
+    model_type: str
+    test_ic: float
+    test_icir: float
+    train_ic: float
+    feature_importance: dict[str, float]
+    n_train_samples: int
+    date: str
+
+
+class MLSignalResponse(BaseModel):
+    dates: list[str]
+    assets: list[str]
+    signal: list[list[float | None]]
+
+
+# --- IC Monitor schemas ---
+
+class ICMonitorRequest(BaseModel):
+    rolling_window: int = Field(default=63, ge=21, le=252, description="Rolling IC window")
+    decay_window: int = Field(default=126, ge=63, le=252, description="Decay detection window")
+    significance_threshold: float = Field(default=0.03, ge=0.01, le=0.1)
+
+
+class FactorICStatsResponse(BaseModel):
+    name: str
+    current_ic: float
+    rolling_icir: float
+    ic_trend: float
+    ic_decay_rate: float
+    half_life_days: int
+    ic_positive_ratio: float
+    alert_level: str
+
+
+class ICMonitorSummary(BaseModel):
+    factors: list[FactorICStatsResponse]
+    alerts: list[dict[str, Any]]
+    adaptive_weights: dict[str, float]
+
+
+# --- Barra schemas ---
+
+class BarraDecomposeRequest(BaseModel):
+    date: str | None = Field(default=None, description="Date for decomposition (YYYY-MM-DD)")
+    half_life: int = Field(default=252, ge=63, le=504, description="Covariance half-life")
+    shrinkage_target: str = Field(default="identity", description="Shrinkage target")
+
+
+class BarraRiskResponse(BaseModel):
+    total_risk: float
+    factor_risk: float
+    specific_risk: float
+    r_squared: float
+    factor_contributions: dict[str, float]
+    factor_exposures: dict[str, float]
+
+
+class BarraCovarianceResponse(BaseModel):
+    factors: list[str]
+    covariance: list[list[float]]
+
+
+# --- Parallel backtest schemas ---
+
+class ParallelSweepRequest(BaseModel):
+    param_grid: dict[str, list] = Field(description="Parameter grid: {param_name: [values]}")
+    base_overrides: dict[str, Any] = Field(default_factory=dict, description="Base config overrides")
+    metric: str = Field(default="sharpe_ratio", description="Optimization metric")
+    max_workers: int | None = Field(default=None, description="Max parallel workers")
+
+
+class ParallelSweepResponse(BaseModel):
+    results: list[dict[str, Any]]
+    best_params: dict[str, Any] | None
+    best_metric: float | None
+    total_duration: float
+    n_success: int
+    n_failed: int
+
+
+# --- PostgreSQL Store schemas ---
+
+class PostgresStoreStatsResponse(BaseModel):
+    backend: str
+    orders: int = 0
+    positions: int = 0
+    trades: int = 0
+    pnl_snapshots: int = 0
+    signals: int = 0
+
+
+# --- WebSocket schemas ---
+
+class WebSocketStatsResponse(BaseModel):
+    source: str
+    connected: bool
+    subscribed: int
+    cached_quotes: int
+    message_count: int = 0
+    last_message_age_s: float | None = None
+
+
+class RealtimeQuoteResponse(BaseModel):
+    code: str
+    name: str = ""
+    price: float = 0.0
+    change_pct: float = 0.0
+    volume: float = 0.0
+    amount: float = 0.0
+    high: float = 0.0
+    low: float = 0.0
+    open: float = 0.0
+    prev_close: float = 0.0
+    bid1_price: float = 0.0
+    ask1_price: float = 0.0
+    timestamp: str = ""
+
+
+# --- Level 2 schemas ---
+
+class OrderBookResponse(BaseModel):
+    code: str
+    best_bid: float = 0.0
+    best_ask: float = 0.0
+    mid_price: float = 0.0
+    spread: float = 0.0
+    spread_bps: float = 0.0
+    bid_depth: float = 0.0
+    ask_depth: float = 0.0
+    depth_imbalance: float = 0.0
+    bids: list[dict[str, Any]]
+    asks: list[dict[str, Any]]
+
+
+class TickDataResponse(BaseModel):
+    code: str
+    timestamp: str
+    price: float
+    volume: float
+    amount: float
+    direction: str = ""
+
+
+class VWAPResponse(BaseModel):
+    code: str
+    vwap: float
+    n_ticks: int
+
+
+class TradeFlowResponse(BaseModel):
+    code: str
+    buy_volume: float
+    sell_volume: float
+    net_flow: float
+    buy_pct: float
+
+
+class Level2StatsResponse(BaseModel):
+    codes: int
+    books_cached: int
+    total_ticks: int
+    running: bool
+
+
+# --- Fundamental schemas ---
+
+class FundamentalMetricsResponse(BaseModel):
+    code: str
+    pe_ttm: float = 0.0
+    pb: float = 0.0
+    ps_ttm: float = 0.0
+    roe: float = 0.0
+    roa: float = 0.0
+    gross_margin: float = 0.0
+    net_margin: float = 0.0
+    revenue_growth: float = 0.0
+    profit_growth: float = 0.0
+    debt_ratio: float = 0.0
+    dividend_yield: float = 0.0
+    market_cap: float = 0.0
+
+
+class FundamentalScreenRequest(BaseModel):
+    codes: list[str] = Field(description="Stock codes to screen")
+    pe_min: float | None = None
+    pe_max: float | None = None
+    pb_min: float | None = None
+    pb_max: float | None = None
+    roe_min: float | None = None
+    roe_max: float | None = None
+    market_cap_min: float | None = None
+    dividend_yield_min: float | None = None
+    debt_ratio_max: float | None = None
+
+
+class FundamentalScreenResponse(BaseModel):
+    total: int
+    passed: int
+    codes: list[str]
+
+
+class FundamentalRankRequest(BaseModel):
+    codes: list[str] = Field(description="Stock codes to rank")
+    metric: str = Field(default="roe", description="Metric to rank by")
+    ascending: bool = Field(default=False)
+    top_n: int | None = Field(default=None, ge=1)
+
+
+class FundamentalRankResponse(BaseModel):
+    metric: str
+    ranked: list[dict[str, Any]]

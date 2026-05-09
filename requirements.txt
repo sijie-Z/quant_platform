@@ -1,16 +1,39 @@
-numpy>=1.24.0
-pandas>=2.0.0
-scipy>=1.10.0
-matplotlib>=3.7.0
-seaborn>=0.12.0
-cvxpy>=1.3.0
-pyyaml>=6.0
-pytest>=7.0
-pytest-cov>=4.0
-scikit-learn>=1.3.0
-tushare>=1.4.0
-numba>=0.58.0
-tables>=3.9.0
-fastapi>=0.100.0
-uvicorn>=0.30.0
-pydantic>=2.0.0
+# Core
+numpy==1.26.2
+pandas==2.1.3
+scipy==1.16.0
+scikit-learn==1.8.0
+cvxpy==1.7.5
+numba==0.63.1
+
+# Data
+tushare==1.4.29
+baostock==0.9.1
+akshare==1.18.59
+tables==3.11.1
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+
+# Visualization
+matplotlib==3.8.4
+seaborn==0.13.2
+
+# Web
+fastapi==0.128.0
+uvicorn==0.40.0
+pydantic==2.12.5
+python-multipart==0.0.6
+websocket-client==1.9.0
+
+# ML
+xgboost==2.1.4
+lightgbm==4.5.0
+shap==0.46.0
+
+# Config
+pyyaml==6.0.2
+python-dotenv==1.0.0
+
+# Testing
+pytest==7.4.3
+pytest-cov==7.1.0
