@@ -1,0 +1,1151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QuantPlatform - A股多因子量化交易平台</title>
+<style>
+/* ── Reset & Base ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-primary: #0a0e17;
+  --bg-secondary: #111827;
+  --bg-card: #1a2332;
+  --bg-card-hover: #1f2b3d;
+  --border: #2d3748;
+  --border-accent: #3b82f6;
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --accent-blue: #3b82f6;
+  --accent-green: #10b981;
+  --accent-yellow: #f59e0b;
+  --accent-red: #ef4444;
+  --accent-purple: #8b5cf6;
+  --accent-cyan: #06b6d4;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── Navigation ── */
+nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  background: rgba(10, 14, 23, 0.95);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  padding: 0 2rem;
+  height: 60px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+
+nav .logo {
+  font-family: var(--font-mono);
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--accent-cyan);
+}
+
+nav .logo span { color: var(--text-muted); }
+
+nav .nav-links { display: flex; gap: 2rem; }
+
+nav .nav-links a {
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.9rem;
+  transition: color 0.2s;
+}
+
+nav .nav-links a:hover { color: var(--accent-blue); }
+
+/* ── Hero ── */
+.hero {
+  padding: 120px 2rem 60px;
+  text-align: center;
+  background: linear-gradient(180deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+}
+
+.hero h1 {
+  font-size: 3rem;
+  font-weight: 800;
+  margin-bottom: 1rem;
+  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue), var(--accent-purple));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.hero .subtitle {
+  font-size: 1.2rem;
+  color: var(--text-secondary);
+  max-width: 700px;
+  margin: 0 auto 2rem;
+}
+
+/* ── Stats Bar ── */
+.stats-bar {
+  display: flex;
+  justify-content: center;
+  gap: 3rem;
+  flex-wrap: wrap;
+  padding: 2rem;
+}
+
+.stat-item {
+  text-align: center;
+}
+
+.stat-value {
+  font-family: var(--font-mono);
+  font-size: 2.5rem;
+  font-weight: 800;
+  color: var(--accent-cyan);
+}
+
+.stat-label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+/* ── Section ── */
+section {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 4rem 2rem;
+}
+
+.section-title {
+  font-size: 2rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+  color: var(--text-primary);
+}
+
+.section-subtitle {
+  color: var(--text-secondary);
+  margin-bottom: 2rem;
+}
+
+/* ── Architecture Diagram ── */
+.arch-diagram {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2rem;
+  overflow-x: auto;
+  margin-bottom: 3rem;
+}
+
+.arch-diagram pre {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.arch-diagram .highlight { color: var(--accent-cyan); font-weight: 700; }
+.arch-diagram .green { color: var(--accent-green); }
+.arch-diagram .yellow { color: var(--accent-yellow); }
+.arch-diagram .purple { color: var(--accent-purple); }
+
+/* ── Module Cards ── */
+.module-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+  gap: 1.5rem;
+}
+
+.module-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.5rem;
+  transition: all 0.3s;
+  cursor: default;
+}
+
+.module-card:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--border-accent);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 30px rgba(59, 130, 246, 0.1);
+}
+
+.module-card .card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.module-card .card-icon {
+  width: 40px; height: 40px;
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.2rem;
+  flex-shrink: 0;
+}
+
+.module-card .card-title {
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.module-card .card-tag {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(59, 130, 246, 0.15);
+  color: var(--accent-blue);
+}
+
+.module-card .card-desc {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+.module-card .card-features {
+  list-style: none;
+}
+
+.module-card .card-features li {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  padding: 0.25rem 0;
+  padding-left: 1.25rem;
+  position: relative;
+}
+
+.module-card .card-features li::before {
+  content: '▸';
+  position: absolute;
+  left: 0;
+  color: var(--accent-green);
+}
+
+/* ── Data Flow ── */
+.flow-container {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  position: relative;
+}
+
+.flow-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 1.5rem;
+  position: relative;
+}
+
+.flow-step::before {
+  content: '';
+  position: absolute;
+  left: 23px;
+  top: 48px;
+  bottom: -1px;
+  width: 2px;
+  background: var(--border);
+}
+
+.flow-step:last-child::before { display: none; }
+
+.flow-number {
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-mono);
+  font-weight: 800;
+  font-size: 1.2rem;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+
+.flow-content {
+  flex: 1;
+  padding-bottom: 2rem;
+}
+
+.flow-content h3 {
+  font-size: 1.1rem;
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+}
+
+.flow-content p {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.flow-content code {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  background: rgba(59, 130, 246, 0.1);
+  color: var(--accent-cyan);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* ── Comparison Table ── */
+.comparison-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.comparison-table th {
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-weight: 700;
+  padding: 1rem;
+  text-align: left;
+  border-bottom: 2px solid var(--border);
+}
+
+.comparison-table td {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.comparison-table tr:hover td {
+  background: var(--bg-card);
+}
+
+.comparison-table .status {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.status-matched { background: rgba(16, 185, 129, 0.15); color: var(--accent-green); }
+.status-close { background: rgba(245, 158, 11, 0.15); color: var(--accent-yellow); }
+.status-gap { background: rgba(239, 68, 68, 0.15); color: var(--accent-red); }
+
+/* ── Code Block ── */
+.code-block {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  margin: 1rem 0;
+}
+
+.code-block .code-header {
+  background: rgba(0,0,0,0.3);
+  padding: 0.5rem 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.code-block pre {
+  padding: 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.6;
+  overflow-x: auto;
+  color: var(--text-secondary);
+}
+
+.code-block .comment { color: var(--text-muted); }
+.code-block .keyword { color: var(--accent-purple); }
+.code-block .string { color: var(--accent-green); }
+.code-block .function { color: var(--accent-cyan); }
+
+/* ── Tech Stack ── */
+.tech-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 1rem;
+}
+
+.tech-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  text-align: center;
+  transition: border-color 0.2s;
+}
+
+.tech-item:hover { border-color: var(--accent-blue); }
+
+.tech-item .tech-name {
+  font-weight: 700;
+  font-size: 1rem;
+  margin-bottom: 0.25rem;
+}
+
+.tech-item .tech-desc {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* ── Footer ── */
+footer {
+  text-align: center;
+  padding: 3rem 2rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+footer a {
+  color: var(--accent-blue);
+  text-decoration: none;
+}
+
+footer a:hover { text-decoration: underline; }
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  .hero h1 { font-size: 2rem; }
+  .stats-bar { gap: 1.5rem; }
+  .stat-value { font-size: 1.8rem; }
+  .module-grid { grid-template-columns: 1fr; }
+  nav .nav-links { display: none; }
+}
+
+/* ── Animations ── */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate { animation: fadeInUp 0.6s ease-out forwards; }
+
+/* ── Terminal Effect ── */
+.terminal {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.terminal-header {
+  background: #161b22;
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.terminal-dot {
+  width: 12px; height: 12px;
+  border-radius: 50%;
+}
+
+.terminal-dot.red { background: #ff5f56; }
+.terminal-dot.yellow { background: #ffbd2e; }
+.terminal-dot.green { background: #27c93f; }
+
+.terminal-title {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-left: 8px;
+}
+
+.terminal-body {
+  padding: 16px;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.8;
+  color: #c9d1d9;
+}
+
+.terminal-body .prompt { color: var(--accent-green); }
+.terminal-body .output { color: #8b949e; }
+.terminal-body .success { color: var(--accent-green); }
+.terminal-body .info { color: var(--accent-cyan); }
+</style>
+</head>
+<body>
+
+<!-- ── Navigation ── -->
+<nav>
+  <div class="logo">QuantPlatform <span>v2.0</span></div>
+  <div class="nav-links">
+    <a href="#architecture">Architecture</a>
+    <a href="#modules">Modules</a>
+    <a href="#dataflow">Data Flow</a>
+    <a href="#comparison">Jane Street</a>
+    <a href="#quickstart">Quick Start</a>
+    <a href="https://github.com/sijie-Z/quant-platform">GitHub</a>
+  </div>
+</nav>
+
+<!-- ── Hero ── -->
+<div class="hero">
+  <h1>A-Share Multi-Factor Quant Platform</h1>
+  <p class="subtitle">
+    A 股多因子量化研究 + 交易平台。从数据到回测到实盘的完整流水线。
+    面向量化开发面试，展示机构级架构设计能力。
+  </p>
+
+  <div class="stats-bar">
+    <div class="stat-item">
+      <div class="stat-value">610</div>
+      <div class="stat-label">Unit Tests</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value">84</div>
+      <div class="stat-label">Python Modules</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value">19.5K+</div>
+      <div class="stat-label">Lines of Python</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value">91</div>
+      <div class="stat-label">REST API Endpoints</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value">15</div>
+      <div class="stat-label">Alpha Factors</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Architecture ── -->
+<section id="architecture">
+  <h2 class="section-title">System Architecture</h2>
+  <p class="section-subtitle">Event-driven architecture — all components communicate through EventBus, all state persisted in SQLite.</p>
+
+  <div class="arch-diagram">
+    <pre>
+                         ┌─────────────────────────────────────────────────────────────┐
+                         │              <span class="highlight">Core Architecture (core/)</span>                      │
+                         │   AsyncEventBus · Store · StateMachine · AuditLog           │
+                         │   Scheduler · MessageBus(Local/Redis/Kafka) · Services      │
+                         └────────────────────────────┬────────────────────────────────┘
+                                                      │ <span class="green">All components communicate via EventBus</span>
+                                                      │ <span class="green">All state persisted via Store (SQLite WAL)</span>
+     ┌────────────────────────────────────────────────┼────────────────────────────────────────────┐
+     │                                                │                                            │
+     ▼                                                ▼                                            ▼
+<span class="yellow">Data Layer</span>           <span class="yellow">Factor Engine</span>             <span class="yellow">Alpha Model</span>              <span class="yellow">Portfolio Optimizer</span>
+ Synthetic               10 Technical                IC/ICIR Weighted           Equal Weight
+ Tushare                 5 Fundamental               ML Signal (XGBoost/LGBM)   Mean Variance
+ Baostock                Cython Hot Paths            LLM Sentiment              Risk Parity
+ PostgreSQL              IC Monitor + Decay
+ WebSocket L2            Graph Network Factor
+ Realtime Fundamentals
+     │                        │                           │                            │
+     └────────────────────────┴───────────────────────────┴────────────────────────────┘
+                                                          │
+                                                          ▼
+     ┌────────────────────────────────────────────────────────────────────────────────┐
+     │                              <span class="purple">Execution & Risk Layer</span>                             │
+     │                                                                                │
+     │  <span class="highlight">Order Book</span>          <span class="highlight">Backtest Engine</span>         <span class="highlight">Risk Engine</span>          <span class="highlight">Execution</span>   │
+     │  Red-Black Tree       Tick-Level Event        Per-tick Greeks          TWAP      │
+     │  Price-Time FIFO      Market Impact           Pre-Trade Check          VWAP      │
+     │  IOC/FOK/Partial      TWAP/VWAP Algo          Auto Delta-Hedge        Iceberg   │
+     │  VPIN Metrics         3 Impact Models          Kill Switch             SmartRouter│
+     │                                        12 Stress Scenarios                        │
+     └────────────────────────────────────────────────────────────────────────────────┘
+                                                          │
+                                                          ▼
+     ┌────────────────────────────────────────────────────────────────────────────────┐
+     │                            <span class="green">Live Trading & Monitoring</span>                             │
+     │                                                                                │
+     │   Trading Engine          Web Dashboard           Monitoring                    │
+     │   AKShare Realtime        FastAPI (91 endpoints)  Prometheus + Grafana          │
+     │   Paper Trading           Vue 3 + ECharts         16 Dashboard Panels           │
+     │   QMT/xtquant Live        WebSocket Push          Structured Logging            │
+     └────────────────────────────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+</section>
+
+<!-- ── Modules ── -->
+<section id="modules">
+  <h2 class="section-title">Core Modules</h2>
+  <p class="section-subtitle">17 new source files (~5,000 lines) + 132 new tests — all integrated into the existing system.</p>
+
+  <div class="module-grid">
+
+    <!-- EventBus v2 -->
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(6,182,212,0.15); color: var(--accent-cyan);">⚡</div>
+        <div>
+          <div class="card-title">AsyncEventBus v2</div>
+          <div class="card-tag">core/event_bus_v2.py</div>
+        </div>
+      </div>
+      <div class="card-desc">High-performance async event bus with per-handler queues, backpressure, and WAL event sourcing.</div>
+      <ul class="card-features">
+        <li>asyncio.Queue per handler — no cross-blocking</li>
+        <li>Backpressure: queue full → publisher waits, never drops</li>
+        <li>P50/P99/P999 latency histogram per handler</li>
+        <li>Dead letter queue with exponential backoff retry</li>
+        <li>Write-ahead log (WAL) for crash recovery</li>
+        <li>Auto-detect sync/async handlers</li>
+      </ul>
+    </div>
+
+    <!-- Order Book -->
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(16,185,129,0.15); color: var(--accent-green);">📊</div>
+        <div>
+          <div class="card-title">Real Order Book (LOB)</div>
+          <div class="card-tag">execution/order_book.py</div>
+        </div>
+      </div>
+      <div class="card-desc">Realistic limit order book with price-time priority matching, replacing naive simulated exchange.</div>
+      <ul class="card-features">
+        <li>Sorted bid/ask price levels (red-black tree pattern)</li>
+        <li>FIFO queue at each level (price-time priority)</li>
+        <li>IOC / FOK / partial fill support</li>
+        <li>L1/L2/L3 market data snapshots</li>
+        <li>VPIN microstructure metrics</li>
+        <li>Spread, depth imbalance analytics</li>
+      </ul>
+    </div>
+
+    <!-- Market Impact -->
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(245,158,11,0.15); color: var(--accent-yellow);">💥</div>
+        <div>
+          <div class="card-title">Market Impact Models</div>
+          <div class="card-tag">execution/market_impact.py</div>
+        </div>
+      </div>
+      <div class="card-desc">Three classic market impact models with weighted ensemble for execution cost estimation.</div>
+      <ul class="card-features">
+        <li>Almgren-Chriss: temporary + permanent impact</li>
+        <li>Square-Root: industry standard (impact ∝ √(Q/V))</li>
+        <li>Kyle's Lambda: informed trading model</li>
+        <li>CompositeImpactModel: weighted ensemble</li>
+        <li>ExecutionCostCalculator: impact + commission + tax</li>
+      </ul>
+    </div>
+
+    <!-- Tick Backtest -->
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(139,92,246,0.15); color: var(--accent-purple);">⏱️</div>
+        <div>
+          <div class="card-title">Tick-Level Backtester</div>
+          <div class="card-tag">backtest/tick_engine.py</div>
+        </div>
+      </div>
+      <div class="card-desc">Event-driven tick replay with real LOB matching and market impact simulation.</div>
+      <ul class="card-features">
+        <li>Event-driven tick replay (not vectorized)</li>
+        <li>Real order book matching per tick</li>
+        <li>Market impact simulation (3 models)</li>
+        <li>TWAP / VWAP execution algorithms</li>
+        <li>Per-tick risk checks</li>
+      </ul>
+    </div>
+
+    <!-- Greeks -->
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(239,68,68,0.15); color: var(--accent-red);">📐</div>
+        <div>
+          <div class="card-title">Options Greeks</div>
+          <div class="card-tag">risk/greeks.py</div>
+        </div>
+      </div>
+      <div class="card-desc">Black-Scholes full Greeks calculator with portfolio aggregation and auto delta-hedge.</div>
+      <ul class="card-features">
+        <li>Black-Scholes: Delta/Gamma/Vega/Theta/Rho</li>
+        <li>math.erf for N() — no scipy dependency</li>
+        <li>Portfolio Greeks aggregation</li>
+        <li>Dollar Greeks (delta/gamma in $)</li>
+        <li>Auto delta-hedge order generation</li>
+      </ul>
+    </div>
+
+    <!-- Realtime Risk -->
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(239,68,68,0.15); color: var(--accent-red);">🛡️</div>
+        <div>
+          <div class="card-title">Real-Time Risk Engine</div>
+          <div class="card-tag">risk/realtime_engine.py</div>
+        </div>
+      </div>
+      <div class="card-desc">Per-tick risk monitoring with pre-trade checks, auto-hedge, and kill switch.</div>
+      <ul class="card-features">
+        <li>Pre-trade check: simulate fill before sending</li>
+        <li>Multi-dimensional limits (7 types)</li>
+        <li>5-level risk escalation: GREEN → KILL</li>
+        <li>Auto delta-hedge when threshold exceeded</li>
+        <li>12 stress test scenarios</li>
+        <li>Kill switch: emergency flatten all</li>
+      </ul>
+    </div>
+
+    <!-- Cython -->
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(6,182,212,0.15); color: var(--accent-cyan);">⚙️</div>
+        <div>
+          <div class="card-title">Cython Hot Paths</div>
+          <div class="card-tag">utils/cyext/</div>
+        </div>
+      </div>
+      <div class="card-desc">4 compute-intensive functions accelerated with Cython, with pure Python fallback.</div>
+      <ul class="card-features">
+        <li>rolling_momentum: log returns with typed memoryviews</li>
+        <li>rolling_volatility: Welford single-pass algorithm</li>
+        <li>rank_ic: Spearman Rank IC with C-level sort</li>
+        <li>zscore_cross_section: online normalization</li>
+        <li>Auto-detect: Cython → Python fallback</li>
+      </ul>
+    </div>
+
+    <!-- Message Bus -->
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(139,92,246,0.15); color: var(--accent-purple);">🔗</div>
+        <div>
+          <div class="card-title">Distributed Message Bus</div>
+          <div class="card-tag">core/message_bus.py</div>
+        </div>
+      </div>
+      <div class="card-desc">Pluggable message bus abstraction with Local, Redis, and Kafka backends.</div>
+      <ul class="card-features">
+        <li>MessageBus ABC with health_check()</li>
+        <li>LocalBus: asyncio.Queue (dev/test)</li>
+        <li>RedisBus: Pub/Sub with pattern matching</li>
+        <li>KafkaBus: aiokafka with consumer groups</li>
+        <li>ServiceRegistry: discover + heartbeat</li>
+      </ul>
+    </div>
+
+  </div>
+</section>
+
+<!-- ── Data Flow ── -->
+<section id="dataflow">
+  <h2 class="section-title">Data Flow</h2>
+  <p class="section-subtitle">One complete pipeline execution: <code>python main.py run</code></p>
+
+  <div class="flow-container">
+    <div class="flow-step">
+      <div class="flow-number" style="background: rgba(6,182,212,0.15); color: var(--accent-cyan);">1</div>
+      <div class="flow-content">
+        <h3>Data Loading</h3>
+        <p><code>DataProvider</code> → <code>DataPipeline</code> (clean/align/filter ST/suspended) → prices, returns, benchmark, metadata, financials. Supports Synthetic / Tushare / Baostock / PostgreSQL.</p>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-number" style="background: rgba(16,185,129,0.15); color: var(--accent-green);">2</div>
+      <div class="flow-content">
+        <h3>Factor Computation</h3>
+        <p><code>FactorEngine</code> computes 15 factors → cross-sectional processing (winsorize → zscore → neutralize) → IC evaluation. Cython hot paths for performance.</p>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-number" style="background: rgba(245,158,11,0.15); color: var(--accent-yellow);">3</div>
+      <div class="flow-content">
+        <h3>Alpha Signal</h3>
+        <p><code>AlphaPipeline</code> combines factors (ICIR-weighted) → cross-sectional rank normalization → signal. Optional: ML signal (XGBoost/LGBM) or LLM sentiment.</p>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-number" style="background: rgba(139,92,246,0.15); color: var(--accent-purple);">4</div>
+      <div class="flow-content">
+        <h3>Portfolio Optimization</h3>
+        <p>Covariance estimation (Ledoit-Wolf/EWMA) → <code>PortfolioOptimizer</code> (EW/MVO/RiskParity) → target weights with constraints (long-only, max weight, sector, turnover, lot size).</p>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-number" style="background: rgba(59,130,246,0.15); color: var(--accent-blue);">5</div>
+      <div class="flow-content">
+        <h3>Backtest</h3>
+        <p><code>BacktestEngine</code> multi-period simulation → daily weight drift → rebalance with costs (commission 0.03% + stamp tax 0.1% + slippage). Optional: tick-level engine with LOB matching + market impact.</p>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-number" style="background: rgba(239,68,68,0.15); color: var(--accent-red);">6</div>
+      <div class="flow-content">
+        <h3>Risk Analysis & Report</h3>
+        <p>VaR/CVaR → Stress tests (2008/2015/2020) → Barra decomposition → Regime detection → HTML report with ECharts + KPI + factor analysis + risk metrics.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Jane Street Comparison ── -->
+<section id="comparison">
+  <h2 class="section-title">vs Jane Street</h2>
+  <p class="section-subtitle">Architecture patterns are aligned. Remaining gaps are physical limits, not code.</p>
+
+  <table class="comparison-table">
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>This Project</th>
+        <th>Jane Street</th>
+        <th>Gap</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Event Bus</td>
+        <td>AsyncEventBus (backpressure + DLQ + WAL)</td>
+        <td>Similar architecture</td>
+        <td><span class="status status-matched">Matched</span></td>
+      </tr>
+      <tr>
+        <td>Order Book</td>
+        <td>Red-black tree + FIFO + IOC/FOK + VPIN</td>
+        <td>Similar architecture</td>
+        <td><span class="status status-matched">Matched</span></td>
+      </tr>
+      <tr>
+        <td>Backtest</td>
+        <td>Tick-level event-driven + market impact</td>
+        <td>Tick-level event-driven</td>
+        <td><span class="status status-matched">Matched</span></td>
+      </tr>
+      <tr>
+        <td>Risk Engine</td>
+        <td>Per-tick Greeks + pre-trade + Kill Switch</td>
+        <td>Per-tick pre-trade + auto-hedge</td>
+        <td><span class="status status-matched">Matched</span></td>
+      </tr>
+      <tr>
+        <td>Factor Compute</td>
+        <td>Cython hot paths</td>
+        <td>C++/Rust</td>
+        <td><span class="status status-close">Close</span></td>
+      </tr>
+      <tr>
+        <td>Latency</td>
+        <td>~10ms (Python)</td>
+        <td>~10μs (OCaml + FPGA + DPDK)</td>
+        <td><span class="status status-gap">1000x</span></td>
+      </tr>
+      <tr>
+        <td>Type Safety</td>
+        <td>Runtime (Python)</td>
+        <td>Compile-time (OCaml)</td>
+        <td><span class="status status-gap">Fundamental</span></td>
+      </tr>
+      <tr>
+        <td>Data</td>
+        <td>Level 2 (10-level book)</td>
+        <td>Level 3 (all orders/cancels)</td>
+        <td><span class="status status-gap">Resource</span></td>
+      </tr>
+      <tr>
+        <td>Strategy</td>
+        <td>Monthly multi-factor stock selection</td>
+        <td>Microsecond market-making + arb</td>
+        <td><span class="status status-gap">Category</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ── Quick Start ── -->
+<section id="quickstart">
+  <h2 class="section-title">Quick Start</h2>
+  <p class="section-subtitle">Get up and running in 3 commands.</p>
+
+  <div class="terminal">
+    <div class="terminal-header">
+      <div class="terminal-dot red"></div>
+      <div class="terminal-dot yellow"></div>
+      <div class="terminal-dot green"></div>
+      <div class="terminal-title">Terminal</div>
+    </div>
+    <div class="terminal-body">
+<span class="comment"># 1. Clone the repo</span>
+<span class="prompt">$</span> git clone https://github.com/sijie-Z/quant-platform.git
+<span class="prompt">$</span> cd quant-platform
+
+<span class="comment"># 2. Install dependencies</span>
+<span class="prompt">$</span> pip install -r requirements.txt
+
+<span class="comment"># 3. Run full pipeline (synthetic data, ~3 minutes)</span>
+<span class="prompt">$</span> python main.py run --force
+
+<span class="output">INFO | [1/6] Loading data... (500 stocks, 5 years)
+INFO | [2/6] Computing factors... (15 factors)
+INFO | [3/6] Generating alpha signal...
+INFO | [4/6] Portfolio optimization...
+INFO | [5/6] Running backtest...
+INFO | [6/6] Generating report...</span>
+<span class="success">INFO | Results saved to: ./results/</span>
+
+<span class="comment"># 4. Run tests (610 tests)</span>
+<span class="prompt">$</span> pytest tests/ -v
+<span class="success">610 passed in 217s</span>
+
+<span class="comment"># 5. Start web dashboard</span>
+<span class="prompt">$</span> python main.py web
+<span class="info">FastAPI + Vue 3 → http://localhost:8000</span>
+    </div>
+  </div>
+
+  <div style="margin-top: 2rem;">
+    <h3 style="margin-bottom: 1rem;">More Commands</h3>
+    <div class="code-block">
+      <div class="code-header">CLI Reference</div>
+      <pre>
+<span class="comment"># Baostock real data (free, no API key)</span>
+python main.py run --use-baostock
+
+<span class="comment"># Strategy comparison</span>
+python main.py compare --optimizers equal_weight,mean_variance,risk_parity
+
+<span class="comment"># Parameter grid search</span>
+python main.py sweep --optimizers equal_weight,mean_variance --frequencies monthly,weekly
+
+<span class="comment"># ML Alpha signal</span>
+python main.py ml train --model lightgbm
+python main.py ml signal --model xgboost
+
+<span class="comment"># LLM research agent</span>
+python main.py research report
+
+<span class="comment"># Performance profiling</span>
+python main.py profile</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ── Tech Stack ── -->
+<section>
+  <h2 class="section-title">Tech Stack</h2>
+  <p class="section-subtitle">Production-grade technologies across the full stack.</p>
+
+  <div class="tech-grid">
+    <div class="tech-item">
+      <div class="tech-name">Python 3.10+</div>
+      <div class="tech-desc">Core language</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">asyncio</div>
+      <div class="tech-desc">Async event bus</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Cython</div>
+      <div class="tech-desc">Hot path acceleration</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Numba</div>
+      <div class="tech-desc">6 JIT kernels</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Pandas / NumPy</div>
+      <div class="tech-desc">Data processing</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">cvxpy</div>
+      <div class="tech-desc">Portfolio optimization</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">XGBoost / LightGBM</div>
+      <div class="tech-desc">ML alpha signals</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">FastAPI</div>
+      <div class="tech-desc">REST API (91 endpoints)</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Vue 3 + ECharts</div>
+      <div class="tech-desc">Bloomberg-style dashboard</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">SQLite WAL</div>
+      <div class="tech-desc">State persistence</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">PostgreSQL</div>
+      <div class="tech-desc">Production storage</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Redis / Kafka</div>
+      <div class="tech-desc">Message bus backends</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Prometheus + Grafana</div>
+      <div class="tech-desc">Monitoring (16 panels)</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Docker</div>
+      <div class="tech-desc">Container deployment</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">GitHub Actions</div>
+      <div class="tech-desc">CI/CD (Py 3.10/3.11/3.12)</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">AKShare</div>
+      <div class="tech-desc">Real-time A-share data</div>
+    </div>
+  </div>
+</section>
+
+<!-- ── A-Share Pitfalls ── -->
+<section>
+  <h2 class="section-title">A-Share Pitfalls Handled</h2>
+  <p class="section-subtitle">10 real-world A-share traps that every quant must handle. We handle all of them.</p>
+
+  <div class="module-grid" style="grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));">
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">1. Forward Adjustment</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">Tushare qfq; synthetic data generates adj_factor for price continuity across dividends.</div>
+    </div>
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">2. Suspension</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">Short suspension (≤30d) forward-fill; long suspension removed from universe.</div>
+    </div>
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">3. Survivorship Bias</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">Track listing/delisting dates; point-in-time universe construction.</div>
+    </div>
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">4. Price Limits</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">Daily returns capped at ±10%; limit-up/down flags prevent impossible fills.</div>
+    </div>
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">5. ST Stocks</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">is_st flag; excluded by default (±5% limits, high delisting risk).</div>
+    </div>
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">6. T+1 Rule</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">Monthly rebalance naturally avoids; daily uses shift(-1) for next-day execution.</div>
+    </div>
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">7. Transaction Costs</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">Commission 0.03% bilateral + stamp tax 0.1% sell-only + slippage model.</div>
+    </div>
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">8. Lot Size</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">Optimizer rounds down to 100-share multiples (1 lot = 100 shares).</div>
+    </div>
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">9. Ex-Dividend</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">Forward adjustment embeds dividend adjustments into historical prices.</div>
+    </div>
+    <div class="module-card" style="padding: 1rem;">
+      <div style="font-weight:700; margin-bottom:0.25rem;">10. Sector Drift</div>
+      <div style="font-size:0.85rem; color:var(--text-secondary);">Latest sector classification; dynamic neutralization handles reclassifications.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Project Structure ── -->
+<section>
+  <h2 class="section-title">Project Structure</h2>
+  <p class="section-subtitle">84 Python modules organized by domain.</p>
+
+  <div class="code-block">
+    <div class="code-header">File Tree</div>
+    <pre>
+quant_platform/
+├── main.py                          <span class="comment"># CLI entry point</span>
+├── app.py                           <span class="comment"># FastAPI application</span>
+├── CLAUDE.md                        <span class="comment"># Full architecture docs</span>
+├── INTERVIEW_CHEATSHEET.md          <span class="comment"># Interview prep (12 topics)</span>
+├── JANE_STREET_GAP_ANALYSIS.md      <span class="comment"># Gap analysis vs Jane Street</span>
+│
+├── core/                            <span class="comment"># ★ Core Architecture</span>
+│   ├── event_bus_v2.py              <span class="comment"># AsyncEventBus (backpressure+DLQ+WAL)</span>
+│   ├── events.py                    <span class="comment"># Event bus bridge (backward compat)</span>
+│   ├── message_bus.py               <span class="comment"># Distributed bus (Local/Redis/Kafka)</span>
+│   ├── store.py                     <span class="comment"># SQLite persistence (WAL, 8 tables)</span>
+│   ├── state_machine.py             <span class="comment"># 8-state lifecycle</span>
+│   ├── audit.py                     <span class="comment"># Compliance audit trail</span>
+│   └── scheduler.py                 <span class="comment"># A-share market hours</span>
+│
+├── data/                            <span class="comment"># Data Layer</span>
+│   └── providers/                   <span class="comment"># Synthetic/Tushare/Baostock/PG/WS/L2</span>
+│
+├── factors/                         <span class="comment"># Factor Engine (15 factors)</span>
+│   ├── technical.py                 <span class="comment"># 10 technical factors</span>
+│   ├── fundamental.py               <span class="comment"># 5 fundamental factors</span>
+│   ├── network.py                   <span class="comment"># Graph network factor</span>
+│   └── ic_monitor.py                <span class="comment"># IC decay monitoring</span>
+│
+├── alpha/                           <span class="comment"># Alpha Model (IC/ICIR/ML/LLM)</span>
+├── portfolio/                       <span class="comment"># Portfolio Optimization (EW/MVO/RP)</span>
+│
+├── backtest/                        <span class="comment"># Backtest Engine</span>
+│   ├── engine.py                    <span class="comment"># Vectorized monthly</span>
+│   └── tick_engine.py               <span class="comment"># ★ Tick-level event-driven</span>
+│
+├── execution/                       <span class="comment"># Execution Layer</span>
+│   ├── order_book.py                <span class="comment"># ★ Real LOB (FIFO+IOC/FOK+VPIN)</span>
+│   └── market_impact.py             <span class="comment"># ★ Impact models (AC/SR/Kyle)</span>
+│
+├── risk/                            <span class="comment"># Risk Management</span>
+│   ├── realtime_engine.py           <span class="comment"># ★ Real-time risk (Greeks+pre-trade)</span>
+│   ├── greeks.py                    <span class="comment"># ★ Black-Scholes Greeks</span>
+│   └── barra.py                     <span class="comment"># Barra 10-factor model</span>
+│
+├── trading/                         <span class="comment"># Live Trading</span>
+│   ├── broker.py                    <span class="comment"># SimulatedBroker (LOB) + QMTBroker</span>
+│   └── engine.py                    <span class="comment"># Trading engine (EventBus+Risk+LOB)</span>
+│
+├── services/                        <span class="comment"># Microservice skeletons</span>
+├── agent/                           <span class="comment"># LLM modules</span>
+├── utils/                           <span class="comment"># Utilities</span>
+│   └── cyext/                       <span class="comment"># ★ Cython hot paths (3 .pyx)</span>
+│
+├── api/                             <span class="comment"># FastAPI (91 endpoints)</span>
+├── frontend/                        <span class="comment"># Vue 3 + ECharts</span>
+├── monitoring/                      <span class="comment"># Grafana dashboard (16 panels)</span>
+│
+└── tests/                           <span class="comment"># 610 unit tests</span>
+    ├── test_core/                   <span class="comment"># EventBus(38) + Store(16) + SM(15) + ...</span>
+    ├── test_execution/              <span class="comment"># OrderBook(22) + OMS(17) + Impact(10)</span>
+    ├── test_risk/                   <span class="comment"># RealTimeRisk(12) + Greeks(8) + ...</span>
+    ├── test_backtest/               <span class="comment"># TickEngine(15) + Cost(4) + ...</span>
+    └── test_utils/                  <span class="comment"># Cython(18) + Numba + Cache + ...</span></pre>
+  </div>
+</section>
+
+<!-- ── Footer ── -->
+<footer>
+  <p>
+    Built for quantitative development interviews.
+    <br>
+    <a href="https://github.com/sijie-Z/quant-platform">GitHub</a> ·
+    <a href="https://github.com/sijie-Z/quant-platform/blob/main/CLAUDE.md">Architecture Docs</a> ·
+    <a href="https://github.com/sijie-Z/quant-platform/blob/main/INTERVIEW_CHEATSHEET.md">Interview Prep</a>
+  </p>
+  <p style="margin-top: 1rem; color: var(--text-muted);">
+    "Architecture patterns are aligned with Jane Street. The remaining gaps are physical limits, not code."
+  </p>
+</footer>
+
+</body>
+</html>
