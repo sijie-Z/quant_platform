@@ -1,12 +1,20 @@
-"""Async event bus — the nervous system of the platform.
+"""Event bus — the nervous system of the platform.
 
 All components communicate through events, not direct calls.
 This is how Jane Street/Citadel systems decouple their components.
 
+Provides two implementations:
+- LegacyEventBus: Original sync event bus (used by unit tests)
+- AsyncEventBus: High-performance async bus with backpressure, latency
+  histograms, dead letter retry, and WAL event sourcing (from event_bus_v2)
+
+`get_event_bus()` returns an AsyncEventBus instance — all existing consumers
+(engine, audit, scheduler, routes) get the upgraded bus transparently.
+
 Usage:
-    bus = EventBus()
-    bus.subscribe('market.tick', on_tick)
-    bus.publish('market.tick', {'code': '600519', 'price': 1800.0})
+    bus = get_event_bus()
+    bus.subscribe('market.tick', on_tick)          # sync handler auto-detected
+    bus.publish('market.tick', {'code': '600519'})
 
 Event types follow domain-driven naming:
     market.tick       — real-time price update
@@ -39,9 +47,32 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Re-export v2 components (primary API)
+# ──────────────────────────────────────────────────────────────────────
+
+from quant_platform.core.event_bus_v2 import (  # noqa: E402
+    AsyncEventBus,
+    Event,
+    HandlerStats,
+    DeadLetterQueue,
+    EventStore,
+    get_async_event_bus,
+)
+
+
+# Type alias for event handlers
+EventHandler = Callable[[Any], None]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Legacy EventBus (backward compat — used by unit tests)
+# ──────────────────────────────────────────────────────────────────────
+
+
 @dataclass
-class Event:
-    """An event on the bus."""
+class LegacyEvent:
+    """Legacy event format (time.time() seconds, time_str in to_dict)."""
     topic: str
     data: dict
     timestamp: float = field(default_factory=time.time)
@@ -64,33 +95,17 @@ class Event:
         }
 
 
-# Type alias for event handlers
-EventHandler = Callable[[Event], None]
+class LegacyEventBus:
+    """Original sync event bus. Kept for backward compatibility with unit tests.
 
-
-class EventBus:
-    """In-process async event bus with synchronous fallback.
-
-    Supports:
-    - Topic-based pub/sub with wildcard matching ('market.*')
-    - Async handlers (run in thread pool)
-    - Sync handlers (run directly)
-    - Event history (ring buffer)
-    - Dead letter queue for failed events
-    - Metrics: publish count, handler count, error count
-
-    Architecture:
-        Publisher → EventBus → Subscriber(s)
-                    ↓
-              Event History (ring buffer)
-              Dead Letter Queue (errors)
+    New code should use AsyncEventBus via get_event_bus().
     """
 
     def __init__(self, history_size: int = 1000):
         self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
-        self._history: list[Event] = []
+        self._history: list[LegacyEvent] = []
         self._history_size = history_size
-        self._dead_letters: list[Event] = []
+        self._dead_letters: list[LegacyEvent] = []
         self._lock = threading.Lock()
         self._metrics = {
             "published": 0,
@@ -98,33 +113,26 @@ class EventBus:
             "errors": 0,
             "dead_letters": 0,
         }
-        self._interceptors: list[Callable[[Event], Event | None]] = []
+        self._interceptors: list[Callable[[LegacyEvent], LegacyEvent | None]] = []
 
     def subscribe(self, topic: str, handler: EventHandler):
-        """Subscribe to a topic. Supports wildcard 'market.*'."""
         with self._lock:
             self._handlers[topic].append(handler)
-            logger.debug("Subscribed to %s: %s", topic, handler.__name__)
 
     def unsubscribe(self, topic: str, handler: EventHandler):
-        """Remove a subscription."""
         with self._lock:
             if topic in self._handlers:
                 self._handlers[topic] = [h for h in self._handlers[topic] if h != handler]
 
-    def add_interceptor(self, fn: Callable[[Event], Event | None]):
-        """Add an event interceptor. Return None to suppress the event."""
+    def add_interceptor(self, fn: Callable[[LegacyEvent], LegacyEvent | None]):
         self._interceptors.append(fn)
 
-    def publish(self, topic: str, data: dict, source: str = "") -> Event:
-        """Publish an event. Returns the Event object."""
-        event = Event(topic=topic, data=data, source=source)
-
-        # Run interceptors
+    def publish(self, topic: str, data: dict, source: str = "") -> LegacyEvent:
+        event = LegacyEvent(topic=topic, data=data, source=source)
         for interceptor in self._interceptors:
             result = interceptor(event)
             if result is None:
-                return event  # suppressed
+                return event
             event = result
 
         with self._lock:
@@ -133,15 +141,12 @@ class EventBus:
             if len(self._history) > self._history_size:
                 self._history = self._history[-self._history_size:]
 
-        # Deliver to matching handlers
         self._deliver(event)
         return event
 
-    def _deliver(self, event: Event):
-        """Deliver event to all matching handlers."""
+    def _deliver(self, event: LegacyEvent):
         with self._lock:
             handlers = list(self._handlers.get(event.topic, []))
-            # Wildcard matching: 'market.*' matches 'market.tick'
             for pattern, pattern_handlers in self._handlers.items():
                 if pattern.endswith('.*') and event.topic.startswith(pattern[:-2]):
                     handlers.extend(pattern_handlers)
@@ -159,13 +164,10 @@ class EventBus:
                     self._dead_letters.append(event)
                     if len(self._dead_letters) > 100:
                         self._dead_letters = self._dead_letters[-50:]
-
                 logger.error("Handler %s failed for %s: %s",
                              handler.__name__, event.topic, e)
-                logger.debug(traceback.format_exc())
 
     def get_history(self, topic: str = "", limit: int = 50) -> list[dict]:
-        """Get recent events, optionally filtered by topic."""
         with self._lock:
             events = self._history
             if topic:
@@ -174,12 +176,10 @@ class EventBus:
             return [e.to_dict() for e in events[-limit:]]
 
     def get_dead_letters(self) -> list[dict]:
-        """Get failed events."""
         with self._lock:
             return [e.to_dict() for e in self._dead_letters]
 
     def get_metrics(self) -> dict:
-        """Get bus metrics."""
         with self._lock:
             return {
                 **self._metrics,
@@ -190,7 +190,6 @@ class EventBus:
             }
 
     def clear(self):
-        """Clear all state."""
         with self._lock:
             self._handlers.clear()
             self._history.clear()
@@ -198,13 +197,24 @@ class EventBus:
             self._metrics = {"published": 0, "delivered": 0, "errors": 0, "dead_letters": 0}
 
 
-# Global singleton
-_bus: EventBus | None = None
+# Backward-compatible alias — tests that create `EventBus()` still work
+EventBus = LegacyEventBus
 
 
-def get_event_bus() -> EventBus:
-    """Get the global event bus singleton."""
+# ──────────────────────────────────────────────────────────────────────
+# Global singleton (returns AsyncEventBus)
+# ──────────────────────────────────────────────────────────────────────
+
+_bus: AsyncEventBus | None = None
+
+
+def get_event_bus() -> AsyncEventBus:
+    """Get the global event bus singleton.
+
+    Returns AsyncEventBus — all existing consumers get the upgraded bus
+    transparently. Sync handlers registered via subscribe() are auto-detected.
+    """
     global _bus
     if _bus is None:
-        _bus = EventBus()
+        _bus = AsyncEventBus()
     return _bus

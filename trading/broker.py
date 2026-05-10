@@ -1,10 +1,15 @@
 """Broker abstraction layer.
 
 Supports:
-- SimulatedBroker: Paper trading with real market prices (no broker needed)
+- SimulatedBroker: Paper trading with real market prices via LOB matching
 - QMTBroker: Live trading via xtquant/miniQMT (requires QMT running)
 
 Both implement the same BrokerInterface for seamless switching.
+
+SimulatedBroker uses a real Limit Order Book (LOB) with:
+- Price-time priority FIFO matching
+- Partial fills
+- Market impact simulation (synthetic liquidity)
 """
 
 from __future__ import annotations
@@ -18,6 +23,13 @@ from typing import Any
 
 import numpy as np
 
+from quant_platform.execution.order_book import (
+    OrderBook,
+    BookOrder,
+    Side as BookSide,
+    OrderType as BookOrderType,
+    Trade,
+)
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -141,7 +153,10 @@ class BrokerInterface(ABC):
 
 
 class SimulatedBroker(BrokerInterface):
-    """Paper trading broker with real market prices.
+    """Paper trading broker with real LOB matching.
+
+    Uses a real Limit Order Book with price-time priority FIFO matching,
+    partial fills, and synthetic market-maker liquidity.
 
     Simulates A-share trading rules:
     - T+1 (can't sell shares bought today)
@@ -161,15 +176,63 @@ class SimulatedBroker(BrokerInterface):
         self._commission_rate = 0.0003   # 0.03%
         self._min_commission = 5.0
         self._stamp_tax_rate = 0.001     # 0.1% sell only
-        self._slippage_bps = 5           # 5 basis points
+
+        # Real order books per symbol
+        self._order_books: dict[str, OrderBook] = {}
+        self._market_prices: dict[str, float] = {}
+
+    def _get_or_create_book(self, symbol: str, price: float) -> OrderBook:
+        """Get or create an order book for a symbol, seeded with liquidity."""
+        if symbol not in self._order_books:
+            book = OrderBook(symbol)
+            self._seed_book(book, symbol, price)
+            self._order_books[symbol] = book
+        return self._order_books[symbol]
+
+    def _seed_book(self, book: OrderBook, symbol: str, price: float):
+        """Seed order book with synthetic market-maker liquidity.
+
+        Creates price levels on each side centered on the reference price,
+        with the best bid/ask touching the price (1 bp spread).
+        This ensures limit orders at the reference price can match.
+        """
+        spread_bps = 1  # 1 bp between levels
+        for i in range(6):
+            # Ask side (offers): start AT price, go up
+            ask_price = round(price * (1 + spread_bps * i / 10000), 2)
+            ask_qty = max(100, int(5000 / (i + 1)))
+            ask_order = BookOrder(
+                order_id=f"mm_ask_{symbol}_{i}",
+                symbol=symbol,
+                side=BookSide.SELL,
+                order_type=BookOrderType.LIMIT,
+                price=ask_price,
+                quantity=ask_qty,
+                source="market_maker",
+            )
+            book.add_order(ask_order)
+
+            # Bid side: start AT price, go down
+            bid_price = round(price * (1 - spread_bps * (i + 1) / 10000), 2)
+            bid_qty = max(100, int(5000 / (i + 1)))
+            bid_order = BookOrder(
+                order_id=f"mm_bid_{symbol}_{i}",
+                symbol=symbol,
+                side=BookSide.BUY,
+                order_type=BookOrderType.LIMIT,
+                price=bid_price,
+                quantity=bid_qty,
+                source="market_maker",
+            )
+            book.add_order(bid_order)
 
     def connect(self) -> bool:
         self._connected = True
-        logger.info("SimulatedBroker connected. Cash: %.2f", self._cash)
+        logger.info("SimulatedBroker connected (LOB matching). Cash: %.2f", self._cash)
         return True
 
     def place_order(self, order: Order) -> Order:
-        """Execute order immediately at market price + slippage."""
+        """Submit order to the real order book for price-time priority matching."""
         if not self._connected:
             order.status = OrderStatus.REJECTED
             order.error_msg = "Not connected"
@@ -192,66 +255,109 @@ class SimulatedBroker(BrokerInterface):
                 self._orders.append(order)
                 return order
 
-        # Calculate fill price with slippage
-        slippage = order.price * self._slippage_bps / 10000
+        # Check cash for buy (pre-check with worst-case price)
         if order.side == OrderSide.BUY:
-            fill_price = order.price + slippage
-        else:
-            fill_price = order.price - slippage
+            worst_cost = order.price * order.quantity * 1.001  # 0.1% buffer
+            if worst_cost > self._cash:
+                order.status = OrderStatus.REJECTED
+                order.error_msg = f"Insufficient cash. Need ~{worst_cost:.2f}, have {self._cash:.2f}"
+                self._orders.append(order)
+                return order
 
-        # Calculate costs
-        trade_value = fill_price * order.quantity
-        commission = max(trade_value * self._commission_rate, self._min_commission)
-        tax = trade_value * self._stamp_tax_rate if order.side == OrderSide.SELL else 0
-        total_cost = trade_value + commission + tax
+        # Get or create order book
+        book = self._get_or_create_book(order.code, order.price)
 
-        # Check cash for buy
-        if order.side == OrderSide.BUY and total_cost > self._cash:
+        # Convert to BookOrder and submit to LOB
+        book_order = BookOrder(
+            order_id=order.order_id,
+            symbol=order.code,
+            side=BookSide.BUY if order.side == OrderSide.BUY else BookSide.SELL,
+            order_type=BookOrderType.LIMIT,
+            price=order.price,
+            quantity=order.quantity,
+            source="broker",
+        )
+        trades = book.add_order(book_order)
+
+        # Process trades from the LOB
+        total_filled = 0
+        total_value = 0.0
+        for trade in trades:
+            total_filled += trade.quantity
+            total_value += trade.price * trade.quantity
+
+        if total_filled == 0:
+            # No liquidity — IOC-style: cancel
             order.status = OrderStatus.REJECTED
-            order.error_msg = f"Insufficient cash. Need {total_cost:.2f}, have {self._cash:.2f}"
+            order.error_msg = "No liquidity available"
             self._orders.append(order)
             return order
 
-        # Execute
+        # Average fill price
+        avg_fill_price = total_value / total_filled
+
+        # Calculate costs
+        commission = max(total_value * self._commission_rate, self._min_commission)
+        tax = total_value * self._stamp_tax_rate if order.side == OrderSide.SELL else 0
+        slippage = abs(avg_fill_price - order.price) * total_filled
+
+        # Update positions and cash
         if order.side == OrderSide.BUY:
+            total_cost = total_value + commission + tax
+            if total_cost > self._cash:
+                # Partial fill at what we can afford
+                affordable_qty = int(self._cash / (avg_fill_price * 1.001) / 100) * 100
+                if affordable_qty <= 0:
+                    order.status = OrderStatus.REJECTED
+                    order.error_msg = f"Insufficient cash after fill. Need {total_cost:.2f}, have {self._cash:.2f}"
+                    self._orders.append(order)
+                    return order
+                total_filled = min(total_filled, affordable_qty)
+                total_value = avg_fill_price * total_filled
+                commission = max(total_value * self._commission_rate, self._min_commission)
+                total_cost = total_value + commission + tax
+
             self._cash -= total_cost
             pos = self._positions.get(order.code)
             if pos:
-                total_qty = pos.quantity + order.quantity
-                pos.avg_cost = (pos.avg_cost * pos.quantity + fill_price * order.quantity) / total_qty
+                total_qty = pos.quantity + total_filled
+                pos.avg_cost = (pos.avg_cost * pos.quantity + avg_fill_price * total_filled) / total_qty
                 pos.quantity = total_qty
             else:
-                pos = Position(code=order.code, quantity=order.quantity,
-                               avg_cost=fill_price)
+                pos = Position(code=order.code, quantity=total_filled, avg_cost=avg_fill_price)
                 self._positions[order.code] = pos
             self._today_bought.add(order.code)
         else:  # SELL
-            self._cash += trade_value - commission - tax
+            self._cash += total_value - commission - tax
             pos = self._positions[order.code]
-            pos.quantity -= order.quantity
-            pos.available -= order.quantity
-            # Realized P&L
-            pos.realized_pnl += (fill_price - pos.avg_cost) * order.quantity
+            pos.quantity -= total_filled
+            pos.available -= total_filled
+            pos.realized_pnl += (avg_fill_price - pos.avg_cost) * total_filled
             if pos.quantity <= 0:
                 del self._positions[order.code]
 
-        order.filled_quantity = order.quantity
-        order.filled_price = fill_price
+        # Fill the order
+        order.filled_quantity = total_filled
+        order.filled_price = avg_fill_price
         order.commission = commission
         order.tax = tax
-        order.slippage = slippage * order.quantity
-        order.status = OrderStatus.FILLED
+        order.slippage = slippage
+        order.status = OrderStatus.FILLED if total_filled >= order.quantity else OrderStatus.PARTIAL
         order.updated_at = datetime.now().isoformat()
 
         self._orders.append(order)
-        logger.info("Filled: %s %s %d @ %.3f (cost: %.2f)",
-                     order.side.value, order.code, order.quantity, fill_price, commission + tax)
+        logger.info("LOB Filled: %s %s %d/%d @ %.3f (cost: %.2f, trades: %d)",
+                     order.side.value, order.code, total_filled, order.quantity,
+                     avg_fill_price, commission + tax, len(trades))
         return order
 
     def cancel_order(self, order_id: str) -> bool:
         for o in self._orders:
             if o.order_id == order_id and o.status == OrderStatus.PENDING:
                 o.status = OrderStatus.CANCELLED
+                # Cancel in the order book too
+                for book in self._order_books.values():
+                    book.cancel_order(order_id)
                 return True
         return False
 
@@ -276,11 +382,26 @@ class SimulatedBroker(BrokerInterface):
             "total_pnl_pct": round(total_pnl / self._initial_cash, 4),
             "n_positions": len(self._positions),
             "connected": self._connected,
-            "broker": "simulated",
+            "broker": "simulated_lob",
         }
+
+    def get_book_snapshot(self, symbol: str) -> dict | None:
+        """Get order book snapshot for a symbol."""
+        book = self._order_books.get(symbol)
+        if book:
+            return book.get_depth_snapshot(levels=5)
+        return None
+
+    def get_book_metrics(self, symbol: str) -> dict | None:
+        """Get microstructure metrics for a symbol."""
+        book = self._order_books.get(symbol)
+        if book:
+            return book.get_microstructure_metrics()
+        return None
 
     def update_market_prices(self, prices: dict[str, float]):
         """Update position prices from real-time market data."""
+        self._market_prices.update(prices)
         for code, pos in self._positions.items():
             if code in prices:
                 pos.update_price(prices[code])

@@ -30,6 +30,7 @@ from quant_platform.trading.broker import (
     BrokerInterface, Order, OrderSide, OrderStatus, OrderType, Position, SimulatedBroker,
 )
 from quant_platform.risk.circuit_breaker import RiskMonitor, RiskLimits, RiskLevel
+from quant_platform.risk.realtime_engine import RealTimeRiskEngine
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -103,7 +104,11 @@ class LiveTradingEngine:
         self._bus = bus or get_event_bus()
         self._sm = state_machine or PortfolioStateMachine()
         self._audit = audit or AuditLog(self._store, self._bus)
-        self._risk = risk_monitor or RiskMonitor()
+        self._risk = risk_monitor or RealTimeRiskEngine(
+            max_daily_loss=0.03,
+            max_drawdown=0.15,
+            auto_hedge=False,
+        )
         self._rebalance_interval = rebalance_interval
         self._n_stocks = n_stocks
         self._min_trade_value = min_trade_value
@@ -137,6 +142,12 @@ class LiveTradingEngine:
         self._session_id = uuid.uuid4().hex[:12]
         self._broker.connect()
         self._stop_event.clear()
+
+        # Set initial equity for risk engine
+        if isinstance(self._risk, RealTimeRiskEngine):
+            account = self._broker.get_account()
+            equity = account.get("total_equity", account.get("initial_cash", 1_000_000))
+            self._risk.set_initial_equity(equity)
         self._running = True
         self._started_at = datetime.now().isoformat()
 
@@ -335,6 +346,14 @@ class LiveTradingEngine:
                 self._audit.log_order(result.to_dict(), AuditAction.ORDER_FILLED,
                                       reason=sig.reason)
                 self._bus.publish("order.filled", result.to_dict(), source="broker")
+                # Update real-time risk engine with fill
+                if isinstance(self._risk, RealTimeRiskEngine):
+                    self._risk.on_fill({
+                        "symbol": order.code,
+                        "side": order.side.value,
+                        "price": result.filled_price,
+                        "quantity": result.filled_quantity,
+                    })
             elif result.status == OrderStatus.REJECTED:
                 self._audit.log_order(result.to_dict(), AuditAction.ORDER_REJECTED,
                                       reason=result.error_msg)

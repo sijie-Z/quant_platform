@@ -117,7 +117,7 @@ def _compute_factors(prices, returns, financials, metadata):
 
     logger.info("Computed %d factors: %s", len(raw_factors), list(raw_factors.keys()))
 
-    sector_map = metadata.get("sector", {}) if metadata else {}
+    sector_map = metadata.get("sector", {}) if metadata is not None else {}
     mcap = fin_unstacked["market_cap"] if fin_unstacked is not None else None
 
     processed_factors = {}
