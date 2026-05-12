@@ -249,28 +249,29 @@ class SyntheticDataProvider(DataProvider):
                 momentum_1m[t] = (row - mu) / std
 
         # Alpha return = weighted combination of signals
-        # Target IC ~0.03-0.05: detectable and tradeable.
+        # Target IC ~0.015-0.02: realistic A-share levels.
         # Momentum is the dominant signal; value/size are weaker.
+        # Signal-to-noise ~1:2 — real markets have more noise than signal.
         alpha_return = np.zeros((n_dates, n_assets))
 
         for t in range(21, n_dates):
-            # Momentum alpha (strongest)
-            alpha_return[t] += 0.04 * momentum_1m[t]
+            # Momentum alpha (moderate, realistic A-share level)
+            alpha_return[t] += 0.015 * momentum_1m[t]
 
             # Value alpha 
             value_weight = min(1.0, t / 63)
-            alpha_return[t] += 0.015 * value_signal * value_weight
+            alpha_return[t] += 0.008 * value_signal * value_weight
 
             # Size alpha
-            alpha_return[t] += 0.01 * size_signal * value_weight
+            alpha_return[t] += 0.005 * size_signal * value_weight
 
         # Scale to ~0.0008/day cross-sectional std → IC ~0.04-0.05
         raw_std = np.nanstd(alpha_return[21:])
         if raw_std > 1e-10:
-            alpha_return *= 0.0008 / raw_std
+            alpha_return *= 0.0003 / raw_std
 
         # Add modest noise (signal-to-noise ~2:1)
-        alpha_noise = self.rng.normal(0, 0.0004, size=(n_dates, n_assets))
+        alpha_noise = self.rng.normal(0, 0.0006, size=(n_dates, n_assets))
         alpha_return += alpha_noise
 
         total_returns = base_returns + alpha_return

@@ -57,6 +57,7 @@
 | **Multi-Factor Signals** | 15 factors (10 technical + 5 fundamental) + 4-factor composite + ML signal | Research |
 | **LLM Enhancement** | Sentiment factor from financial news + RAG research agent | Differentiated |
 | **A-Share Pitfalls** | 10 real-world traps handled (adjacency / suspension / ST / limit-up / T+1 / costs) | Production |
+| **Look-Ahead Prevention** | Point-in-time IC weighting + IC shift fix + Walk-Forward fold-recompute + realistic synthetic alpha | Production |
 
 > Documentation: [CLAUDE.md](CLAUDE.md) | Interview Guide: [INTERVIEW_CHEATSHEET.md](INTERVIEW_CHEATSHEET.md) | Jane Street Gap Analysis: [JANE_STREET_GAP_ANALYSIS.md](JANE_STREET_GAP_ANALYSIS.md)
 

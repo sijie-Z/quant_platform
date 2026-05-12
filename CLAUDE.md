@@ -894,6 +894,38 @@ risk.var.method: "historical" | "parametric" | "monte_carlo"
 
 ---
 
+## 未来函数防范与过拟合控制
+
+> 这是量化回测中最容易被忽视但最致命的问题。面试官必问。
+
+### 5项显式防护
+
+| # | 问题 | 严重度 | 防护方案 | 代码位置 |
+|---|------|--------|---------|---------|
+| 1 | **IC权重全量数据泄漏** | 严重 | IC/ICIR加权改为 **point-in-time**：每个时间点只用该点之前的数据计算因子权重，信号严格因果 | `alpha/combination.py:35-140` |
+| 2 | **IC计算shift链条** | 中等 | returns 已在 pipeline 做过 shift(-1)（t→t+1收益率），IC计算不再重复 shift；period>1 时计算累计前向收益率 | `factors/evaluation.py:21-65` |
+| 3 | **Walk-Forward信号泄漏** | 严重 | Walk-Forward 新增 `factors`/`alpha_kwargs` 参数，每个 fold 内用 train-only 数据**重新计算信号**，而非使用全量预计算信号 | `backtest/walkforward.py:47-71` |
+| 4 | **合成数据人造Alpha** | 中等 | Alpha强度从 IC~0.04 降至 IC~0.015-0.02，信噪比从 2:1 降至 1:2，接近真实A股水平 | `data/providers/synthetic.py:251-274` |
+| 5 | **默认配置过拟合倾向** | 中等 | 默认 Alpha 合成方法从 `icir_weighted` 改为 `equal_weight`——避免在面试演示时用全量优化后的参数 | `config/default.yaml:47` |
+
+### 设计哲学
+
+```
+信号 = 因子 × 权重(只用到t日的数据)
+
+t=2021-01: 还没积累足够的IC历史 → 等权
+t=2021-06: 有过去6个月的IC数据 → IC加权
+t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因子权重）
+
+关键：2021年的信号绝不会"知道"2025年哪个因子好使。
+```
+
+### 面试一句话
+
+> "这个平台在三个层面防止了未来函数：信号生成层做 point-in-time IC 加权，每个时间点只用之前的数据计算因子权重；验证层做 Walk-Forward，每个 fold 内用 train-only 数据重新算信号而非复用全量信号；数据层降低了合成数据的人造 alpha 强度到真实市场水平。IC 计算也不存在 shift 链条错误——这是很多量化项目最容易犯的错误。"
+
+---
+
 ## 面试亮点
 
 ### 核心技术 (必讲)
@@ -905,10 +937,11 @@ risk.var.method: "historical" | "parametric" | "monte_carlo"
 5. **Numba JIT 加速** — 6个计算内核 LLVM 编译，prange 并行化，日志输出 Pandas vs Numba 加速比
 6. **LLM Agent 集成** — 财经新闻情感因子，Strategy 模式可插拔 OpenAI，JSON 缓存
 7. **向量化回测** — 热路径无 for 循环，月频调仓+日频漂移，完整成本模型
+8. **未来函数防范** — Point-in-time IC加权(严格因果) + IC计算无shift链条 + Walk-Forward折内重算信号 + 合成数据真实IC水平，5项显式防护
 
 ### 机构级模块 (加分项)
 
-6. **Walk-Forward验证** — 滚动/扩展窗口OOS测试，折叠稳定性分析，避免过拟合金标准
+6. **Walk-Forward验证** — 滚动/扩展窗口OOS测试，每个fold内用train-only数据重算信号(非复用全量预计算信号)，真正的OOS验证，避免过拟合金标准
 7. **蒙特卡洛模拟** — Block Bootstrap + Student-t参数化模拟，置信区间+尾部风险概率
 8. **因子风险分解** — 系统性vs特异性风险归因，R-squared模型拟合，因子贡献分解
 9. **智能执行算法** — TWAP/VWAP/Iceberg三种机构级算法 + SmartRouter自动选择

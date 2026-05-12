@@ -287,33 +287,66 @@
 ## 12. Walk-Forward 验证
 
 ### 30 秒版本
-> "滚动/扩展窗口的时序交叉验证，避免过拟合。默认训练期 504 天（~2 年），测试期 126 天（~6 个月），输出 OOS 收益和稳定性指标。"
+> "滚动/扩展窗口的时序交叉验证，避免过拟合。每个 fold 内用 train-only 数据重新计算信号（非复用全量预计算信号），输出 OOS 收益和稳定性指标。"
 
 ### 3 分钟版本
 
-**问题**：全样本回测容易过拟合——你在整个历史数据上调参数，当然表现好。
+**问题**：全样本回测容易过拟合——你在整个历史数据上调参数，当然表现好。更隐蔽的问题是：即使切分了 train/test，如果 signal 是用全量 IC 数据预计算的，test 期间的 signal 依然嵌入了未来信息。
 
-**方案**：Walk-Forward 验证，只用未来数据评估。
+**方案**：Walk-Forward 验证，每个 fold 内用 train-period 数据重新计算 IC 权重和信号。
 
 **实现细节**：
 - 滚动窗口：固定训练期长度，每次向前滚动测试期
 - 扩展窗口：训练期从起点开始，越来越长
-- gap：训练和测试之间留间隔，防止信息泄漏
+- **核心创新**：`factors`/`alpha_kwargs` 参数，传入后每个 fold 内调用 `_compute_signal_in_sample()` 用 train-only 数据重算 Alpha 信号
+- 不传 `factors` 则向后兼容使用预计算信号
 - 折叠指标：每个折叠计算 Sharpe/Calmar/MaxDD
 - 稳定性指标：`mean_sharpe`、`std_sharpe`、`sharpe_consistency`（正 Sharpe 折叠占比）
+- 返回值增加 `signal_recomputed: True/False` 标记
 
 **追问预判**：
 - Q: "Walk-Forward 会降低收益吗？" → A: "会。全样本回测的收益是虚高的，Walk-Forward 给你真实预期。如果 Walk-Forward 结果和全样本差距很大，说明策略过拟合了。"
+- Q: "为什么要在 fold 内重算信号？" → A: "因为原来的 signal 用全量 IC 数据计算因子权重——2021 年的信号'知道'2025 年哪个因子好使。折叠内重算确保 test 期的信号完全来自 train 期的信息。"
 
 ---
 
-## 通用追问准备
+## 13. 未来函数防范
+
+### 30 秒版本
+> "五个层面：Point-in-time IC 加权（每个时间点只用之前数据算因子权重）、IC 计算无 shift 链条错误、Walk-Forward 折内重算信号、合成数据真实 IC 水平、默认等权配置。每个问题有明确的代码位置和面试话术。"
+
+### 3 分钟版本
+
+**问题**：量化回测项目最常犯的错误就是未来函数——回测很美，实盘归零。
+
+**方案**：5 项显式防护，每项有代码+测试。
+
+**实现细节**：
+
+| # | 防护 | 代码位置 | 效果 |
+|---|------|---------|------|
+| 1 | **Point-in-time IC 加权** | `alpha/combination.py:35-140` | 每个时间点预计算 IC 时序，只用 t 之前的数据算权重 |
+| 2 | **IC 计算 shift 修正** | `factors/evaluation.py:21-65` | returns 已做过 shift(-1)，IC 计算不再重复 shift；period>1 时计算累计收益 |
+| 3 | **Walk-Forward 信号重算** | `backtest/walkforward.py:226-261` | 每个 fold 用 train-only 数据重算信号，而非复用全量预计算信号 |
+| 4 | **合成数据真实度** | `data/providers/synthetic.py:251-274` | Alpha 强度 IC~0.015（原 0.04），信噪比 1:2（原 2:1） |
+| 5 | **默认等权配置** | `config/default.yaml:47` | `alpha.method: equal_weight`，避免演示时用过拟合参数 |
+
+**追问预判**：
+- Q: "你怎么证明没有未来函数？" → A: "三个证据：1) 跑 `pytest tests/test_alpha/ tests/test_factors/test_evaluation.py` 全部通过；2) Walk-Forward 的 OOS Sharpe 确实低于全样本 Sharpe（差距合理）；3) 合成数据因子 IC 在 0.015 左右而非 0.04-0.05。"
+- Q: "Point-in-time 会增加多少计算时间？" → A: "IC 时序预计算是 O(n_dates × n_factors)，只多一次循环。对于 5 年/500 只/15 因子的数据，额外开销约 3-5 秒，完全可接受。"
+- Q: "为什么之前有这个漏洞？" → A: "这是量化面试项目的常见设计取舍——为了演示效果把参数和权重调得很漂亮。但面试官一定会追问'你真的没有未来函数吗'，所以我决定正面解决。"
+
+---
+
 
 ### "你这个系统有多少行代码？"
 > "Python 约 19,500 行，Vue 前端约 9,800 行，610 个单元测试。新增的 Jane Street 级模块（EventBus v2、订单簿、市场冲击、逐笔回测、Greeks、实时风控、Cython 热路径、消息总线、微服务骨架）约 5,000 行 Python + 3 个 Cython .pyx 文件 + 132 个新测试。"
 
 ### "你怎么做测试的？"
 > "610 个 pytest 测试覆盖全模块。每个新模块都有独立测试：EventBus（pub/sub、通配符、拦截器、DLQ）、订单簿（FIFO 撮合、IOC/FOK、部分成交）、风控（Greeks 精度、限额检查、Kill Switch、压力测试）。CI 用 GitHub Actions 在 Python 3.10/3.11/3.12 矩阵跑。"
+
+### "你怎么防止未来函数和过拟合？"
+> "五个层面：1) IC 加权做 point-in-time，每个时间点只用之前数据算权重；2) IC 计算修复了 returns shift 链条错误；3) Walk-Forward 每个 fold 内用 train-only 数据重新算信号；4) 合成数据 alpha 强度降到真实水平 IC~0.015；5) 默认等权配置而不是 ICIR 加权。每个点都有代码位置和测试覆盖。"
 
 ### "如果给你一个月，你会做什么？"
 > "三件事：1) 接入 Tushare Pro 真实数据，替换合成数据做 backtest validation；2) 用 Rust 重写热路径（因子计算和订单撮合），目标延迟从 10ms 降到 100μs；3) 在 AWS 上部署 Prometheus + Grafana + Kafka，做真实的分布式事件流。"

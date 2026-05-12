@@ -29,7 +29,7 @@ def rank_ic(
 
     Args:
         factor: (date x asset) factor values.
-        forward_returns: (date x asset) forward returns.
+        forward_returns: (date x asset) forward 1-day returns (return[t] = r_{t→t+1}).
         period: Return horizon (1 = next day, 5 = next week, 21 = next month).
 
     Returns:
@@ -37,20 +37,27 @@ def rank_ic(
     """
     from quant_platform.utils.numba_accelerator import HAS_NUMBA, rank_ic_numba
 
-    fwd_ret = forward_returns.shift(-period)
+    # forward_returns[t] is already r_{t→t+1} (shifted in pipeline).
+    # Build target: for period=N, compute cumulative return t→t+N.
+    if period == 1:
+        target = forward_returns
+    else:
+        # Cumulative forward return over `period` days: (1+r₁)(1+r₂)...(1+r_N) - 1
+        target = (1 + forward_returns).rolling(period).apply(
+            lambda x: x.prod() - 1, raw=True
+        ).shift(-(period - 1))
 
     if HAS_NUMBA:
-        # Align indices
-        common_dates = factor.index.intersection(fwd_ret.index)
+        common_dates = factor.index.intersection(target.index)
         f_aligned = factor.loc[common_dates]
-        r_aligned = fwd_ret.loc[common_dates]
+        r_aligned = target.loc[common_dates]
         return rank_ic_numba(f_aligned, r_aligned)
 
     # Pure Pandas fallback
     ic_series = []
-    for date in factor.index.intersection(fwd_ret.index):
+    for date in factor.index.intersection(target.index):
         f = factor.loc[date]
-        r = fwd_ret.loc[date]
+        r = target.loc[date]
         common = f.dropna().index.intersection(r.dropna().index)
         if len(common) < 30:
             continue
@@ -70,12 +77,18 @@ def pearson_ic(
     period: int = 1,
 ) -> pd.Series:
     """Compute Pearson IC between factor and forward returns."""
-    fwd_ret = forward_returns.shift(-period)
+    # forward_returns[t] is already r_{t→t+1} (shifted in pipeline).
+    if period == 1:
+        target = forward_returns
+    else:
+        target = (1 + forward_returns).rolling(period).apply(
+            lambda x: x.prod() - 1, raw=True
+        ).shift(-(period - 1))
 
     ic_series = []
-    for date in factor.index.intersection(fwd_ret.index):
+    for date in factor.index.intersection(target.index):
         f = factor.loc[date]
-        r = fwd_ret.loc[date]
+        r = target.loc[date]
         common = f.dropna().index.intersection(r.dropna().index)
         if len(common) < 30:
             continue
@@ -138,14 +151,20 @@ def quantile_returns(
     Returns:
         DataFrame with columns for each quantile's mean return per date.
     """
-    fwd_ret = forward_returns.shift(-period)
-
     quantile_rets = {f"Q{i+1}": [] for i in range(n_quantiles)}
     dates_list = []
 
-    for date in factor.index.intersection(fwd_ret.index):
+    # forward_returns[t] is already r_{t→t+1} (shifted in pipeline).
+    if period == 1:
+        target = forward_returns
+    else:
+        target = (1 + forward_returns).rolling(period).apply(
+            lambda x: x.prod() - 1, raw=True
+        ).shift(-(period - 1))
+
+    for date in factor.index.intersection(target.index):
         f = factor.loc[date].dropna()
-        r = fwd_ret.loc[date].dropna()
+        r = target.loc[date].dropna()
         common = f.index.intersection(r.index)
         if len(common) < n_quantiles * 5:
             continue

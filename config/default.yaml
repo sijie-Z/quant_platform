@@ -44,7 +44,7 @@ factors:
 
 # --- Alpha Model ---
 alpha:
-  method: "icir_weighted"  # equal_weight, ic_weighted, icir_weighted
+  method: "equal_weight"  # equal_weight, ic_weighted, icir_weighted
   lookback: 252            # Days for IC/ICIR estimation
   min_icir: 0.0            # Minimum ICIR to include factor
 

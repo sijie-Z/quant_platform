@@ -6,6 +6,9 @@ evaluates on out-of-sample. The gold standard for avoiding overfitting.
 Two modes:
 - Rolling: fixed train window slides forward
 - Expanding: train window grows from the start
+
+When `factors` dict is provided, signals are recomputed per fold using
+only train-period data — eliminating look-ahead from IC/ICIR weighting.
 """
 
 from __future__ import annotations
@@ -30,6 +33,10 @@ class WalkForwardValidator:
 
     Each fold trains on in-sample data and evaluates out-of-sample.
     The concatenated OOS returns give an unbiased estimate of live performance.
+
+    If `factors` dict is provided, signals are recomputed per fold using only
+    train-period data — eliminating look-ahead from IC/ICIR weighting and
+    making the OOS evaluation truly representative of live performance.
     """
 
     def __init__(
@@ -53,8 +60,18 @@ class WalkForwardValidator:
         sector_map: pd.Series,
         financials: pd.DataFrame | None = None,
         engine_kwargs: dict | None = None,
+        factors: dict[str, pd.DataFrame] | None = None,
+        alpha_kwargs: dict | None = None,
     ) -> dict:
         """Run walk-forward validation.
+
+        Args:
+            signal: Pre-computed (date x asset) alpha signal. Used as fallback
+                    when `factors` is None (backward compatible).
+            factors: If provided, signal is recomputed per fold using only
+                     train-period data. Eliminates look-ahead from IC weighting.
+            alpha_kwargs: Dict with 'method', 'lookback', 'min_icir' for signal
+                          recomputation. Required when factors is provided.
 
         Returns:
             dict with keys:
@@ -64,8 +81,12 @@ class WalkForwardValidator:
             - aggregate_metrics: metrics computed on full OOS period
             - fold_details: train/test date ranges per fold
             - n_folds: number of folds used
+            - signal_recomputed: True if signal was recomputed per fold
         """
         engine_kwargs = engine_kwargs or {}
+        alpha_kwargs = alpha_kwargs or {}
+        signal_recomputed = factors is not None
+
         dates = signal.index
         n_dates = len(dates)
 
@@ -81,7 +102,7 @@ class WalkForwardValidator:
         while True:
             if self.mode == "expanding":
                 train_start = 0
-            else:  # rolling
+            else:
                 train_start = start
 
             train_end = start + self.train_period
@@ -105,8 +126,9 @@ class WalkForwardValidator:
             if test_end >= n_dates:
                 break
 
-        logger.info("Walk-forward: %d folds (%s mode, train=%d, test=%d, step=%d)",
-                     len(folds), self.mode, self.train_period, self.test_period, self.step_size)
+        logger.info("Walk-forward: %d folds (%s mode, train=%d, test=%d, step=%d, recomputed=%s)",
+                     len(folds), self.mode, self.train_period, self.test_period, self.step_size,
+                     signal_recomputed)
 
         oos_returns_list = []
         oos_benchmark_list = []
@@ -118,34 +140,44 @@ class WalkForwardValidator:
             train_sl = fold_info["train_slice"]
             test_sl = fold_info["test_slice"]
 
-            # In-sample signal and prices (for calibration, e.g., factor weights)
-            train_signal = signal.iloc[train_sl]
-            train_returns = returns.iloc[train_sl]
+            # --- Build signal for this fold ---
+            if factors is not None:
+                fold_signal = self._compute_signal_in_sample(
+                    factors, returns, train_sl, test_sl, alpha_kwargs,
+                )
+            else:
+                # Backward compatible: use pre-computed signal
+                fold_signal = signal.iloc[test_sl]
 
-            # Out-of-sample data
-            test_signal = signal.iloc[test_sl]
             test_prices = prices.iloc[test_sl]
             test_returns = returns.iloc[test_sl]
             test_benchmark = benchmark_returns.iloc[test_sl]
 
-            # Build engine with same params
             engine = BacktestEngine(**engine_kwargs)
 
-            # Run on OOS period
             try:
-                # Need full price history for covariance estimation
                 full_sl = slice(max(0, train_sl.start - 252), test_sl.stop)
                 full_prices = prices.iloc[full_sl]
                 full_returns = returns.iloc[full_sl]
 
-                result = engine.run(
-                    signal=test_signal,
-                    prices=full_prices.loc[test_signal.index[0]:],
-                    returns=full_returns.loc[test_signal.index[0]:],
-                    benchmark_returns=test_benchmark,
-                    sector_map=sector_map,
-                    financials=financials.iloc[full_sl] if financials is not None else None,
-                )
+                if fold_signal.index[0] in full_prices.index:
+                    result = engine.run(
+                        signal=fold_signal,
+                        prices=full_prices.loc[fold_signal.index[0]:],
+                        returns=full_returns.loc[fold_signal.index[0]:],
+                        benchmark_returns=test_benchmark,
+                        sector_map=sector_map,
+                        financials=financials.iloc[full_sl] if financials is not None else None,
+                    )
+                else:
+                    result = engine.run(
+                        signal=fold_signal,
+                        prices=test_prices,
+                        returns=test_returns,
+                        benchmark_returns=test_benchmark,
+                        sector_map=sector_map,
+                        financials=financials,
+                    )
 
                 oos_ret = result["daily_returns"]
                 oos_bench = result.get("benchmark_returns", test_benchmark)
@@ -153,7 +185,6 @@ class WalkForwardValidator:
                 oos_returns_list.append(oos_ret)
                 oos_benchmark_list.append(oos_bench)
 
-                # Per-fold metrics
                 if len(oos_ret) > 0:
                     m = all_metrics(oos_ret, oos_bench)
                     m["fold"] = fi
@@ -166,13 +197,13 @@ class WalkForwardValidator:
 
                 fold_details.append({
                     "fold": fi,
-                    "train": f"{fold_info['train_dates'][0]} → {fold_info['train_dates'][1]}",
-                    "test": f"{fold_info['test_dates'][0]} → {fold_info['test_dates'][1]}",
-                    "oos_days": len(test_signal),
+                    "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
+                    "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
+                    "oos_days": len(fold_signal),
                     "sharpe": fold_metrics[-1].get("sharpe_ratio", 0) if fold_metrics else 0,
                 })
 
-                logger.info("  Fold %d: OOS %s → %s (%d days, Sharpe=%.2f)",
+                logger.info("  Fold %d: OOS %s -> %s (%d days, Sharpe=%.2f)",
                             fi, fold_info["test_dates"][0], fold_info["test_dates"][1],
                             len(oos_ret), fold_metrics[-1].get("sharpe_ratio", 0))
 
@@ -180,20 +211,18 @@ class WalkForwardValidator:
                 logger.warning("  Fold %d failed: %s", fi, e)
                 fold_details.append({
                     "fold": fi,
-                    "train": f"{fold_info['train_dates'][0]} → {fold_info['train_dates'][1]}",
-                    "test": f"{fold_info['test_dates'][0]} → {fold_info['test_dates'][1]}",
+                    "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
+                    "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
                     "oos_days": 0,
                     "error": str(e)[:100],
                 })
 
-        # Concatenate OOS returns
         if not oos_returns_list:
             raise ValueError("All walk-forward folds failed")
 
         oos_returns = pd.concat(oos_returns_list)
         oos_benchmark = pd.concat(oos_benchmark_list) if oos_benchmark_list else None
 
-        # Aggregate OOS metrics
         aggregate = all_metrics(oos_returns, oos_benchmark)
 
         # Stability analysis across folds
@@ -223,4 +252,49 @@ class WalkForwardValidator:
             "mode": self.mode,
             "train_period": self.train_period,
             "test_period": self.test_period,
+            "signal_recomputed": signal_recomputed,
         }
+
+    def _compute_signal_in_sample(
+        self,
+        factors: dict[str, pd.DataFrame],
+        forward_returns: pd.DataFrame,
+        train_slice: slice,
+        test_slice: slice,
+        alpha_kwargs: dict,
+    ) -> pd.DataFrame:
+        """Recompute signal using only train-period data for IC weights.
+
+        Factor values are taken from the test period (those are observable),
+        but IC weights are estimated from train-period data only.
+        """
+        from quant_platform.alpha.combination import (
+            combine_equal_weight,
+            combine_ic_weighted,
+            combine_icir_weighted,
+        )
+
+        method = alpha_kwargs.get("method", "equal_weight")
+        lookback = alpha_kwargs.get("lookback", 252)
+        min_icir = alpha_kwargs.get("min_icir", 0.0)
+
+        # Slice factors to train + test dates (test period has factor values)
+        full_slice = slice(train_slice.start, test_slice.stop)
+        fold_factors = {}
+        for name, df in factors.items():
+            fold_factors[name] = df.iloc[full_slice]
+
+        # Slice forward_returns to train period only
+        train_returns = forward_returns.iloc[train_slice]
+
+        if method == "equal_weight":
+            return combine_equal_weight(fold_factors)
+
+        elif method == "ic_weighted":
+            return combine_ic_weighted(fold_factors, train_returns, lookback)
+
+        elif method == "icir_weighted":
+            return combine_icir_weighted(fold_factors, train_returns, lookback, min_icir)
+
+        else:
+            return combine_equal_weight(fold_factors)
