@@ -122,6 +122,7 @@ class SyntheticDataProvider(DataProvider):
         self._prices = self._build_price_data(returns)
         self._benchmark = self._generate_benchmark()
         self._financials = self._generate_financials()
+        self._st_timeseries = self._generate_st_timeseries()
 
         logger.info("Synthetic data generation complete: %d dates, %d assets",
                      len(self._dates), len(self._assets))
@@ -461,12 +462,16 @@ class SyntheticDataProvider(DataProvider):
             revenue = market_cap_t * self.rng.uniform(0.1, 1.0, size=n_assets)
             net_profit = roe_t * net_assets
 
+            # publish_date: report_date + 40-50 calendar days (realistic A-share lag)
+            publish_date = qdate + pd.DateOffset(days=40 + int(self.rng.integers(0, 11)))
+
             for i, asset in enumerate(self._assets):
                 rows.append([
                     qdate, asset,
                     market_cap_t[i], total_assets[i], net_assets[i],
                     revenue[i], net_profit[i], roe_t[i],
                     pb_t[i], pe_t[i], asset_growth_t[i],
+                    publish_date,
                 ])
 
         df = pd.DataFrame(rows, columns=[
@@ -474,6 +479,7 @@ class SyntheticDataProvider(DataProvider):
             "market_cap", "total_assets", "net_assets",
             "revenue", "net_profit", "roe",
             "pb_ratio", "pe_ratio", "asset_growth",
+            "publish_date",
         ])
         df = df.set_index(["date", "asset"]).sort_index()
 
@@ -483,7 +489,112 @@ class SyntheticDataProvider(DataProvider):
             [all_dates, self._assets], names=["date", "asset"]
         )
         df_full = df.reindex(full_idx)
+        # Forward-fill financial values but keep publish_date from the original quarter
         df_full = df_full.groupby("asset").ffill()
         df_full = df_full.groupby("asset").bfill()  # Fill initial NaN
 
         return df_full
+
+    # ------------------------------------------------------------------
+    # ST timeseries (point-in-time)
+    # ------------------------------------------------------------------
+
+    def _generate_st_timeseries(self) -> pd.DataFrame:
+        """Generate daily ST status with realistic announcement lag.
+
+        ST status changes are announced by the exchange, but there is a
+        delay between the trigger event (e.g., consecutive losses) and
+        the public announcement. We model this as:
+        - Actual ST trigger: random date
+        - Public announcement (effective for trading): trigger + 1-3 trading days
+        - The trader only knows about ST AFTER the announcement date.
+        """
+        records = []
+        for i, asset in enumerate(self._assets):
+            # Determine if this stock ever becomes ST
+            if not self._metadata.loc[asset, "is_st"]:
+                # Never ST: all dates False
+                continue
+
+            # ST events: 1-2 episodes per ST stock
+            n_episodes = self.rng.integers(1, 3)
+            for _ in range(n_episodes):
+                # Random trigger date
+                trigger_idx = self.rng.integers(60, len(self._dates) - 60)
+                trigger_date = self._dates[trigger_idx]
+
+                # Announcement lag: 1-3 trading days after trigger
+                announce_idx = min(trigger_idx + int(self.rng.integers(1, 4)),
+                                   len(self._dates) - 1)
+                announce_date = self._dates[announce_idx]
+
+                # ST duration: 30-200 trading days
+                duration = int(self.rng.integers(30, 200))
+                end_idx = min(announce_idx + duration, len(self._dates) - 1)
+                end_date = self._dates[end_idx]
+
+                records.append({
+                    "asset": asset,
+                    "trigger_date": trigger_date,
+                    "announce_date": announce_date,
+                    "end_date": end_date,
+                    "is_st": True,
+                })
+
+        if not records:
+            return pd.DataFrame(columns=["asset", "announce_date", "is_st"])
+
+        return pd.DataFrame(records)
+
+    def get_st_timeseries(self) -> pd.DataFrame:
+        """Return ST status timeseries with announcement dates.
+
+        Returns:
+            DataFrame with columns: asset, trigger_date, announce_date, end_date, is_st
+            Use announce_date for point-in-time filtering (trader only knows after announcement).
+        """
+        if self._st_timeseries is None:
+            self._generate_all()
+        return self._st_timeseries
+
+    # ------------------------------------------------------------------
+    # Industry changes (point-in-time)
+    # ------------------------------------------------------------------
+
+    def get_industry_changes(self) -> pd.DataFrame:
+        """Return industry classification with effective dates.
+
+        Industry reclassifications happen ~2 times per year for ~5% of stocks.
+        The effective date is when the new classification takes effect.
+
+        Returns:
+            DataFrame with columns: asset, industry, effective_date
+        """
+        records = []
+        all_dates = pd.DatetimeIndex(self._dates)
+        # Industry changes happen at semi-annual boundaries
+        semi_annual = all_dates[all_dates.is_quarter_end][::2]  # Every other quarter end
+
+        for i, asset in enumerate(self._assets):
+            current_industry = self._sector_map[asset]
+            # Initial classification
+            records.append({
+                "asset": asset,
+                "industry": current_industry,
+                "effective_date": self._dates[0],
+            })
+
+            # ~5% chance of reclassification per semi-annual period
+            for change_date in semi_annual:
+                if self.rng.random() < 0.05:
+                    new_industry = self.rng.choice(
+                        [s for s in SECTORS if s != current_industry]
+                    )
+                    records.append({
+                        "asset": asset,
+                        "industry": new_industry,
+                        "effective_date": change_date,
+                    })
+                    current_industry = new_industry
+
+        return pd.DataFrame(records)

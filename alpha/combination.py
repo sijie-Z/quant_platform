@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.factors.evaluation import ic_summary, rank_ic
+from quant_platform.factors.ic_monitor import FactorICAutoDecay
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -40,6 +41,7 @@ def combine_ic_weighted(
     factors: dict[str, pd.DataFrame],
     forward_returns: pd.DataFrame,
     lookback: int = 252,
+    ic_decay: FactorICAutoDecay | None = None,
 ) -> pd.DataFrame:
     """Weight factors by mean Rank IC — point-in-time, no look-ahead.
 
@@ -48,6 +50,8 @@ def combine_ic_weighted(
     less history, but the signal is strictly causal.
 
     Factors with stronger recent predictive power get higher weight.
+    If ic_decay is provided, factors with persistently low IC are
+    automatically zeroed out and weights are renormalized.
     """
     if not factors:
         raise ValueError("No factors provided")
@@ -72,13 +76,23 @@ def combine_ic_weighted(
                 weights[name] = 0.0
                 continue
             recent = ic_hist.iloc[-lookback:] if len(ic_hist) > lookback else ic_hist
-            weights[name] = recent.mean()
+            mean_ic = recent.mean()
+            weights[name] = mean_ic
+
+            # Update auto-decay monitor
+            if ic_decay is not None:
+                ic_decay.update(name, mean_ic)
+                ic_decay.check_and_update(name)
 
         total_abs = sum(abs(v) for v in weights.values())
         if total_abs < 1e-10:
             weights = {name: 1.0 / len(factor_names) for name in factor_names}
         else:
             weights = {name: v / total_abs for name, v in weights.items()}
+
+        # Apply auto-decay: zero out disabled factors and renormalize
+        if ic_decay is not None:
+            weights = ic_decay.get_active_weights(weights)
 
         row = _build_row(aligned, weights, date)
         if row is not None:
@@ -95,6 +109,7 @@ def combine_icir_weighted(
     forward_returns: pd.DataFrame,
     lookback: int = 252,
     min_icir: float = 0.0,
+    ic_decay: FactorICAutoDecay | None = None,
 ) -> pd.DataFrame:
     """Weight factors by ICIR — point-in-time, no look-ahead.
 
@@ -102,6 +117,8 @@ def combine_icir_weighted(
     Factors with ICIR below min_icir are excluded.
 
     At each date, only IC history before that date is used.
+    If ic_decay is provided, factors with persistently low IC are
+    automatically zeroed out and weights are renormalized.
     """
     if not factors:
         raise ValueError("No factors provided")
@@ -129,6 +146,11 @@ def combine_icir_weighted(
             summary = ic_summary(recent)
             icir_values[name] = summary["icir"]
 
+            # Update auto-decay monitor with mean IC from this window
+            if ic_decay is not None:
+                ic_decay.update(name, recent.mean())
+                ic_decay.check_and_update(name)
+
         # Filter and weight
         filtered = {name: v for name, v in icir_values.items() if v >= min_icir}
         if not filtered:
@@ -139,6 +161,10 @@ def combine_icir_weighted(
             weights = {name: 1.0 / len(filtered) for name in filtered}
         else:
             weights = {name: max(v, 0) / total for name, v in filtered.items()}
+
+        # Apply auto-decay: zero out disabled factors and renormalize
+        if ic_decay is not None:
+            weights = ic_decay.get_active_weights(weights)
 
         row = _build_row(aligned, weights, date)
         if row is not None:

@@ -19,6 +19,7 @@ Used to:
 from __future__ import annotations
 
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -307,3 +308,159 @@ class FactorICMonitor:
                 reverse=True,
             )
         ]
+
+
+class FactorICAutoDecay:
+    """Automatic factor weight decay based on rolling IC performance.
+
+    Tracks per-factor IC history. When a factor's average IC over the
+    decay window drops below the threshold, its weight is zeroed out.
+    When IC recovers above the recovery threshold for the recovery
+    window, the factor is re-enabled.
+
+    Usage:
+        decay = FactorICAutoDecay()
+        decay.update("momentum_1m", 0.03)
+        decay.update("momentum_1m", 0.01)
+        ...
+        weights = decay.get_active_weights({"momentum_1m": 0.5, "volatility": 0.5})
+    """
+
+    def __init__(
+        self,
+        decay_window: int = 20,
+        decay_threshold: float = 0.01,
+        recovery_window: int = 5,
+        recovery_threshold: float = 0.02,
+    ):
+        self.decay_window = decay_window
+        self.decay_threshold = decay_threshold
+        self.recovery_window = recovery_window
+        self.recovery_threshold = recovery_threshold
+        self._ic_history: dict[str, deque] = {}
+        self._disabled_factors: set[str] = set()
+        self._events: list[dict] = []
+
+    def update(self, factor_name: str, ic_value: float) -> None:
+        """Record a new IC observation for a factor.
+
+        Args:
+            factor_name: Factor identifier.
+            ic_value: Latest rank IC value.
+        """
+        if factor_name not in self._ic_history:
+            self._ic_history[factor_name] = deque(
+                maxlen=max(self.decay_window, self.recovery_window) * 2
+            )
+        self._ic_history[factor_name].append(ic_value)
+
+    def check_and_update(self, factor_name: str) -> bool:
+        """Check if a factor should be disabled or re-enabled.
+
+        Must be called after update() with sufficient history.
+
+        Args:
+            factor_name: Factor to check.
+
+        Returns:
+            True if factor is active, False if disabled.
+        """
+        history = self._ic_history.get(factor_name)
+        if history is None or len(history) < self.decay_window:
+            return factor_name not in self._disabled_factors
+
+        recent = list(history)[-self.decay_window:]
+        avg_ic = sum(recent) / len(recent)
+
+        if factor_name not in self._disabled_factors:
+            # Check for decay
+            if avg_ic < self.decay_threshold:
+                self._disabled_factors.add(factor_name)
+                event = {
+                    "factor": factor_name,
+                    "action": "disabled",
+                    "avg_ic": round(avg_ic, 6),
+                    "window": self.decay_window,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                self._events.append(event)
+                logger.warning(
+                    "Factor %s DISABLED: avg IC %.4f < threshold %.4f over %d days",
+                    factor_name, avg_ic, self.decay_threshold, self.decay_window,
+                )
+                return False
+        else:
+            # Check for recovery
+            if len(history) >= self.recovery_window:
+                recovery_avg = sum(list(history)[-self.recovery_window:]) / self.recovery_window
+                if recovery_avg > self.recovery_threshold:
+                    self._disabled_factors.discard(factor_name)
+                    event = {
+                        "factor": factor_name,
+                        "action": "recovered",
+                        "avg_ic": round(recovery_avg, 6),
+                        "window": self.recovery_window,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    self._events.append(event)
+                    logger.info(
+                        "Factor %s RECOVERED: avg IC %.4f > threshold %.4f over %d days",
+                        factor_name, recovery_avg, self.recovery_threshold,
+                        self.recovery_window,
+                    )
+                    return True
+
+        return factor_name not in self._disabled_factors
+
+    def get_active_weights(
+        self,
+        base_weights: dict[str, float],
+    ) -> dict[str, float]:
+        """Adjust factor weights by zeroing out disabled factors.
+
+        Disabled factors get weight 0. Remaining weights are renormalized
+        to sum to 1. If all factors are disabled, falls back to equal weight.
+
+        Args:
+            base_weights: Original factor weights (e.g., from ICIR weighting).
+
+        Returns:
+            Adjusted weights with disabled factors set to 0 and renormalized.
+            All keys from base_weights are preserved.
+        """
+        active = {
+            k: v for k, v in base_weights.items()
+            if k not in self._disabled_factors
+        }
+        total = sum(active.values())
+
+        if total < 1e-10:
+            # All disabled — fallback to equal weight of original factors
+            logger.warning("All factors disabled by IC decay — falling back to equal weight")
+            n = len(base_weights)
+            return {k: 1.0 / n for k in base_weights} if n > 0 else {}
+
+        renormalized = {k: v / total for k, v in active.items()}
+        # Include disabled factors with weight 0
+        result = {k: renormalized.get(k, 0.0) for k in base_weights}
+        return result
+
+    @property
+    def disabled_factors(self) -> set[str]:
+        """Set of currently disabled factor names."""
+        return self._disabled_factors.copy()
+
+    @property
+    def events(self) -> list[dict]:
+        """History of disable/recover events."""
+        return self._events.copy()
+
+    def is_active(self, factor_name: str) -> bool:
+        """Check if a factor is currently active."""
+        return factor_name not in self._disabled_factors
+
+    def reset(self) -> None:
+        """Reset all state (for testing)."""
+        self._ic_history.clear()
+        self._disabled_factors.clear()
+        self._events.clear()

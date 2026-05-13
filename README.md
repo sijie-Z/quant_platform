@@ -5,7 +5,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/Tests-610%20Passed-brightgreen?logo=pytest" alt="Tests">
+  <img src="https://img.shields.io/badge/Tests-652%20Passed-brightgreen?logo=pytest" alt="Tests">
   <img src="https://img.shields.io/badge/Modules-84-orange" alt="Modules">
   <img src="https://img.shields.io/badge/Lines-27%2C000%2B-yellow" alt="Lines">
   <img src="https://img.shields.io/badge/API-91%20Endpoints-red?logo=fastapi" alt="API">
@@ -58,6 +58,9 @@
 | **LLM Enhancement** | Sentiment factor from financial news + RAG research agent | Differentiated |
 | **A-Share Pitfalls** | 10 real-world traps handled (adjacency / suspension / ST / limit-up / T+1 / costs) | Production |
 | **Look-Ahead Prevention** | Point-in-time IC weighting + IC shift fix + Walk-Forward fold-recompute + realistic synthetic alpha | Production |
+| **Point-in-Time Data** | Financials with publish_date filtering + ST announcement lag + industry effective_date — zero look-ahead | Production |
+| **IC Auto-Decay** | FactorICAutoDecay: rolling IC monitoring → auto-disable on decay → auto-recover on IC rebound | Production |
+| **Pre-Flight Health Check** | 5-point system check (data/balance/positions/routing/limits) → SystemBlockError on failure | Production |
 
 > Documentation: [CLAUDE.md](CLAUDE.md) | Interview Guide: [INTERVIEW_CHEATSHEET.md](INTERVIEW_CHEATSHEET.md) | Jane Street Gap Analysis: [JANE_STREET_GAP_ANALYSIS.md](JANE_STREET_GAP_ANALYSIS.md)
 
@@ -194,6 +197,7 @@ Data Layer  -->  Factor Engine  -->  Alpha Model  -->  Portfolio Optimizer
 | `stress.py` | Stress testing: 2008 Financial Crisis / 2015 A-Share Crash / 2020 COVID |
 | `barra.py` | Barra 10-factor risk model: cross-sectional regression + Ledoit-Wolf shrinkage + risk attribution |
 | `regime.py` | Market regime detection: volatility / trend / correlation |
+| `healthcheck.py` | **Pre-flight Health Check**: data connection / account balance / position sync / order routing / risk limits — blocks trading on failure |
 
 </details>
 
@@ -299,7 +303,7 @@ open http://localhost:8000/api/docs
 ### Test
 
 ```bash
-# Run all 610 tests
+# Run all 652 tests
 pytest tests/ -v
 
 # Run core architecture tests only
@@ -435,7 +439,8 @@ quant_platform/
 │   ├── var.py                       # VaR/CVaR
 │   ├── stress.py                    # Stress testing
 │   ├── barra.py                     # Barra 10-factor model
-│   └── regime.py                    # Market regime detection
+│   ├── regime.py                    # Market regime detection
+│   └── healthcheck.py               # Pre-flight system health check
 │
 ├── trading/                         # Live Trading
 │   ├── broker.py                    # SimulatedBroker(LOB) + QMTBroker
@@ -472,13 +477,13 @@ quant_platform/
 ├── docs/
 │   └── index.html                   # GitHub Pages architecture documentation
 │
-└── tests/                           # 610 Unit Tests
+└── tests/                           # 652 Unit Tests
     ├── test_core/                   # EventBus(13)+EventBus v2(25)+MessageBus(16)+Store(16)+StateMachine(15)+Audit(10)+Scheduler(2)
     ├── test_execution/              # OrderBook(22)+OMS(17)+Algorithms(13)+MarketImpact(10)
-    ├── test_risk/                   # RealTimeRisk(12)+Greeks(8)+VaR(7)+Barra(16)+...
+    ├── test_risk/                   # RealTimeRisk(12)+Greeks(8)+VaR(7)+Barra(16)+HealthCheck(16)+...
     ├── test_backtest/               # TickEngine(15)+Cost(4)+Metrics(7)+WalkForward(2)
     ├── test_utils/                  # Cython(18)+Numba+Cache+Config+Metrics
-    └── ...                          # 610 tests total
+    └── ...                          # 652 tests total
 ```
 
 ---

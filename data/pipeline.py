@@ -46,6 +46,10 @@ class DataPipeline:
         self.returns: pd.DataFrame | None = None
         self.valid_assets: pd.Index | None = None
 
+        # Point-in-time data (populated during run if provider supports it)
+        self._st_timeseries: pd.DataFrame | None = None
+        self._industry_changes: pd.DataFrame | None = None
+
     def run(self) -> None:
         """Execute the full ETL pipeline."""
         logger.info("Running data pipeline: %s to %s",
@@ -64,6 +68,9 @@ class DataPipeline:
             str(self.start_date.date()), str(self.end_date.date())
         )
 
+        # Load point-in-time data if provider supports it
+        self._load_point_in_time_data()
+
         self._clean_prices()
         self._compute_returns()
         self._align()
@@ -80,6 +87,9 @@ class DataPipeline:
         """Filter investable universe based on config rules."""
         meta = self.metadata
 
+        # Static ST filter: exclude stocks flagged as ST in metadata
+        # This is the coarse filter. Point-in-time ST lookup via
+        # get_st_status() provides finer-grained per-date filtering.
         if self.exclude_st:
             meta = meta[~meta["is_st"]]
 
@@ -92,6 +102,116 @@ class DataPipeline:
 
         self.metadata = meta
         self.valid_assets = meta.index
+
+    # ------------------------------------------------------------------
+    # Point-in-time data loading
+    # ------------------------------------------------------------------
+
+    def _load_point_in_time_data(self) -> None:
+        """Load ST timeseries and industry changes from provider if available."""
+        if hasattr(self.provider, 'get_st_timeseries'):
+            try:
+                self._st_timeseries = self.provider.get_st_timeseries()
+                logger.info("Loaded ST timeseries: %d records", len(self._st_timeseries))
+            except Exception as e:
+                logger.warning("Failed to load ST timeseries: %s", e)
+
+        if hasattr(self.provider, 'get_industry_changes'):
+            try:
+                self._industry_changes = self.provider.get_industry_changes()
+                logger.info("Loaded industry changes: %d records", len(self._industry_changes))
+            except Exception as e:
+                logger.warning("Failed to load industry changes: %s", e)
+
+    def get_financials_as_of(self, as_of_date: pd.Timestamp) -> pd.DataFrame:
+        """Get financial data available as of a given date (no look-ahead).
+
+        Only includes financials whose publish_date <= as_of_date.
+        For each asset, returns the most recently published record.
+
+        Args:
+            as_of_date: The date to filter by (inclusive).
+
+        Returns:
+            DataFrame with latest available financials per asset.
+        """
+        if self.financials is None:
+            return pd.DataFrame()
+
+        if "publish_date" not in self.financials.columns:
+            # No publish_date column — use all data (legacy provider)
+            logger.warning("Financials missing publish_date — using all data (no PIT filter)")
+            return self.financials
+
+        # Filter: only records whose publish_date <= as_of_date
+        available = self.financials[self.financials["publish_date"] <= as_of_date]
+        if available.empty:
+            return pd.DataFrame()
+
+        # For each asset, take the record with the latest publish_date
+        # Reset index to work with date/asset columns
+        available = available.reset_index()
+        idx = available.groupby("asset")["publish_date"].idxmax()
+        latest = available.loc[idx].set_index(["date", "asset"])
+
+        return latest
+
+    def get_st_status(self, as_of_date: pd.Timestamp) -> set:
+        """Get set of assets that are ST as of a given date.
+
+        Uses announcement dates (not trigger dates) to prevent look-ahead.
+        A stock is ST from its announce_date until its end_date.
+
+        Args:
+            as_of_date: The date to check ST status for.
+
+        Returns:
+            Set of asset codes that are ST on as_of_date.
+        """
+        if self._st_timeseries is None or self._st_timeseries.empty:
+            # Fallback to static metadata
+            if self.metadata is not None and "is_st" in self.metadata.columns:
+                return set(self.metadata[self.metadata["is_st"]].index)
+            return set()
+
+        st_assets = set()
+        for _, row in self._st_timeseries.iterrows():
+            announce = pd.Timestamp(row["announce_date"])
+            end = pd.Timestamp(row["end_date"])
+            if announce <= as_of_date <= end:
+                st_assets.add(row["asset"])
+
+        return st_assets
+
+    def get_industry_map(self, as_of_date: pd.Timestamp) -> dict:
+        """Get industry classification as of a given date.
+
+        Uses effective_date to return the classification that was in effect
+        on as_of_date, preventing look-ahead from future reclassifications.
+
+        Args:
+            as_of_date: The date to get classification for.
+
+        Returns:
+            Dict mapping asset -> industry string.
+        """
+        if self._industry_changes is None or self._industry_changes.empty:
+            # Fallback to metadata
+            if self.metadata is not None and "sector" in self.metadata.columns:
+                return self.metadata["sector"].to_dict()
+            return {}
+
+        # Filter to changes effective on or before as_of_date
+        available = self._industry_changes[
+            self._industry_changes["effective_date"] <= as_of_date
+        ]
+        if available.empty:
+            return {}
+
+        # For each asset, take the latest effective_date
+        idx = available.groupby("asset")["effective_date"].idxmax()
+        latest = available.loc[idx]
+        return dict(zip(latest["asset"], latest["industry"]))
 
     # ------------------------------------------------------------------
     # Price cleaning

@@ -30,6 +30,7 @@ from quant_platform.trading.broker import (
     BrokerInterface, Order, OrderSide, OrderStatus, OrderType, Position, SimulatedBroker,
 )
 from quant_platform.risk.circuit_breaker import RiskMonitor, RiskLimits, RiskLevel
+from quant_platform.risk.healthcheck import HealthCheck, SystemBlockError
 from quant_platform.risk.realtime_engine import RealTimeRiskEngine
 from quant_platform.utils.logging import get_logger
 
@@ -142,6 +143,19 @@ class LiveTradingEngine:
         self._session_id = uuid.uuid4().hex[:12]
         self._broker.connect()
         self._stop_event.clear()
+
+        # Pre-flight health check
+        health = HealthCheck(
+            event_bus=self._bus,
+            broker=self._broker,
+            risk_monitor=self._risk,
+        )
+        try:
+            health.run_all_sync()
+        except SystemBlockError as e:
+            logger.critical("Engine start blocked by health check: %s", e)
+            self._bus.publish("engine.start_blocked", {"error": str(e)}, source="engine")
+            raise
 
         # Set initial equity for risk engine
         if isinstance(self._risk, RealTimeRiskEngine):
