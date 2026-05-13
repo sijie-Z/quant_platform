@@ -39,6 +39,11 @@ try:
 except ImportError:
     TenantContext = None  # type: ignore[assignment,misc]
 
+try:
+    from quant_platform.operations.nav import NAVCalculator
+except ImportError:
+    NAVCalculator = None  # type: ignore[assignment,misc]
+
 logger = get_logger(__name__)
 
 
@@ -140,6 +145,11 @@ class LiveTradingEngine:
         self._cycle_log: list[CycleResult] = []
         self._session_id = ""
 
+        # NAV calculator
+        self._nav_calc = None
+        if NAVCalculator is not None:
+            self._nav_calc = NAVCalculator(self._store)
+
         # Scheduler
         self._scheduler = TradingScheduler(self._sm, self._store, self._bus, rebalance_interval)
 
@@ -222,6 +232,21 @@ class LiveTradingEngine:
             "stopped_at": datetime.now().isoformat(),
             "total_trades": self._trade_count,
         })
+
+        # Day-end NAV calculation
+        if self._nav_calc is not None:
+            try:
+                account = self._broker.get_account()
+                cash = account.get("cash", 0)
+                market_value = account.get("total_equity", 0) - cash
+                nav = self._nav_calc.update_daily_nav(
+                    date=datetime.now().strftime("%Y-%m-%d"),
+                    cash=cash,
+                    market_value=market_value,
+                )
+                self._bus.publish("nav.updated", nav.to_dict(), source="engine")
+            except Exception as e:
+                logger.warning("NAV calculation failed: %s", e)
 
         self._audit.log(AuditAction.ENGINE_STOP, "engine",
                         details={"trades": self._trade_count, "cycles": self._cycle_count})

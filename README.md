@@ -5,9 +5,9 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/Tests-763%20Passed-brightgreen?logo=pytest" alt="Tests">
-  <img src="https://img.shields.io/badge/Modules-88-orange" alt="Modules">
-  <img src="https://img.shields.io/badge/Lines-29%2C000%2B-yellow" alt="Lines">
+  <img src="https://img.shields.io/badge/Tests-824%20Passed-brightgreen?logo=pytest" alt="Tests">
+  <img src="https://img.shields.io/badge/Modules-91-orange" alt="Modules">
+  <img src="https://img.shields.io/badge/Lines-30%2C000%2B-yellow" alt="Lines">
   <img src="https://img.shields.io/badge/API-91%20Endpoints-red?logo=fastapi" alt="API">
   <img src="https://img.shields.io/badge/Factors-15-purple" alt="Factors">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
@@ -176,6 +176,25 @@ Data Layer  -->  Factor Engine  -->  Alpha Model  -->  Portfolio Optimizer
 </details>
 
 <details>
+<summary><b>5a. Compliance</b> <code>compliance/</code> — Regulatory reporting</summary>
+
+| Module | Function |
+|--------|----------|
+| `exporter.py` | Trade/order/risk log export: CSV/Excel, Chinese+English field names (成交编号/Trade ID), UTF-8 BOM, tenant_id filtering |
+
+</details>
+
+<details>
+<summary><b>5b. Fund Operations</b> <code>operations/</code> — NAV and investor reporting</summary>
+
+| Module | Function |
+|--------|----------|
+| `nav.py` | NAV calculator: daily NAV with management fee (annualized/252), performance fee (high-water mark method), HWM tracking |
+| `investor.py` | Investor portal: sanitized performance view (NAV curve, returns, drawdown, Sharpe, monthly returns matrix) — no position exposure |
+
+</details>
+
+<details>
 <summary><b>6. Backtest Engine</b> <code>backtest/</code> — Event-driven tick replay</summary>
 
 | Module | Function |
@@ -306,7 +325,7 @@ open http://localhost:8000/api/docs
 ### Test
 
 ```bash
-# Run all 763 tests
+# Run all 824 tests
 pytest tests/ -v
 
 # Run core architecture tests only
@@ -441,6 +460,13 @@ quant_platform/
 │   ├── algorithms.py                # TWAP/VWAP/Iceberg
 │   └── oms.py                       # Order management
 │
+├── compliance/                      # Regulatory Compliance
+│   └── exporter.py                  # Trade/order/risk log export (CSV/Excel, CN+EN fields)
+│
+├── operations/                      # Fund Operations
+│   ├── nav.py                       # NAV calculator (mgmt fee, perf fee, HWM)
+│   └── investor.py                  # Investor portal (sanitized performance view)
+│
 ├── risk/                            # Risk Management
 │   ├── realtime_engine.py           # Real-time risk (Greeks+precheck+Kill Switch)
 │   ├── greeks.py                    # Black-Scholes Greeks
@@ -486,14 +512,16 @@ quant_platform/
 ├── docs/
 │   └── index.html                   # GitHub Pages architecture documentation
 │
-└── tests/                           # 763 Unit Tests
-    ├── test_core/                   # EventBus(13)+EventBus v2(25)+MessageBus(16)+Store(16)+StateMachine(15)+Audit(10)+Scheduler(2)
+└── tests/                           # 824 Unit Tests
+    ├── test_core/                   # EventBus(13)+EventBus v2(25)+MessageBus(16)+Store(16)+StateMachine(15)+Audit(10)+Scheduler(2)+Tenant(8)
     ├── test_execution/              # OrderBook(22)+OMS(17)+Algorithms(13)+MarketImpact(10)+TCA(21)
+    ├── test_compliance/             # ComplianceExporter(21)
+    ├── test_operations/             # NAV(21)+InvestorPortal(19)
     ├── test_risk/                   # RealTimeRisk(12)+Greeks(8)+VaR(7)+Barra(16)+HealthCheck(16)+...
     ├── test_backtest/               # TickEngine(15)+Cost(4)+Metrics(7)+WalkForward(2)+Capacity(9)
     ├── test_research/               # DeflatedSharpe(8)+MultipleTesting(8)
     ├── test_utils/                  # Cython(18)+Numba+Cache+Config+Metrics
-    └── ...                          # 763 tests total
+    └── ...                          # 824 tests total
 ```
 
 ---

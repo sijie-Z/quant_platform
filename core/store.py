@@ -171,6 +171,20 @@ class Store:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS nav_history (
+                    date TEXT PRIMARY KEY,
+                    nav_total REAL NOT NULL,
+                    nav_per_unit REAL NOT NULL,
+                    total_units REAL NOT NULL,
+                    cash REAL DEFAULT 0,
+                    market_value REAL DEFAULT 0,
+                    mgmt_fee REAL DEFAULT 0,
+                    perf_fee REAL DEFAULT 0,
+                    high_water_mark REAL DEFAULT 1.0,
+                    daily_return REAL DEFAULT 0,
+                    cumulative_return REAL DEFAULT 0
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);
                 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
                 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
@@ -483,6 +497,34 @@ class Store:
             rows = conn.execute(
                 "SELECT * FROM config_snapshots ORDER BY created_at DESC LIMIT ?",
                 (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    # ── NAV History ──
+
+    def save_nav(self, nav: dict):
+        """Save a NAV record."""
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO nav_history
+                    (date, nav_total, nav_per_unit, total_units, cash, market_value,
+                     mgmt_fee, perf_fee, high_water_mark, daily_return, cumulative_return)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    nav['date'], nav['nav_total'], nav['nav_per_unit'],
+                    nav['total_units'], nav.get('cash', 0),
+                    nav.get('market_value', 0), nav.get('mgmt_fee', 0),
+                    nav.get('perf_fee', 0), nav.get('high_water_mark', 1.0),
+                    nav.get('daily_return', 0), nav.get('cumulative_return', 0),
+                ))
+
+    def get_nav_history(self, days: int = 365 * 3) -> list[dict]:
+        """Get NAV history for the last N days."""
+        with self._conn() as conn:
+            cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            rows = conn.execute(
+                "SELECT * FROM nav_history WHERE date > ? ORDER BY date",
+                (cutoff,)).fetchall()
             return [dict(r) for r in rows]
 
     # ── Stats ──
