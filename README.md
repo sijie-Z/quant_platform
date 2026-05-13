@@ -7,7 +7,7 @@
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/Tests-610%20Passed-brightgreen?logo=pytest" alt="Tests">
   <img src="https://img.shields.io/badge/Modules-84-orange" alt="Modules">
-  <img src="https://img.shields.io/badge/Lines-19%2C500%2B-yellow" alt="Lines">
+  <img src="https://img.shields.io/badge/Lines-27%2C000%2B-yellow" alt="Lines">
   <img src="https://img.shields.io/badge/API-91%20Endpoints-red?logo=fastapi" alt="API">
   <img src="https://img.shields.io/badge/Factors-15-purple" alt="Factors">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
@@ -464,7 +464,7 @@ quant_platform/
 │   └── schemas.py                   # Pydantic models
 │
 ├── frontend/                        # Vue 3 Frontend
-│   └── src/components/              # 35 Vue components
+│   └── src/components/              # 37 Vue components
 │
 ├── monitoring/
 │   └── grafana_dashboard.json       # Grafana 16-panel template
