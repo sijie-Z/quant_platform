@@ -5,7 +5,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/Tests-652%20Passed-brightgreen?logo=pytest" alt="Tests">
+  <img src="https://img.shields.io/badge/Tests-691%20Passed-brightgreen?logo=pytest" alt="Tests">
   <img src="https://img.shields.io/badge/Modules-84-orange" alt="Modules">
   <img src="https://img.shields.io/badge/Lines-27%2C000%2B-yellow" alt="Lines">
   <img src="https://img.shields.io/badge/API-91%20Endpoints-red?logo=fastapi" alt="API">
@@ -61,6 +61,9 @@
 | **Point-in-Time Data** | Financials with publish_date filtering + ST announcement lag + industry effective_date — zero look-ahead | Production |
 | **IC Auto-Decay** | FactorICAutoDecay: rolling IC monitoring → auto-disable on decay → auto-recover on IC rebound | Production |
 | **Pre-Flight Health Check** | 5-point system check (data/balance/positions/routing/limits) → SystemBlockError on failure | Production |
+| **Deflated Sharpe Ratio** | FactorValidator: bootstrap E[max SR] + non-normality correction + BH FDR control | Research |
+| **Purged Walk-Forward** | TimeSeriesCV with configurable purge gap + embargo — zero train/test leakage | Production |
+| **Strategy Capacity** | CapacityEstimator: participation rate cap + impact cost + AUM-vs-Sharpe curve | Production |
 
 > Documentation: [CLAUDE.md](CLAUDE.md) | Interview Guide: [INTERVIEW_CHEATSHEET.md](INTERVIEW_CHEATSHEET.md) | Jane Street Gap Analysis: [JANE_STREET_GAP_ANALYSIS.md](JANE_STREET_GAP_ANALYSIS.md)
 
@@ -303,7 +306,7 @@ open http://localhost:8000/api/docs
 ### Test
 
 ```bash
-# Run all 652 tests
+# Run all 691 tests
 pytest tests/ -v
 
 # Run core architecture tests only
@@ -409,6 +412,9 @@ quant_platform/
 │   ├── ic_monitor.py                # IC monitoring
 │   └── network.py                   # Graph network factors
 │
+├── research/                        # Research Validation
+│   └── validation.py                # Deflated Sharpe + BH FDR + Bonferroni
+│
 ├── alpha/                           # Alpha Model
 │   ├── combination.py               # 3 combination methods
 │   ├── pipeline.py                  # AlphaPipeline
@@ -424,7 +430,8 @@ quant_platform/
 │   ├── tick_engine.py               # Tick-level event-driven backtest
 │   ├── cost_model.py                # Cost model
 │   ├── walkforward.py               # Walk-Forward validation
-│   └── distributed.py               # Parallel backtest
+│   ├── distributed.py               # Parallel backtest
+│   └── capacity.py                  # Strategy capacity estimation
 │
 ├── execution/                       # Execution Layer
 │   ├── order_book.py                # Real LOB (red-black tree+FIFO+IOC/FOK+VPIN)
@@ -477,13 +484,14 @@ quant_platform/
 ├── docs/
 │   └── index.html                   # GitHub Pages architecture documentation
 │
-└── tests/                           # 652 Unit Tests
+└── tests/                           # 691 Unit Tests
     ├── test_core/                   # EventBus(13)+EventBus v2(25)+MessageBus(16)+Store(16)+StateMachine(15)+Audit(10)+Scheduler(2)
     ├── test_execution/              # OrderBook(22)+OMS(17)+Algorithms(13)+MarketImpact(10)
     ├── test_risk/                   # RealTimeRisk(12)+Greeks(8)+VaR(7)+Barra(16)+HealthCheck(16)+...
-    ├── test_backtest/               # TickEngine(15)+Cost(4)+Metrics(7)+WalkForward(2)
+    ├── test_backtest/               # TickEngine(15)+Cost(4)+Metrics(7)+WalkForward(2)+Capacity(9)
+    ├── test_research/               # DeflatedSharpe(8)+MultipleTesting(8)
     ├── test_utils/                  # Cython(18)+Numba+Cache+Config+Metrics
-    └── ...                          # 652 tests total
+    └── ...                          # 691 tests total
 ```
 
 ---

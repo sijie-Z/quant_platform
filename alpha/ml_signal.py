@@ -59,6 +59,8 @@ class MLSignalConfig:
     forward_horizon: int = 21          # Predict 1-month forward return
     n_splits: int = 5                  # Time-series CV splits
     top_n_features: int = 15           # Max features to use
+    purge_gap: int = 10                # Purge gap between train/test (trading days)
+    embargo: int = 0                   # Embargo after test set (trading days)
 
     # XGBoost params
     xgb_params: dict = field(default_factory=lambda: {
@@ -107,15 +109,30 @@ class ModelPerformance:
 
 
 class TimeSeriesCV:
-    """Time-series aware cross-validation.
+    """Time-series aware cross-validation with purge gap.
 
     Generates expanding/rolling train-test splits that respect temporal order.
     No future data leaks into training.
 
+    The purge gap ensures no information leakage between train and test sets.
+    The embargo period after the test set prevents the test set's labels from
+    bleeding into future training sets (important when labels are computed
+    from overlapping windows, e.g., 21-day forward returns).
+
     Split pattern (expanding):
-    [----train----][--test--]
-    [--------train--------][--test--]
-    [------------train------------][--test--]
+    [----train----][purge][--test--][embargo]
+    [--------train--------][purge][--test--][embargo]
+    [------------train------------][purge][--test--][embargo]
+
+    Args:
+        n_splits: Number of CV folds.
+        train_size: Minimum training set size (samples).
+        test_size: Test set size (samples).
+        gap: Purge gap between train and test (trading days).
+             Removes any overlap from label computation windows.
+        embargo: Embargo period after test set (trading days).
+                 Prevents test labels from leaking into next train set.
+        mode: 'expanding' (growing window) or 'rolling' (fixed window).
     """
 
     def __init__(
@@ -123,33 +140,42 @@ class TimeSeriesCV:
         n_splits: int = 5,
         train_size: int = 252,
         test_size: int = 63,
-        gap: int = 21,
+        gap: int = 10,
+        embargo: int = 0,
         mode: str = "expanding",
     ):
         self.n_splits = n_splits
         self.train_size = train_size
         self.test_size = test_size
-        self.gap = gap  # Gap between train and test to avoid leakage
+        self.gap = gap
+        self.embargo = embargo
         self.mode = mode
 
     def split(self, n_samples: int):
-        """Generate train/test index pairs."""
+        """Generate train/test index pairs with purge and embargo.
+
+        Args:
+            n_samples: Total number of samples.
+
+        Yields:
+            (train_indices, test_indices) tuples.
+        """
         min_size = self.train_size + self.gap + self.test_size
         if n_samples < min_size:
             raise ValueError(f"Need at least {min_size} samples, got {n_samples}")
 
-        # Calculate step size
+        # Step size accounts for test_size + embargo (next fold's train starts after embargo)
         available = n_samples - self.train_size - self.gap
-        step = max(1, (available - self.test_size) // (self.n_splits - 1))
+        step = max(1, (available - self.test_size) // max(self.n_splits - 1, 1))
 
         for i in range(self.n_splits):
             if self.mode == "expanding":
                 train_start = 0
             else:  # rolling
-                train_start = max(0, i * step)
+                train_start = max(0, i * step - self.embargo * i)
 
             train_end = self.train_size + i * step
-            test_start = train_end + self.gap
+            test_start = train_end + self.gap  # purge gap
             test_end = min(test_start + self.test_size, n_samples)
 
             if train_end >= n_samples or test_start >= n_samples:
@@ -160,6 +186,47 @@ class TimeSeriesCV:
 
             if len(train_idx) > 0 and len(test_idx) > 0:
                 yield train_idx, test_idx
+
+
+def purged_walk_forward_splits(
+    n_samples: int,
+    n_splits: int = 5,
+    gap: int = 10,
+    test_size: int | None = None,
+    embargo: int = 0,
+    mode: str = "expanding",
+) -> list[tuple[list[int], list[int]]]:
+    """Generate purged walk-forward train/test splits.
+
+    Convenience function that returns all splits as a list.
+    The purge gap ensures no information leakage between train and test.
+    The embargo prevents test labels from bleeding into future training.
+
+    Args:
+        n_samples: Total number of samples.
+        n_splits: Number of folds.
+        gap: Purge gap between train and test (default 10 trading days).
+        test_size: Test set size (default: n_samples // (n_splits + 1)).
+        embargo: Embargo period after test set (default 0).
+        mode: 'expanding' or 'rolling'.
+
+    Returns:
+        List of (train_indices, test_indices) tuples.
+    """
+    if test_size is None:
+        test_size = max(21, n_samples // (n_splits + 1))
+
+    train_size = max(63, n_samples - n_splits * (test_size + gap + embargo) - gap)
+
+    cv = TimeSeriesCV(
+        n_splits=n_splits,
+        train_size=train_size,
+        test_size=test_size,
+        gap=gap,
+        embargo=embargo,
+        mode=mode,
+    )
+    return list(cv.split(n_samples))
 
 
 class MLSignalGenerator:
@@ -299,12 +366,13 @@ class MLSignalGenerator:
             logger.warning("Not enough data for ML training: %d samples", len(X_full))
             return ModelPerformance(date=str(first_factor.index[-1]), model_type=self.config.model_type)
 
-        # Time-series CV
+        # Time-series CV with purge gap
         cv = TimeSeriesCV(
             n_splits=self.config.n_splits,
             train_size=self.config.train_window,
             test_size=63,
-            gap=21,
+            gap=self.config.purge_gap,
+            embargo=self.config.embargo,
         )
 
         cv_results = []
