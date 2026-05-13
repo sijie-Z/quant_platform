@@ -29,6 +29,11 @@ from typing import Any
 from quant_platform.core.events import EventBus, get_event_bus
 from quant_platform.utils.logging import get_logger
 
+try:
+    from quant_platform.core.context import TenantContext
+except ImportError:
+    TenantContext = None  # type: ignore[assignment,misc]
+
 logger = get_logger(__name__)
 
 
@@ -269,14 +274,25 @@ class HealthCheck:
             return False
 
     def _check_account_balance(self) -> bool:
-        """Check if account has sufficient balance."""
+        """Check if account has sufficient balance.
+
+        Uses TenantContext to identify which tenant's account to check.
+        """
         if self._broker is None:
             return True
         try:
+            tenant_id = "default"
+            if TenantContext is not None:
+                try:
+                    tenant_id = TenantContext.get_current().tenant_id
+                except Exception:
+                    pass
+            logger.debug("Checking account balance for tenant: %s", tenant_id)
             account = self._broker.get_account()
             cash = account.get("cash", 0)
             if cash < self._min_cash:
-                logger.warning("Insufficient cash: %.2f < %.2f", cash, self._min_cash)
+                logger.warning("Insufficient cash for %s: %.2f < %.2f",
+                               tenant_id, cash, self._min_cash)
                 return False
             return True
         except Exception as e:

@@ -20,6 +20,11 @@ from quant_platform.execution.models import (
 )
 from quant_platform.utils.logging import get_logger
 
+try:
+    from quant_platform.core.context import TenantContext
+except ImportError:
+    TenantContext = None  # type: ignore[assignment,misc]
+
 logger = get_logger(__name__)
 
 # A-share cost constants
@@ -78,8 +83,17 @@ class OrderManager:
                     f"trying to sell {quantity}"
                 )
 
+        # Get tenant from context if available
+        tenant_id = "default"
+        if TenantContext is not None:
+            try:
+                tenant_id = TenantContext.get_current().tenant_id
+            except Exception:
+                pass
+
         order = Order(
             ticker=ticker,
+            tenant_id=tenant_id,
             side=OrderSide(side),
             order_type=OrderType(order_type),
             quantity=quantity,
@@ -241,12 +255,15 @@ class OrderManager:
         self.snapshots.append(snapshot)
         return snapshot
 
-    def get_order_blotter(self) -> list[dict]:
-        """Get all orders as a list of dicts."""
+    def get_order_blotter(self, tenant_id: str = "") -> list[dict]:
+        """Get all orders as a list of dicts, optionally filtered by tenant."""
         result = []
         for order in self.blotter:
+            if tenant_id and order.tenant_id != tenant_id:
+                continue
             result.append({
                 "order_id": order.order_id,
+                "tenant_id": order.tenant_id,
                 "ticker": order.ticker,
                 "side": order.side.value,
                 "type": order.order_type.value,

@@ -69,6 +69,7 @@ class Store:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS orders (
                     order_id TEXT PRIMARY KEY,
+                    tenant_id TEXT DEFAULT 'default',
                     code TEXT NOT NULL,
                     side TEXT NOT NULL,
                     order_type TEXT DEFAULT 'limit',
@@ -90,6 +91,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS positions (
                     code TEXT PRIMARY KEY,
+                    tenant_id TEXT DEFAULT 'default',
                     name TEXT DEFAULT '',
                     quantity INTEGER NOT NULL,
                     available INTEGER NOT NULL,
@@ -103,6 +105,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS trades (
                     trade_id TEXT PRIMARY KEY,
+                    tenant_id TEXT DEFAULT 'default',
                     order_id TEXT NOT NULL,
                     code TEXT NOT NULL,
                     side TEXT NOT NULL,
@@ -177,7 +180,25 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_events_topic ON events(topic);
                 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp);
             """)
+
+            # Migrate existing tables: add tenant_id if missing
+            self._migrate_tenant_id(conn)
+
+            # Create tenant_id indexes after migration
+            conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_orders_tenant ON orders(tenant_id);
+                CREATE INDEX IF NOT EXISTS idx_trades_tenant ON trades(tenant_id);
+                CREATE INDEX IF NOT EXISTS idx_positions_tenant ON positions(tenant_id);
+            """)
         logger.info("Store initialized: %s", self._db_path)
+
+    def _migrate_tenant_id(self, conn: sqlite3.Connection) -> None:
+        """Add tenant_id column to existing tables if missing."""
+        for table in ("orders", "trades", "positions"):
+            cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if "tenant_id" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT DEFAULT 'default'")
+                logger.info("Migrated %s: added tenant_id", table)
 
     # ── Orders ──
 
@@ -187,13 +208,14 @@ class Store:
             with self._conn() as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO orders
-                    (order_id, code, side, order_type, quantity, price,
+                    (order_id, tenant_id, code, side, order_type, quantity, price,
                      filled_quantity, filled_price, status, commission, tax,
                      slippage, broker_order_id, error_msg, strategy_id, signal_id,
                      created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    order['order_id'], order['code'], order['side'],
+                    order['order_id'], order.get('tenant_id', 'default'),
+                    order['code'], order['side'],
                     order.get('order_type', 'limit'), order['quantity'], order['price'],
                     order.get('filled_quantity', 0), order.get('filled_price', 0),
                     order.get('status', 'pending'), order.get('commission', 0),
@@ -204,11 +226,15 @@ class Store:
                     order.get('updated_at', datetime.now().isoformat()),
                 ))
 
-    def get_orders(self, status: str = "", code: str = "", limit: int = 100) -> list[dict]:
+    def get_orders(self, status: str = "", code: str = "", limit: int = 100,
+                   tenant_id: str = "") -> list[dict]:
         """Get orders with optional filters."""
         with self._conn() as conn:
             query = "SELECT * FROM orders WHERE 1=1"
             params = []
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
             if status:
                 query += " AND status = ?"
                 params.append(status)
@@ -228,27 +254,34 @@ class Store:
             with self._conn() as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO positions
-                    (code, name, quantity, available, avg_cost, current_price,
+                    (code, tenant_id, name, quantity, available, avg_cost, current_price,
                      market_value, unrealized_pnl, realized_pnl, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    pos['code'], pos.get('name', ''), pos['quantity'],
+                    pos['code'], pos.get('tenant_id', 'default'),
+                    pos.get('name', ''), pos['quantity'],
                     pos.get('available', pos['quantity']), pos['avg_cost'],
                     pos.get('current_price', 0), pos.get('market_value', 0),
                     pos.get('unrealized_pnl', 0), pos.get('realized_pnl', 0),
                     datetime.now().isoformat(),
                 ))
 
-    def delete_position(self, code: str):
+    def delete_position(self, code: str, tenant_id: str = ""):
         """Remove a position."""
         with self._lock:
             with self._conn() as conn:
                 conn.execute("DELETE FROM positions WHERE code = ?", (code,))
 
-    def get_positions(self) -> list[dict]:
+    def get_positions(self, tenant_id: str = "") -> list[dict]:
         """Get all current positions."""
         with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM positions WHERE quantity > 0").fetchall()
+            if tenant_id:
+                rows = conn.execute(
+                    "SELECT * FROM positions WHERE quantity > 0 AND tenant_id = ?",
+                    (tenant_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM positions WHERE quantity > 0").fetchall()
             return [dict(r) for r in rows]
 
     # ── Trades ──
@@ -259,28 +292,42 @@ class Store:
             with self._conn() as conn:
                 conn.execute("""
                     INSERT INTO trades
-                    (trade_id, order_id, code, side, quantity, price,
+                    (trade_id, tenant_id, order_id, code, side, quantity, price,
                      commission, tax, executed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     trade.get('trade_id', trade.get('order_id', '')),
+                    trade.get('tenant_id', 'default'),
                     trade['order_id'], trade['code'], trade['side'],
                     trade['quantity'], trade['price'],
                     trade.get('commission', 0), trade.get('tax', 0),
                     trade.get('executed_at', datetime.now().isoformat()),
                 ))
 
-    def get_trades(self, code: str = "", limit: int = 100) -> list[dict]:
+    def get_trades(self, code: str = "", limit: int = 100,
+                   tenant_id: str = "") -> list[dict]:
         """Get trade history."""
         with self._conn() as conn:
             if code:
-                rows = conn.execute(
-                    "SELECT * FROM trades WHERE code = ? ORDER BY executed_at DESC LIMIT ?",
-                    (code, limit)).fetchall()
+                if tenant_id:
+                    rows = conn.execute(
+                        "SELECT * FROM trades WHERE code = ? AND tenant_id = ? "
+                        "ORDER BY executed_at DESC LIMIT ?",
+                        (code, tenant_id, limit)).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM trades WHERE code = ? ORDER BY executed_at DESC LIMIT ?",
+                        (code, limit)).fetchall()
             else:
-                rows = conn.execute(
-                    "SELECT * FROM trades ORDER BY executed_at DESC LIMIT ?",
-                    (limit,)).fetchall()
+                if tenant_id:
+                    rows = conn.execute(
+                        "SELECT * FROM trades WHERE tenant_id = ? "
+                        "ORDER BY executed_at DESC LIMIT ?",
+                        (tenant_id, limit)).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM trades ORDER BY executed_at DESC LIMIT ?",
+                        (limit,)).fetchall()
             return [dict(r) for r in rows]
 
     # ── P&L History ──

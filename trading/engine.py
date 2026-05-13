@@ -34,6 +34,11 @@ from quant_platform.risk.healthcheck import HealthCheck, SystemBlockError
 from quant_platform.risk.realtime_engine import RealTimeRiskEngine
 from quant_platform.utils.logging import get_logger
 
+try:
+    from quant_platform.core.context import TenantContext
+except ImportError:
+    TenantContext = None  # type: ignore[assignment,misc]
+
 logger = get_logger(__name__)
 
 
@@ -99,6 +104,7 @@ class LiveTradingEngine:
         rebalance_interval: int = 300,
         n_stocks: int = 50,
         min_trade_value: float = 1000,
+        tenant_id: str = "default",
     ):
         self._broker = broker
         self._store = store or Store()
@@ -113,6 +119,11 @@ class LiveTradingEngine:
         self._rebalance_interval = rebalance_interval
         self._n_stocks = n_stocks
         self._min_trade_value = min_trade_value
+        self._tenant_id = tenant_id
+
+        # Set tenant context for this engine instance
+        if TenantContext is not None:
+            TenantContext.set_current(TenantContext(tenant_id=tenant_id))
 
         self._running = False
         self._thread: threading.Thread | None = None

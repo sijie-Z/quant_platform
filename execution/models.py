@@ -52,6 +52,7 @@ class Fill:
 class Order:
     """Single order in the OMS blotter."""
     order_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    tenant_id: str = "default"
     ticker: str = ""
     side: OrderSide = OrderSide.BUY
     order_type: OrderType = OrderType.MARKET

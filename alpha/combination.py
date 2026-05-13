@@ -20,6 +20,11 @@ from quant_platform.factors.evaluation import ic_summary, rank_ic
 from quant_platform.factors.ic_monitor import FactorICAutoDecay
 from quant_platform.utils.logging import get_logger
 
+try:
+    from quant_platform.factors.factor_timing import RegimeBasedTimer
+except ImportError:
+    RegimeBasedTimer = None  # type: ignore[assignment,misc]
+
 logger = get_logger(__name__)
 
 
@@ -42,6 +47,8 @@ def combine_ic_weighted(
     forward_returns: pd.DataFrame,
     lookback: int = 252,
     ic_decay: FactorICAutoDecay | None = None,
+    regime_timer: RegimeBasedTimer | None = None,
+    current_regime: str = "normal",
 ) -> pd.DataFrame:
     """Weight factors by mean Rank IC — point-in-time, no look-ahead.
 
@@ -94,6 +101,11 @@ def combine_ic_weighted(
         if ic_decay is not None:
             weights = ic_decay.get_active_weights(weights)
 
+        # Apply regime-based factor timing
+        if regime_timer is not None:
+            weights = regime_timer.get_regime_weights(weights, current_regime)
+            weights = regime_timer.smooth_transition(weights)
+
         row = _build_row(aligned, weights, date)
         if row is not None:
             row.name = date
@@ -110,6 +122,8 @@ def combine_icir_weighted(
     lookback: int = 252,
     min_icir: float = 0.0,
     ic_decay: FactorICAutoDecay | None = None,
+    regime_timer: RegimeBasedTimer | None = None,
+    current_regime: str = "normal",
 ) -> pd.DataFrame:
     """Weight factors by ICIR — point-in-time, no look-ahead.
 
@@ -165,6 +179,11 @@ def combine_icir_weighted(
         # Apply auto-decay: zero out disabled factors and renormalize
         if ic_decay is not None:
             weights = ic_decay.get_active_weights(weights)
+
+        # Apply regime-based factor timing
+        if regime_timer is not None:
+            weights = regime_timer.get_regime_weights(weights, current_regime)
+            weights = regime_timer.smooth_transition(weights)
 
         row = _build_row(aligned, weights, date)
         if row is not None:
