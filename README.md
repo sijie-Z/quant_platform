@@ -5,10 +5,10 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/Tests-824%20Passed-brightgreen?logo=pytest" alt="Tests">
+  <img src="https://img.shields.io/badge/Tests-857%20Passed-brightgreen?logo=pytest" alt="Tests">
   <img src="https://img.shields.io/badge/Modules-91-orange" alt="Modules">
   <img src="https://img.shields.io/badge/Lines-30%2C000%2B-yellow" alt="Lines">
-  <img src="https://img.shields.io/badge/API-91%20Endpoints-red?logo=fastapi" alt="API">
+  <img src="https://img.shields.io/badge/API-97%20Endpoints-red?logo=fastapi" alt="API">
   <img src="https://img.shields.io/badge/Factors-15-purple" alt="Factors">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
 </p>
@@ -325,7 +325,7 @@ open http://localhost:8000/api/docs
 ### Test
 
 ```bash
-# Run all 824 tests
+# Run all 857 tests
 pytest tests/ -v
 
 # Run core architecture tests only
@@ -512,16 +512,17 @@ quant_platform/
 ├── docs/
 │   └── index.html                   # GitHub Pages architecture documentation
 │
-└── tests/                           # 824 Unit Tests
+└── tests/                           # 857 Unit Tests
     ├── test_core/                   # EventBus(13)+EventBus v2(25)+MessageBus(16)+Store(16)+StateMachine(15)+Audit(10)+Scheduler(2)+Tenant(8)
     ├── test_execution/              # OrderBook(22)+OMS(17)+Algorithms(13)+MarketImpact(10)+TCA(21)
+    ├── test_api/                    # MonitorAPI(33)
     ├── test_compliance/             # ComplianceExporter(21)
     ├── test_operations/             # NAV(21)+InvestorPortal(19)
     ├── test_risk/                   # RealTimeRisk(12)+Greeks(8)+VaR(7)+Barra(16)+HealthCheck(16)+...
     ├── test_backtest/               # TickEngine(15)+Cost(4)+Metrics(7)+WalkForward(2)+Capacity(9)
     ├── test_research/               # DeflatedSharpe(8)+MultipleTesting(8)
     ├── test_utils/                  # Cython(18)+Numba+Cache+Config+Metrics
-    └── ...                          # 824 tests total
+    └── ...                          # 857 tests total
 ```
 
 ---

@@ -270,6 +270,31 @@ export function toggleCoreKillSwitch(activate = true, reason = '') {
   return api.post('/core/risk/kill-switch', { activate, reason }).then(r => r.data)
 }
 
+// Monitor Dashboard endpoints
+export function getMonitorRiskOverview() {
+  return api.get('/monitor/risk-overview').then(r => r.data)
+}
+
+export function getMonitorTCASummary() {
+  return api.get('/monitor/tca-summary').then(r => r.data)
+}
+
+export function getMonitorFactorStatus() {
+  return api.get('/monitor/factor-status').then(r => r.data)
+}
+
+export function getMonitorCapacityGauge() {
+  return api.get('/monitor/capacity-gauge').then(r => r.data)
+}
+
+export function updateMonitorConfig(params) {
+  return api.post('/monitor/config', params).then(r => r.data)
+}
+
+export function triggerMonitorKillSwitch(params) {
+  return api.post('/monitor/kill-switch', params).then(r => r.data)
+}
+
 // WebSocket for real-time pipeline status
 export function createStatusSocket(onMessage, onError) {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'

@@ -58,6 +58,11 @@
       <div v-else-if="currentView === 'settings'" class="app-scroll">
         <SettingsPage @toast="onToast" />
       </div>
+
+      <!-- Monitor View -->
+      <div v-else-if="currentView === 'monitor'" class="app-scroll">
+        <MonitorDashboard @toast="onToast" />
+      </div>
     </div>
 
     <!-- Status Bar -->
@@ -83,6 +88,7 @@ import ParamSweep from './components/ParamSweep.vue'
 import FactorRanking from './components/FactorRanking.vue'
 import RunHistory from './components/RunHistory.vue'
 import SettingsPage from './components/Settings.vue'
+import MonitorDashboard from './components/MonitorDashboard.vue'
 import StatusBar from './components/StatusBar.vue'
 import Toast from './components/Toast.vue'
 import CommandPalette from './components/CommandPalette.vue'
@@ -98,6 +104,7 @@ const views = [
   { id: 'factors', label: 'Factors' },
   { id: 'history', label: 'History' },
   { id: 'settings', label: 'Settings' },
+  { id: 'monitor', label: 'Monitor' },
 ]
 
 const currentView = ref('terminal')

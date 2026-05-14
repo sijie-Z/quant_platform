@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from quant_platform.api.routes import router as api_router
+from quant_platform.api.monitor import router as monitor_router
 
 # Determine frontend dist path
 _FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
@@ -50,6 +51,7 @@ def create_app(serve_frontend: bool = True) -> FastAPI:
 
     # API routes
     app.include_router(api_router)
+    app.include_router(monitor_router)
 
     # Serve frontend static files in production
     if serve_frontend and _DIST_DIR.exists():
