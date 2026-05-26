@@ -1,10 +1,9 @@
 """Tests for core.store — SQLite persistence."""
 
 import json
-import os
-import tempfile
 
 import pytest
+
 from quant_platform.core.store import Store
 
 

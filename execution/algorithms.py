@@ -14,11 +14,10 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
 
 import numpy as np
 
-from quant_platform.execution.models import Order, OrderSide, OrderType, OrderStatus
+from quant_platform.execution.models import Order
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)

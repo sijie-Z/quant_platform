@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quant_platform.utils.config import load_config
-from quant_platform.utils.logging import setup_logging, get_logger
+from quant_platform.utils.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
@@ -39,10 +39,10 @@ def _resolve_config_path(config_path_arg) -> Path:
 
 def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
     """Load and clean data. Returns (prices, returns, benchmark, metadata, financials, turnover)."""
+    from quant_platform.data.pipeline import DataPipeline
+    from quant_platform.data.providers.baostock_provider import BaostockDataProvider
     from quant_platform.data.providers.synthetic import SyntheticDataProvider
     from quant_platform.data.providers.tushare_loader import TushareProvider
-    from quant_platform.data.providers.baostock_provider import BaostockDataProvider
-    from quant_platform.data.pipeline import DataPipeline
 
     provider = None
 
@@ -91,11 +91,11 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
 
 def _compute_factors(prices, returns, financials, metadata, turnover=None, config=None):
     """Compute and process all registered factors. Returns (processed_factors, ic_results, sector_map, fin_unstacked)."""
-    from quant_platform.factors.technical import register_all as register_technical
+    from quant_platform.factors.evaluation import ic_summary, rank_ic
     from quant_platform.factors.fundamental import register_all as register_fundamental
-    from quant_platform.factors.registry import get_registry
     from quant_platform.factors.processing import process_factor
-    from quant_platform.factors.evaluation import rank_ic, ic_summary
+    from quant_platform.factors.registry import get_registry
+    from quant_platform.factors.technical import register_all as register_technical
 
     register_technical()
     register_fundamental()
@@ -150,8 +150,8 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
 def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financials,
                   optimizer_override=None, frequency_override=None):
     """Set up and run backtest engine. Returns results dict."""
-    from quant_platform.backtest.engine import BacktestEngine
     from quant_platform.backtest.cost_model import CostModel
+    from quant_platform.backtest.engine import BacktestEngine
     from quant_platform.portfolio.constraints import PortfolioConstraints
 
     constraints = PortfolioConstraints(
@@ -206,11 +206,12 @@ def _generate_signal(config, processed_factors, returns):
 def cmd_run(args) -> int:
     """Execute full pipeline: data -> factors -> alpha -> portfolio -> backtest -> report."""
     import yaml
+
     from quant_platform.utils.cache import PipelineCache
 
     config_path = _resolve_config_path(args.config)
 
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, encoding="utf-8") as f:
         raw_config = yaml.safe_load(f)
 
     cache_key = PipelineCache.make_config_hash(raw_config)
@@ -420,6 +421,7 @@ def cmd_compare(args) -> int:
 def cmd_sweep(args) -> int:
     """Parameter sweep: grid search over key parameters."""
     import itertools
+
     import pandas as pd
 
     config = load_config(args.config)
@@ -513,11 +515,12 @@ def cmd_cache(args) -> int:
 def cmd_web(args) -> int:
     """Start the web server (FastAPI + Vue frontend)."""
     import uvicorn
+
     from quant_platform.app import create_app
 
     app = create_app(serve_frontend=not args.no_frontend)
     mode = "API + Frontend" if not args.no_frontend else "API only"
-    print(f"Quant Platform Web Server starting...")
+    print("Quant Platform Web Server starting...")
     print(f"  Mode: {mode}")
     print(f"  API:  http://{args.host}:{args.port}/api/docs")
     if not args.no_frontend:
@@ -525,7 +528,7 @@ def cmd_web(args) -> int:
         if _DIST_DIR.exists():
             print(f"  UI:   http://{args.host}:{args.port}/")
         else:
-            print(f"  UI:   Frontend not built. Run: cd frontend && npm run build")
+            print("  UI:   Frontend not built. Run: cd frontend && npm run build")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
@@ -599,6 +602,7 @@ def cmd_research(args) -> int:
     if args.subcommand == "report":
         import json
         from pathlib import Path
+
         from quant_platform.agent.research_agent import ResearchAgent
 
         results_dir = Path(args.results_dir)
@@ -728,6 +732,7 @@ def cmd_trade(args) -> int:
 def _resolve_qmt_kwargs(config) -> dict:
     """Extract QMT kwargs from config, resolving password from env."""
     import os
+    from typing import Any
     kwargs: dict[str, Any] = {}
     if hasattr(config, "execution") and hasattr(config.execution, "qmt"):
         qmt = config.execution.qmt

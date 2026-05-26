@@ -1,9 +1,6 @@
 """Tests for purged walk-forward splits in ML signal generation."""
 
-import numpy as np
-import pandas as pd
 import pytest
-
 from quant_platform.alpha.ml_signal import (
     MLSignalConfig,
     TimeSeriesCV,

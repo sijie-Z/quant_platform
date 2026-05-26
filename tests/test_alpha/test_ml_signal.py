@@ -3,7 +3,6 @@
 import numpy as np
 import pandas as pd
 import pytest
-
 from quant_platform.alpha.ml_signal import (
     HAS_LGB,
     HAS_XGB,

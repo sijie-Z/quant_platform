@@ -122,12 +122,12 @@ class TestCalculateDailyNav:
 
     def test_hwm_updates(self, store):
         calc = NAVCalculator(store, annual_mgmt_fee=0.0, perf_fee_rate=0.0)
-        nav1 = calc.calculate_daily_nav(
+        calc.calculate_daily_nav(
             date=_D2, cash=5_000_000, market_value=5_000_000,
         )
         assert calc._high_water_mark == 1.0
 
-        nav2 = calc.calculate_daily_nav(
+        calc.calculate_daily_nav(
             date=_D3, cash=5_000_000, market_value=5_100_000,
         )
         assert calc._high_water_mark > 1.0

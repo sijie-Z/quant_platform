@@ -10,8 +10,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
-from quant_platform.trading.broker import Order, OrderSide, OrderStatus, OrderType, Position
-
+from quant_platform.trading.broker import OrderSide, OrderStatus, OrderType
 
 # ── Exchange detection ──
 

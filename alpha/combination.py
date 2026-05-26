@@ -13,7 +13,6 @@ Walk-Forward validation meaningful.
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from quant_platform.factors.evaluation import ic_summary, rank_ic

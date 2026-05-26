@@ -1,15 +1,13 @@
 """Tests for Transaction Cost Analysis (TCA)."""
 
-import numpy as np
+from datetime import datetime
+
 import pandas as pd
 import pytest
-from datetime import datetime
 
 from quant_platform.execution.tca import (
     TCAEngine,
     TCAResult,
-    TCASummary,
-    TCABenchmark,
     VWAPCalculator,
 )
 

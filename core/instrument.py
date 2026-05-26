@@ -14,11 +14,11 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class InstrumentType(str, Enum):
+class InstrumentType(StrEnum):
     """Supported asset classes."""
     STOCK = "stock"
     ETF = "etf"

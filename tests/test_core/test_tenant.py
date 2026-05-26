@@ -1,7 +1,8 @@
 """Tests for multi-tenant context and isolation."""
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from quant_platform.core.context import TenantContext
 

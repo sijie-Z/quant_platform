@@ -1,7 +1,6 @@
 """Tests for core.events — EventBus."""
 
-import pytest
-from quant_platform.core.events import EventBus, Event, get_event_bus
+from quant_platform.core.events import Event, EventBus
 
 
 class TestEventBus:

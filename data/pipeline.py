@@ -9,11 +9,9 @@ Transforms raw data provider output into analysis-ready DataFrames with:
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import DataProvider
-from quant_platform.data.schema import validate_financials, validate_prices
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -211,7 +209,7 @@ class DataPipeline:
         # For each asset, take the latest effective_date
         idx = available.groupby("asset")["effective_date"].idxmax()
         latest = available.loc[idx]
-        return dict(zip(latest["asset"], latest["industry"]))
+        return dict(zip(latest["asset"], latest["industry"], strict=False))
 
     # ------------------------------------------------------------------
     # Price cleaning
@@ -247,7 +245,7 @@ class DataPipeline:
         # Rolling count of consecutive NaN
         # Identify runs where all values are NaN for > max_suspension_days
         for asset in close.columns:
-            nan_runs = suspended[asset].astype(int).groupby(
+            suspended[asset].astype(int).groupby(
                 (suspended[asset] != suspended[asset].shift()).cumsum()
             ).cumsum()
             # Don't actually remove, just flag for awareness

@@ -13,7 +13,6 @@ Design:
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from quant_platform.backtest.cost_model import CostModel

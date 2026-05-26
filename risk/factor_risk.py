@@ -137,7 +137,7 @@ def factor_risk_decomposition(
     for name in contributions:
         factor_variances[name] = contributions[name].var()
 
-    total_factor_var = sum(factor_variances.values())
+    sum(factor_variances.values())
     alpha_var = alpha.var()
 
     risk_share = {}

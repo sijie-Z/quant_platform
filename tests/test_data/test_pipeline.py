@@ -1,6 +1,5 @@
 """Tests for data pipeline."""
 
-import numpy as np
 
 from quant_platform.data.pipeline import DataPipeline
 

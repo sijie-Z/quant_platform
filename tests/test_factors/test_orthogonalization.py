@@ -3,11 +3,9 @@
 import numpy as np
 import pandas as pd
 import pytest
-
 from quant_platform.factors.orthogonalization import (
     FactorOrthogonalizer,
     OrthMethod,
-    OrthResult,
     orthogonalize_factors,
 )
 

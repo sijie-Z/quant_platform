@@ -1,8 +1,9 @@
 """Tests for execution.oms — Order Management System."""
 
 import pytest
+
+from quant_platform.execution.models import OrderStatus
 from quant_platform.execution.oms import OrderManager, SimulatedExchange
-from quant_platform.execution.models import Order, OrderSide, OrderStatus
 
 
 class TestOrderManager:

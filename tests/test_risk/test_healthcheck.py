@@ -5,7 +5,6 @@ and blocks trading when critical checks fail.
 """
 
 import pytest
-
 from quant_platform.core.events import EventBus
 from quant_platform.risk.healthcheck import (
     CheckResult,

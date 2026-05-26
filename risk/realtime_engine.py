@@ -25,14 +25,12 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
+from enum import StrEnum
 
 import numpy as np
 
 from quant_platform.risk.greeks import (
     GreeksCalculator,
-    OptionGreeks,
     PortfolioGreeks,
 )
 from quant_platform.utils.logging import get_logger
@@ -45,7 +43,7 @@ logger = get_logger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 
-class RiskLevel(str, Enum):
+class RiskLevel(StrEnum):
     GREEN = "green"       # Normal operation
     YELLOW = "yellow"     # Warning, increased monitoring
     ORANGE = "orange"     # Approaching limits, reduce exposure
@@ -53,7 +51,7 @@ class RiskLevel(str, Enum):
     KILL = "kill"         # Kill switch activated, liquidate
 
 
-class LimitType(str, Enum):
+class LimitType(StrEnum):
     POSITION_SIZE = "position_size"
     SECTOR_EXPOSURE = "sector_exposure"
     DAILY_LOSS = "daily_loss"

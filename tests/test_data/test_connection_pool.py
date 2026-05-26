@@ -1,9 +1,8 @@
 """Tests for data provider connection pool."""
 
 import time
-import pytest
-import pandas as pd
 
+import pandas as pd
 from quant_platform.data.providers.connection_pool import (
     DataProviderPool,
     SourceHealth,

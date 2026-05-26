@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import pandas as pd
 
-from quant_platform.factors.evaluation import rank_ic
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)

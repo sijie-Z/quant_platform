@@ -2,12 +2,11 @@
 
 import numpy as np
 import pandas as pd
-
 from quant_platform.risk.var import (
-    historical_var,
-    parametric_var,
-    monte_carlo_var,
     historical_cvar,
+    historical_var,
+    monte_carlo_var,
+    parametric_var,
     var_summary,
 )
 

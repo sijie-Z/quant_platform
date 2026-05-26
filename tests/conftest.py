@@ -5,15 +5,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import pytest
 
 # Ensure the package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from quant_platform.data.providers.synthetic import SyntheticDataProvider
 from quant_platform.data.pipeline import DataPipeline
+from quant_platform.data.providers.synthetic import SyntheticDataProvider
 
 
 @pytest.fixture(scope="session")

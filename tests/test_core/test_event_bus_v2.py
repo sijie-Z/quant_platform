@@ -11,9 +11,7 @@ from quant_platform.core.event_bus_v2 import (
     Event,
     EventStore,
     HandlerStats,
-    benchmark_event_bus,
 )
-
 
 # ── Event Tests ──
 

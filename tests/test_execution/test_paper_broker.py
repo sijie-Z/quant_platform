@@ -1,9 +1,17 @@
 """Tests for enhanced paper trading broker."""
 
-import time
 
-import pytest
 
+from quant_platform.execution.order_book import (
+    BookOrder,
+    OrderBook,
+)
+from quant_platform.execution.order_book import (
+    OrderType as BookOrderType,
+)
+from quant_platform.execution.order_book import (
+    Side as BookSide,
+)
 from quant_platform.execution.paper_broker import (
     EXCHANGE_LATENCY_MS,
     LATENCY_PROFILES,
@@ -13,15 +21,7 @@ from quant_platform.execution.paper_broker import (
     PaperBroker,
     PaperBrokerMetrics,
 )
-from quant_platform.execution.order_book import (
-    BookOrder,
-    BookOrderStatus,
-    OrderBook,
-    OrderType as BookOrderType,
-    Side as BookSide,
-)
 from quant_platform.trading.broker import Order, OrderSide, OrderType
-
 
 # ── LatencyConfig ──
 

@@ -1,25 +1,17 @@
 """Tests for Cython-accelerated hot paths (with Python fallback)."""
 
 import numpy as np
-import pytest
 
 from quant_platform.utils.cyext import (
-    HAS_CYTHON,
     benchmark_cython_speedup,
     rank_ic,
-    rank_ic_py,
     rolling_max_drawdown,
-    rolling_max_drawdown_py,
     rolling_momentum,
     rolling_momentum_py,
     rolling_volatility,
-    rolling_volatility_py,
     zscore_cross_section,
-    zscore_cross_section_py,
 )
-from quant_platform.utils.cyext._fast_rank import batch_rank_ic_cy
 from quant_platform.utils.cyext._fast_zscore import winsorize_cy, zscore_panel_cy
-
 
 # ── Rolling Momentum Tests ──
 

@@ -4,25 +4,27 @@ Key fixes:
 - Point-in-time IC estimation (no look-ahead)
 - Cross-sectional factor processing (no time-series leakage)
 """
-import logging, sys, warnings
+import logging
+import sys
+import warnings
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from quant_platform.factors.technical import register_all as reg_tech
-from quant_platform.factors.registry import get_registry
-from quant_platform.factors.processing import process_factor
-from quant_platform.factors.evaluation import rank_ic, ic_summary
-from quant_platform.backtest.engine import BacktestEngine
-from quant_platform.backtest.cost_model import CostModel
-from quant_platform.backtest.metrics import all_metrics
-from quant_platform.portfolio.constraints import PortfolioConstraints
+from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
 from quant_platform.alpha.pipeline import AlphaPipeline
-from quant_platform.alpha.ml_signal import MLSignalGenerator, MLSignalConfig
+from quant_platform.backtest.cost_model import CostModel
+from quant_platform.backtest.engine import BacktestEngine
+from quant_platform.backtest.metrics import all_metrics
 from quant_platform.core.store import Store
+from quant_platform.factors.evaluation import ic_summary, rank_ic
+from quant_platform.factors.processing import process_factor
+from quant_platform.factors.registry import get_registry
+from quant_platform.factors.technical import register_all as reg_tech
+from quant_platform.portfolio.constraints import PortfolioConstraints
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -33,6 +35,7 @@ warnings.filterwarnings('ignore')
 # ═══════════════════════════════════════════════════════════════════════════
 logger.info("Loading Baostock data (2021-01 ~ 2026-05)...")
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
+
 provider = BaostockDataProvider(cache_enabled=True)
 assets = provider._get_major_stocks_list()[:500]  # 500 stocks for better diversification
 df = provider._fetch_daily_data(assets, "2021-01-01", "2026-05-23")
@@ -397,7 +400,8 @@ with store._conn() as conn:
 
 peak = 0.0
 for i in range(len(pv)):
-    date = pv.index[i]; val = float(pv.iloc[i])
+    date = pv.index[i]
+    val = float(pv.iloc[i])
     peak = max(peak, val)
     dd = (peak - val) / max(peak, 1)
     rtn = float(dr.loc[date]) if date in dr.index and pd.notna(dr.loc[date]) else 0.0

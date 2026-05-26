@@ -1,11 +1,11 @@
 """Tests for graph-based network centrality factor."""
 
 import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
-from pathlib import Path
-
 from quant_platform.factors.network import (
     CentralityType,
     NetworkFactor,
@@ -102,7 +102,7 @@ class TestNetworkFactor:
         recent = result.iloc[-50:].mean()
         # Group 1 (stocks 0-9) are correlated, should have higher centrality
         group1_mean = recent.iloc[:10].mean()
-        group3_mean = recent.iloc[20:].mean()
+        recent.iloc[20:].mean()
         # Correlated group should generally have higher centrality
         assert group1_mean > 0
 

@@ -1,6 +1,5 @@
 """Tests for parallel backtest engine."""
 
-import pytest
 
 from quant_platform.backtest.distributed import (
     BacktestResult,

@@ -23,8 +23,7 @@ Reference:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-from typing import Any
+from enum import StrEnum
 
 import numpy as np
 import pandas as pd
@@ -34,7 +33,7 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-class OrthMethod(str, Enum):
+class OrthMethod(StrEnum):
     """Orthogonalization methods."""
     GRAM_SCHMIDT = "gram_schmidt"
     PCA = "pca"

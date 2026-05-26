@@ -123,9 +123,9 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
         prev_weights: pd.Series | None = None,
         sector_map: pd.Series | None = None,
     ) -> pd.Series:
-        import cvxpy as cp
-
         import math
+
+        import cvxpy as cp
         # Pre-filter: only optimize top-N stocks by signal for numerical stability
         # Must select enough to satisfy sum(w) == 1 with max_weight cap
         min_needed = int(math.ceil(1.0 / max(self.constraints.max_weight, 0.01)))
@@ -255,7 +255,7 @@ class RiskParityOptimizer(PortfolioOptimizer):
 
         n = len(selected)
         w = cp.Variable(n)
-        portfolio_risk = cp.quad_form(w, cov)
+        cp.quad_form(w, cov)
 
         # Marginal risk contributions
         marginal_risk = cov @ w

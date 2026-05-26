@@ -20,9 +20,7 @@ from __future__ import annotations
 import json
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -411,7 +409,7 @@ class MLSignalGenerator:
         # Feature importance
         if hasattr(self.model, 'feature_importances_'):
             importances = self.model.feature_importances_
-            self.feature_importance = dict(zip(feature_names, importances.tolist()))
+            self.feature_importance = dict(zip(feature_names, importances.tolist(), strict=False))
 
         # Aggregate CV metrics
         test_ics = [r["test_ic"] for r in cv_results]
@@ -519,7 +517,7 @@ class MLSignalGenerator:
         return {
             "shap_values": shap_values,
             "feature_names": feature_names,
-            "mean_abs_shap": dict(zip(feature_names, mean_abs_shap.tolist())),
+            "mean_abs_shap": dict(zip(feature_names, mean_abs_shap.tolist(), strict=False)),
         }
 
     def generate(

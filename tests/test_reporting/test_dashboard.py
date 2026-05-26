@@ -8,14 +8,14 @@ import pandas as pd
 
 from quant_platform.reporting.dashboard import generate_dashboard
 from quant_platform.reporting.performance import (
-    plot_equity_curve,
     plot_drawdown,
-    plot_rolling_sharpe,
+    plot_equity_curve,
     plot_monthly_returns_heatmap,
+    plot_rolling_sharpe,
 )
-from quant_platform.risk.var import var_summary
-from quant_platform.risk.stress import run_all_stress_tests
 from quant_platform.risk.exposure import exposure_report
+from quant_platform.risk.stress import run_all_stress_tests
+from quant_platform.risk.var import var_summary
 
 
 class TestPerformancePlots:

@@ -2,7 +2,6 @@
 
 import numpy as np
 import pandas as pd
-
 from quant_platform.alpha.combination import (
     combine_equal_weight,
     combine_ic_weighted,
@@ -39,7 +38,7 @@ def test_combine_equal_weight():
 def test_combine_empty():
     try:
         combine_equal_weight({})
-        assert False, "Should have raised"
+        raise AssertionError("Should have raised")
     except ValueError:
         pass
 

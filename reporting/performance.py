@@ -6,6 +6,7 @@ Generates publication-quality charts for backtest results.
 from __future__ import annotations
 
 import matplotlib
+
 matplotlib.use("Agg")  # Non-interactive backend
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -15,10 +16,6 @@ import seaborn as sns
 
 from quant_platform.backtest.metrics import (
     TRADING_DAYS_PER_YEAR,
-    annualized_return,
-    annualized_volatility,
-    max_drawdown,
-    sharpe_ratio,
 )
 
 # Style

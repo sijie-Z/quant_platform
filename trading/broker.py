@@ -18,34 +18,35 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
-import numpy as np
-
 from quant_platform.execution.order_book import (
-    OrderBook,
     BookOrder,
-    Side as BookSide,
+    OrderBook,
+)
+from quant_platform.execution.order_book import (
     OrderType as BookOrderType,
-    Trade,
+)
+from quant_platform.execution.order_book import (
+    Side as BookSide,
 )
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-class OrderSide(str, Enum):
+class OrderSide(StrEnum):
     BUY = "buy"
     SELL = "sell"
 
 
-class OrderType(str, Enum):
+class OrderType(StrEnum):
     LIMIT = "limit"
     MARKET = "market"
 
 
-class OrderStatus(str, Enum):
+class OrderStatus(StrEnum):
     PENDING = "pending"
     SUBMITTED = "submitted"
     PARTIAL = "partial"
@@ -522,9 +523,9 @@ class QMTBroker(BrokerInterface):
             self._password = os.environ.get("QMT_PASSWORD", "")
 
         try:
+            import xtquant.xtconstant as xtc
             from xtquant.xttrader import XtQuantTrader
             from xtquant.xttype import StockAccount
-            import xtquant.xtconstant as xtc
             self._XtQuantTrader = XtQuantTrader
             self._StockAccount = StockAccount
             self._xtc = xtc
@@ -802,7 +803,9 @@ class QMTBroker(BrokerInterface):
         """
         try:
             from quant_platform.trading.qmt_utils import (
-                from_qmt_code, qmt_status_to_internal, qmt_trade_to_dict,
+                from_qmt_code,
+                qmt_status_to_internal,
+                qmt_trade_to_dict,
             )
 
             d = qmt_trade_to_dict(response)
@@ -810,7 +813,7 @@ class QMTBroker(BrokerInterface):
             qmt_status = d.get("status", d.get("order_status", 0))
             filled_qty = d.get("filled_quantity", d.get("volume", 0))
             filled_price = d.get("filled_price", d.get("price", 0.0))
-            code = from_qmt_code(d.get("code", ""))
+            from_qmt_code(d.get("code", ""))
 
             new_status = qmt_status_to_internal(int(qmt_status) if qmt_status else 0)
 

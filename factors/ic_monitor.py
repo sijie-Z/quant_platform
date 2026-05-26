@@ -20,13 +20,12 @@ from __future__ import annotations
 
 import warnings
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
-from quant_platform.factors.evaluation import rank_ic
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -103,7 +102,7 @@ class FactorICMonitor:
             window_dates = common_dates[i - window:i]
 
             # Get factor values and returns for the window
-            factor_window = factor.loc[window_dates]
+            factor.loc[window_dates]
             returns_window = forward_returns.loc[window_dates]
 
             # Compute cross-sectional rank IC for each date, then average

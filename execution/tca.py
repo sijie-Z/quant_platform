@@ -19,10 +19,9 @@ Reference:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import numpy as np
@@ -38,7 +37,7 @@ logger = get_logger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 
-class TCABenchmark(str, Enum):
+class TCABenchmark(StrEnum):
     """TCA benchmark types."""
     ARRIVAL_PRICE = "arrival_price"
     VWAP = "vwap"

@@ -1,14 +1,10 @@
 """Tests for factor timing — regime-based weight adjustment."""
 
-import numpy as np
-import pandas as pd
 import pytest
-
 from quant_platform.factors.factor_timing import (
+    _FACTOR_CATEGORIES,
     RegimeBasedTimer,
     map_regime_to_name,
-    _FACTOR_CATEGORIES,
-    _REGIME_PROFILES,
 )
 
 

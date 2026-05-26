@@ -4,7 +4,6 @@ Verifies that factors are automatically disabled when their rolling IC
 drops below threshold, and re-enabled when IC recovers.
 """
 
-import pytest
 
 from quant_platform.factors.ic_monitor import FactorICAutoDecay
 

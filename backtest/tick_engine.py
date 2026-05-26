@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -392,7 +393,6 @@ class TickBacktester:
 
         equity = self.capital
         peak_equity = equity
-        daily_equity = []
 
         for tick in tick_data.stream():
             # 1. Update order book with tick
@@ -635,8 +635,7 @@ class TickBacktester:
             buy_trades = trade_df[trade_df['side'] == 'buy']
             sell_trades = trade_df[trade_df['side'] == 'sell']
             # Simplified: count profitable round trips
-            n_round_trips = min(len(buy_trades), len(sell_trades))
-            win_rate = 0.5  # Placeholder
+            min(len(buy_trades), len(sell_trades))
 
         return BacktestResult(
             equity_curve=equity_curve,

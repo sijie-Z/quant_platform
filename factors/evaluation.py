@@ -67,7 +67,7 @@ def rank_ic(
     if not ic_series:
         return pd.Series(dtype=float)
 
-    dates, values = zip(*ic_series)
+    dates, values = zip(*ic_series, strict=False)
     return pd.Series(values, index=pd.DatetimeIndex(dates), name="rank_ic")
 
 
@@ -98,7 +98,7 @@ def pearson_ic(
     if not ic_series:
         return pd.Series(dtype=float)
 
-    dates, values = zip(*ic_series)
+    dates, values = zip(*ic_series, strict=False)
     return pd.Series(values, index=pd.DatetimeIndex(dates), name="pearson_ic")
 
 
@@ -249,7 +249,7 @@ def factor_turnover(factor: pd.DataFrame) -> pd.Series:
     if not turnover_series:
         return pd.Series(dtype=float)
 
-    dates_vals, vals = zip(*turnover_series)
+    dates_vals, vals = zip(*turnover_series, strict=False)
     return pd.Series(vals, index=pd.DatetimeIndex(dates_vals), name="turnover")
 
 

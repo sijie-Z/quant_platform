@@ -19,7 +19,6 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import DataProvider
-from quant_platform.data.schema import SECTORS, validate_financials, validate_prices
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)

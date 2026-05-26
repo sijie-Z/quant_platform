@@ -1,17 +1,13 @@
 """Tests for WebSocket real-time quote provider."""
 
-import json
-import numpy as np
-import pandas as pd
-import pytest
-import threading
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
+import pytest
 from quant_platform.data.providers.websocket_provider import (
     RealtimeQuote,
-    WebSocketQuoteProvider,
     SimulatedWebSocketProvider,
+    WebSocketQuoteProvider,
 )
 
 

@@ -1,7 +1,8 @@
 """Tests for core.audit — Audit log."""
 
 import pytest
-from quant_platform.core.audit import AuditLog, AuditAction
+
+from quant_platform.core.audit import AuditAction, AuditLog
 from quant_platform.core.events import EventBus
 from quant_platform.core.store import Store
 

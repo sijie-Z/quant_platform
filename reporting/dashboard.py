@@ -10,18 +10,15 @@ Presents a complete picture of backtest results in a single report, including:
 from __future__ import annotations
 
 import os
-from datetime import timedelta
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from quant_platform.backtest.metrics import all_metrics, max_drawdown
+from quant_platform.backtest.metrics import all_metrics
 from quant_platform.reporting.performance import (
     plot_drawdown,
     plot_equity_curve,
-    plot_ic_decay,
     plot_monthly_returns_heatmap,
     plot_rolling_sharpe,
 )

@@ -2,18 +2,14 @@
 
 import numpy as np
 import pandas as pd
-
 from quant_platform.backtest.metrics import (
+    all_metrics,
     annualized_return,
     annualized_volatility,
-    sharpe_ratio,
-    sortino_ratio,
-    max_drawdown,
-    calmar_ratio,
-    win_rate,
-    profit_loss_ratio,
     information_ratio,
-    all_metrics,
+    max_drawdown,
+    sharpe_ratio,
+    win_rate,
 )
 
 

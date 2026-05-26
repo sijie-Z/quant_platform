@@ -1,8 +1,6 @@
 """Tests for synthetic data provider."""
 
-import numpy as np
 import pandas as pd
-
 from quant_platform.data.providers.synthetic import SyntheticDataProvider
 from quant_platform.data.schema import SECTORS
 

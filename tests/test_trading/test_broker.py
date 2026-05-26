@@ -1,18 +1,18 @@
 """Tests for trading.broker — Simulated, QMT, XTP brokers and registry."""
 
 import pytest
+
 from quant_platform.trading.broker import (
+    BROKER_REGISTRY,
     BrokerInterface,
     Order,
     OrderSide,
     OrderStatus,
-    OrderType,
     Position,
     QMTBroker,
     SimulatedBroker,
     XTPBroker,
     create_broker,
-    BROKER_REGISTRY,
 )
 
 

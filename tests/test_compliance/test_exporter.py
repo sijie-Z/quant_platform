@@ -2,15 +2,14 @@
 
 import csv
 import os
-from pathlib import Path
 
 import pytest
 
 from quant_platform.compliance.exporter import (
-    ComplianceExporter,
-    ExportResult,
     ORDER_FIELDS,
     TRADE_FIELDS,
+    ComplianceExporter,
+    ExportResult,
 )
 from quant_platform.core.store import Store
 
@@ -92,7 +91,6 @@ class TestExportTradeLog:
     def test_export_xlsx_fallback_to_csv(self, exporter, store, monkeypatch):
         _seed_trades(store, 2)
         # Simulate openpyxl not installed
-        import quant_platform.compliance.exporter as mod
         original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
 
         def mock_import(name, *args, **kwargs):
@@ -143,7 +141,7 @@ class TestExportTradeLog:
         result = exporter.export_trade_log(
             start="2024-01-01", end="2024-12-31", format="csv",
         )
-        with open(result.file_path, "r", encoding="utf-8-sig") as f:
+        with open(result.file_path, encoding="utf-8-sig") as f:
             reader = csv.reader(f)
             headers = next(reader)
         assert any("成交" in h for h in headers)
@@ -192,7 +190,7 @@ class TestExportOrderLog:
         result = exporter.export_order_log(
             start="2024-01-01", end="2024-12-31", format="csv",
         )
-        with open(result.file_path, "r", encoding="utf-8-sig") as f:
+        with open(result.file_path, encoding="utf-8-sig") as f:
             reader = csv.reader(f)
             headers = next(reader)
         assert any("委托" in h for h in headers)
@@ -245,7 +243,7 @@ class TestExportRiskLog:
         result = exporter.export_risk_log(
             start="2024-01-01", end="2024-12-31", format="csv",
         )
-        with open(result.file_path, "r", encoding="utf-8-sig") as f:
+        with open(result.file_path, encoding="utf-8-sig") as f:
             reader = csv.reader(f)
             headers = next(reader)
         assert any("盈亏" in h for h in headers)

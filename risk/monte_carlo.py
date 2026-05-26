@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 from scipy import stats as sp_stats
 
-from quant_platform.backtest.metrics import all_metrics
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)

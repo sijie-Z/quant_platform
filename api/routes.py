@@ -59,6 +59,7 @@ from quant_platform.api.schemas import (
     VWAPResponse,
     WebSocketStatsResponse,
 )
+from quant_platform.execution.oms import OrderManager
 from quant_platform.main import (
     _compute_factors,
     _generate_signal,
@@ -86,6 +87,7 @@ _ws_clients: set[WebSocket] = set()
 
 async def _broadcast_status(run_id: str, status: dict):
     """Push status update to all connected WebSocket clients."""
+    global _ws_clients
     if not _ws_clients:
         return
     msg = json.dumps({"type": "status", "run_id": run_id, **status})
@@ -100,6 +102,7 @@ async def _broadcast_status(run_id: str, status: dict):
 
 async def _broadcast_event(event_type: str, data: dict):
     """Push an event to all connected WebSocket clients."""
+    global _ws_clients
     if not _ws_clients:
         return
     msg = json.dumps({"type": "event", "event": event_type, "data": data, "ts": datetime.now().isoformat()})
@@ -296,8 +299,8 @@ def _execute_pipeline(run_id: str, req: RunRequest):
         )
 
         # Risk
-        from quant_platform.risk.var import var_summary
         from quant_platform.risk.stress import run_all_stress_tests
+        from quant_platform.risk.var import var_summary
         risk = var_summary(strategy_returns)
         stress_df = run_all_stress_tests(strategy_returns)
         stress_tests = [
@@ -830,7 +833,6 @@ def _build_chart_data(
 @router.get("/demo")
 async def get_demo():
     """Return demo data for immediate UI preview without running a pipeline."""
-    import math
     import random
     rng = random.Random(42)
     n = 1000
@@ -1255,7 +1257,7 @@ async def import_holdings(file_content: dict):
             "sample": df.head(5).to_dict(orient="records"),
         }
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
 
 
 @router.get("/portfolio/holdings")
@@ -1277,10 +1279,9 @@ async def get_live_portfolio():
 
     try:
         # Fetch real prices from baostock
-        from quant_platform.data.providers.baostock_provider import (
-            BaostockDataProvider, _to_bs_code
-        )
         import baostock as bs
+
+        from quant_platform.data.providers.baostock_provider import _to_bs_code
 
         lg = bs.login()
         if lg.error_code != "0":
@@ -1349,7 +1350,7 @@ async def get_live_portfolio():
 # Order Management System
 # ---------------------------------------------------------------------------
 
-def _get_oms() -> "OrderManager":
+def _get_oms() -> OrderManager:
     """Get or create the global OMS instance."""
     global _oms_instance
     if _oms_instance is None:
@@ -1383,7 +1384,7 @@ async def create_order(order_req: dict):
             "status": order.status.value,
         }
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
 
 
 @router.post("/oms/fill")
@@ -1403,7 +1404,7 @@ async def fill_order(fill_req: dict):
             "avg_price": round(order.avg_fill_price, 2),
         }
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
 
 
 @router.get("/oms/blotter")
@@ -1471,9 +1472,10 @@ async def get_stock_realtime(code: str):
     """Get real-time price for a single stock from baostock."""
     try:
         import baostock as bs
+
         from quant_platform.data.providers.baostock_provider import _to_bs_code
 
-        lg = bs.login()
+        bs.login()
         bs_code = _to_bs_code(code.zfill(6))
         today = datetime.now().strftime("%Y-%m-%d")
 
@@ -1494,7 +1496,7 @@ async def get_stock_realtime(code: str):
             # Try last trading day
             from datetime import timedelta
             yesterday = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-            lg = bs.login()
+            bs.login()
             rs = bs.query_history_k_data_plus(
                 bs_code,
                 "date,open,high,low,close,preclose,volume,amount,pctChg",
@@ -1525,7 +1527,7 @@ async def get_stock_realtime(code: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -1555,7 +1557,7 @@ def _run_walkforward(result: dict, params: dict) -> dict:
     test_period = params.get("test_period", 126)
     mode = params.get("mode", "rolling")
 
-    validator = WalkForwardValidator(
+    WalkForwardValidator(
         train_period=train_period,
         test_period=test_period,
         step_size=test_period,
@@ -1576,7 +1578,7 @@ def _run_walkforward(result: dict, params: dict) -> dict:
 
     # Generate synthetic walk-forward results based on the run data
     import random
-    rng = random.Random(42)
+    random.Random(42)
 
     n_folds = max(1, (len(dates) - train_period) // test_period)
     fold_details = []
@@ -1908,7 +1910,7 @@ _risk_monitor = None
 def _get_risk_monitor():
     global _risk_monitor
     if _risk_monitor is None:
-        from quant_platform.risk.circuit_breaker import RiskMonitor, RiskLimits
+        from quant_platform.risk.circuit_breaker import RiskLimits, RiskMonitor
         _risk_monitor = RiskMonitor(RiskLimits(
             max_single_position_pct=0.05,
             max_sector_pct=0.30,
@@ -2191,7 +2193,7 @@ async def data_quality_check(req: dict):
     if result and "prices" in result:
         prices = result["prices"]
         if isinstance(prices, pd.DataFrame):
-            checks = monitor.check_prices(prices)
+            monitor.check_prices(prices)
             returns = prices.pct_change().dropna()
             monitor.check_returns(returns)
     else:
@@ -2200,7 +2202,7 @@ async def data_quality_check(req: dict):
         provider = SyntheticDataProvider(n_stocks=50, start_date="2023-01-01", end_date="2024-12-31")
         prices = provider.get_prices("2023-01-01", "2024-12-31")
         if isinstance(prices, pd.DataFrame):
-            checks = monitor.check_prices(prices)
+            monitor.check_prices(prices)
             returns = prices.pct_change().dropna()
             monitor.check_returns(returns)
 
@@ -2212,10 +2214,10 @@ async def data_quality_check(req: dict):
 # Core Architecture (shared singletons)
 # ---------------------------------------------------------------------------
 
-from quant_platform.core.events import EventBus, get_event_bus
-from quant_platform.core.store import Store
-from quant_platform.core.state_machine import PortfolioStateMachine, PortfolioState
 from quant_platform.core.audit import AuditLog
+from quant_platform.core.events import get_event_bus
+from quant_platform.core.state_machine import PortfolioStateMachine
+from quant_platform.core.store import Store
 from quant_platform.risk.circuit_breaker import RiskMonitor
 
 _core_store = Store()
@@ -2394,7 +2396,7 @@ async def market_snapshot():
         records = top[['代码', '名称', '最新价', '涨跌幅', '成交额', '换手率', '市盈率-动态', '总市值']].to_dict('records')
         return {"stocks": records, "total": len(df), "timestamp": datetime.now().isoformat()}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, str(e)) from e
 
 
 @router.get("/market/gainers")
@@ -2406,7 +2408,7 @@ async def market_gainers():
         df = rt.get_top_gainers(20)
         return {"stocks": df.to_dict('records')}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, str(e)) from e
 
 
 @router.get("/market/losers")
@@ -2418,7 +2420,7 @@ async def market_losers():
         df = rt.get_top_losers(20)
         return {"stocks": df.to_dict('records')}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, str(e)) from e
 
 
 @router.get("/market/sectors")
@@ -2431,7 +2433,7 @@ async def market_sectors():
         records = df.head(30).to_dict('records')
         return {"sectors": records}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -2553,7 +2555,7 @@ async def ml_train(req: MLTrainRequest):
         )
     except Exception as e:
         logger.error("ML train failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/ml/predict", response_model=MLSignalResponse)
@@ -2585,7 +2587,7 @@ async def ml_predict(req: MLTrainRequest):
         return MLSignalResponse(dates=dates, assets=assets, signal=signal_data)
     except Exception as e:
         logger.error("ML predict failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 # ────────────────────────────────────────────────────────────────
@@ -2636,7 +2638,7 @@ async def ic_monitor_compute(req: ICMonitorRequest):
         return ICMonitorSummary(factors=factor_stats, alerts=alerts, adaptive_weights=weights)
     except Exception as e:
         logger.error("IC monitor compute failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/ic-monitor/alerts")
@@ -2654,7 +2656,7 @@ async def ic_monitor_alerts():
         return {"alerts": monitor.get_alerts()}
     except Exception as e:
         logger.error("IC monitor alerts failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 # ────────────────────────────────────────────────────────────────
@@ -2697,7 +2699,7 @@ async def barra_decompose(req: BarraDecomposeRequest):
         )
     except Exception as e:
         logger.error("Barra decompose failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/barra/covariance", response_model=BarraCovarianceResponse)
@@ -2723,7 +2725,7 @@ async def barra_covariance(req: BarraDecomposeRequest):
         )
     except Exception as e:
         logger.error("Barra covariance failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 # ────────────────────────────────────────────────────────────────
@@ -2753,7 +2755,7 @@ async def parallel_sweep(req: ParallelSweepRequest):
         )
     except Exception as e:
         logger.error("Parallel sweep failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 # ────────────────────────────────────────────────────────────────
@@ -2763,8 +2765,9 @@ async def parallel_sweep(req: ParallelSweepRequest):
 @router.get("/metrics")
 async def prometheus_metrics():
     """Export system metrics in Prometheus text format."""
-    from quant_platform.utils.metrics import get_metrics
     from fastapi.responses import PlainTextResponse
+
+    from quant_platform.utils.metrics import get_metrics
     return PlainTextResponse(
         content=get_metrics().export_text(),
         media_type="text/plain; version=0.0.4; charset=utf-8",

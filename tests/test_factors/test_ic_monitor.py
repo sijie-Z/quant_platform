@@ -3,7 +3,6 @@
 import numpy as np
 import pandas as pd
 import pytest
-
 from quant_platform.factors.ic_monitor import (
     FactorICMonitor,
     FactorICStats,

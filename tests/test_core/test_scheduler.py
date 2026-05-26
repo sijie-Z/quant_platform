@@ -1,9 +1,10 @@
 """Tests for core.scheduler — Trading scheduler."""
 
 import pytest
+
+from quant_platform.core.events import EventBus
 from quant_platform.core.scheduler import TradingScheduler
 from quant_platform.core.state_machine import PortfolioStateMachine
-from quant_platform.core.events import EventBus
 from quant_platform.core.store import Store
 
 

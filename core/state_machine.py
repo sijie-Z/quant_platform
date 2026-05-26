@@ -16,17 +16,17 @@ Transitions are logged and published as events.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
-from typing import Any, Callable
+from enum import StrEnum
 
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-class PortfolioState(str, Enum):
+class PortfolioState(StrEnum):
     INIT = "init"
     READY = "ready"
     PRE_MARKET = "pre_market"

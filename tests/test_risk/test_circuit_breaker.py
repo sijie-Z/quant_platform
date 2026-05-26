@@ -1,8 +1,9 @@
 """Tests for risk.circuit_breaker — RiskMonitor and circuit breakers."""
 
-import pytest
 from quant_platform.risk.circuit_breaker import (
-    RiskMonitor, RiskLimits, RiskLevel, BreachType, RiskBreach,
+    BreachType,
+    RiskLevel,
+    RiskMonitor,
 )
 
 

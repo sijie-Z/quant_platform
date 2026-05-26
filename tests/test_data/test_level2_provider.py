@@ -1,16 +1,14 @@
 """Tests for Level 2 market data provider."""
 
-import numpy as np
-import pandas as pd
-import pytest
 import time
 
+import pytest
 from quant_platform.data.providers.level2_provider import (
+    Level2DataProvider,
+    OrderBookAnalytics,
     OrderBookLevel,
     OrderBookSnapshot,
     TickData,
-    Level2DataProvider,
-    OrderBookAnalytics,
 )
 
 

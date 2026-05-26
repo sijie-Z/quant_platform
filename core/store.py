@@ -27,7 +27,6 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 from quant_platform.utils.logging import get_logger
 
@@ -218,9 +217,8 @@ class Store:
 
     def save_order(self, order: dict):
         """Save or update an order."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
+        with self._lock, self._conn() as conn:
+            conn.execute("""
                     INSERT OR REPLACE INTO orders
                     (order_id, tenant_id, code, side, order_type, quantity, price,
                      filled_quantity, filled_price, status, commission, tax,
@@ -228,17 +226,17 @@ class Store:
                      created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    order['order_id'], order.get('tenant_id', 'default'),
-                    order['code'], order['side'],
-                    order.get('order_type', 'limit'), order['quantity'], order['price'],
-                    order.get('filled_quantity', 0), order.get('filled_price', 0),
-                    order.get('status', 'pending'), order.get('commission', 0),
-                    order.get('tax', 0), order.get('slippage', 0),
-                    order.get('broker_order_id', ''), order.get('error_msg', ''),
-                    order.get('strategy_id', ''), order.get('signal_id', ''),
-                    order.get('created_at', datetime.now().isoformat()),
-                    order.get('updated_at', datetime.now().isoformat()),
-                ))
+                order['order_id'], order.get('tenant_id', 'default'),
+                order['code'], order['side'],
+                order.get('order_type', 'limit'), order['quantity'], order['price'],
+                order.get('filled_quantity', 0), order.get('filled_price', 0),
+                order.get('status', 'pending'), order.get('commission', 0),
+                order.get('tax', 0), order.get('slippage', 0),
+                order.get('broker_order_id', ''), order.get('error_msg', ''),
+                order.get('strategy_id', ''), order.get('signal_id', ''),
+                order.get('created_at', datetime.now().isoformat()),
+                order.get('updated_at', datetime.now().isoformat()),
+            ))
 
     def get_orders(self, status: str = "", code: str = "", limit: int = 100,
                    tenant_id: str = "") -> list[dict]:
@@ -264,27 +262,25 @@ class Store:
 
     def save_position(self, pos: dict):
         """Save or update a position."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
+        with self._lock, self._conn() as conn:
+            conn.execute("""
                     INSERT OR REPLACE INTO positions
                     (code, tenant_id, name, quantity, available, avg_cost, current_price,
                      market_value, unrealized_pnl, realized_pnl, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    pos['code'], pos.get('tenant_id', 'default'),
-                    pos.get('name', ''), pos['quantity'],
-                    pos.get('available', pos['quantity']), pos['avg_cost'],
-                    pos.get('current_price', 0), pos.get('market_value', 0),
-                    pos.get('unrealized_pnl', 0), pos.get('realized_pnl', 0),
-                    datetime.now().isoformat(),
-                ))
+                pos['code'], pos.get('tenant_id', 'default'),
+                pos.get('name', ''), pos['quantity'],
+                pos.get('available', pos['quantity']), pos['avg_cost'],
+                pos.get('current_price', 0), pos.get('market_value', 0),
+                pos.get('unrealized_pnl', 0), pos.get('realized_pnl', 0),
+                datetime.now().isoformat(),
+            ))
 
     def delete_position(self, code: str, tenant_id: str = ""):
         """Remove a position."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("DELETE FROM positions WHERE code = ?", (code,))
+        with self._lock, self._conn() as conn:
+            conn.execute("DELETE FROM positions WHERE code = ?", (code,))
 
     def get_positions(self, tenant_id: str = "") -> list[dict]:
         """Get all current positions."""
@@ -302,21 +298,20 @@ class Store:
 
     def save_trade(self, trade: dict):
         """Record an executed trade."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
+        with self._lock, self._conn() as conn:
+            conn.execute("""
                     INSERT INTO trades
                     (trade_id, tenant_id, order_id, code, side, quantity, price,
                      commission, tax, executed_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    trade.get('trade_id', trade.get('order_id', '')),
-                    trade.get('tenant_id', 'default'),
-                    trade['order_id'], trade['code'], trade['side'],
-                    trade['quantity'], trade['price'],
-                    trade.get('commission', 0), trade.get('tax', 0),
-                    trade.get('executed_at', datetime.now().isoformat()),
-                ))
+                trade.get('trade_id', trade.get('order_id', '')),
+                trade.get('tenant_id', 'default'),
+                trade['order_id'], trade['code'], trade['side'],
+                trade['quantity'], trade['price'],
+                trade.get('commission', 0), trade.get('tax', 0),
+                trade.get('executed_at', datetime.now().isoformat()),
+            ))
 
     def get_trades(self, code: str = "", limit: int = 100,
                    tenant_id: str = "") -> list[dict]:
@@ -348,21 +343,20 @@ class Store:
 
     def save_pnl_snapshot(self, snapshot: dict):
         """Save a P&L snapshot."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
+        with self._lock, self._conn() as conn:
+            conn.execute("""
                     INSERT INTO pnl_history
                     (timestamp, total_equity, cash, market_value, daily_pnl,
                      daily_pnl_pct, cumulative_pnl, n_positions, max_drawdown, sharpe_ratio)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    snapshot.get('timestamp', datetime.now().isoformat()),
-                    snapshot['total_equity'], snapshot['cash'],
-                    snapshot['market_value'], snapshot.get('daily_pnl', 0),
-                    snapshot.get('daily_pnl_pct', 0), snapshot.get('cumulative_pnl', 0),
-                    snapshot.get('n_positions', 0), snapshot.get('max_drawdown', 0),
-                    snapshot.get('sharpe_ratio', 0),
-                ))
+                snapshot.get('timestamp', datetime.now().isoformat()),
+                snapshot['total_equity'], snapshot['cash'],
+                snapshot['market_value'], snapshot.get('daily_pnl', 0),
+                snapshot.get('daily_pnl_pct', 0), snapshot.get('cumulative_pnl', 0),
+                snapshot.get('n_positions', 0), snapshot.get('max_drawdown', 0),
+                snapshot.get('sharpe_ratio', 0),
+            ))
 
     def get_pnl_history(self, days: int = 30) -> list[dict]:
         """Get P&L history for the last N days."""
@@ -377,20 +371,19 @@ class Store:
 
     def save_signal(self, signal: dict):
         """Save an alpha signal."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
+        with self._lock, self._conn() as conn:
+            conn.execute("""
                     INSERT OR REPLACE INTO signals
                     (signal_id, code, direction, strength, factor_values,
                      strategy_id, generated_at, consumed)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    signal['signal_id'], signal['code'], signal['direction'],
-                    signal['strength'], json.dumps(signal.get('factor_values', {})),
-                    signal.get('strategy_id', ''),
-                    signal.get('generated_at', datetime.now().isoformat()),
-                    signal.get('consumed', 0),
-                ))
+                signal['signal_id'], signal['code'], signal['direction'],
+                signal['strength'], json.dumps(signal.get('factor_values', {})),
+                signal.get('strategy_id', ''),
+                signal.get('generated_at', datetime.now().isoformat()),
+                signal.get('consumed', 0),
+            ))
 
     def get_signals(self, consumed: int = -1, limit: int = 100) -> list[dict]:
         """Get signals. consumed=-1 for all, 0 for unconsumed, 1 for consumed."""
@@ -418,21 +411,20 @@ class Store:
 
     def save_session(self, session: dict):
         """Save a trading session record."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
+        with self._lock, self._conn() as conn:
+            conn.execute("""
                     INSERT OR REPLACE INTO sessions
                     (session_id, strategy_id, broker, status, started_at,
                      stopped_at, total_trades, total_pnl, config)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    session['session_id'], session.get('strategy_id', ''),
-                    session.get('broker', 'simulated'), session.get('status', 'active'),
-                    session.get('started_at', datetime.now().isoformat()),
-                    session.get('stopped_at', ''),
-                    session.get('total_trades', 0), session.get('total_pnl', 0),
-                    json.dumps(session.get('config', {})),
-                ))
+                session['session_id'], session.get('strategy_id', ''),
+                session.get('broker', 'simulated'), session.get('status', 'active'),
+                session.get('started_at', datetime.now().isoformat()),
+                session.get('stopped_at', ''),
+                session.get('total_trades', 0), session.get('total_pnl', 0),
+                json.dumps(session.get('config', {})),
+            ))
 
     def get_sessions(self, limit: int = 20) -> list[dict]:
         """Get trading session history."""
@@ -446,17 +438,16 @@ class Store:
 
     def log_event(self, event: dict):
         """Log an event for audit trail."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
+        with self._lock, self._conn() as conn:
+            conn.execute("""
                     INSERT INTO events (event_id, topic, data, source, timestamp, created_at)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (
-                    event.get('event_id', ''), event.get('topic', ''),
-                    json.dumps(event.get('data', {})),
-                    event.get('source', ''), event.get('timestamp', time.time()),
-                    datetime.now().isoformat(),
-                ))
+                event.get('event_id', ''), event.get('topic', ''),
+                json.dumps(event.get('data', {})),
+                event.get('source', ''), event.get('timestamp', time.time()),
+                datetime.now().isoformat(),
+            ))
 
     def get_events(self, topic: str = "", limit: int = 100) -> list[dict]:
         """Get event log."""
@@ -484,9 +475,8 @@ class Store:
 
     def save_config_snapshot(self, config: dict, description: str = ""):
         """Save a configuration snapshot."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
+        with self._lock, self._conn() as conn:
+            conn.execute("""
                     INSERT INTO config_snapshots (config, description, created_at)
                     VALUES (?, ?, ?)
                 """, (json.dumps(config), description, datetime.now().isoformat()))
@@ -503,20 +493,19 @@ class Store:
 
     def save_nav(self, nav: dict):
         """Save a NAV record."""
-        with self._lock:
-            with self._conn() as conn:
-                conn.execute("""
+        with self._lock, self._conn() as conn:
+            conn.execute("""
                     INSERT OR REPLACE INTO nav_history
                     (date, nav_total, nav_per_unit, total_units, cash, market_value,
                      mgmt_fee, perf_fee, high_water_mark, daily_return, cumulative_return)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    nav['date'], nav['nav_total'], nav['nav_per_unit'],
-                    nav['total_units'], nav.get('cash', 0),
-                    nav.get('market_value', 0), nav.get('mgmt_fee', 0),
-                    nav.get('perf_fee', 0), nav.get('high_water_mark', 1.0),
-                    nav.get('daily_return', 0), nav.get('cumulative_return', 0),
-                ))
+                nav['date'], nav['nav_total'], nav['nav_per_unit'],
+                nav['total_units'], nav.get('cash', 0),
+                nav.get('market_value', 0), nav.get('mgmt_fee', 0),
+                nav.get('perf_fee', 0), nav.get('high_water_mark', 1.0),
+                nav.get('daily_return', 0), nav.get('cumulative_return', 0),
+            ))
 
     def get_nav_history(self, days: int = 365 * 3) -> list[dict]:
         """Get NAV history for the last N days."""

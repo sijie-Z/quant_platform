@@ -8,7 +8,6 @@ Analyzes concentration and factor exposures of portfolio weights:
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 

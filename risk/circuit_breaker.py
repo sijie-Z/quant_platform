@@ -15,16 +15,15 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, date
-from enum import Enum
-from typing import Any
+from datetime import datetime
+from enum import StrEnum
 
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-class RiskLevel(str, Enum):
+class RiskLevel(StrEnum):
     GREEN = "green"       # Normal operation
     YELLOW = "yellow"     # Warning — increased monitoring
     ORANGE = "orange"     # Elevated — restrict new positions
@@ -32,7 +31,7 @@ class RiskLevel(str, Enum):
     KILL = "kill"         # Emergency — flatten everything
 
 
-class BreachType(str, Enum):
+class BreachType(StrEnum):
     POSITION_LIMIT = "position_limit"
     SECTOR_LIMIT = "sector_limit"
     DAILY_LOSS = "daily_loss"

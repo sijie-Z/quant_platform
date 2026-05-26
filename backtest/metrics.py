@@ -60,7 +60,8 @@ def max_drawdown(daily_returns: pd.Series) -> tuple[float, pd.Timestamp, pd.Time
         (max_dd, peak_date, trough_date)
     """
     from quant_platform.utils.numba_accelerator import (
-        HAS_NUMBA, max_drawdown_numba, max_drawdown_pandas, benchmark,
+        HAS_NUMBA,
+        max_drawdown_numba,
     )
 
     if HAS_NUMBA:

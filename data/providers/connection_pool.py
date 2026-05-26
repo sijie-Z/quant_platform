@@ -22,7 +22,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import pandas as pd
@@ -32,7 +32,7 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-class SourceStatus(str, Enum):
+class SourceStatus(StrEnum):
     HEALTHY = "healthy"
     DEGRADED = "degraded"
     CIRCUIT_OPEN = "circuit_open"

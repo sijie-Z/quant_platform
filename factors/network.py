@@ -33,7 +33,7 @@ Usage:
 from __future__ import annotations
 
 import warnings
-from enum import Enum
+from enum import StrEnum
 
 import numpy as np
 import pandas as pd
@@ -44,7 +44,7 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-class CentralityType(str, Enum):
+class CentralityType(StrEnum):
     DEGREE = "degree"
     EIGENVECTOR = "eigenvector"
     BETWEENNESS = "betweenness"

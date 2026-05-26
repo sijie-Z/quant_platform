@@ -1,13 +1,11 @@
 """Tests for fundamental factors."""
 
-import numpy as np
-import pandas as pd
 
 from quant_platform.factors.fundamental import (
-    LogMarketCap,
-    PbRatio,
     ROE,
     AssetGrowth,
+    LogMarketCap,
+    PbRatio,
 )
 
 
@@ -43,6 +41,6 @@ def test_requires_financials(prices):
     factor = LogMarketCap()
     try:
         factor.compute(prices, None)
-        assert False, "Should have raised ValueError"
+        raise AssertionError("Should have raised ValueError")
     except ValueError:
         pass

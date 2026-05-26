@@ -33,14 +33,13 @@ Event types follow domain-driven naming:
 
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
-import traceback
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from quant_platform.utils.logging import get_logger
 
@@ -53,13 +52,7 @@ logger = get_logger(__name__)
 
 from quant_platform.core.event_bus_v2 import (  # noqa: E402
     AsyncEventBus,
-    Event,
-    HandlerStats,
-    DeadLetterQueue,
-    EventStore,
-    get_async_event_bus,
 )
-
 
 # Type alias for event handlers
 EventHandler = Callable[[Any], None]
@@ -148,9 +141,7 @@ class LegacyEventBus:
         with self._lock:
             handlers = list(self._handlers.get(event.topic, []))
             for pattern, pattern_handlers in self._handlers.items():
-                if pattern.endswith('.*') and event.topic.startswith(pattern[:-2]):
-                    handlers.extend(pattern_handlers)
-                elif pattern == '*':
+                if pattern.endswith('.*') and event.topic.startswith(pattern[:-2]) or pattern == '*':
                     handlers.extend(pattern_handlers)
 
         for handler in handlers:

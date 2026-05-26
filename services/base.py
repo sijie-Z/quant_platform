@@ -22,10 +22,8 @@ import asyncio
 import signal
 import time
 from abc import ABC, abstractmethod
-from typing import Any
 
 from quant_platform.core.message_bus import (
-    Message,
     MessageBus,
     ServiceInfo,
     ServiceRegistry,

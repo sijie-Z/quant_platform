@@ -1,7 +1,9 @@
 """Tests for reporting.html_report — HTML report generation."""
 
 import os
+
 import pytest
+
 from quant_platform.reporting.html_report import generate_html_report
 
 

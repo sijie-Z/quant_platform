@@ -24,8 +24,6 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
-
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)

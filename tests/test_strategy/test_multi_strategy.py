@@ -1,9 +1,10 @@
 """Tests for strategy.multi_strategy — Multi-strategy manager."""
 
 import numpy as np
-import pytest
+
 from quant_platform.strategy.multi_strategy import (
-    MultiStrategyManager, StrategyConfig, StrategyState,
+    MultiStrategyManager,
+    StrategyConfig,
 )
 
 

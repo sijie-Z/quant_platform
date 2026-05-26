@@ -18,12 +18,10 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import threading
-import time
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Generator
 
 from quant_platform.utils.logging import get_logger
 
@@ -32,10 +30,19 @@ logger = get_logger(__name__)
 # Optional imports — graceful degradation
 try:
     from sqlalchemy import (
-        create_engine, Column, String, Float, Integer, DateTime, Text,
-        Index, text, MetaData, Table,
+        Column,
+        DateTime,
+        Float,
+        Index,
+        Integer,
+        MetaData,
+        String,
+        Table,
+        Text,
+        create_engine,
+        text,
     )
-    from sqlalchemy.orm import sessionmaker, declarative_base
+    from sqlalchemy.orm import declarative_base, sessionmaker
     from sqlalchemy.pool import QueuePool
     HAS_SQLALCHEMY = True
 except ImportError:
@@ -213,72 +220,67 @@ class PostgresStore:
         if self._fallback_store:
             return self._fallback_store.save_order(order)
 
-        with self._lock:
-            with self._session() as session:
-                row = session.get(OrderRow, order.get("order_id"))
-                if row:
-                    for k, v in order.items():
-                        if hasattr(row, k):
-                            setattr(row, k, v)
-                else:
-                    session.add(OrderRow(**{
-                        k: v for k, v in order.items()
-                        if hasattr(OrderRow, k)
-                    }))
+        with self._lock, self._session() as session:
+            row = session.get(OrderRow, order.get("order_id"))
+            if row:
+                for k, v in order.items():
+                    if hasattr(row, k):
+                        setattr(row, k, v)
+            else:
+                session.add(OrderRow(**{
+                    k: v for k, v in order.items()
+                    if hasattr(OrderRow, k)
+                }))
 
     def save_trade(self, trade: dict):
         """Save a trade execution."""
         if self._fallback_store:
             return self._fallback_store.save_trade(trade)
 
-        with self._lock:
-            with self._session() as session:
-                session.add(TradeRow(**{
-                    k: v for k, v in trade.items()
-                    if hasattr(TradeRow, k)
-                }))
+        with self._lock, self._session() as session:
+            session.add(TradeRow(**{
+                k: v for k, v in trade.items()
+                if hasattr(TradeRow, k)
+            }))
 
     def save_position(self, position: dict):
         """Save or update a position."""
         if self._fallback_store:
             return self._fallback_store.save_position(position)
 
-        with self._lock:
-            with self._session() as session:
-                row = session.get(PositionRow, position.get("code"))
-                if row:
-                    for k, v in position.items():
-                        if hasattr(row, k):
-                            setattr(row, k, v)
-                else:
-                    session.add(PositionRow(**{
-                        k: v for k, v in position.items()
-                        if hasattr(PositionRow, k)
-                    }))
+        with self._lock, self._session() as session:
+            row = session.get(PositionRow, position.get("code"))
+            if row:
+                for k, v in position.items():
+                    if hasattr(row, k):
+                        setattr(row, k, v)
+            else:
+                session.add(PositionRow(**{
+                    k: v for k, v in position.items()
+                    if hasattr(PositionRow, k)
+                }))
 
     def save_pnl(self, pnl: dict):
         """Save a P&L snapshot."""
         if self._fallback_store:
             return self._fallback_store.save_pnl(pnl)
 
-        with self._lock:
-            with self._session() as session:
-                session.add(PnLRow(**{
-                    k: v for k, v in pnl.items()
-                    if hasattr(PnLRow, k)
-                }))
+        with self._lock, self._session() as session:
+            session.add(PnLRow(**{
+                k: v for k, v in pnl.items()
+                if hasattr(PnLRow, k)
+            }))
 
     def save_signal(self, signal: dict):
         """Save an alpha signal."""
         if self._fallback_store:
             return self._fallback_store.save_signal(signal)
 
-        with self._lock:
-            with self._session() as session:
-                session.add(SignalRow(**{
-                    k: v for k, v in signal.items()
-                    if hasattr(SignalRow, k)
-                }))
+        with self._lock, self._session() as session:
+            session.add(SignalRow(**{
+                k: v for k, v in signal.items()
+                if hasattr(SignalRow, k)
+            }))
 
     def get_orders(self, status: str | None = None, limit: int = 100) -> list[dict]:
         """Get orders, optionally filtered by status."""

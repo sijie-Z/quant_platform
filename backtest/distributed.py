@@ -22,10 +22,9 @@ Usage:
 from __future__ import annotations
 
 import time
-import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from quant_platform.utils.logging import get_logger
 
@@ -80,9 +79,8 @@ def _run_single_backtest(args: tuple) -> BacktestResult:
 
     try:
         # Import inside worker to avoid pickling issues
+        from quant_platform.main import _compute_factors, _generate_signal, _load_data, _run_backtest
         from quant_platform.utils.config import load_config
-        from quant_platform.main import _load_data, _compute_factors, _generate_signal, _run_backtest
-        from quant_platform.backtest.metrics import compute_metrics
 
         # Merge config overrides
         config = load_config()
@@ -103,7 +101,6 @@ def _run_single_backtest(args: tuple) -> BacktestResult:
         daily_returns = backtest_result.get("daily_returns")
         if daily_returns is not None:
             import numpy as np
-            import pandas as pd
 
             total_return = float((1 + daily_returns).prod() - 1)
             ann_return = float((1 + total_return) ** (252 / max(len(daily_returns), 1)) - 1)
@@ -186,7 +183,7 @@ class ParallelBacktester:
         # Build task args
         tasks = []
         for i, combo in enumerate(combinations):
-            params = dict(zip(param_names, combo))
+            params = dict(zip(param_names, combo, strict=False))
             overrides = {**base_overrides}
             for k, v in params.items():
                 overrides[k] = v

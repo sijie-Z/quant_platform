@@ -8,7 +8,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 

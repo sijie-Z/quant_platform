@@ -4,8 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 from quant_platform.risk.regime import (
-    VolatilityRegimeDetector, TrendRegimeDetector,
-    CorrelationRegimeDetector, CompositeRegimeDetector, RegimeType,
+    CompositeRegimeDetector,
+    CorrelationRegimeDetector,
+    RegimeType,
+    TrendRegimeDetector,
+    VolatilityRegimeDetector,
 )
 
 

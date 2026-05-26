@@ -20,11 +20,10 @@ Usage:
 
 from __future__ import annotations
 
-import time
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
 
 import pandas as pd
 
@@ -232,8 +231,8 @@ class FundamentalDataProvider:
 
         Endpoint: http://push2.eastmoney.com/api/qt/stock/get
         """
-        import urllib.request
         import json
+        import urllib.request
 
         # Determine market prefix
         if code.startswith("6"):

@@ -36,7 +36,9 @@ def winsorize(
         return factor
 
     from quant_platform.utils.numba_accelerator import (
-        HAS_NUMBA, winsorize_numba, winsorize_pandas,
+        HAS_NUMBA,
+        winsorize_numba,
+        winsorize_pandas,
     )
 
     if HAS_NUMBA and factor.shape[1] >= 10:

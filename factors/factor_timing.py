@@ -206,7 +206,7 @@ def map_regime_to_name(regime_result: dict) -> str:
     Returns:
         One of "high_vol", "bull_trend", "bear_trend", "normal".
     """
-    overall = regime_result.get("overall_regime", "neutral")
+    regime_result.get("overall_regime", "neutral")
     vol_regime = regime_result.get("volatility", {}).get("regime", "")
     trend_regime = regime_result.get("trend", {}).get("regime", "")
 

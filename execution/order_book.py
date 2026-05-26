@@ -30,7 +30,6 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
 
 from quant_platform.utils.logging import get_logger
 
@@ -42,19 +41,19 @@ logger = get_logger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 
-class Side(str, enum.Enum):
+class Side(enum.StrEnum):
     BUY = "buy"
     SELL = "sell"
 
 
-class OrderType(str, enum.Enum):
+class OrderType(enum.StrEnum):
     MARKET = "market"
     LIMIT = "limit"
     IOC = "ioc"          # Immediate or Cancel: fill what you can, cancel rest
     FOK = "fok"          # Fill or Kill: fill all or cancel all
 
 
-class BookOrderStatus(str, enum.Enum):
+class BookOrderStatus(enum.StrEnum):
     OPEN = "open"
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"

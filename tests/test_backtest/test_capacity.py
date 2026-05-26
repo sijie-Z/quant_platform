@@ -3,7 +3,6 @@
 import numpy as np
 import pandas as pd
 import pytest
-
 from quant_platform.backtest.capacity import CapacityCurve, CapacityEstimator, CapacityResult
 from quant_platform.execution.market_impact import SquareRootModel
 

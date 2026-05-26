@@ -1,13 +1,11 @@
 """Tests for cross-asset instrument abstraction."""
 
-import pytest
 
 from quant_platform.core.instrument import (
     AssetUniverse,
     Instrument,
     InstrumentType,
 )
-
 
 # ── InstrumentType ──
 

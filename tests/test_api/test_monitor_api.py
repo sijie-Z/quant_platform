@@ -1,21 +1,19 @@
 """Tests for monitor API endpoints — aggregation layer for dashboard."""
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from quant_platform.api.monitor import (
     CapacityGaugeResponse,
     ConfigUpdateRequest,
-    ConfigUpdateResponse,
-    KillSwitchRequest,
-    KillSwitchResponse,
-    RiskOverviewResponse,
     FactorStatusResponse,
+    KillSwitchRequest,
+    RiskOverviewResponse,
     TCASummaryResponse,
     router,
 )
 from quant_platform.core.store import Store
-from fastapi import FastAPI
 
 
 @pytest.fixture
@@ -200,8 +198,8 @@ class TestCapacityGauge:
 class TestConfigUpdate:
     def test_returns_200_with_valid_config(self, app, client):
         # Patch risk monitor
-        from quant_platform.risk.circuit_breaker import RiskMonitor
         import quant_platform.api.monitor as mod
+        from quant_platform.risk.circuit_breaker import RiskMonitor
         mod._core_risk = RiskMonitor()
 
         resp = client.post("/api/monitor/config", json={
@@ -211,8 +209,8 @@ class TestConfigUpdate:
         assert resp.status_code == 200
 
     def test_response_structure(self, app, client):
-        from quant_platform.risk.circuit_breaker import RiskMonitor
         import quant_platform.api.monitor as mod
+        from quant_platform.risk.circuit_breaker import RiskMonitor
         mod._core_risk = RiskMonitor()
 
         data = client.post("/api/monitor/config", json={
@@ -223,8 +221,8 @@ class TestConfigUpdate:
         assert "max_position_pct" in data["updated"]
 
     def test_rejects_position_over_20_pct(self, app, client):
-        from quant_platform.risk.circuit_breaker import RiskMonitor
         import quant_platform.api.monitor as mod
+        from quant_platform.risk.circuit_breaker import RiskMonitor
         mod._core_risk = RiskMonitor()
 
         resp = client.post("/api/monitor/config", json={
@@ -233,8 +231,8 @@ class TestConfigUpdate:
         assert resp.status_code == 422  # Validation error
 
     def test_rejects_drawdown_over_30_pct(self, app, client):
-        from quant_platform.risk.circuit_breaker import RiskMonitor
         import quant_platform.api.monitor as mod
+        from quant_platform.risk.circuit_breaker import RiskMonitor
         mod._core_risk = RiskMonitor()
 
         resp = client.post("/api/monitor/config", json={
@@ -257,8 +255,8 @@ class TestConfigUpdate:
 
 class TestKillSwitch:
     def test_activate_returns_200(self, app, client):
-        from quant_platform.risk.circuit_breaker import RiskMonitor
         import quant_platform.api.monitor as mod
+        from quant_platform.risk.circuit_breaker import RiskMonitor
         mod._core_risk = RiskMonitor()
 
         resp = client.post("/api/monitor/kill-switch", json={
@@ -268,8 +266,8 @@ class TestKillSwitch:
         assert resp.status_code == 200
 
     def test_activate_response(self, app, client):
-        from quant_platform.risk.circuit_breaker import RiskMonitor
         import quant_platform.api.monitor as mod
+        from quant_platform.risk.circuit_breaker import RiskMonitor
         mod._core_risk = RiskMonitor()
 
         data = client.post("/api/monitor/kill-switch", json={
@@ -279,8 +277,8 @@ class TestKillSwitch:
         assert "ACTIVATED" in data["message"]
 
     def test_deactivate_response(self, app, client):
-        from quant_platform.risk.circuit_breaker import RiskMonitor
         import quant_platform.api.monitor as mod
+        from quant_platform.risk.circuit_breaker import RiskMonitor
         mod._core_risk = RiskMonitor()
 
         # First activate

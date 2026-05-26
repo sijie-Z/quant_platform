@@ -8,17 +8,15 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
-from typing import Any
+from enum import StrEnum
 
 
-class OrderSide(str, Enum):
+class OrderSide(StrEnum):
     BUY = "buy"
     SELL = "sell"
 
 
-class OrderType(str, Enum):
+class OrderType(StrEnum):
     MARKET = "market"
     LIMIT = "limit"
     TWAP = "twap"          # Time-Weighted Average Price
@@ -26,7 +24,7 @@ class OrderType(str, Enum):
     ICEBERG = "iceberg"    # Hidden quantity
 
 
-class OrderStatus(str, Enum):
+class OrderStatus(StrEnum):
     PENDING = "pending"        # Created, not yet sent
     SUBMITTED = "submitted"    # Sent to broker/exchange
     PARTIAL = "partial"        # Partially filled

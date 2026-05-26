@@ -23,12 +23,12 @@ import numpy as np
 
 # Try to import Cython versions
 try:
+    from quant_platform.utils.cyext._fast_rank import rank_ic_cy
     from quant_platform.utils.cyext._fast_rolling import (
+        rolling_max_drawdown_cy,
         rolling_momentum_cy,
         rolling_volatility_cy,
-        rolling_max_drawdown_cy,
     )
-    from quant_platform.utils.cyext._fast_rank import rank_ic_cy
     from quant_platform.utils.cyext._fast_zscore import zscore_cross_section_cy
     HAS_CYTHON = True
 except ImportError:
@@ -132,7 +132,7 @@ def rank_ic_py(factor: np.ndarray, returns: np.ndarray) -> float:
     r_rank = np.argsort(np.argsort(r)).astype(float)
 
     # Pearson correlation of ranks = Spearman correlation
-    n = len(f_rank)
+    len(f_rank)
     f_mean = np.mean(f_rank)
     r_mean = np.mean(r_rank)
 

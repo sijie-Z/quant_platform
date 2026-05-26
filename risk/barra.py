@@ -29,7 +29,6 @@ Reference: Barra Risk Model Handbook (MSCI)
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -334,7 +333,6 @@ class BarraModel:
         if not self.factor_returns_history:
             return
 
-        residuals = {}
         for fr in self.factor_returns_history:
             # We don't have the actual residuals here, estimate from factor model
             pass

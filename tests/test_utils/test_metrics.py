@@ -1,7 +1,7 @@
 """Tests for Prometheus-compatible metrics collector."""
 
-import time
 import threading
+import time
 
 import pytest
 

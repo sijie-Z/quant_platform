@@ -248,7 +248,7 @@ async def get_tca_summary():
         rng = np.random.default_rng(123)
         for date in sorted(daily.keys())[-30:]:
             day_trades = daily[date]
-            n = len(day_trades)
+            len(day_trades)
             # Simulated IS based on trade count and price variance
             prices = [t.get("price", 0) for t in day_trades if t.get("price", 0) > 0]
             if prices:
@@ -300,7 +300,7 @@ async def get_factor_status():
 
     # Try to get IC monitor data
     try:
-        from quant_platform.factors.ic_monitor import FactorICAutoDecay
+        pass
         # Check for disabled factors in the auto-decay system
         # In production, this would be a shared instance
     except Exception:
@@ -324,7 +324,7 @@ async def get_factor_status():
                         fv = json.loads(fv)
                     except Exception:
                         fv = {}
-                strength = sig.get("strength", 0)
+                sig.get("strength", 0)
                 for factor_name, value in fv.items():
                     if isinstance(value, (int, float)):
                         factor_ics.setdefault(factor_name, []).append(float(value))
@@ -490,7 +490,7 @@ async def update_monitor_config(req: ConfigUpdateRequest):
             }, source="monitor")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     return ConfigUpdateResponse(updated=updated, limits=limits)
 
@@ -524,7 +524,7 @@ async def monitor_kill_switch(req: KillSwitchRequest):
         return KillSwitchResponse(active=req.activate, message=msg)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 # ── Helpers ──

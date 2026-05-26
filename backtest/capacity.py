@@ -32,10 +32,7 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.backtest.cost_model import CostModel
-from quant_platform.backtest.metrics import all_metrics
 from quant_platform.execution.market_impact import (
-    AlmgrenChrissModel,
-    CompositeImpactModel,
     SquareRootModel,
 )
 from quant_platform.utils.logging import get_logger

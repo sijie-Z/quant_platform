@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 import pytest
 from quant_platform.risk.factor_risk import (
-    estimate_factor_betas, factor_risk_decomposition, factor_contribution_summary,
+    estimate_factor_betas,
+    factor_contribution_summary,
+    factor_risk_decomposition,
 )
 
 

@@ -103,7 +103,7 @@ class DataService(BaseService):
         try:
             request = msg.data
             symbol = request.get("symbol", "")
-            data_type = request.get("type", "tick")
+            request.get("type", "tick")
 
             # Fetch data
             # data = self._data_source.get_data(symbol, data_type)

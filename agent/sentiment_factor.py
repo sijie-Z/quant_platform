@@ -22,9 +22,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -286,7 +284,7 @@ class LLMSentimentFactor(BaseFactor):
         cache_file = self.cache_dir / "sentiment_cache.json"
         if cache_file.exists():
             try:
-                with open(cache_file, "r", encoding="utf-8") as f:
+                with open(cache_file, encoding="utf-8") as f:
                     data = json.load(f)
                 self._cache = data
                 logger.debug("Loaded %d cached sentiment scores", len(data))

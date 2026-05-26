@@ -1,16 +1,13 @@
 """Tests for PostgreSQL data provider and store."""
 
-import json
-import numpy as np
+from unittest.mock import MagicMock, patch
+
 import pandas as pd
 import pytest
-from datetime import datetime, timedelta
-from unittest.mock import patch, MagicMock
-
 from quant_platform.data.providers.postgres_provider import (
-    PostgresStore,
-    PostgresDataProvider,
     AsyncPostgresStore,
+    PostgresDataProvider,
+    PostgresStore,
 )
 
 

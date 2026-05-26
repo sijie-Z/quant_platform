@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from quant_platform.core.events import EventBus, get_event_bus
@@ -37,7 +37,7 @@ except ImportError:
 logger = get_logger(__name__)
 
 
-class CheckStatus(str, Enum):
+class CheckStatus(StrEnum):
     PASS = "pass"
     FAIL = "fail"
     SKIP = "skip"

@@ -15,11 +15,9 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
 
 import numpy as np
 import pandas as pd
-
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -140,7 +138,7 @@ class MultiStrategyManager:
         if all_returns and sum(weights) > 0:
             min_len = min(len(r) for r in all_returns)
             portfolio_rets = np.zeros(min_len)
-            for rets, w in zip(all_returns, weights):
+            for rets, w in zip(all_returns, weights, strict=False):
                 portfolio_rets += np.array(rets[-min_len:]) * w
 
             agg_sharpe = float(portfolio_rets.mean() / portfolio_rets.std() * np.sqrt(252)) if portfolio_rets.std() > 0 else 0

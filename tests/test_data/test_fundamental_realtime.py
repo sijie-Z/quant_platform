@@ -1,13 +1,12 @@
 """Tests for real-time fundamental data provider."""
 
-import numpy as np
-import pandas as pd
-import pytest
 import time
 
+import pandas as pd
+import pytest
 from quant_platform.data.providers.fundamental_realtime import (
-    FundamentalMetrics,
     FundamentalDataProvider,
+    FundamentalMetrics,
     FundamentalScreener,
 )
 

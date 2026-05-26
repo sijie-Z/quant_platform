@@ -24,7 +24,6 @@ Performance target:
 from __future__ import annotations
 
 import asyncio
-import bisect
 import json
 import logging
 import os
@@ -32,10 +31,11 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -363,7 +363,7 @@ class EventStore:
         if not self._wal_path or not self._wal_path.exists():
             return []
         events = []
-        with open(self._wal_path, 'r', encoding='utf-8') as f:
+        with open(self._wal_path, encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -692,7 +692,7 @@ class AsyncEventBus:
         if len(pattern_parts) != len(topic_parts):
             return False
 
-        for pp, tp in zip(pattern_parts, topic_parts):
+        for pp, tp in zip(pattern_parts, topic_parts, strict=False):
             if pp == '*':
                 continue
             if pp != tp:
@@ -934,7 +934,6 @@ async def benchmark_event_bus(
     """
     bus = AsyncEventBus(default_queue_size=queue_size)
     received = {"count": 0}
-    latencies = []
 
     async def counter_handler(event: Event):
         received["count"] += 1

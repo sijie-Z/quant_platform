@@ -22,8 +22,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from quant_platform.api.routes import router as api_router
 from quant_platform.api.monitor import router as monitor_router
+from quant_platform.api.routes import router as api_router
 
 # Determine frontend dist path
 _FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
@@ -78,14 +78,14 @@ def main():
     app = create_app(serve_frontend=serve_frontend)
 
     mode = "API + Frontend" if serve_frontend else "API only"
-    print(f"Quant Platform Web Server starting...")
+    print("Quant Platform Web Server starting...")
     print(f"  Mode: {mode}")
     print(f"  API:  http://{args.host}:{args.port}/api/docs")
     if serve_frontend:
         if _DIST_DIR.exists():
             print(f"  UI:   http://{args.host}:{args.port}/")
         else:
-            print(f"  UI:   Frontend not built. Run: cd frontend && npm run build")
+            print("  UI:   Frontend not built. Run: cd frontend && npm run build")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

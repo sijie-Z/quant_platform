@@ -43,19 +43,21 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections import deque
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
+from enum import StrEnum
 
 import numpy as np
 
 from quant_platform.execution.order_book import (
     BookOrder,
-    BookOrderStatus,
     OrderBook,
-    OrderType as BookOrderType,
-    Side as BookSide,
     Trade,
+)
+from quant_platform.execution.order_book import (
+    OrderType as BookOrderType,
+)
+from quant_platform.execution.order_book import (
+    Side as BookSide,
 )
 from quant_platform.utils.logging import get_logger
 
@@ -73,7 +75,7 @@ EXCHANGE_LATENCY_MS: dict[str, float] = {
 }
 
 
-class LatencyModel(str, Enum):
+class LatencyModel(StrEnum):
     """Pre-configured latency profiles."""
     ZERO = "zero"       # No latency (instant)
     LOW = "low"         # Co-located (1-3ms)
@@ -402,7 +404,6 @@ class PaperBroker:
             FillRecord with fill details
         """
         from quant_platform.trading.broker import Order as BrokerOrder
-        from quant_platform.trading.broker import OrderSide, OrderStatus
 
         # Extract order fields (support both Order types)
         if isinstance(order, BrokerOrder):

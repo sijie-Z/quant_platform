@@ -2,12 +2,11 @@
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from quant_platform.agent.sentiment_factor import (
-    LLMSentimentFactor,
-    KeywordSentimentAnalyzer,
     SAMPLE_HEADLINES_POOL,
+    KeywordSentimentAnalyzer,
+    LLMSentimentFactor,
 )
 
 

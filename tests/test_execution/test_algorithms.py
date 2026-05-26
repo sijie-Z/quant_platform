@@ -1,10 +1,13 @@
 """Tests for execution.algorithms — TWAP/VWAP/Iceberg/SmartRouter."""
 
-import pytest
 from datetime import datetime
+
 from quant_platform.execution.algorithms import (
-    TWAPAlgorithm, VWAPAlgorithm, IcebergAlgorithm, SmartRouter,
-    ExecutionPlan, ExecutionSlice,
+    ExecutionPlan,
+    IcebergAlgorithm,
+    SmartRouter,
+    TWAPAlgorithm,
+    VWAPAlgorithm,
 )
 from quant_platform.execution.models import Order, OrderSide
 

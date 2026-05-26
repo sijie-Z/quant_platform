@@ -1,8 +1,8 @@
 """Tests for core.state_machine — Portfolio state machine."""
 
-import pytest
 from quant_platform.core.state_machine import (
-    PortfolioStateMachine, PortfolioState, StateTransition,
+    PortfolioState,
+    PortfolioStateMachine,
 )
 
 

@@ -5,10 +5,8 @@ ST status by announcement date, and industry classification by effective_date,
 preventing look-ahead bias.
 """
 
-import numpy as np
 import pandas as pd
 import pytest
-
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.synthetic import SyntheticDataProvider
 

@@ -20,13 +20,13 @@ from __future__ import annotations
 import asyncio
 
 from quant_platform.core.message_bus import Message, MessageBus, create_message_bus
+from quant_platform.execution.algorithms import SmartRouter
 from quant_platform.execution.order_book import (
     BookOrder,
     OrderBookManager,
     OrderType,
     Side,
 )
-from quant_platform.execution.algorithms import SmartRouter
 from quant_platform.services.base import BaseService
 from quant_platform.utils.logging import get_logger
 
@@ -74,7 +74,7 @@ class ExecutionService(BaseService):
             )
 
             # Smart routing
-            algo = self.smart_router.select_algorithm(
+            self.smart_router.select_algorithm(
                 quantity=order.quantity,
                 symbol=order.symbol,
                 urgency=data.get("urgency", "normal"),
@@ -140,7 +140,7 @@ class ExecutionService(BaseService):
             tick = msg.data
             symbol = tick.get("symbol", "")
             if symbol:
-                book = self.order_manager.get_or_create(symbol)
+                self.order_manager.get_or_create(symbol)
                 # Update book state from tick
                 # (simplified — real impl would process order-by-order)
         except Exception as e:

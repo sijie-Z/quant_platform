@@ -24,34 +24,28 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any
 
 import numpy as np
 
-from quant_platform.core.store import Store
-from quant_platform.core.events import get_event_bus
 from quant_platform.core.audit import AuditLog
+from quant_platform.core.events import get_event_bus
 from quant_platform.core.state_machine import PortfolioStateMachine
-from quant_platform.risk.circuit_breaker import RiskMonitor, RiskLimits
-from quant_platform.trading.broker import (
-    BROKER_REGISTRY,
-    BrokerInterface,
-    Order,
-    OrderSide,
-    OrderStatus,
-    OrderType,
-    SimulatedBroker,
-    create_broker,
-)
+from quant_platform.core.store import Store
 from quant_platform.execution.paper_broker import (
     LatencyModel,
     PaperBroker,
     PaperBrokerMetrics,
+)
+from quant_platform.risk.circuit_breaker import RiskMonitor
+from quant_platform.trading.broker import (
+    Order,
+    OrderSide,
+    OrderType,
+    SimulatedBroker,
+    create_broker,
 )
 from quant_platform.utils.logging import get_logger
 
@@ -410,7 +404,7 @@ class LiveRunner:
 
         # Update risk monitor state
         risk_status = self._risk.get_status()
-        risk_level = risk_status.get("risk_level", "GREEN")
+        risk_status.get("risk_level", "GREEN")
 
         # Calculate P&L
         equity = self._get_equity()
@@ -480,7 +474,7 @@ class LiveRunner:
         # Generate synthetic price paths
         base_prices = {}
         for code in self._universe:
-            group = int(code[0:3]) if code.isdigit() else hash(code) % 1000
+            int(code[0:3]) if code.isdigit() else hash(code) % 1000
             base_prices[code] = 10.0 + rng.uniform(5, 195)
 
         for d in range(days):

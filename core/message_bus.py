@@ -33,8 +33,9 @@ import json
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 from quant_platform.utils.logging import get_logger
 
@@ -195,7 +196,7 @@ class LocalBus(MessageBus):
         # Create consumer tasks for all existing subscriptions
         for topic, handlers in self._handlers.items():
             queues = self._queues.get(topic, [])
-            for handler, queue in zip(handlers, queues):
+            for handler, queue in zip(handlers, queues, strict=False):
                 task = asyncio.create_task(self._consume(handler, queue, topic))
                 self._tasks.append(task)
         logger.info("LocalBus started with %d subscriptions", sum(len(h) for h in self._handlers.values()))
@@ -227,7 +228,7 @@ class LocalBus(MessageBus):
                 msg = await asyncio.wait_for(queue.get(), timeout=1.0)
                 await handler(msg)
                 self._delivered += 1
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
@@ -243,7 +244,7 @@ class LocalBus(MessageBus):
         topic_parts = topic.split('.')
         if len(pattern_parts) != len(topic_parts):
             return False
-        return all(p == '*' or p == t for p, t in zip(pattern_parts, topic_parts))
+        return all(p == '*' or p == t for p, t in zip(pattern_parts, topic_parts, strict=False))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -410,7 +411,7 @@ class RedisBus(MessageBus):
         topic_parts = topic.split('.')
         if len(pattern_parts) != len(topic_parts):
             return False
-        return all(p == '*' or p == t for p, t in zip(pattern_parts, topic_parts))
+        return all(p == '*' or p == t for p, t in zip(pattern_parts, topic_parts, strict=False))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -453,7 +454,7 @@ class KafkaBus(MessageBus):
 
     async def start(self):
         try:
-            from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+            from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
             self._producer = AIOKafkaProducer(
                 bootstrap_servers=self._brokers,

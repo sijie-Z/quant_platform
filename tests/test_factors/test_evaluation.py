@@ -2,15 +2,14 @@
 
 import numpy as np
 import pandas as pd
-
 from quant_platform.factors.evaluation import (
-    rank_ic,
-    pearson_ic,
-    ic_summary,
-    quantile_returns,
     factor_correlation,
     factor_turnover,
     ic_decay,
+    ic_summary,
+    pearson_ic,
+    quantile_returns,
+    rank_ic,
 )
 
 

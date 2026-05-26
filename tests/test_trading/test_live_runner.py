@@ -8,8 +8,6 @@ from quant_platform.trading.live_runner import (
     LiveRunner,
     SessionReport,
 )
-from quant_platform.execution.paper_broker import LatencyModel
-
 
 # ── DailyReport ──
 

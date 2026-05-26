@@ -9,10 +9,8 @@ from quant_platform.execution.order_book import (
     OrderType,
     PriceLevel,
     Side,
-    Trade,
     benchmark_order_book,
 )
-
 
 # ── PriceLevel Tests ──
 

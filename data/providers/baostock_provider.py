@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import DataProvider
@@ -360,7 +358,7 @@ class BaostockDataProvider(DataProvider):
         cache_key = "industry_map"
         cached = self._load_cache(cache_key)
         if cached is not None:
-            return dict(zip(cached.index, cached["industry"]))
+            return dict(zip(cached.index, cached["industry"], strict=False))
 
         self._login()
         import baostock as bs
@@ -382,7 +380,7 @@ class BaostockDataProvider(DataProvider):
             lambda x: x[:3] if isinstance(x, str) and len(x) >= 3 else "Unknown")
 
         self._save_cache(cache_key, df[["industry"]])
-        return dict(zip(df.index, df["industry"]))
+        return dict(zip(df.index, df["industry"], strict=False))
 
     def close(self):
         """Logout from baostock."""

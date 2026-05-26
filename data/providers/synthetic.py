@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import DataProvider
-from quant_platform.data.schema import SECTORS, SECTOR_WEIGHTS
+from quant_platform.data.schema import SECTOR_WEIGHTS, SECTORS
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -259,7 +259,7 @@ class SyntheticDataProvider(DataProvider):
             # Momentum alpha (moderate, realistic A-share level)
             alpha_return[t] += 0.015 * momentum_1m[t]
 
-            # Value alpha 
+            # Value alpha
             value_weight = min(1.0, t / 63)
             alpha_return[t] += 0.008 * value_signal * value_weight
 

@@ -1,13 +1,12 @@
 """Tests for technical factors."""
 
-import numpy as np
 
 from quant_platform.factors.technical import (
+    MACDFactor,
     Momentum1M,
     Momentum12M,
-    Volatility20D,
     RSIFactor,
-    MACDFactor,
+    Volatility20D,
 )
 
 

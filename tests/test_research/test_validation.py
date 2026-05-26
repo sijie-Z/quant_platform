@@ -1,6 +1,5 @@
 """Tests for FactorValidator — Deflated Sharpe Ratio and multiple testing correction."""
 
-import math
 
 import numpy as np
 import pytest

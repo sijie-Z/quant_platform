@@ -5,16 +5,12 @@ import asyncio
 import pytest
 
 from quant_platform.core.message_bus import (
-    KafkaBus,
     LocalBus,
     Message,
-    MessageBus,
-    RedisBus,
     ServiceInfo,
     ServiceRegistry,
     create_message_bus,
 )
-
 
 # ── Message Tests ──
 

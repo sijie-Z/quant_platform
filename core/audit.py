@@ -15,8 +15,7 @@ from __future__ import annotations
 import time
 import uuid
 from datetime import datetime
-from enum import Enum
-from typing import Any
+from enum import StrEnum
 
 from quant_platform.core.events import EventBus, get_event_bus
 from quant_platform.core.store import Store
@@ -25,7 +24,7 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-class AuditAction(str, Enum):
+class AuditAction(StrEnum):
     SIGNAL_GENERATED = "signal_generated"
     ORDER_SUBMITTED = "order_submitted"
     ORDER_FILLED = "order_filled"
@@ -66,7 +65,7 @@ class AuditLog:
     ):
         """Log an audit event."""
         event_id = uuid.uuid4().hex[:12]
-        now = datetime.now().isoformat()
+        datetime.now().isoformat()
 
         record = {
             "event_id": event_id,

@@ -2,32 +2,30 @@
 
 import os
 import sys
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from quant_platform.trading.broker import (
-    QMTBroker,
     Order,
     OrderSide,
     OrderStatus,
     OrderType,
-    Position,
+    QMTBroker,
     create_broker,
 )
 from quant_platform.trading.qmt_utils import (
     classify_exchange,
-    to_qmt_code,
-    from_qmt_code,
-    to_qmt_exchange,
-    to_qmt_price_type,
-    to_qmt_order_type,
-    qmt_status_to_internal,
     describe_qmt_error,
-    qmt_trade_to_dict,
+    from_qmt_code,
     qmt_position_to_dict,
+    qmt_status_to_internal,
+    qmt_trade_to_dict,
+    to_qmt_code,
+    to_qmt_exchange,
+    to_qmt_order_type,
+    to_qmt_price_type,
 )
-
 
 # ── Symbol mapping ──
 
