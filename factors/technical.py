@@ -15,6 +15,9 @@ import pandas as pd
 
 from quant_platform.factors.base import BaseFactor, FactorCategory
 from quant_platform.factors.registry import get_registry
+from quant_platform.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +130,10 @@ class TurnoverFactor(BaseFactor):
         return self._name
 
     def compute(self, prices: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        turnover = kwargs.get("turnover")
+        if turnover is not None:
+            return turnover.rolling(self._period).mean()
+        logger.warning("turnover data not provided, using price SMA as proxy")
         return prices.rolling(self._period).mean()
 
 

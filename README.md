@@ -5,8 +5,8 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/Tests-857%20Passed-brightgreen?logo=pytest" alt="Tests">
-  <img src="https://img.shields.io/badge/Modules-91-orange" alt="Modules">
+  <img src="https://img.shields.io/badge/Tests-1077%20Passed-brightgreen?logo=pytest" alt="Tests">
+  <img src="https://img.shields.io/badge/Modules-96-orange" alt="Modules">
   <img src="https://img.shields.io/badge/Lines-30%2C000%2B-yellow" alt="Lines">
   <img src="https://img.shields.io/badge/API-97%20Endpoints-red?logo=fastapi" alt="API">
   <img src="https://img.shields.io/badge/Factors-15-purple" alt="Factors">
@@ -97,7 +97,7 @@ Data Layer  -->  Factor Engine  -->  Alpha Model  -->  Portfolio Optimizer
                                                           |
                                                           v
                                       Web Dashboard (Vue 3 + ECharts)
-                                      REST API (91 endpoints)
+                                      REST API (97 endpoints)
                                       WebSocket (Real-time Push)
 ```
 
@@ -259,7 +259,7 @@ Data Layer  -->  Factor Engine  -->  Alpha Model  -->  Portfolio Optimizer
 <details>
 <summary><b>11. Web Interface</b> <code>app.py</code> + <code>frontend/</code></summary>
 
-- **FastAPI**: 91 REST API endpoints
+- **FastAPI**: 97 REST API endpoints
 - **Vue 3 Frontend**: Bloomberg Terminal-style dark dashboard + 8 views
 - **WebSocket**: EventBus -> WebSocket bridge, real-time trading event push
 
@@ -312,6 +312,23 @@ python main.py ml train --model lightgbm
 python main.py ml signal --model xgboost
 ```
 
+### Live Trading
+
+```bash
+# Paper trading (default, 30-day simulation)
+python main.py trade
+
+# Paper trading with custom settings
+python main.py trade --broker paper --days 60 --universe "600519,000858,000001,300750"
+
+# QMT sim trading (requires miniQMT + xtquant installed)
+export QMT_PASSWORD="your_sim_password"
+python main.py trade --broker qmt --days 30
+
+# QMT with no dual-track (primary broker only)
+python main.py trade --broker qmt --no-dual-track
+```
+
 ### Web Service
 
 ```bash
@@ -325,7 +342,7 @@ open http://localhost:8000/api/docs
 ### Test
 
 ```bash
-# Run all 857 tests
+# Run all 1077 tests
 pytest tests/ -v
 
 # Run core architecture tests only
@@ -500,7 +517,7 @@ quant_platform/
 │   └── config.py                    # YAML config loading
 │
 ├── api/                             # Web API
-│   ├── routes.py                    # 91 FastAPI endpoints
+│   ├── routes.py                    # 97 FastAPI endpoints
 │   └── schemas.py                   # Pydantic models
 │
 ├── frontend/                        # Vue 3 Frontend
@@ -512,7 +529,7 @@ quant_platform/
 ├── docs/
 │   └── index.html                   # GitHub Pages architecture documentation
 │
-└── tests/                           # 857 Unit Tests
+└── tests/                           # 1077 Unit Tests
     ├── test_core/                   # EventBus(13)+EventBus v2(25)+MessageBus(16)+Store(16)+StateMachine(15)+Audit(10)+Scheduler(2)+Tenant(8)
     ├── test_execution/              # OrderBook(22)+OMS(17)+Algorithms(13)+MarketImpact(10)+TCA(21)
     ├── test_api/                    # MonitorAPI(33)
@@ -522,7 +539,7 @@ quant_platform/
     ├── test_backtest/               # TickEngine(15)+Cost(4)+Metrics(7)+WalkForward(2)+Capacity(9)
     ├── test_research/               # DeflatedSharpe(8)+MultipleTesting(8)
     ├── test_utils/                  # Cython(18)+Numba+Cache+Config+Metrics
-    └── ...                          # 857 tests total
+    └── ...                          # 1077 tests total
 ```
 
 ---

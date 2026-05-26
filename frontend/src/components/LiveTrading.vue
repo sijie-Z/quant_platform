@@ -8,23 +8,23 @@
         <span v-if="stateMachine" class="lt-sm-badge" :class="'sm-' + stateMachine">{{ stateMachine }}</span>
         <span v-if="marketStatus" class="lt-market-badge">{{ marketStatus }}</span>
         <span v-if="riskLevel" class="lt-risk-badge" :class="'risk-' + riskLevel">{{ riskLevel }}</span>
-        <span v-if="state.started_at" class="lt-started">Started: {{ fmtTime(state.started_at) }}</span>
+        <span v-if="state.started_at" class="lt-started">{{ locale === 'zh-CN' ? '启动于: ' : 'Started: ' }}{{ fmtTime(state.started_at) }}</span>
       </div>
       <div class="lt-control-right">
         <button v-if="engineStatus !== 'running'" class="lt-btn lt-btn-start" @click="start">
-          ▶ Start Trading
+          {{ locale === 'zh-CN' ? '▶ 启动交易' : '▶ Start Trading' }}
         </button>
         <button v-else class="lt-btn lt-btn-stop" @click="stop">
-          ■ Stop
+          {{ locale === 'zh-CN' ? '■ 停止' : '■ Stop' }}
         </button>
         <button v-if="riskLevel === 'kill'" class="lt-btn lt-btn-kill" @click="deactivateKill">
-          Unlock Kill Switch
+          {{ locale === 'zh-CN' ? '解除熔断' : 'Unlock Kill Switch' }}
         </button>
         <button v-else-if="engineStatus === 'running'" class="lt-btn lt-btn-kill-on" @click="activateKill">
-          Kill Switch
+          {{ locale === 'zh-CN' ? '紧急熔断' : 'Kill Switch' }}
         </button>
         <button class="lt-btn lt-btn-refresh" @click="refresh" :disabled="refreshing">
-          ↻ Refresh
+          {{ locale === 'zh-CN' ? '↻ 刷新' : '↻ Refresh' }}
         </button>
       </div>
     </div>
@@ -33,33 +33,33 @@
     <div v-if="engineStatus === 'idle' || engineStatus === 'no_engine'" class="lt-config">
       <div class="lt-config-row">
         <div class="lt-field">
-          <label>Broker</label>
+          <label>{{ locale === 'zh-CN' ? '券商' : 'Broker' }}</label>
           <select v-model="config.broker">
-            <option value="simulated">Paper Trading (Simulated)</option>
-            <option value="qmt">QMT/xtquant (Live)</option>
+            <option value="simulated">{{ locale === 'zh-CN' ? '模拟交易' : 'Paper Trading (Simulated)' }}</option>
+            <option value="qmt">{{ locale === 'zh-CN' ? 'QMT/xtquant (实盘)' : 'QMT/xtquant (Live)' }}</option>
           </select>
         </div>
         <div class="lt-field">
-          <label>Initial Cash</label>
+          <label>{{ locale === 'zh-CN' ? '初始资金' : 'Initial Cash' }}</label>
           <input v-model.number="config.initial_cash" type="number" step="100000" />
         </div>
         <div class="lt-field">
-          <label>Portfolio Size</label>
+          <label>{{ locale === 'zh-CN' ? '持仓数量' : 'Portfolio Size' }}</label>
           <input v-model.number="config.n_stocks" type="number" step="10" />
         </div>
         <div class="lt-field">
-          <label>Rebalance (sec)</label>
+          <label>{{ locale === 'zh-CN' ? '再平衡(秒)' : 'Rebalance (sec)' }}</label>
           <input v-model.number="config.rebalance_interval" type="number" step="60" />
         </div>
       </div>
       <div v-if="config.broker === 'qmt'" class="lt-config-row">
         <div class="lt-field lt-field-wide">
-          <label>QMT Path</label>
+          <label>{{ locale === 'zh-CN' ? 'QMT路径' : 'QMT Path' }}</label>
           <input v-model="config.qmt_path" placeholder="C:\国金证券QMT\UserData_mini" />
         </div>
         <div class="lt-field">
-          <label>Account ID</label>
-          <input v-model="config.account_id" placeholder="Your broker account ID" />
+          <label>{{ locale === 'zh-CN' ? '账户ID' : 'Account ID' }}</label>
+          <input v-model="config.account_id" :placeholder="locale === 'zh-CN' ? '请输入券商账户ID' : 'Your broker account ID'" />
         </div>
       </div>
     </div>
@@ -67,47 +67,47 @@
     <!-- Live Metrics (when running) -->
     <div v-if="engineStatus === 'running' || engineStatus === 'error'" class="lt-metrics">
       <div class="lt-metric">
-        <div class="lt-metric-label">Portfolio Value</div>
+        <div class="lt-metric-label">{{ locale === 'zh-CN' ? '组合价值' : 'Portfolio Value' }}</div>
         <div class="lt-metric-val">{{ fmtMoney(state.portfolio_value) }}</div>
       </div>
       <div class="lt-metric">
-        <div class="lt-metric-label">Cash</div>
+        <div class="lt-metric-label">{{ locale === 'zh-CN' ? '现金' : 'Cash' }}</div>
         <div class="lt-metric-val">{{ fmtMoney(state.cash) }}</div>
       </div>
       <div class="lt-metric">
-        <div class="lt-metric-label">Total P&L</div>
+        <div class="lt-metric-label">{{ locale === 'zh-CN' ? '总盈亏' : 'Total P&L' }}</div>
         <div class="lt-metric-val" :class="state.total_pnl >= 0 ? 'pos' : 'neg'">
           {{ fmtMoney(state.total_pnl) }} ({{ (state.total_pnl_pct * 100).toFixed(2) }}%)
         </div>
       </div>
       <div class="lt-metric">
-        <div class="lt-metric-label">Positions</div>
+        <div class="lt-metric-label">{{ locale === 'zh-CN' ? '持仓数' : 'Positions' }}</div>
         <div class="lt-metric-val">{{ state.n_positions }}</div>
       </div>
       <div class="lt-metric">
-        <div class="lt-metric-label">Cycles</div>
+        <div class="lt-metric-label">{{ locale === 'zh-CN' ? '运行周期' : 'Cycles' }}</div>
         <div class="lt-metric-val">{{ state.n_cycles }}</div>
       </div>
       <div class="lt-metric">
-        <div class="lt-metric-label">Trades</div>
+        <div class="lt-metric-label">{{ locale === 'zh-CN' ? '交易次数' : 'Trades' }}</div>
         <div class="lt-metric-val">{{ state.total_trades }}</div>
       </div>
     </div>
 
     <!-- Positions Table -->
     <div v-if="positions.length" class="lt-section">
-      <div class="lt-section-title">Live Positions</div>
+      <div class="lt-section-title">{{ locale === 'zh-CN' ? '实时持仓' : 'Live Positions' }}</div>
       <table class="lt-table">
         <thead>
           <tr>
-            <th>Code</th>
-            <th>Name</th>
-            <th>Qty</th>
-            <th>Avg Cost</th>
-            <th>Price</th>
-            <th>Market Value</th>
-            <th>P&L</th>
-            <th>P&L %</th>
+            <th>{{ locale === 'zh-CN' ? '代码' : 'Code' }}</th>
+            <th>{{ locale === 'zh-CN' ? '名称' : 'Name' }}</th>
+            <th>{{ locale === 'zh-CN' ? '数量' : 'Qty' }}</th>
+            <th>{{ locale === 'zh-CN' ? '均价' : 'Avg Cost' }}</th>
+            <th>{{ locale === 'zh-CN' ? '现价' : 'Price' }}</th>
+            <th>{{ locale === 'zh-CN' ? '市值' : 'Market Value' }}</th>
+            <th>{{ locale === 'zh-CN' ? '盈亏' : 'P&L' }}</th>
+            <th>{{ locale === 'zh-CN' ? '盈亏%' : 'P&L %' }}</th>
           </tr>
         </thead>
         <tbody>
@@ -131,14 +131,14 @@
 
     <!-- Recent Cycles -->
     <div v-if="cycles.length" class="lt-section">
-      <div class="lt-section-title">Recent Trading Cycles</div>
+      <div class="lt-section-title">{{ locale === 'zh-CN' ? '近期交易周期' : 'Recent Trading Cycles' }}</div>
       <div class="lt-cycles">
         <div v-for="c in cycles" :key="c.cycle_id" class="lt-cycle">
           <div class="lt-cycle-head">
             <span class="lt-cycle-id">#{{ c.cycle_id }}</span>
             <span class="lt-cycle-time">{{ fmtTime(c.timestamp) }}</span>
-            <span class="lt-cycle-signals">{{ c.signals?.length || 0 }} signals</span>
-            <span class="lt-cycle-orders">{{ c.orders?.length || 0 }} orders</span>
+            <span class="lt-cycle-signals">{{ c.signals?.length || 0 }}{{ locale === 'zh-CN' ? '个信号' : ' signals' }}</span>
+            <span class="lt-cycle-orders">{{ c.orders?.length || 0 }}{{ locale === 'zh-CN' ? '个订单' : ' orders' }}</span>
             <span class="lt-cycle-eq">{{ fmtMoney(c.portfolio_value) }}</span>
           </div>
           <div v-if="c.orders?.length" class="lt-cycle-orders-detail">
@@ -157,38 +157,38 @@
     <!-- Risk Monitor -->
     <div v-if="riskStatus" class="lt-section">
       <div class="lt-section-title">
-        Risk Monitor
+        {{ locale === 'zh-CN' ? '风险监控' : 'Risk Monitor' }}
         <span class="lt-risk-level" :class="'risk-' + (riskStatus.risk_level || 'green')">
           {{ (riskStatus.risk_level || 'green').toUpperCase() }}
         </span>
       </div>
       <div class="lt-risk-grid">
         <div class="lt-risk-item">
-          <span class="lt-risk-label">Kill Switch</span>
+          <span class="lt-risk-label">{{ locale === 'zh-CN' ? '紧急熔断' : 'Kill Switch' }}</span>
           <span :class="riskStatus.kill_switch_active ? 'neg' : 'pos'">
-            {{ riskStatus.kill_switch_active ? 'ACTIVE' : 'OFF' }}
+            {{ riskStatus.kill_switch_active ? (locale === 'zh-CN' ? '已激活' : 'ACTIVE') : (locale === 'zh-CN' ? '关闭' : 'OFF') }}
           </span>
         </div>
         <div class="lt-risk-item">
-          <span class="lt-risk-label">Portfolio Value</span>
+          <span class="lt-risk-label">{{ locale === 'zh-CN' ? '组合价值' : 'Portfolio Value' }}</span>
           <span class="mono">{{ fmtMoney(riskStatus.portfolio_value) }}</span>
         </div>
         <div class="lt-risk-item">
-          <span class="lt-risk-label">Peak Value</span>
+          <span class="lt-risk-label">{{ locale === 'zh-CN' ? '峰值' : 'Peak Value' }}</span>
           <span class="mono">{{ fmtMoney(riskStatus.peak_value) }}</span>
         </div>
         <div class="lt-risk-item">
-          <span class="lt-risk-label">Daily P&L</span>
+          <span class="lt-risk-label">{{ locale === 'zh-CN' ? '日盈亏' : 'Daily P&L' }}</span>
           <span class="mono" :class="(riskStatus.daily_pnl || 0) >= 0 ? 'pos' : 'neg'">
             {{ fmtMoney(riskStatus.daily_pnl) }}
           </span>
         </div>
         <div class="lt-risk-item">
-          <span class="lt-risk-label">Max Drawdown Limit</span>
+          <span class="lt-risk-label">{{ locale === 'zh-CN' ? '最大回撤限额' : 'Max Drawdown Limit' }}</span>
           <span class="mono">{{ ((riskStatus.limits?.max_drawdown_pct || 0.15) * 100).toFixed(0) }}%</span>
         </div>
         <div class="lt-risk-item">
-          <span class="lt-risk-label">Max Position Limit</span>
+          <span class="lt-risk-label">{{ locale === 'zh-CN' ? '仓位上限' : 'Max Position Limit' }}</span>
           <span class="mono">{{ ((riskStatus.limits?.max_single_position_pct || 0.05) * 100).toFixed(0) }}%</span>
         </div>
       </div>
@@ -206,7 +206,7 @@
     <div class="lt-triple">
       <!-- State Machine History -->
       <div class="lt-section lt-triple-col">
-        <div class="lt-section-title">State Machine</div>
+        <div class="lt-section-title">{{ locale === 'zh-CN' ? '状态机' : 'State Machine' }}</div>
         <div class="lt-sm-history">
           <div v-for="(t, i) in stateHistory" :key="i" class="lt-sm-transition">
             <span class="lt-sm-from" :class="'sm-' + t.from">{{ t.from }}</span>
@@ -215,13 +215,13 @@
             <span class="lt-sm-reason">{{ t.reason }}</span>
             <span class="lt-sm-time">{{ fmtTime(t.time) }}</span>
           </div>
-          <div v-if="!stateHistory.length" class="lt-empty">No transitions yet</div>
+          <div v-if="!stateHistory.length" class="lt-empty">{{ locale === 'zh-CN' ? '暂无状态转换' : 'No transitions yet' }}</div>
         </div>
       </div>
 
       <!-- Audit Log -->
       <div class="lt-section lt-triple-col">
-        <div class="lt-section-title">Audit Trail</div>
+        <div class="lt-section-title">{{ locale === 'zh-CN' ? '审计日志' : 'Audit Trail' }}</div>
         <div class="lt-audit-list">
           <div v-for="(e, i) in auditEvents" :key="i" class="lt-audit-item">
             <span class="lt-audit-action" :class="'audit-' + (e.data?.action || '')">
@@ -230,14 +230,14 @@
             <span class="lt-audit-comp">{{ e.data?.component || '' }}</span>
             <span class="lt-audit-reason">{{ e.data?.reason || '' }}</span>
           </div>
-          <div v-if="!auditEvents.length" class="lt-empty">No audit events</div>
+          <div v-if="!auditEvents.length" class="lt-empty">{{ locale === 'zh-CN' ? '暂无审计事件' : 'No audit events' }}</div>
         </div>
       </div>
 
       <!-- Event Stream -->
       <div class="lt-section lt-triple-col">
         <div class="lt-section-title">
-          Event Stream
+          {{ locale === 'zh-CN' ? '事件流' : 'Event Stream' }}
           <span class="lt-event-count">{{ wsEvents.length }}</span>
         </div>
         <div class="lt-event-list">
@@ -245,7 +245,7 @@
             <span class="lt-event-topic">{{ e.event }}</span>
             <span class="lt-event-data">{{ summarizeEvent(e.data) }}</span>
           </div>
-          <div v-if="!wsEvents.length" class="lt-empty">No events yet</div>
+          <div v-if="!wsEvents.length" class="lt-empty">{{ locale === 'zh-CN' ? '暂无事件' : 'No events yet' }}</div>
         </div>
       </div>
     </div>
@@ -253,7 +253,7 @@
     <!-- Market Snapshot -->
     <div class="lt-section">
       <div class="lt-section-title">
-        Real-Time Market
+        {{ locale === 'zh-CN' ? '实时行情' : 'Real-Time Market' }}
         <span class="lt-market-time" v-if="marketTime">{{ marketTime }}</span>
       </div>
       <div v-if="marketStocks.length" class="lt-market-grid">
@@ -264,13 +264,14 @@
           <div class="lt-stock-change">{{ (s['涨跌幅'] || 0).toFixed(2) }}%</div>
         </div>
       </div>
-      <div v-else class="lt-empty">Loading market data...</div>
+      <div v-else class="lt-empty">{{ locale === 'zh-CN' ? '加载行情数据...' : 'Loading market data...' }}</div>
     </div>
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
+import { useI18n } from '../i18n/index.js'
 import {
   startTrading, stopTrading, getTradingStatus,
   getTradingPositions, getTradingAccount, getTradingCycles,
@@ -278,6 +279,8 @@ import {
   getCoreState, getCoreAudit, getCoreRisk, toggleCoreKillSwitch,
   createStatusSocket
 } from '../api/index.js'
+
+const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 
@@ -318,11 +321,11 @@ async function start() {
   try {
     await startTrading(config)
     engineStatus.value = 'running'
-    emit('toast', { message: 'Live trading engine started', type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '实盘交易引擎已启动' : 'Live trading engine started', type: 'success' })
     startPolling()
     connectWS()
   } catch (e) {
-    emit('toast', { message: 'Failed to start: ' + (e.response?.data?.detail || e.message), type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '启动失败: ' + (e.response?.data?.detail || e.message) : 'Failed to start: ' + (e.response?.data?.detail || e.message), type: 'error' })
   }
 }
 
@@ -330,30 +333,30 @@ async function stop() {
   try {
     await stopTrading()
     engineStatus.value = 'idle'
-    emit('toast', { message: 'Engine stopped', type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '引擎已停止' : 'Engine stopped', type: 'success' })
     stopPolling()
   } catch (e) {
-    emit('toast', { message: 'Failed to stop', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '停止失败' : 'Failed to stop', type: 'error' })
   }
 }
 
 async function activateKill() {
   try {
     await toggleCoreKillSwitch(true, 'Manual UI activation')
-    emit('toast', { message: 'Kill switch activated — all orders blocked', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '紧急熔断已激活 — 所有订单已被阻止' : 'Kill switch activated — all orders blocked', type: 'error' })
     await fetchRisk()
   } catch (e) {
-    emit('toast', { message: 'Failed to activate kill switch', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '激活熔断失败' : 'Failed to activate kill switch', type: 'error' })
   }
 }
 
 async function deactivateKill() {
   try {
     await toggleCoreKillSwitch(false)
-    emit('toast', { message: 'Kill switch deactivated', type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '紧急熔断已解除' : 'Kill switch deactivated', type: 'success' })
     await fetchRisk()
   } catch (e) {
-    emit('toast', { message: 'Failed to deactivate kill switch', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '解除熔断失败' : 'Failed to deactivate kill switch', type: 'error' })
   }
 }
 

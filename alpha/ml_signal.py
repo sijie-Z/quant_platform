@@ -526,34 +526,87 @@ class MLSignalGenerator:
         self,
         factors: dict[str, pd.DataFrame],
         forward_returns: pd.DataFrame,
-        force_retrain: bool = False,
     ) -> pd.DataFrame:
-        """Full pipeline: train (if needed) and generate signals.
+        """Walk-forward signal generation — NO look-ahead bias.
 
-        Args:
-            factors: processed factor values
-            forward_returns: forward returns for training
-            force_retrain: force retraining even if model exists
+        For each date t:
+        1. Train on data[0:t] (expanding window)
+        2. Predict only on data[t] (current cross-section)
+        3. Retrain every retrain_frequency dates
 
-        Returns:
-            (date x asset) ML-based alpha signal
+        This is the ONLY correct way to use ML in backtesting.
         """
         first_factor = list(factors.values())[0]
-        current_date = first_factor.index[-1]
+        dates = first_factor.index
+        assets = first_factor.columns
+        feature_names = sorted(factors.keys())[:self.config.top_n_features]
+        n_dates = len(dates)
 
-        should_train = (
-            self.model is None
-            or force_retrain
-            or self._last_train_date is None
-            or (hasattr(current_date, 'freq') and
-                len(pd.bdate_range(self._last_train_date, current_date)) > self.config.retrain_frequency)
-        )
+        signal_data = np.full((n_dates, len(assets)), np.nan)
+        model = None
+        last_train_idx = -self.config.retrain_frequency  # force first train
+        perf_log = []
 
-        if should_train:
-            logger.info("Training ML model (force=%s)...", force_retrain)
-            self.train(factors, forward_returns)
+        for i in range(max(self.config.train_window, 60), n_dates):
+            # Check if we need to retrain
+            if i - last_train_idx >= self.config.retrain_frequency or model is None:
+                # Prepare training data: all dates before i
+                train_start = max(0, i - self.config.train_window)
+                X_train, y_train, feat_names = self._prepare_dataset(
+                    factors, forward_returns, train_start, i
+                )
 
-        return self.predict(factors)
+                if len(X_train) < 100:
+                    continue
+
+                model = self._create_model()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    model.fit(X_train, y_train)
+
+                last_train_idx = i
+
+                # Quick in-sample IC check
+                train_pred = model.predict(X_train)
+                train_ic = float(np.corrcoef(y_train, train_pred)[0, 1]) if len(y_train) > 10 else 0
+                perf_log.append({'idx': i, 'date': str(dates[i])[:10], 'train_ic': train_ic,
+                                 'n_train': len(X_train)})
+
+            if model is None:
+                continue
+
+            # Predict on current date only
+            features = []
+            valid_mask = np.ones(len(assets), dtype=bool)
+            for name in feature_names:
+                df = factors[name]
+                if dates[i] in df.index:
+                    row = df.loc[dates[i]].values
+                else:
+                    row = np.full(len(assets), np.nan)
+                features.append(row)
+                valid_mask = valid_mask & ~np.isnan(row)
+
+            if not valid_mask.any():
+                continue
+
+            X = np.column_stack(features)
+            X_valid = X[valid_mask]
+
+            pred = model.predict(X_valid)
+            signal_data[i][valid_mask] = pred
+
+        signal = pd.DataFrame(signal_data, index=dates, columns=assets)
+        # Cross-sectional rank normalization
+        signal = signal.rank(axis=1, pct=True, na_option="keep") - 0.5
+
+        # Log performance
+        if perf_log:
+            avg_ic = np.mean([p['train_ic'] for p in perf_log])
+            logger.info("Walk-forward ML: %d retrain cycles, avg train_IC=%.4f",
+                        len(perf_log), avg_ic)
+
+        return signal
 
     def save_model(self, path: str):
         """Save model to disk."""

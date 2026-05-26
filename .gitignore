@@ -21,16 +21,21 @@ env/
 .quant_cache/
 .sentiment_cache/
 .pytest_cache/
+.agent_cache/
+.ruff_cache/
+.mypy_cache/
 
 # Results (generated)
 results/*.csv
 results/*.png
 results/*.pdf
+results/
 
 # Coverage
 .coverage
 htmlcov/
 .coverage.*
+*.py,cover
 
 # Jupyter
 .ipynb_checkpoints/
@@ -54,3 +59,14 @@ data/*.db
 
 # Frontend build
 frontend/dist/
+
+# Cache
+.cache/
+
+# Logs
+*.log
+baostock_run.log
+baostock_run_err.log
+
+# Generated data
+frontend/data/

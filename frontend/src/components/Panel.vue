@@ -10,7 +10,7 @@
         <button
           class="panel-max-btn"
           @click="maximized = !maximized"
-          :title="maximized ? 'Restore' : 'Maximize'"
+          :title="maximized ? $t('common.close') : $t('panel.loading')"
         >{{ maximized ? '&#9633;' : '&#9634;' }}</button>
       </div>
     </div>
@@ -22,6 +22,9 @@
 
 <script setup>
 import { ref, computed } from 'vue'
+import { useI18n } from '../i18n/index.js'
+
+const { $t } = useI18n()
 
 const props = defineProps({
   title: { type: String, default: '' },
@@ -30,6 +33,8 @@ const props = defineProps({
 })
 
 const maximized = ref(false)
+
+const maximizeTitle = computed(() => maximized.value ? $t('common.close') : $t('panel.loading'))
 
 const dotStyle = computed(() => {
   if (!props.dotColor) return {}
@@ -81,11 +86,13 @@ const dotStyle = computed(() => {
   font-weight: 600;
   color: var(--text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.8px;
+  letter-spacing: 0.5px;
   display: flex;
   align-items: center;
-  gap: 7px;
-  white-space: nowrap;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .panel-dot {

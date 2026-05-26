@@ -77,7 +77,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import TerminalHeader from './components/TerminalHeader.vue'
 import TerminalDashboard from './components/TerminalDashboard.vue'
 import LivePortfolio from './components/LivePortfolio.vue'
@@ -93,19 +93,22 @@ import StatusBar from './components/StatusBar.vue'
 import Toast from './components/Toast.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import { healthCheck } from './api/index.js'
+import { useI18n } from './i18n/index.js'
 
-const views = [
-  { id: 'terminal', label: 'Terminal' },
-  { id: 'trading', label: 'Trading' },
-  { id: 'live', label: 'Live' },
-  { id: 'oms', label: 'OMS' },
-  { id: 'compare', label: 'Compare' },
-  { id: 'sweep', label: 'Sweep' },
-  { id: 'factors', label: 'Factors' },
-  { id: 'history', label: 'History' },
-  { id: 'settings', label: 'Settings' },
-  { id: 'monitor', label: 'Monitor' },
-]
+const { $t } = useI18n()
+
+const views = computed(() => [
+  { id: 'terminal', label: $t('nav.terminal') },
+  { id: 'trading', label: $t('nav.trading') },
+  { id: 'live', label: $t('nav.live') },
+  { id: 'oms', label: $t('nav.oms') },
+  { id: 'compare', label: $t('nav.compare') },
+  { id: 'sweep', label: $t('nav.sweep') },
+  { id: 'factors', label: $t('nav.factors') },
+  { id: 'history', label: $t('nav.history') },
+  { id: 'settings', label: $t('nav.settings') },
+  { id: 'monitor', label: $t('nav.monitor') },
+])
 
 const currentView = ref('terminal')
 const backendAlive = ref(false)

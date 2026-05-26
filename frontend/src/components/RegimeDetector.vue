@@ -3,11 +3,11 @@
     <div class="regime-header">
       <div class="regime-title">
         <span :class="['regime-dot', `regime-${regime?.overall_regime || 'neutral'}`]"></span>
-        MARKET REGIME DETECTOR
+        {{ locale === 'zh-CN' ? '市场状态检测' : 'MARKET REGIME DETECTOR' }}
       </div>
       <div class="regime-actions">
         <button class="btn btn-sm btn-primary" @click="detect" :disabled="loading">
-          {{ loading ? 'Analyzing...' : 'Detect Regime' }}
+          {{ loading ? (locale === 'zh-CN' ? '分析中...' : 'Analyzing...') : (locale === 'zh-CN' ? '检测状态' : 'Detect Regime') }}
         </button>
       </div>
     </div>
@@ -28,14 +28,14 @@
           </svg>
           <div class="regime-score-label">
             <div class="regime-score-value">{{ (regime.composite_risk_score * 100).toFixed(0) }}</div>
-            <div class="regime-score-sub">RISK</div>
+            <div class="regime-score-sub">{{ locale === 'zh-CN' ? '风险' : 'RISK' }}</div>
           </div>
         </div>
         <div class="regime-score-info">
           <div :class="['regime-badge-lg', `regime-badge-${regime.overall_regime}`]">
-            {{ regime.overall_regime?.toUpperCase() }}
+            {{ locale === 'zh-CN' ? (regime.overall_regime === 'risk_on' ? '风险偏好' : regime.overall_regime === 'risk_off' ? '风险规避' : regime.overall_regime === 'cautious' ? '谨慎' : '中性') : regime.overall_regime?.toUpperCase() }}
           </div>
-          <div class="regime-recommendation">{{ regime.recommendation }}</div>
+          <div class="regime-recommendation">{{ locale === 'zh-CN' ? (regime.recommendation === 'Full allocation to risk assets' ? '满仓风险资产' : regime.recommendation === 'Reduce risk exposure' ? '降低风险敞口' : regime.recommendation === 'Defensive positioning' ? '防御性配置' : regime.recommendation === 'Capital preservation' ? '资本保全是首要任务' : regime.recommendation) : regime.recommendation }}</div>
         </div>
       </div>
 
@@ -43,56 +43,56 @@
       <div class="regime-grid">
         <!-- Volatility -->
         <div class="regime-panel">
-          <div class="regime-panel-title">VOLATILITY</div>
+          <div class="regime-panel-title">{{ locale === 'zh-CN' ? '波动率' : 'VOLATILITY' }}</div>
           <div :class="['regime-badge', `vol-${regime.volatility?.regime}`]">
-            {{ regime.volatility?.regime?.replace('_', ' ')?.toUpperCase() }}
+            {{ locale === 'zh-CN' ? (regime.volatility?.regime === 'low_volatility' ? '低波动' : regime.volatility?.regime === 'medium_volatility' ? '中波动' : regime.volatility?.regime === 'high_volatility' ? '高波动' : '极端波动') : regime.volatility?.regime?.replace('_', ' ')?.toUpperCase() }}
           </div>
           <div class="regime-detail">
-            <span>Current Vol</span>
+            <span>{{ locale === 'zh-CN' ? '当前波动率' : 'Current Vol' }}</span>
             <span class="regime-mono">{{ (regime.volatility?.current_vol * 100)?.toFixed(1) }}%</span>
           </div>
           <div class="regime-detail">
-            <span>Percentile</span>
+            <span>{{ locale === 'zh-CN' ? '百分位' : 'Percentile' }}</span>
             <span class="regime-mono">{{ (regime.volatility?.percentile * 100)?.toFixed(0) }}%</span>
           </div>
           <div class="regime-detail">
-            <span>Confidence</span>
+            <span>{{ locale === 'zh-CN' ? '置信度' : 'Confidence' }}</span>
             <span class="regime-mono">{{ (regime.volatility?.confidence * 100)?.toFixed(0) }}%</span>
           </div>
         </div>
 
         <!-- Trend -->
         <div class="regime-panel">
-          <div class="regime-panel-title">TREND</div>
+          <div class="regime-panel-title">{{ locale === 'zh-CN' ? '趋势' : 'TREND' }}</div>
           <div :class="['regime-badge', `trend-${regime.trend?.regime}`]">
-            {{ regime.trend?.regime?.toUpperCase() }}
+            {{ locale === 'zh-CN' ? (regime.trend?.regime === 'bull' ? '牛市' : regime.trend?.regime === 'bear' ? '熊市' : '震荡') : regime.trend?.regime?.toUpperCase() }}
           </div>
           <div class="regime-detail">
-            <span>MA Spread</span>
+            <span>{{ locale === 'zh-CN' ? '均线差' : 'MA Spread' }}</span>
             <span class="regime-mono">{{ (regime.trend?.ma_spread * 100)?.toFixed(2) }}%</span>
           </div>
           <div class="regime-detail">
-            <span>Crossovers</span>
+            <span>{{ locale === 'zh-CN' ? '交叉次数' : 'Crossovers' }}</span>
             <span class="regime-mono">{{ regime.trend?.recent_crossovers }}</span>
           </div>
           <div class="regime-detail">
-            <span>Confidence</span>
+            <span>{{ locale === 'zh-CN' ? '置信度' : 'Confidence' }}</span>
             <span class="regime-mono">{{ (regime.trend?.confidence * 100)?.toFixed(0) }}%</span>
           </div>
         </div>
 
         <!-- Correlation -->
         <div class="regime-panel">
-          <div class="regime-panel-title">CORRELATION</div>
+          <div class="regime-panel-title">{{ locale === 'zh-CN' ? '相关性' : 'CORRELATION' }}</div>
           <div :class="['regime-badge', `corr-${regime.correlation?.regime}`]">
-            {{ regime.correlation?.regime?.replace('_', ' ')?.toUpperCase() }}
+            {{ locale === 'zh-CN' ? (regime.correlation?.regime === 'normal_correlation' ? '正常相关' : '压力相关') : regime.correlation?.regime?.replace('_', ' ')?.toUpperCase() }}
           </div>
           <div class="regime-detail">
-            <span>Avg Corr</span>
+            <span>{{ locale === 'zh-CN' ? '平均相关性' : 'Avg Corr' }}</span>
             <span class="regime-mono">{{ regime.correlation?.avg_correlation?.toFixed(3) }}</span>
           </div>
           <div class="regime-detail">
-            <span>Assets</span>
+            <span>{{ locale === 'zh-CN' ? '资产数' : 'Assets' }}</span>
             <span class="regime-mono">{{ regime.correlation?.n_assets || 'N/A' }}</span>
           </div>
         </div>
@@ -100,7 +100,7 @@
 
       <!-- Regime History -->
       <div class="regime-history" v-if="regime.history?.length">
-        <div class="regime-history-title">REGIME HISTORY</div>
+        <div class="regime-history-title">{{ locale === 'zh-CN' ? '状态历史' : 'REGIME HISTORY' }}</div>
         <div ref="historyChartRef" class="regime-history-chart"></div>
       </div>
     </template>
@@ -108,8 +108,8 @@
     <!-- Empty State -->
     <div v-if="!regime && !loading" class="regime-empty">
       <div class="regime-empty-icon">&#9729;</div>
-      <h3>Market Regime Detection</h3>
-      <p>Run a pipeline first, then detect the current market regime using volatility, trend, and correlation analysis.</p>
+      <h3>{{ locale === 'zh-CN' ? '市场状态检测' : 'Market Regime Detection' }}</h3>
+      <p>{{ locale === 'zh-CN' ? '请先运行流水线，然后通过波动率、趋势和相关性分析检测当前市场状态。' : 'Run a pipeline first, then detect the current market regime using volatility, trend, and correlation analysis.' }}</p>
     </div>
   </div>
 </template>
@@ -118,6 +118,9 @@
 import { ref, onMounted, onBeforeUnmount, nextTick, computed } from 'vue'
 import * as echarts from 'echarts'
 import { detectRegime } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 const props = defineProps({ runId: { type: String, default: '' } })
@@ -138,7 +141,7 @@ const scoreColor = computed(() => {
 
 async function detect() {
   if (!props.runId) {
-    emit('toast', { message: 'Run a pipeline first', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '请先运行流水线' : 'Run a pipeline first', type: 'error' })
     return
   }
   loading.value = true
@@ -146,9 +149,9 @@ async function detect() {
     regime.value = await detectRegime({ run_id: props.runId })
     await nextTick()
     renderHistory()
-    emit('toast', { message: `Regime: ${regime.value.overall_regime}`, type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `市场状态：${regime.value.overall_regime === 'risk_on' ? '风险偏好' : regime.value.overall_regime === 'risk_off' ? '风险规避' : regime.value.overall_regime === 'cautious' ? '谨慎' : '中性'}` : `Regime: ${regime.value.overall_regime}`, type: 'success' })
   } catch (e) {
-    emit('toast', { message: `Detection failed: ${e.response?.data?.detail || e.message}`, type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `检测失败：${e.response?.data?.detail || e.message}` : `Detection failed: ${e.response?.data?.detail || e.message}`, type: 'error' })
   } finally {
     loading.value = false
   }
@@ -177,7 +180,9 @@ function renderHistory() {
       formatter: (params) => {
         const idx = params[0].dataIndex
         const h = history[idx]
-        return `${h.date}<br/>Vol: ${h.volatility}<br/>Trend: ${h.trend}<br/>Percentile: ${(h.vol_percentile * 100).toFixed(0)}%`
+        const volLabel = locale.value === 'zh-CN' ? (h.volatility === 'low_volatility' ? '低波动' : h.volatility === 'medium_volatility' ? '中波动' : h.volatility === 'high_volatility' ? '高波动' : '极端波动') : h.volatility
+        const trendLabel = locale.value === 'zh-CN' ? (h.trend === 'bull' ? '牛市' : h.trend === 'bear' ? '熊市' : '震荡') : h.trend
+        return `${h.date}<br/>${locale.value === 'zh-CN' ? '波动率：' : 'Vol: '}${volLabel}<br/>${locale.value === 'zh-CN' ? '趋势：' : 'Trend: '}${trendLabel}<br/>${locale.value === 'zh-CN' ? '百分位：' : 'Percentile: '}${(h.vol_percentile * 100).toFixed(0)}%`
       },
     },
     grid: { top: 8, right: 16, bottom: 24, left: 40 },

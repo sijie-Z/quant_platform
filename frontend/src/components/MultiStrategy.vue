@@ -3,47 +3,47 @@
     <!-- Add Strategy Form -->
     <div class="ms-add-form">
       <div class="ms-form-row">
-        <input v-model="newStrat.name" placeholder="Strategy name" class="ms-input" />
+        <input v-model="newStrat.name" :placeholder="locale === 'zh-CN' ? '策略名称' : 'Strategy name'" class="ms-input" />
         <select v-model="newStrat.optimizer" class="ms-select">
-          <option value="equal_weight">Equal Weight</option>
-          <option value="mean_variance">Mean-Variance</option>
-          <option value="risk_parity">Risk Parity</option>
+          <option value="equal_weight">{{ locale === 'zh-CN' ? '等权' : 'Equal Weight' }}</option>
+          <option value="mean_variance">{{ locale === 'zh-CN' ? '均值方差' : 'Mean-Variance' }}</option>
+          <option value="risk_parity">{{ locale === 'zh-CN' ? '风险平价' : 'Risk Parity' }}</option>
         </select>
         <select v-model="newStrat.alpha_method" class="ms-select">
-          <option value="equal_weight">EW Alpha</option>
-          <option value="ic_weighted">IC Alpha</option>
-          <option value="icir_weighted">ICIR Alpha</option>
+          <option value="equal_weight">{{ locale === 'zh-CN' ? '等权Alpha' : 'EW Alpha' }}</option>
+          <option value="ic_weighted">{{ locale === 'zh-CN' ? 'IC加权Alpha' : 'IC Alpha' }}</option>
+          <option value="icir_weighted">{{ locale === 'zh-CN' ? 'ICIR加权Alpha' : 'ICIR Alpha' }}</option>
         </select>
         <input v-model.number="newStrat.allocation_pct" type="number" min="0" max="1" step="0.05"
-          placeholder="Alloc %" class="ms-input ms-input-sm" />
-        <button class="ms-btn ms-btn-add" @click="addNew">+ Add</button>
+          :placeholder="locale === 'zh-CN' ? '分配比例%' : 'Alloc %'" class="ms-input ms-input-sm" />
+        <button class="ms-btn ms-btn-add" @click="addNew">{{ locale === 'zh-CN' ? '+ 添加' : '+ Add' }}</button>
       </div>
     </div>
 
     <!-- Aggregate Metrics -->
     <div class="ms-agg" v-if="metrics">
       <div class="ms-agg-card">
-        <div class="ms-agg-label">Total Capital</div>
+        <div class="ms-agg-label">{{ locale === 'zh-CN' ? '总资本' : 'Total Capital' }}</div>
         <div class="ms-agg-val">{{ fmtNum(metrics.total_capital) }}</div>
       </div>
       <div class="ms-agg-card">
-        <div class="ms-agg-label">Total Value</div>
+        <div class="ms-agg-label">{{ locale === 'zh-CN' ? '总价值' : 'Total Value' }}</div>
         <div class="ms-agg-val">{{ fmtNum(metrics.total_value) }}</div>
       </div>
       <div class="ms-agg-card">
-        <div class="ms-agg-label">Total P&L</div>
+        <div class="ms-agg-label">{{ locale === 'zh-CN' ? '总盈亏' : 'Total P&L' }}</div>
         <div class="ms-agg-val" :class="metrics.total_pnl >= 0 ? 'pos' : 'neg'">{{ fmtNum(metrics.total_pnl) }}</div>
       </div>
       <div class="ms-agg-card">
-        <div class="ms-agg-label">Aggregate Sharpe</div>
+        <div class="ms-agg-label">{{ locale === 'zh-CN' ? '综合夏普' : 'Aggregate Sharpe' }}</div>
         <div class="ms-agg-val accent">{{ metrics.aggregate_sharpe?.toFixed(2) || '--' }}</div>
       </div>
       <div class="ms-agg-card">
-        <div class="ms-agg-label">Aggregate DD</div>
+        <div class="ms-agg-label">{{ locale === 'zh-CN' ? '综合回撤' : 'Aggregate DD' }}</div>
         <div class="ms-agg-val neg">{{ (metrics.aggregate_max_dd * 100)?.toFixed(1) || '0.0' }}%</div>
       </div>
       <div class="ms-agg-card">
-        <div class="ms-agg-label">Active</div>
+        <div class="ms-agg-label">{{ locale === 'zh-CN' ? '活跃数' : 'Active' }}</div>
         <div class="ms-agg-val accent">{{ metrics.n_active }}/{{ metrics.n_strategies }}</div>
       </div>
     </div>
@@ -53,16 +53,16 @@
       <table class="ms-table">
         <thead>
           <tr>
-            <th>Name</th>
-            <th>Optimizer</th>
-            <th>Alpha</th>
-            <th>Allocation</th>
-            <th>Capital</th>
-            <th>Value</th>
-            <th>P&L</th>
-            <th>Return</th>
-            <th>Sharpe</th>
-            <th>Max DD</th>
+            <th>{{ locale === 'zh-CN' ? '名称' : 'Name' }}</th>
+            <th>{{ locale === 'zh-CN' ? '优化器' : 'Optimizer' }}</th>
+            <th>{{ locale === 'zh-CN' ? 'Alpha' : 'Alpha' }}</th>
+            <th>{{ locale === 'zh-CN' ? '分配比例' : 'Allocation' }}</th>
+            <th>{{ locale === 'zh-CN' ? '资本' : 'Capital' }}</th>
+            <th>{{ locale === 'zh-CN' ? '价值' : 'Value' }}</th>
+            <th>{{ locale === 'zh-CN' ? '盈亏' : 'P&L' }}</th>
+            <th>{{ locale === 'zh-CN' ? '收益率' : 'Return' }}</th>
+            <th>{{ locale === 'zh-CN' ? '夏普' : 'Sharpe' }}</th>
+            <th>{{ locale === 'zh-CN' ? '最大回撤' : 'Max DD' }}</th>
             <th></th>
           </tr>
         </thead>
@@ -79,11 +79,11 @@
             <td class="mono accent">{{ s.sharpe_ratio?.toFixed(2) || '0.00' }}</td>
             <td class="mono neg">{{ (s.max_drawdown * 100).toFixed(1) }}%</td>
             <td>
-              <button class="ms-btn-rm" @click="remove(s.strategy_id)" title="Remove">&times;</button>
+              <button class="ms-btn-rm" @click="remove(s.strategy_id)" :title="locale === 'zh-CN' ? '删除' : 'Remove'">&times;</button>
             </td>
           </tr>
           <tr v-if="!strategies.length">
-            <td colspan="11" class="ms-empty">No strategies registered. Add one above.</td>
+            <td colspan="11" class="ms-empty">{{ locale === 'zh-CN' ? '尚未注册策略。请在上方添加。' : 'No strategies registered. Add one above.' }}</td>
           </tr>
         </tbody>
       </table>
@@ -91,14 +91,14 @@
 
     <!-- Correlation Matrix -->
     <div class="ms-corr" v-if="metrics?.correlation_matrix && Object.keys(metrics.correlation_matrix).length > 1">
-      <div class="ms-corr-title">Strategy Correlation Matrix</div>
+      <div class="ms-corr-title">{{ locale === 'zh-CN' ? '策略相关性矩阵' : 'Strategy Correlation Matrix' }}</div>
       <div class="ms-corr-grid">
         <div v-for="(row, sid) in metrics.correlation_matrix" :key="sid" class="ms-corr-row">
           <div class="ms-corr-label">{{ getStratName(sid) }}</div>
           <div v-for="(val, sid2) in row" :key="sid2"
             class="ms-corr-cell"
             :style="{ background: corrColor(val) }"
-            :title="`${getStratName(sid)} vs ${getStratName(sid2)}: ${val?.toFixed(3)}`">
+            :title="locale === 'zh-CN' ? `${getStratName(sid)} 对比 ${getStratName(sid2)}：${val?.toFixed(3)}` : `${getStratName(sid)} vs ${getStratName(sid2)}: ${val?.toFixed(3)}`">
             {{ val?.toFixed(2) }}
           </div>
         </div>
@@ -107,7 +107,7 @@
 
     <!-- Risk Alerts -->
     <div class="ms-alerts" v-if="alerts.length">
-      <div class="ms-alert-title">Risk Alerts</div>
+      <div class="ms-alert-title">{{ locale === 'zh-CN' ? '风险告警' : 'Risk Alerts' }}</div>
       <div v-for="a in alerts" :key="a.strategy_id + a.type" class="ms-alert" :class="'ms-alert-' + a.severity">
         <span class="ms-alert-icon">{{ a.severity === 'red' ? '!!' : '!' }}</span>
         <span>{{ a.message }}</span>
@@ -119,6 +119,9 @@
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
 import { addStrategy, removeStrategy, listStrategies, getStrategyMetrics, getStrategyAlerts } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 
@@ -140,32 +143,32 @@ async function loadAll() {
     metrics.value = m
     alerts.value = a.alerts || []
   } catch (e) {
-    console.error('Failed to load strategies', e)
+    console.error(locale.value === 'zh-CN' ? '加载策略失败' : 'Failed to load strategies', e)
   }
 }
 
 async function addNew() {
   if (!newStrat.name) {
-    emit('toast', { message: 'Strategy name required', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '需要策略名称' : 'Strategy name required', type: 'error' })
     return
   }
   try {
     await addStrategy({ ...newStrat })
-    emit('toast', { message: `Added strategy: ${newStrat.name}`, type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `已添加策略：${newStrat.name}` : `Added strategy: ${newStrat.name}`, type: 'success' })
     newStrat.name = ''
     await loadAll()
   } catch (e) {
-    emit('toast', { message: 'Failed to add strategy', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '添加策略失败' : 'Failed to add strategy', type: 'error' })
   }
 }
 
 async function remove(sid) {
   try {
     await removeStrategy(sid)
-    emit('toast', { message: 'Strategy removed', type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '策略已移除' : 'Strategy removed', type: 'success' })
     await loadAll()
   } catch (e) {
-    emit('toast', { message: 'Failed to remove strategy', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '移除策略失败' : 'Failed to remove strategy', type: 'error' })
   }
 }
 

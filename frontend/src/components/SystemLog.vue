@@ -10,13 +10,16 @@
       <span class="syslog-msg">{{ entry.message }}</span>
     </div>
     <div v-if="!entries.length" class="syslog-empty">
-      <span class="syslog-cursor">_</span> Awaiting pipeline activity...
+      <span class="syslog-cursor">_</span> {{ locale === 'zh-CN' ? '等待流水线活动...' : 'Awaiting pipeline activity...' }}
     </div>
   </div>
 </template>
 
 <script setup>
 import { ref, watch, nextTick } from 'vue'
+import { useI18n } from '../i18n/index.js'
+
+const { locale } = useI18n()
 
 const props = defineProps({
   entries: { type: Array, default: () => [] },

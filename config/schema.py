@@ -98,12 +98,65 @@ class OutputConfig:
 
 
 @dataclass
+class InstrumentConfig:
+    """Single instrument definition for cross-asset support."""
+    symbol: str = ""
+    asset_type: str = "stock"       # stock, etf, future, option, index
+    exchange: str = "SSE"
+    multiplier: float = 1.0
+    tick_size: float = 0.01
+    lot_size: int = 100
+    margin_rate: float = 1.0
+    commission_rate: float | None = None
+    commission_per_lot: float = 0.0
+    stamp_tax_rate: float | None = None
+    t_plus: int = 1
+    price_limit: float = 0.10
+    underlying: str = ""
+    expiry: str = ""
+
+
+@dataclass
+class QMTConfig:
+    """QMT/miniQMT broker configuration."""
+    account: str = ""               # sim/live account ID
+    password: str = ""              # Override env QMT_PASSWORD (prefer env)
+    server: str = "localhost:58610" # miniQMT TCP address
+    mode: str = "sim"               # sim or live
+    data_server: str = ""           # Market data server (defaults to server)
+    connect_timeout: float = 5.0    # Connection timeout seconds
+
+
+@dataclass
+class ExecutionConfig:
+    """Execution layer configuration (broker, QMT, etc.)."""
+    broker_type: str = "simulated"  # simulated, paper, qmt
+    qmt: QMTConfig = field(default_factory=QMTConfig)
+
+
+@dataclass
+class FactorsConfig:
+    """Factor configuration: which factors are enabled."""
+    enabled_technicals: tuple[str, ...] = (
+        "momentum_1m", "momentum_3m", "momentum_6m", "momentum_12m",
+        "volatility_20d", "volatility_60d",
+        "turnover_20d", "rsi_14d", "amplitude_20d", "macd",
+    )
+    enabled_fundamentals: tuple[str, ...] = (
+        "log_market_cap", "pb_ratio", "pe_ratio", "roe", "asset_growth",
+    )
+
+
+@dataclass
 class Config:
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    factors: FactorsConfig = field(default_factory=FactorsConfig)
     alpha: AlphaConfig = field(default_factory=AlphaConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     costs: CostsConfig = field(default_factory=CostsConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    instruments: list[InstrumentConfig] = field(default_factory=list)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)

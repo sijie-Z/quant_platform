@@ -28,6 +28,7 @@ from quant_platform.config.schema import (
     CostsConfig,
     CovarianceConfig,
     DataConfig,
+    FactorsConfig,
     OutputConfig,
     PortfolioConfig,
     PortfolioConstraintsConfig,
@@ -35,6 +36,29 @@ from quant_platform.config.schema import (
     UniverseConfig,
     VarConfig,
 )
+
+
+def _parse_factors(raw_factors: dict | None) -> FactorsConfig:
+    """Parse factors config from YAML, extracting enabled factor names."""
+    if raw_factors is None:
+        return FactorsConfig()
+
+    enabled_technicals = []
+    tech_config = raw_factors.get("technical", {})
+    for name, cfg in tech_config.items():
+        if isinstance(cfg, dict) and cfg.get("enabled", True):
+            enabled_technicals.append(name)
+
+    enabled_fundamentals = []
+    fund_config = raw_factors.get("fundamental", {})
+    for name, cfg in fund_config.items():
+        if isinstance(cfg, dict) and cfg.get("enabled", True):
+            enabled_fundamentals.append(name)
+
+    return FactorsConfig(
+        enabled_technicals=tuple(enabled_technicals) or FactorsConfig.enabled_technicals,
+        enabled_fundamentals=tuple(enabled_fundamentals) or FactorsConfig.enabled_fundamentals,
+    )
 
 
 def _parse_config(raw: dict[str, Any]) -> Config:
@@ -65,10 +89,12 @@ def _parse_config(raw: dict[str, Any]) -> Config:
     risk = RiskConfig(var=var_config, **risk_raw)
 
     output = OutputConfig(**raw.get("output", {}))
+    factors = _parse_factors(raw.get("factors"))
 
     return Config(
         universe=universe,
         data=data,
+        factors=factors,
         alpha=alpha,
         portfolio=portfolio,
         backtest=backtest,
@@ -78,12 +104,26 @@ def _parse_config(raw: dict[str, Any]) -> Config:
     )
 
 
-def load_config(config_path: str | Path | None = None) -> Config:
-    """Load configuration from YAML file.
+def load_config(
+    config_path: str | Path | None = None,
+    *,
+    raw: dict[str, Any] | None = None,
+) -> Config:
+    """Load configuration from YAML file or pre-parsed dict.
 
-    Priority: 1) provided config_path, 2) QUANT_CONFIG env var,
-    3) default config at quant_platform/config/default.yaml
+    Priority: 1) raw dict, 2) provided config_path, 3) QUANT_CONFIG env var,
+    4) default config at quant_platform/config/default.yaml
+
+    Args:
+        config_path: Path to YAML config file.
+        raw: Pre-loaded raw dict (takes precedence over config_path).
+
+    Returns:
+        Config dataclass with validated fields.
     """
+    if raw is not None:
+        return _parse_config(raw)
+
     if config_path is None:
         config_path = os.environ.get("QUANT_CONFIG", None)
 

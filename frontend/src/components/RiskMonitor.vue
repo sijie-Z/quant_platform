@@ -3,17 +3,17 @@
     <div class="rm-header">
       <div class="rm-title">
         <span :class="['rm-dot', `rm-${status?.risk_level || 'green'}`]"></span>
-        RISK MONITOR
+        {{ locale === 'zh-CN' ? '风险监控' : 'RISK MONITOR' }}
       </div>
       <div class="rm-actions">
         <button
           :class="['btn', 'btn-sm', status?.kill_switch ? 'btn-danger' : 'btn-secondary']"
           @click="toggleKill"
         >
-          {{ status?.kill_switch ? 'Deactivate Kill Switch' : 'Kill Switch' }}
+          {{ status?.kill_switch ? (locale === 'zh-CN' ? '解除熔断开关' : 'Deactivate Kill Switch') : (locale === 'zh-CN' ? '熔断开关' : 'Kill Switch') }}
         </button>
         <button class="btn btn-sm btn-secondary" @click="refresh" :disabled="loading">
-          {{ loading ? '...' : 'Refresh' }}
+          {{ loading ? '...' : (locale === 'zh-CN' ? '刷新' : 'Refresh') }}
         </button>
       </div>
     </div>
@@ -25,50 +25,50 @@
           {{ status.risk_level === 'green' ? '&#10003;' : status.risk_level === 'kill' ? '&#9888;' : '&#9679;' }}
         </span>
         <span class="rm-banner-text">
-          {{ status.risk_level === 'green' ? 'ALL CLEAR' : status.risk_level === 'kill' ? 'KILL SWITCH ACTIVE' : 'RISK BREACH DETECTED' }}
+          {{ status.risk_level === 'green' ? (locale === 'zh-CN' ? '一切正常' : 'ALL CLEAR') : status.risk_level === 'kill' ? (locale === 'zh-CN' ? '熔断开关已触发' : 'KILL SWITCH ACTIVE') : (locale === 'zh-CN' ? '检测到风险违规' : 'RISK BREACH DETECTED') }}
         </span>
         <span class="rm-banner-detail" v-if="status.n_breaches_today">
-          {{ status.n_breaches_today }} breach(es) today
+          {{ locale === 'zh-CN' ? `今日${status.n_breaches_today}次违规` : `${status.n_breaches_today} breach(es) today` }}
         </span>
       </div>
 
       <!-- Risk Metrics -->
       <div class="rm-metrics">
         <div class="rm-metric">
-          <div class="rm-metric-label">Portfolio Value</div>
+          <div class="rm-metric-label">{{ locale === 'zh-CN' ? '组合价值' : 'Portfolio Value' }}</div>
           <div class="rm-metric-value">{{ formatNum(status.portfolio_value) }}</div>
         </div>
         <div class="rm-metric">
-          <div class="rm-metric-label">Peak Value</div>
+          <div class="rm-metric-label">{{ locale === 'zh-CN' ? '峰值' : 'Peak Value' }}</div>
           <div class="rm-metric-value">{{ formatNum(status.peak_value) }}</div>
         </div>
         <div class="rm-metric">
-          <div class="rm-metric-label">Current DD</div>
+          <div class="rm-metric-label">{{ locale === 'zh-CN' ? '当前回撤' : 'Current DD' }}</div>
           <div :class="['rm-metric-value', status.current_drawdown > 0.1 ? 'rm-neg' : '']">
             {{ (status.current_drawdown * 100)?.toFixed(2) }}%
           </div>
         </div>
         <div class="rm-metric">
-          <div class="rm-metric-label">Daily P&L</div>
+          <div class="rm-metric-label">{{ locale === 'zh-CN' ? '日盈亏' : 'Daily P&L' }}</div>
           <div :class="['rm-metric-value', status.daily_pnl >= 0 ? 'rm-pos' : 'rm-neg']">
             {{ status.daily_pnl >= 0 ? '+' : '' }}{{ formatNum(status.daily_pnl) }}
           </div>
         </div>
         <div class="rm-metric">
-          <div class="rm-metric-label">Daily P&L %</div>
+          <div class="rm-metric-label">{{ locale === 'zh-CN' ? '日盈亏%' : 'Daily P&L %' }}</div>
           <div :class="['rm-metric-value', status.daily_pnl_pct >= 0 ? 'rm-pos' : 'rm-neg']">
             {{ (status.daily_pnl_pct * 100)?.toFixed(2) }}%
           </div>
         </div>
         <div class="rm-metric">
-          <div class="rm-metric-label">Positions</div>
+          <div class="rm-metric-label">{{ locale === 'zh-CN' ? '持仓数' : 'Positions' }}</div>
           <div class="rm-metric-value">{{ status.n_positions }}</div>
         </div>
       </div>
 
       <!-- Limits -->
       <div class="rm-limits">
-        <div class="rm-limit-title">RISK LIMITS</div>
+        <div class="rm-limit-title">{{ locale === 'zh-CN' ? '风险限额' : 'RISK LIMITS' }}</div>
         <div class="rm-limit-row" v-for="(val, key) in status.limits" :key="key">
           <span class="rm-limit-name">{{ formatLimitName(key) }}</span>
           <div class="rm-limit-bar-wrap">
@@ -81,7 +81,7 @@
 
       <!-- Recent Breaches -->
       <div class="rm-breaches" v-if="status.recent_breaches?.length">
-        <div class="rm-breach-title">RECENT BREACHES</div>
+        <div class="rm-breach-title">{{ locale === 'zh-CN' ? '近期违规' : 'RECENT BREACHES' }}</div>
         <div v-for="b in status.recent_breaches" :key="b.timestamp" :class="['rm-breach-item', `rm-breach-${b.severity}`]">
           <span class="rm-breach-severity">{{ b.severity }}</span>
           <span class="rm-breach-msg">{{ b.message }}</span>
@@ -92,8 +92,8 @@
 
     <div v-if="!status && !loading" class="rm-empty">
       <div class="rm-empty-icon">&#9888;</div>
-      <h3>Risk Monitor</h3>
-      <p>Real-time risk monitoring with position limits, loss limits, drawdown circuit breakers, and emergency kill switch.</p>
+      <h3>{{ locale === 'zh-CN' ? '风险监控' : 'Risk Monitor' }}</h3>
+      <p>{{ locale === 'zh-CN' ? '实时风险监控，包括仓位限制、亏损限制、回撤熔断和紧急熔断开关。' : 'Real-time risk monitoring with position limits, loss limits, drawdown circuit breakers, and emergency kill switch.' }}</p>
     </div>
   </div>
 </template>
@@ -101,10 +101,23 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { getRiskStatus, toggleKillSwitch } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 const loading = ref(false)
 const status = ref(null)
+
+const limitNameMap = {
+  max_position_pct: { en: 'Position', zh: '仓位' },
+  max_drawdown_pct: { en: 'Drawdown', zh: '回撤' },
+  max_kill_drawdown_pct: { en: 'Kill Drawdown', zh: '熔断回撤' },
+  max_daily_loss_pct: { en: 'Daily Loss', zh: '日亏损' },
+  max_leverage: { en: 'Leverage', zh: '杠杆' },
+  max_sector_pct: { en: 'Sector', zh: '行业集中度' },
+  max_order_freq: { en: 'Order Freq', zh: '订单频率' },
+}
 
 function formatNum(v) {
   if (v == null) return '--'
@@ -112,6 +125,10 @@ function formatNum(v) {
 }
 
 function formatLimitName(key) {
+  const known = limitNameMap[key]
+  if (known) {
+    return locale.value === 'zh-CN' ? known.zh : known.en
+  }
   return key.replace(/_/g, ' ').replace(/max /, '').replace(/pct/, '').trim()
 }
 
@@ -136,12 +153,13 @@ async function refresh() {
 
 async function toggleKill() {
   const action = status.value?.kill_switch ? 'deactivate' : 'activate'
+  const reason = locale.value === 'zh-CN' ? '从界面手动触发' : 'Manual toggle from UI'
   try {
-    await toggleKillSwitch({ action, reason: 'Manual toggle from UI' })
+    await toggleKillSwitch({ action, reason })
     await refresh()
-    emit('toast', { message: `Kill switch ${action}d`, type: action === 'activate' ? 'error' : 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `熔断开关已${action === 'activate' ? '触发' : '解除'}` : `Kill switch ${action}d`, type: action === 'activate' ? 'error' : 'success' })
   } catch (e) {
-    emit('toast', { message: `Failed: ${e.message}`, type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `操作失败：${e.message}` : `Failed: ${e.message}`, type: 'error' })
   }
 }
 

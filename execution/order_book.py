@@ -284,6 +284,10 @@ class OrderBook:
 
         return trades
 
+    def get_order(self, order_id: str) -> BookOrder | None:
+        """Look up an order by ID without removing it."""
+        return self._orders.get(order_id)
+
     def cancel_order(self, order_id: str) -> BookOrder | None:
         """Cancel an order by ID."""
         self._invalidate_cache()

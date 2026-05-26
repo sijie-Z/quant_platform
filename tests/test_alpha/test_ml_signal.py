@@ -139,11 +139,12 @@ class TestMLSignalGenerator:
 
     @pytest.mark.skipif(not HAS_LGB, reason="lightgbm not installed")
     def test_generate(self, sample_factors, sample_forward_returns):
-        cfg = MLSignalConfig(model_type="lightgbm", n_splits=2)
+        cfg = MLSignalConfig(model_type="lightgbm", train_window=100, retrain_frequency=50)
         gen = MLSignalGenerator(config=cfg)
         signal = gen.generate(sample_factors, sample_forward_returns)
         assert isinstance(signal, pd.DataFrame)
-        assert gen.model is not None
+        assert signal.shape[0] > 0
+        assert not signal.isna().all().all()
 
     @pytest.mark.skipif(not HAS_LGB, reason="lightgbm not installed")
     def test_feature_importance(self, sample_factors, sample_forward_returns):

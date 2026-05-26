@@ -125,9 +125,14 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
     ) -> pd.Series:
         import cvxpy as cp
 
+        import math
         # Pre-filter: only optimize top-N stocks by signal for numerical stability
-        max_n = min(len(signal.dropna()), int(1.0 / max(self.constraints.max_weight, 0.01)))
-        max_n = min(max_n, 100)  # Hard cap for MVO numerical stability
+        # Must select enough to satisfy sum(w) == 1 with max_weight cap
+        min_needed = int(math.ceil(1.0 / max(self.constraints.max_weight, 0.01)))
+        max_n = max(
+            min_needed,
+            min(len(signal.dropna()), 100)
+        )
 
         top_assets = signal.dropna().nlargest(max_n).index
         if cov_matrix is not None:
@@ -161,9 +166,10 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
             w <= self.constraints.max_weight,
         ]
 
-        # Sector constraint
-        if sector_map is not None and self.constraints.max_sector_exposure < 1.0:
-            for sector in sector_map[assets].unique():
+        # Sector constraint (skip if all assets are in the same sector — infeasible otherwise)
+        unique_sectors = sector_map[assets].unique() if sector_map is not None else []
+        if len(unique_sectors) > 1 and self.constraints.max_sector_exposure < 1.0:
+            for sector in unique_sectors:
                 mask = (sector_map[assets] == sector).values.astype(float)
                 if mask.sum() > 0:
                     constraints_list.append(mask @ w <= self.constraints.max_sector_exposure)
@@ -175,17 +181,19 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
                 cp.sum(cp.abs(w - prev_w)) <= 2 * self.constraints.max_turnover
             )
 
-        try:
-            problem = cp.Problem(objective, constraints_list)
-            problem.solve(solver=cp.ECOS, verbose=False)
-        except Exception:
-            logger.warning("MVO solver failed, falling back to equal weight")
-            return EqualWeightOptimizer(self.constraints).optimize(
-                signal, cov_matrix, prices, prev_weights, sector_map
-            )
+        solved = False
+        for solver in [cp.ECOS, cp.SCS]:
+            try:
+                problem = cp.Problem(objective, constraints_list)
+                problem.solve(solver=solver, verbose=False)
+                if w.value is not None:
+                    solved = True
+                    break
+            except Exception:
+                continue
 
-        if w.value is None:
-            logger.warning("MVO returned no solution, falling back to equal weight")
+        if not solved:
+            logger.warning("MVO solver failed, falling back to equal weight")
             return EqualWeightOptimizer(self.constraints).optimize(
                 signal, cov_matrix, prices, prev_weights, sector_map
             )
@@ -197,6 +205,14 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
             weights = weights / total
         else:
             weights = pd.Series(0.0, index=signal.index)
+
+        # Volatility targeting: scale weights down if portfolio vol exceeds target
+        if self.constraints.target_volatility > 0 and cov_matrix is not None:
+            port_vol = np.sqrt(weights[assets] @ cov @ weights[assets])
+            if port_vol > 1e-8:
+                scale = min(1.0, self.constraints.target_volatility / port_vol)
+                weights = weights * scale
+                # sum(weights) < 1 means remaining weight is cash (0% return)
 
         return weights.reindex(signal.index, fill_value=0.0)
 

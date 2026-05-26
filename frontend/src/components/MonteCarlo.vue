@@ -3,20 +3,20 @@
     <div class="mc-header">
       <div class="mc-title">
         <span class="mc-dot"></span>
-        MONTE CARLO SIMULATION
+        {{ locale === 'zh-CN' ? '蒙特卡洛模拟' : 'MONTE CARLO SIMULATION' }}
       </div>
       <div class="mc-actions">
         <select v-model="mcMethod" class="mc-select">
-          <option value="bootstrap">Block Bootstrap</option>
-          <option value="parametric">Student-t Parametric</option>
+          <option value="bootstrap">{{ locale === 'zh-CN' ? '分块自助法' : 'Block Bootstrap' }}</option>
+          <option value="parametric">{{ locale === 'zh-CN' ? '学生t参数化' : 'Student-t Parametric' }}</option>
         </select>
         <select v-model.number="nSims" class="mc-select">
-          <option :value="500">500 sims</option>
-          <option :value="1000">1000 sims</option>
-          <option :value="5000">5000 sims</option>
+          <option :value="500">{{ locale === 'zh-CN' ? '500次模拟' : '500 sims' }}</option>
+          <option :value="1000">{{ locale === 'zh-CN' ? '1000次模拟' : '1000 sims' }}</option>
+          <option :value="5000">{{ locale === 'zh-CN' ? '5000次模拟' : '5000 sims' }}</option>
         </select>
         <button class="btn btn-sm btn-primary" @click="runMC" :disabled="loading">
-          {{ loading ? 'Simulating...' : 'Run Simulation' }}
+          {{ loading ? (locale === 'zh-CN' ? '模拟中...' : 'Simulating...') : (locale === 'zh-CN' ? '运行模拟' : 'Run Simulation') }}
         </button>
       </div>
     </div>
@@ -25,22 +25,22 @@
     <div class="mc-grid" v-if="result">
       <!-- Terminal Value -->
       <div class="mc-panel">
-        <div class="mc-panel-title">TERMINAL VALUE (1Y)</div>
+        <div class="mc-panel-title">{{ locale === 'zh-CN' ? '终值（1年）' : 'TERMINAL VALUE (1Y)' }}</div>
         <div class="mc-stat-row">
           <div class="mc-stat">
-            <span class="mc-stat-label">Mean</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '均值' : 'Mean' }}</span>
             <span class="mc-stat-value">{{ result.terminal_value?.mean?.toFixed(3) }}</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">Median</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '中位数' : 'Median' }}</span>
             <span class="mc-stat-value">{{ result.terminal_value?.median?.toFixed(3) }}</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">5th %ile</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '5%分位' : '5th %ile' }}</span>
             <span class="mc-stat-value mc-neg">{{ result.terminal_value?.p5?.toFixed(3) }}</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">95th %ile</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '95%分位' : '95th %ile' }}</span>
             <span class="mc-stat-value mc-pos">{{ result.terminal_value?.p95?.toFixed(3) }}</span>
           </div>
         </div>
@@ -48,24 +48,24 @@
 
       <!-- Annual Return -->
       <div class="mc-panel">
-        <div class="mc-panel-title">ANNUAL RETURN</div>
+        <div class="mc-panel-title">{{ locale === 'zh-CN' ? '年化收益' : 'ANNUAL RETURN' }}</div>
         <div class="mc-stat-row">
           <div class="mc-stat">
-            <span class="mc-stat-label">Mean</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '均值' : 'Mean' }}</span>
             <span :class="['mc-stat-value', result.annual_return?.mean > 0 ? 'mc-pos' : 'mc-neg']">
               {{ (result.annual_return?.mean * 100)?.toFixed(1) }}%
             </span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">P(>0)</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? 'P(>0)' : 'P(>0)' }}</span>
             <span class="mc-stat-value">{{ (result.annual_return?.prob_positive * 100)?.toFixed(0) }}%</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">P(>10%)</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? 'P(>10%)' : 'P(>10%)' }}</span>
             <span class="mc-stat-value">{{ (result.annual_return?.prob_10pct * 100)?.toFixed(0) }}%</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">5th %ile</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '5%分位' : '5th %ile' }}</span>
             <span class="mc-stat-value mc-neg">{{ (result.annual_return?.p5 * 100)?.toFixed(1) }}%</span>
           </div>
         </div>
@@ -73,22 +73,22 @@
 
       <!-- Max Drawdown -->
       <div class="mc-panel">
-        <div class="mc-panel-title">MAX DRAWDOWN</div>
+        <div class="mc-panel-title">{{ locale === 'zh-CN' ? '最大回撤' : 'MAX DRAWDOWN' }}</div>
         <div class="mc-stat-row">
           <div class="mc-stat">
-            <span class="mc-stat-label">Mean</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '均值' : 'Mean' }}</span>
             <span class="mc-stat-value mc-neg">{{ (result.max_drawdown?.mean * 100)?.toFixed(1) }}%</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">Worst</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '最差' : 'Worst' }}</span>
             <span class="mc-stat-value mc-neg">{{ (result.max_drawdown?.worst * 100)?.toFixed(1) }}%</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">P(>20%)</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? 'P(>20%)' : 'P(>20%)' }}</span>
             <span class="mc-stat-value mc-warn">{{ (result.max_drawdown?.prob_20pct * 100)?.toFixed(0) }}%</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">P(>30%)</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? 'P(>30%)' : 'P(>30%)' }}</span>
             <span class="mc-stat-value mc-neg">{{ (result.max_drawdown?.prob_30pct * 100)?.toFixed(0) }}%</span>
           </div>
         </div>
@@ -96,24 +96,24 @@
 
       <!-- Sharpe -->
       <div class="mc-panel" v-if="result.sharpe?.mean != null">
-        <div class="mc-panel-title">SHARPE RATIO</div>
+        <div class="mc-panel-title">{{ locale === 'zh-CN' ? '夏普比率' : 'SHARPE RATIO' }}</div>
         <div class="mc-stat-row">
           <div class="mc-stat">
-            <span class="mc-stat-label">Mean</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '均值' : 'Mean' }}</span>
             <span :class="['mc-stat-value', result.sharpe?.mean > 0 ? 'mc-pos' : 'mc-neg']">
               {{ result.sharpe?.mean?.toFixed(2) }}
             </span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">Median</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '中位数' : 'Median' }}</span>
             <span class="mc-stat-value">{{ result.sharpe?.median?.toFixed(2) }}</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">P(>0)</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? 'P(>0)' : 'P(>0)' }}</span>
             <span class="mc-stat-value">{{ (result.sharpe?.prob_positive * 100)?.toFixed(0) }}%</span>
           </div>
           <div class="mc-stat">
-            <span class="mc-stat-label">Std Dev</span>
+            <span class="mc-stat-label">{{ locale === 'zh-CN' ? '标准差' : 'Std Dev' }}</span>
             <span class="mc-stat-value">{{ result.sharpe?.std?.toFixed(3) }}</span>
           </div>
         </div>
@@ -127,15 +127,15 @@
 
     <!-- Fitted Distribution Info -->
     <div class="mc-fit-info" v-if="result?.fitted_distribution">
-      <span class="mc-fit-label">Fitted:</span>
-      <span class="mc-fit-value">Student-t (df={{ result.fitted_distribution.df }}, loc={{ result.fitted_distribution.loc }}, scale={{ result.fitted_distribution.scale }})</span>
+      <span class="mc-fit-label">{{ locale === 'zh-CN' ? '拟合分布：' : 'Fitted:' }}</span>
+      <span class="mc-fit-value">{{ locale === 'zh-CN' ? `学生t（自由度=${result.fitted_distribution.df}，位置=${result.fitted_distribution.loc}，尺度=${result.fitted_distribution.scale}）` : `Student-t (df=${result.fitted_distribution.df}, loc=${result.fitted_distribution.loc}, scale=${result.fitted_distribution.scale})` }}</span>
     </div>
 
     <!-- Empty State -->
     <div v-if="!result && !loading" class="mc-empty">
       <div class="mc-empty-icon">&#9858;</div>
-      <h3>Monte Carlo Simulation</h3>
-      <p>Run a pipeline first, then simulate thousands of scenarios to estimate confidence intervals and tail risks.</p>
+      <h3>{{ locale === 'zh-CN' ? '蒙特卡洛模拟' : 'Monte Carlo Simulation' }}</h3>
+      <p>{{ locale === 'zh-CN' ? '请先运行流水线，然后模拟数千种情景以估计置信区间和尾部风险。' : 'Run a pipeline first, then simulate thousands of scenarios to estimate confidence intervals and tail risks.' }}</p>
     </div>
   </div>
 </template>
@@ -144,6 +144,9 @@
 import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import { runMonteCarlo } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 const props = defineProps({ runId: { type: String, default: '' } })
@@ -158,7 +161,7 @@ let resizeObs = null
 
 async function runMC() {
   if (!props.runId) {
-    emit('toast', { message: 'Run a pipeline first', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '请先运行流水线' : 'Run a pipeline first', type: 'error' })
     return
   }
   loading.value = true
@@ -171,9 +174,9 @@ async function runMC() {
     })
     await nextTick()
     renderDistChart()
-    emit('toast', { message: `Monte Carlo: ${nSims.value} simulations completed`, type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `蒙特卡洛：${nSims.value}次模拟已完成` : `Monte Carlo: ${nSims.value} simulations completed`, type: 'success' })
   } catch (e) {
-    emit('toast', { message: `Simulation failed: ${e.response?.data?.detail || e.message}`, type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `模拟失败：${e.response?.data?.detail || e.message}` : `Simulation failed: ${e.response?.data?.detail || e.message}`, type: 'error' })
   } finally {
     loading.value = false
   }

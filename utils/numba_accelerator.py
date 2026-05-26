@@ -287,11 +287,14 @@ def rank_ic_numba(
 
 @jit(nopython=True, cache=True)
 def _ledoit_wolf_shrinkage_numba(returns: np.ndarray) -> np.ndarray:
-    """Numba JIT: Ledoit-Wolf covariance shrinkage.
+    """Numba JIT: Ledoit-Wolf covariance shrinkage with optimal intensity.
 
     Shrinks sample covariance toward a structured target (constant correlation).
-    This is the simplest Ledoit-Wolf variant - the full version requires
-    solving a more complex optimization.
+    Uses the analytical optimal shrinkage intensity from Ledoit & Wolf (2004).
+
+    Reference:
+        Ledoit, O., & Wolf, M. (2004). "A well-conditioned estimator for
+        large-dimensional covariance matrices." Journal of Multivariate Analysis.
     """
     n, p = returns.shape
 
@@ -300,8 +303,10 @@ def _ledoit_wolf_shrinkage_numba(returns: np.ndarray) -> np.ndarray:
     demeaned = returns - mean_ret
     sample_cov = (demeaned.T @ demeaned) / (n - 1)
 
-    # Target: constant correlation
+    # Target: constant correlation matrix
     stds = np.sqrt(np.diag(sample_cov))
+
+    # Average pairwise correlation
     avg_corr = 0.0
     count = 0
     for i in range(p):
@@ -310,9 +315,8 @@ def _ledoit_wolf_shrinkage_numba(returns: np.ndarray) -> np.ndarray:
                 corr = sample_cov[i, j] / (stds[i] * stds[j])
                 avg_corr += corr
                 count += 1
-
     if count > 0:
-        avg_corr = avg_corr / count
+        avg_corr /= count
     else:
         avg_corr = 0.0
 
@@ -321,12 +325,58 @@ def _ledoit_wolf_shrinkage_numba(returns: np.ndarray) -> np.ndarray:
     for i in range(p):
         for j in range(p):
             if i == j:
-                target[i, j] = stds[i] ** 2
+                target[i, j] = sample_cov[i, j]
             else:
                 target[i, j] = avg_corr * stds[i] * stds[j]
 
-    # Simple shrinkage intensity (can be refined)
-    shrinkage = 0.2  # Fixed rate for simplicity
+    # --- Optimal shrinkage intensity ---
+    # γ̂ = Σᵢⱼ (f_{ij} - s_{ij})²
+    gamma_hat = 0.0
+    for i in range(p):
+        for j in range(p):
+            diff = target[i, j] - sample_cov[i, j]
+            gamma_hat += diff * diff
+
+    # π̂ = Σᵢⱼ var(s_{ij}) — summed over all entries
+    # For each entry, var(s_{ij}) ≈ (1/n) * Σₜ [(xₜᵢ-μᵢ)(xₜⱼ-μⱼ) - s_{ij}]²
+    pi_hat = 0.0
+    for i in range(p):
+        for j in range(p):
+            var_ij = 0.0
+            for t in range(n):
+                dev = demeaned[t, i] * demeaned[t, j] - sample_cov[i, j]
+                var_ij += dev * dev
+            pi_hat += var_ij / n
+
+    # ρ̂ = Σᵢⱼ cov(s_{ij}, f_{ij})
+    # Under constant correlation target, f_{ij} depends on sᵢᵢ, sⱼⱼ, and avg_corr
+    # We use the asymptotic approximation: ρ̂ = Σᵢⱼ var(f_{ij})
+    # which simplifies for the constant correlation target.
+    rho_hat = 0.0
+    for i in range(p):
+        for j in range(p):
+            if i == j:
+                # fᵢᵢ = sᵢᵢ, so var(fᵢᵢ) = var(sᵢᵢ)
+                var_ii = 0.0
+                for t in range(n):
+                    dev = demeaned[t, i] * demeaned[t, i] - sample_cov[i, i]
+                    var_ii += dev * dev
+                rho_hat += var_ii / n
+            else:
+                # fᵢⱼ = avg_corr * stdᵢ * stdⱼ
+                # The asymptotic covariance is approximately θ * fᵢⱼ where
+                # θ = var(avg_corr) / avg_corr + ...
+                # For simplicity, approximate as 0 (target is near-deterministic
+                # for large n relative to p, and the shrinkage formula is robust)
+                pass
+
+    # κ̂ = π̂ - ρ̂
+    kappa = max(0.0, pi_hat - rho_hat)
+
+    # δ* = max(0, min(1, κ̂ / (n × γ̂)))
+    denom = n * max(gamma_hat, 1e-10)
+    shrinkage = kappa / denom
+    shrinkage = max(0.0, min(1.0, shrinkage))
 
     return (1 - shrinkage) * sample_cov + shrinkage * target
 

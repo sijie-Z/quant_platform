@@ -14,6 +14,9 @@
 
 <script setup>
 import { computed } from 'vue'
+import { useI18n } from '../i18n/index.js'
+
+const { $t } = useI18n()
 
 const props = defineProps({
   performance: { type: Object, default: null },
@@ -21,32 +24,32 @@ const props = defineProps({
 })
 
 const metrics = computed(() => {
-  if (!props.performance) return placeholderMetrics
+  if (!props.performance) return placeholderMetrics.value
   const p = props.performance
   const r = props.risk || {}
 
   return [
-    { key: 'ret',    label: 'TOTAL RET',   display: pct(p.total_return),      tone: p.total_return >= 0 ? 'pos' : 'neg' },
-    { key: 'ann',    label: 'ANN. RET',    display: pct(p.annual_return),     tone: p.annual_return >= 0 ? 'pos' : 'neg' },
-    { key: 'vol',    label: 'ANN. VOL',    display: pct(p.annual_volatility), tone: 'neu' },
-    { key: 'sharpe', label: 'SHARPE',      display: num(p.sharpe_ratio),      tone: p.sharpe_ratio >= 1 ? 'pos' : p.sharpe_ratio >= 0 ? 'neu' : 'neg' },
-    { key: 'sort',   label: 'SORTINO',     display: num(p.sortino_ratio),     tone: p.sortino_ratio >= 0 ? 'pos' : 'neg' },
-    { key: 'dd',     label: 'MAX DD',      display: pct(p.max_drawdown),      tone: 'neg' },
-    { key: 'var',    label: 'VAR 95%',     display: r.historical_var != null ? pct(r.historical_var) : '--', tone: 'neg' },
-    { key: 'win',    label: 'WIN RATE',    display: pct(p.win_rate),          tone: p.win_rate >= 0.5 ? 'pos' : 'neu', sub: `${p.n_rebalances || 0} rebal` },
+    { key: 'ret',    label: $t('kpi.totalReturn'),   display: pct(p.total_return),      tone: p.total_return >= 0 ? 'pos' : 'neg' },
+    { key: 'ann',    label: $t('kpi.annualizedReturn'), display: pct(p.annual_return),     tone: p.annual_return >= 0 ? 'pos' : 'neg' },
+    { key: 'vol',    label: $t('kpi.volatility'), display: pct(p.annual_volatility), tone: 'neu' },
+    { key: 'sharpe', label: $t('kpi.sharpe'),      display: num(p.sharpe_ratio),      tone: p.sharpe_ratio >= 1 ? 'pos' : p.sharpe_ratio >= 0 ? 'neu' : 'neg' },
+    { key: 'sort',   label: $t('kpi.calmar'), display: num(p.sortino_ratio),     tone: p.sortino_ratio >= 0 ? 'pos' : 'neg' },
+    { key: 'dd',     label: $t('kpi.maxDrawdown'),      display: pct(p.max_drawdown),      tone: 'neg' },
+    { key: 'var',    label: $t('kpi.volatility'),     display: r.historical_var != null ? pct(r.historical_var) : '--', tone: 'neg' },
+    { key: 'win',    label: $t('kpi.winRate'),    display: pct(p.win_rate),          tone: p.win_rate >= 0.5 ? 'pos' : 'neu', sub: `${p.n_rebalances || 0} ${$t('common.month')}` },
   ]
 })
 
-const placeholderMetrics = [
-  { key: 'ret',    label: 'TOTAL RET',   display: '--', tone: 'dim' },
-  { key: 'ann',    label: 'ANN. RET',    display: '--', tone: 'dim' },
-  { key: 'vol',    label: 'ANN. VOL',    display: '--', tone: 'dim' },
-  { key: 'sharpe', label: 'SHARPE',      display: '--', tone: 'dim' },
-  { key: 'sort',   label: 'SORTINO',     display: '--', tone: 'dim' },
-  { key: 'dd',     label: 'MAX DD',      display: '--', tone: 'dim' },
-  { key: 'var',    label: 'VAR 95%',     display: '--', tone: 'dim' },
-  { key: 'win',    label: 'WIN RATE',    display: '--', tone: 'dim' },
-]
+const placeholderMetrics = computed(() => [
+  { key: 'ret',    label: $t('kpi.totalReturn'),   display: '--', tone: 'dim' },
+  { key: 'ann',    label: $t('kpi.annualizedReturn'),    display: '--', tone: 'dim' },
+  { key: 'vol',    label: $t('kpi.volatility'),    display: '--', tone: 'dim' },
+  { key: 'sharpe', label: $t('kpi.sharpe'),      display: '--', tone: 'dim' },
+  { key: 'sort',   label: $t('kpi.calmar'),     display: '--', tone: 'dim' },
+  { key: 'dd',     label: $t('kpi.maxDrawdown'),      display: '--', tone: 'dim' },
+  { key: 'var',    label: $t('kpi.volatility'),     display: '--', tone: 'dim' },
+  { key: 'win',    label: $t('kpi.winRate'),    display: '--', tone: 'dim' },
+])
 
 function pct(v) {
   if (v == null) return '--'
@@ -82,10 +85,10 @@ function num(v) {
 }
 
 .kpi-label {
-  font-size: 9px;
+  font-size: 8px;
   font-weight: 600;
   color: var(--text-dim);
-  letter-spacing: 0.8px;
+  letter-spacing: 0.3px;
   text-transform: uppercase;
   white-space: nowrap;
   overflow: hidden;

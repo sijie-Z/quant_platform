@@ -3,25 +3,25 @@
     <div class="wf-header">
       <div class="wf-title">
         <span class="wf-dot"></span>
-        WALK-FORWARD VALIDATION
+        {{ locale === 'zh-CN' ? '滚动窗口验证' : 'WALK-FORWARD VALIDATION' }}
       </div>
       <div class="wf-actions">
         <select v-model="wfMode" class="wf-select">
-          <option value="rolling">Rolling Window</option>
-          <option value="expanding">Expanding Window</option>
+          <option value="rolling">{{ locale === 'zh-CN' ? '滚动窗口' : 'Rolling Window' }}</option>
+          <option value="expanding">{{ locale === 'zh-CN' ? '扩展窗口' : 'Expanding Window' }}</option>
         </select>
         <select v-model.number="trainPeriod" class="wf-select">
-          <option :value="252">1Y Train</option>
-          <option :value="504">2Y Train</option>
-          <option :value="756">3Y Train</option>
+          <option :value="252">{{ locale === 'zh-CN' ? '1年训练' : '1Y Train' }}</option>
+          <option :value="504">{{ locale === 'zh-CN' ? '2年训练' : '2Y Train' }}</option>
+          <option :value="756">{{ locale === 'zh-CN' ? '3年训练' : '3Y Train' }}</option>
         </select>
         <select v-model.number="testPeriod" class="wf-select">
-          <option :value="63">3M Test</option>
-          <option :value="126">6M Test</option>
-          <option :value="252">1Y Test</option>
+          <option :value="63">{{ locale === 'zh-CN' ? '3月测试' : '3M Test' }}</option>
+          <option :value="126">{{ locale === 'zh-CN' ? '6月测试' : '6M Test' }}</option>
+          <option :value="252">{{ locale === 'zh-CN' ? '1年测试' : '1Y Test' }}</option>
         </select>
         <button class="btn btn-sm btn-primary" @click="runWF" :disabled="loading">
-          {{ loading ? 'Running...' : 'Run Walk-Forward' }}
+          {{ loading ? (locale === 'zh-CN' ? '运行中...' : 'Running...') : (locale === 'zh-CN' ? '运行滚动验证' : 'Run Walk-Forward') }}
         </button>
       </div>
     </div>
@@ -29,33 +29,33 @@
     <!-- Stability Summary -->
     <div class="wf-summary" v-if="result">
       <div class="wf-card">
-        <div class="wf-card-label">Folds</div>
+        <div class="wf-card-label">{{ locale === 'zh-CN' ? '折叠数' : 'Folds' }}</div>
         <div class="wf-card-value">{{ result.n_folds }}</div>
       </div>
       <div class="wf-card">
-        <div class="wf-card-label">Mean Sharpe</div>
+        <div class="wf-card-label">{{ locale === 'zh-CN' ? '平均夏普' : 'Mean Sharpe' }}</div>
         <div :class="['wf-card-value', result.stability?.mean_sharpe > 0 ? 'wf-pos' : 'wf-neg']">
           {{ result.stability?.mean_sharpe?.toFixed(2) }}
         </div>
       </div>
       <div class="wf-card">
-        <div class="wf-card-label">Sharpe Std</div>
+        <div class="wf-card-label">{{ locale === 'zh-CN' ? '夏普标准差' : 'Sharpe Std' }}</div>
         <div class="wf-card-value">{{ result.stability?.std_sharpe?.toFixed(3) }}</div>
       </div>
       <div class="wf-card">
-        <div class="wf-card-label">Consistency</div>
+        <div class="wf-card-label">{{ locale === 'zh-CN' ? '一致性' : 'Consistency' }}</div>
         <div :class="['wf-card-value', result.stability?.sharpe_consistency > 0.6 ? 'wf-pos' : 'wf-warn']">
           {{ (result.stability?.sharpe_consistency * 100)?.toFixed(0) }}%
         </div>
       </div>
       <div class="wf-card">
-        <div class="wf-card-label">Positive Folds</div>
+        <div class="wf-card-label">{{ locale === 'zh-CN' ? '正收益折叠' : 'Positive Folds' }}</div>
         <div class="wf-card-value wf-pos">
           {{ result.stability?.positive_folds }}/{{ result.stability?.total_folds }}
         </div>
       </div>
       <div class="wf-card">
-        <div class="wf-card-label">Mean Return</div>
+        <div class="wf-card-label">{{ locale === 'zh-CN' ? '平均收益' : 'Mean Return' }}</div>
         <div :class="['wf-card-value', result.stability?.mean_return_pct > 0 ? 'wf-pos' : 'wf-neg']">
           {{ result.stability?.mean_return_pct?.toFixed(1) }}%
         </div>
@@ -72,13 +72,13 @@
       <table class="wf-tbl">
         <thead>
           <tr>
-            <th>Fold</th>
-            <th>Train Period</th>
-            <th>Test Period</th>
-            <th>OOS Days</th>
-            <th>Sharpe</th>
-            <th>Return %</th>
-            <th>Verdict</th>
+            <th>{{ locale === 'zh-CN' ? '折叠' : 'Fold' }}</th>
+            <th>{{ locale === 'zh-CN' ? '训练期' : 'Train Period' }}</th>
+            <th>{{ locale === 'zh-CN' ? '测试期' : 'Test Period' }}</th>
+            <th>{{ locale === 'zh-CN' ? '样本外天数' : 'OOS Days' }}</th>
+            <th>{{ locale === 'zh-CN' ? '夏普' : 'Sharpe' }}</th>
+            <th>{{ locale === 'zh-CN' ? '收益率%' : 'Return %' }}</th>
+            <th>{{ locale === 'zh-CN' ? '判定' : 'Verdict' }}</th>
           </tr>
         </thead>
         <tbody>
@@ -95,7 +95,7 @@
             </td>
             <td>
               <span :class="['wf-badge', f.sharpe > 0.5 ? 'wf-badge-good' : f.sharpe > 0 ? 'wf-badge-ok' : 'wf-badge-bad']">
-                {{ f.sharpe > 0.5 ? 'STRONG' : f.sharpe > 0 ? 'WEAK' : 'FAIL' }}
+                {{ f.sharpe > 0.5 ? (locale === 'zh-CN' ? '强' : 'STRONG') : f.sharpe > 0 ? (locale === 'zh-CN' ? '弱' : 'WEAK') : (locale === 'zh-CN' ? '失败' : 'FAIL') }}
               </span>
             </td>
           </tr>
@@ -106,8 +106,8 @@
     <!-- Empty State -->
     <div v-if="!result && !loading" class="wf-empty">
       <div class="wf-empty-icon">&#9878;</div>
-      <h3>Walk-Forward Validation</h3>
-      <p>Run a pipeline first, then validate with out-of-sample testing. This is the gold standard for avoiding overfitting.</p>
+      <h3>{{ locale === 'zh-CN' ? '滚动窗口验证' : 'Walk-Forward Validation' }}</h3>
+      <p>{{ locale === 'zh-CN' ? '请先运行流水线，然后通过样本外测试验证策略。这是避免过拟合的黄金标准。' : 'Run a pipeline first, then validate with out-of-sample testing. This is the gold standard for avoiding overfitting.' }}</p>
     </div>
   </div>
 </template>
@@ -116,6 +116,9 @@
 import { ref, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
 import { runWalkForward } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 const props = defineProps({ runId: { type: String, default: '' } })
@@ -131,7 +134,7 @@ let resizeObs = null
 
 async function runWF() {
   if (!props.runId) {
-    emit('toast', { message: 'Run a pipeline first', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '请先运行流水线' : 'Run a pipeline first', type: 'error' })
     return
   }
   loading.value = true
@@ -144,9 +147,9 @@ async function runWF() {
     })
     await nextTick()
     renderOOSChart()
-    emit('toast', { message: `Walk-forward: ${result.value.n_folds} folds completed`, type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `滚动窗口验证：${result.value.n_folds}个折叠已完成` : `Walk-forward: ${result.value.n_folds} folds completed`, type: 'success' })
   } catch (e) {
-    emit('toast', { message: `Walk-forward failed: ${e.response?.data?.detail || e.message}`, type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `滚动窗口验证失败：${e.response?.data?.detail || e.message}` : `Walk-forward failed: ${e.response?.data?.detail || e.message}`, type: 'error' })
   } finally {
     loading.value = false
   }

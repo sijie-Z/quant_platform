@@ -3,32 +3,32 @@
     <div class="dq-header">
       <button class="dq-btn" @click="runCheck" :disabled="loading">
         <span v-if="loading" class="dq-spinner"></span>
-        <span v-else>Run Quality Check</span>
+        <span v-else>{{ locale === 'zh-CN' ? '运行质量检查' : 'Run Quality Check' }}</span>
       </button>
       <span class="dq-status" v-if="report">
         <span :class="report.overall_status === 'PASS' ? 'dq-pass' : 'dq-fail'">
-          {{ report.overall_status }}
+          {{ report.overall_status === 'PASS' ? (locale === 'zh-CN' ? '通过' : 'PASS') : (locale === 'zh-CN' ? '失败' : 'FAIL') }}
         </span>
-        <span class="dq-rate">{{ (report.pass_rate * 100).toFixed(0) }}% pass rate</span>
+        <span class="dq-rate">{{ locale === 'zh-CN' ? `${(report.pass_rate * 100).toFixed(0)}% 通过率` : `${(report.pass_rate * 100).toFixed(0)}% pass rate` }}</span>
       </span>
     </div>
 
     <!-- Summary Cards -->
     <div class="dq-summary" v-if="report">
       <div class="dq-card">
-        <div class="dq-card-label">Total Checks</div>
+        <div class="dq-card-label">{{ locale === 'zh-CN' ? '总检查项' : 'Total Checks' }}</div>
         <div class="dq-card-val">{{ report.total_checks }}</div>
       </div>
       <div class="dq-card dq-card-pass">
-        <div class="dq-card-label">Passed</div>
+        <div class="dq-card-label">{{ locale === 'zh-CN' ? '通过' : 'Passed' }}</div>
         <div class="dq-card-val pos">{{ report.passed }}</div>
       </div>
       <div class="dq-card dq-card-fail">
-        <div class="dq-card-label">Failed</div>
+        <div class="dq-card-label">{{ locale === 'zh-CN' ? '失败' : 'Failed' }}</div>
         <div class="dq-card-val neg">{{ report.failed }}</div>
       </div>
       <div class="dq-card" v-for="(count, sev) in report.by_severity" :key="sev">
-        <div class="dq-card-label">{{ sev }}</div>
+        <div class="dq-card-label">{{ locale === 'zh-CN' ? (sev === 'info' ? '信息' : sev === 'warn' ? '警告' : sev === 'error' ? '错误' : sev === 'critical' ? '严重' : sev) : sev }}</div>
         <div class="dq-card-val" :class="sevClass(sev)">{{ count }}</div>
       </div>
     </div>
@@ -39,14 +39,14 @@
         <div class="dq-check-head">
           <span class="dq-check-icon">{{ c.passed ? '&#10003;' : '&#10007;' }}</span>
           <span class="dq-check-name">{{ c.name }}</span>
-          <span class="dq-check-sev" :class="sevClass(c.severity)">{{ c.severity }}</span>
+          <span class="dq-check-sev" :class="sevClass(c.severity)">{{ locale === 'zh-CN' ? (c.severity === 'info' ? '信息' : c.severity === 'warn' ? '警告' : c.severity === 'error' ? '错误' : c.severity === 'critical' ? '严重' : c.severity) : c.severity }}</span>
         </div>
         <div class="dq-check-msg">{{ c.message }}</div>
       </div>
     </div>
 
     <div v-if="!report && !loading" class="dq-empty">
-      Click "Run Quality Check" to analyze data integrity.
+      {{ locale === 'zh-CN' ? '点击"运行质量检查"以分析数据完整性。' : 'Click "Run Quality Check" to analyze data integrity.' }}
     </div>
   </div>
 </template>
@@ -54,6 +54,9 @@
 <script setup>
 import { ref } from 'vue'
 import { runDataQuality } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 const props = defineProps({ runId: { type: String, default: '' } })
 const emit = defineEmits(['toast'])
@@ -65,9 +68,10 @@ async function runCheck() {
   loading.value = true
   try {
     report.value = await runDataQuality(props.runId)
-    emit('toast', { message: `Quality check: ${report.value.overall_status} (${report.value.passed}/${report.value.total_checks})`, type: report.value.overall_status === 'PASS' ? 'success' : 'error' })
+    const statusLabel = report.value.overall_status === 'PASS' ? (locale.value === 'zh-CN' ? '通过' : 'PASS') : (locale.value === 'zh-CN' ? '失败' : 'FAIL')
+    emit('toast', { message: locale.value === 'zh-CN' ? `质量检查：${statusLabel}（${report.value.passed}/${report.value.total_checks}）` : `Quality check: ${statusLabel} (${report.value.passed}/${report.value.total_checks})`, type: report.value.overall_status === 'PASS' ? 'success' : 'error' })
   } catch (e) {
-    emit('toast', { message: 'Quality check failed: ' + (e.response?.data?.detail || e.message), type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `质量检查失败：${e.response?.data?.detail || e.message}` : 'Quality check failed: ' + (e.response?.data?.detail || e.message), type: 'error' })
   } finally {
     loading.value = false
   }

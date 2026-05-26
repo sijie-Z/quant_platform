@@ -340,7 +340,7 @@
 
 
 ### "你这个系统有多少行代码？"
-> "Python 约 19,500 行，Vue 前端约 9,800 行，610 个单元测试。新增的 Jane Street 级模块（EventBus v2、订单簿、市场冲击、逐笔回测、Greeks、实时风控、Cython 热路径、消息总线、微服务骨架）约 5,000 行 Python + 3 个 Cython .pyx 文件 + 132 个新测试。"
+> "Python 约 19,500 行，Vue 前端约 9,800 行，1077 个单元测试。新增的 Jane Street 级模块（EventBus v2、订单簿、市场冲击、逐笔回测、Greeks、实时风控、Cython 热路径、消息总线、微服务骨架）约 5,000 行 Python + 3 个 Cython .pyx 文件 + 132 个新测试。"
 
 ### "你怎么做测试的？"
 > "610 个 pytest 测试覆盖全模块。每个新模块都有独立测试：EventBus（pub/sub、通配符、拦截器、DLQ）、订单簿（FIFO 撮合、IOC/FOK、部分成交）、风控（Greeks 精度、限额检查、Kill Switch、压力测试）。CI 用 GitHub Actions 在 Python 3.10/3.11/3.12 矩阵跑。"

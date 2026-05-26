@@ -92,3 +92,52 @@ output:
   results_dir: "./results"
   save_plots: true
   plot_format: "png"       # png, pdf, svg
+
+# --- Instruments (Cross-Asset) ---
+# If empty or absent, all symbols default to A-share stock parameters.
+# Add entries to override per-instrument: lot_size, multiplier, margin, costs, etc.
+instruments: []
+  # Example entries (uncomment to enable):
+  # - symbol: "510300"
+  #   asset_type: etf
+  #   stamp_tax_rate: 0.0          # ETFs exempt from stamp tax
+  # - symbol: "IF2406"
+  #   asset_type: future
+  #   exchange: CFFEX
+  #   multiplier: 300
+  #   tick_size: 0.2
+  #   lot_size: 1
+  #   margin_rate: 0.12
+  #   commission_per_lot: 25.0
+  #   stamp_tax_rate: 0.0
+  #   t_plus: 0
+  # - symbol: "IC2406"
+  #   asset_type: future
+  #   exchange: CFFEX
+  #   multiplier: 200
+  #   tick_size: 0.2
+  #   lot_size: 1
+  #   margin_rate: 0.14
+  #   commission_per_lot: 25.0
+  #   stamp_tax_rate: 0.0
+  #   t_plus: 0
+  # - symbol: "cu2406"
+  #   asset_type: future
+  #   exchange: SHFE
+  #   multiplier: 5
+  #   tick_size: 10.0
+  #   lot_size: 1
+  #   margin_rate: 0.10
+  #   commission_per_lot: 3.0
+  #   stamp_tax_rate: 0.0
+  #   t_plus: 0
+
+# --- Execution ---
+execution:
+  broker_type: "simulated"     # simulated, paper, qmt
+  qmt:
+    account: ""                # QMT sim/live account ID
+    password: ""               # LEAVE EMPTY — use env QMT_PASSWORD
+    server: "localhost:58610"  # miniQMT TCP address
+    mode: "sim"                # sim or live
+    data_server: ""            # market data server (defaults to server)

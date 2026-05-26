@@ -165,16 +165,16 @@ def combine_icir_weighted(
                 ic_decay.update(name, recent.mean())
                 ic_decay.check_and_update(name)
 
-        # Filter and weight
-        filtered = {name: v for name, v in icir_values.items() if v >= min_icir}
+        # Filter and weight (keep sign — negative ICIR means reverse the factor)
+        filtered = {name: v for name, v in icir_values.items() if abs(v) >= min_icir}
         if not filtered:
-            filtered = {name: max(v, 0.01) for name, v in icir_values.items()}
+            filtered = dict(icir_values)
 
-        total = sum(max(v, 0) for v in filtered.values())
+        total = sum(abs(v) for v in filtered.values())
         if total < 1e-10:
             weights = {name: 1.0 / len(filtered) for name in filtered}
         else:
-            weights = {name: max(v, 0) / total for name, v in filtered.items()}
+            weights = {name: v / total for name, v in filtered.items()}
 
         # Apply auto-decay: zero out disabled factors and renormalize
         if ic_decay is not None:

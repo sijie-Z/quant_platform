@@ -2,8 +2,8 @@
   <div>
     <div class="section-header">
       <div>
-        <div class="section-title">Parameter Sweep</div>
-        <div class="section-subtitle">Grid search across optimizer, frequency, and universe size</div>
+        <div class="section-title">{{ locale === 'zh-CN' ? '参数网格搜索' : 'Parameter Sweep' }}</div>
+        <div class="section-subtitle">{{ locale === 'zh-CN' ? '在优化器、频率和股票池规模间进行网格搜索' : 'Grid search across optimizer, frequency, and universe size' }}</div>
       </div>
     </div>
 
@@ -12,32 +12,32 @@
       <div class="card-header">
         <div class="card-title">
           <span class="card-title-dot"></span>
-          Sweep Configuration
+          {{ locale === 'zh-CN' ? '扫描配置' : 'Sweep Configuration' }}
         </div>
-        <span class="tag tag-purple" v-if="totalCombinations">{{ totalCombinations }} combinations</span>
+        <span class="tag tag-purple" v-if="totalCombinations">{{ totalCombinations }} {{ locale === 'zh-CN' ? '种组合' : 'combinations' }}</span>
       </div>
       <div class="form-row">
         <div class="form-group">
-          <label for="sweep-opt">Optimizers</label>
+          <label for="sweep-opt">{{ locale === 'zh-CN' ? '优化器' : 'Optimizers' }}</label>
           <select id="sweep-opt" v-model="selectedOptimizers" multiple class="select-multiple">
-            <option value="equal_weight">Equal Weight</option>
-            <option value="mean_variance">Mean Variance</option>
-            <option value="risk_parity">Risk Parity</option>
+            <option value="equal_weight">{{ locale === 'zh-CN' ? '等权' : 'Equal Weight' }}</option>
+            <option value="mean_variance">{{ locale === 'zh-CN' ? '均值方差' : 'Mean Variance' }}</option>
+            <option value="risk_parity">{{ locale === 'zh-CN' ? '风险平价' : 'Risk Parity' }}</option>
           </select>
         </div>
         <div class="form-group">
-          <label for="sweep-freq">Frequencies</label>
+          <label for="sweep-freq">{{ locale === 'zh-CN' ? '频率' : 'Frequencies' }}</label>
           <select id="sweep-freq" v-model="selectedFrequencies" multiple class="select-multiple-short">
-            <option value="monthly">Monthly</option>
-            <option value="weekly">Weekly</option>
+            <option value="monthly">{{ locale === 'zh-CN' ? '月度' : 'Monthly' }}</option>
+            <option value="weekly">{{ locale === 'zh-CN' ? '周度' : 'Weekly' }}</option>
           </select>
         </div>
         <div class="form-group">
-          <label for="sweep-n">Universe Size</label>
+          <label for="sweep-n">{{ locale === 'zh-CN' ? '股票池规模' : 'Universe Size' }}</label>
           <select id="sweep-n" v-model="selectedNStocks" multiple class="select-multiple-short">
-            <option :value="100">100 stocks</option>
-            <option :value="200">200 stocks</option>
-            <option :value="300">300 stocks</option>
+            <option :value="100">{{ locale === 'zh-CN' ? '100只股票' : '100 stocks' }}</option>
+            <option :value="200">{{ locale === 'zh-CN' ? '200只股票' : '200 stocks' }}</option>
+            <option :value="300">{{ locale === 'zh-CN' ? '300只股票' : '300 stocks' }}</option>
           </select>
         </div>
       </div>
@@ -45,11 +45,11 @@
         <button class="btn btn-primary" :disabled="loading" @click="runSweep">
           <span v-if="loading">
             <span class="status-spinner" style="display:inline-block;"></span>
-            Sweeping...
+            {{ locale === 'zh-CN' ? '扫描中...' : 'Sweeping...' }}
           </span>
-          <span v-else>&#9654; Run Sweep</span>
+          <span v-else>&#9654; {{ locale === 'zh-CN' ? '开始扫描' : 'Run Sweep' }}</span>
         </button>
-        <span v-if="loading" class="text-muted text-sm">This may take several minutes...</span>
+        <span v-if="loading" class="text-muted text-sm">{{ locale === 'zh-CN' ? '这可能需要几分钟...' : 'This may take several minutes...' }}</span>
       </div>
     </div>
 
@@ -60,12 +60,12 @@
     <!-- Best Params -->
     <Transition name="tab-content">
       <div v-if="bestParams" class="best-params">
-        <span class="best-params-badge">Optimal</span>
+        <span class="best-params-badge">{{ locale === 'zh-CN' ? '最优' : 'Optimal' }}</span>
         <div class="best-params-info">
-          <span>Optimizer: <strong>{{ bestParams.optimizer }}</strong></span>
-          <span>Frequency: <strong>{{ bestParams.frequency }}</strong></span>
-          <span>N Stocks: <strong>{{ bestParams.n_stocks }}</strong></span>
-          <span>Sharpe: <strong class="text-green">{{ bestParams.sharpe }}</strong></span>
+          <span>{{ locale === 'zh-CN' ? '优化器：' : 'Optimizer: ' }}<strong>{{ bestParams.optimizer }}</strong></span>
+          <span>{{ locale === 'zh-CN' ? '频率：' : 'Frequency: ' }}<strong>{{ bestParams.frequency }}</strong></span>
+          <span>{{ locale === 'zh-CN' ? '股票数：' : 'N Stocks: ' }}<strong>{{ bestParams.n_stocks }}</strong></span>
+          <span>{{ locale === 'zh-CN' ? '夏普比：' : 'Sharpe: ' }}<strong class="text-green">{{ bestParams.sharpe }}</strong></span>
         </div>
       </div>
     </Transition>
@@ -75,9 +75,9 @@
       <div class="card-header">
         <div class="card-title">
           <span class="card-title-dot"></span>
-          Sharpe Ratio Heatmap
+          {{ locale === 'zh-CN' ? '夏普比率热力图' : 'Sharpe Ratio Heatmap' }}
         </div>
-        <span class="text-xs text-dim">Darker green = higher Sharpe</span>
+        <span class="text-xs text-dim">{{ locale === 'zh-CN' ? '颜色越深 = 夏普比越高' : 'Darker green = higher Sharpe' }}</span>
       </div>
       <div class="heatmap-container">
         <div class="heatmap-block" v-for="hm in heatmapData" :key="hm.optimizer">
@@ -86,7 +86,7 @@
             <table>
               <thead>
                 <tr>
-                  <th style="font-size:10px;">N \ Freq</th>
+                  <th style="font-size:10px;">N \ {{ locale === 'zh-CN' ? '频率' : 'Freq' }}</th>
                   <th v-for="freq in hm.frequencies" :key="freq">{{ freq }}</th>
                 </tr>
               </thead>
@@ -114,9 +114,9 @@
       <div class="card-header">
         <div class="card-title">
           <span class="card-title-dot"></span>
-          Sweep Results
+          {{ locale === 'zh-CN' ? '扫描结果' : 'Sweep Results' }}
         </div>
-        <span class="text-xs text-dim">{{ table.length }} combinations tested</span>
+        <span class="text-xs text-dim">{{ table.length }} {{ locale === 'zh-CN' ? '种组合已测试' : 'combinations tested' }}</span>
       </div>
       <div class="table-container">
         <table>
@@ -139,8 +139,8 @@
     <!-- Empty -->
     <div v-if="!table.length && !loading && !error" class="empty-state">
       <div class="empty-icon">&#9881;</div>
-      <h3>Grid Search</h3>
-      <p>Select optimizers, frequencies, and universe sizes, then click "Run Sweep" to find optimal parameters.</p>
+      <h3>{{ locale === 'zh-CN' ? '网格搜索' : 'Grid Search' }}</h3>
+      <p>{{ locale === 'zh-CN' ? '选择优化器、频率和股票池规模，然后点击"开始扫描"以查找最优参数。' : 'Select optimizers, frequencies, and universe sizes, then click "Run Sweep" to find optimal parameters.' }}</p>
     </div>
   </div>
 </template>
@@ -148,8 +148,10 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { sweepParameters } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
 
 const emit = defineEmits(['toast'])
+const { $t, locale } = useI18n()
 
 const selectedOptimizers = ref(['equal_weight', 'mean_variance', 'risk_parity'])
 const selectedFrequencies = ref(['monthly', 'weekly'])
@@ -245,10 +247,10 @@ async function runSweep() {
     if (res.table.length) {
       columns.value = Object.keys(res.table[0])
     }
-    emit('toast', { message: `Sweep complete: ${res.table.length} combinations`, type: 'success' })
+    emit('toast', { message: (locale.value === 'zh-CN' ? '扫描完成：' : 'Sweep complete: ') + res.table.length + (locale.value === 'zh-CN' ? '种组合' : ' combinations'), type: 'success' })
   } catch (e) {
     error.value = e.response?.data?.detail || e.message
-    emit('toast', { message: 'Sweep failed', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '扫描失败' : 'Sweep failed', type: 'error' })
   } finally {
     loading.value = false
   }

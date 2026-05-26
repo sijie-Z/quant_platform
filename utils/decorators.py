@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from typing import Any, ParamSpec, TypeVar
 
-from utils.logging import get_logger
+from quant_platform.utils.logging import get_logger
 
 P = ParamSpec("P")
 R = TypeVar("R")

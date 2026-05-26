@@ -5,14 +5,14 @@
 
     <!-- Row 1: Equity + Drawdown -->
     <div class="tg-row-main">
-      <Panel title="EQUITY CURVE" dotColor="#4da6ff" class="tg-equity">
+      <Panel :title="$t('terminal.equityCurve')" dotColor="#4da6ff" class="tg-equity">
         <template #actions>
           <span class="panel-tag" v-if="perf">{{ (perf.total_return * 100).toFixed(1) }}% total</span>
         </template>
         <div v-if="loading" class="tg-skeleton-chart"></div>
         <div v-else ref="equityRef" class="tg-chart"></div>
       </Panel>
-      <Panel title="DRAWDOWN" dotColor="#f87171" class="tg-drawdown">
+      <Panel :title="$t('terminal.drawdown')" dotColor="#f87171" class="tg-drawdown">
         <template #actions>
           <span class="panel-tag neg" v-if="perf">{{ (perf.max_drawdown * 100).toFixed(1) }}% max</span>
         </template>
@@ -23,7 +23,7 @@
 
     <!-- Row 2: Factor Heatmap + Risk + Holdings -->
     <div class="tg-row-secondary">
-      <Panel title="FACTOR IC HEATMAP" dotColor="#34d399" class="tg-factors">
+      <Panel :title="$t('terminal.factorIc')" dotColor="#34d399" class="tg-factors">
         <template #actions>
           <span class="panel-tag" v-if="factors.length">{{ factors.length }} factors</span>
         </template>
@@ -31,12 +31,12 @@
         <FactorHeatmap v-else :factors="factors" />
       </Panel>
 
-      <Panel title="RISK ANALYSIS" dotColor="#fb923c" class="tg-risk">
+      <Panel :title="$t('terminal.riskGauges')" dotColor="#fb923c" class="tg-risk">
         <div v-if="loading" class="tg-skeleton-block"></div>
         <RiskGauges v-else :risk="risk" :stressTests="stressTests" />
       </Panel>
 
-      <Panel title="PORTFOLIO EXPOSURE" dotColor="#a78bfa" class="tg-holdings">
+      <Panel :title="$t('terminal.portfolioExposure')" dotColor="#a78bfa" class="tg-holdings">
         <div v-if="loading" class="tg-skeleton-block"></div>
         <HoldingsPanel v-else :exposure="exposure" />
       </Panel>
@@ -44,7 +44,7 @@
 
     <!-- Row 3: Distribution + Excess Return + Holdings Table -->
     <div class="tg-row-analytics">
-      <Panel title="RETURN DISTRIBUTION" dotColor="#818cf8" class="tg-dist">
+      <Panel :title="$t('terminal.returnDistribution')" dotColor="#818cf8" class="tg-dist">
         <template #actions>
           <span class="panel-tag" v-if="chartData?.return_distribution">
             μ={{ chartData.return_distribution.mean?.toFixed(2) }}% σ={{ chartData.return_distribution.std?.toFixed(2) }}%
@@ -54,7 +54,7 @@
         <ReturnDistribution v-else :distribution="chartData?.return_distribution" />
       </Panel>
 
-      <Panel title="EXCESS CUMULATIVE" dotColor="#34d399" class="tg-excess">
+      <Panel :title="$t('terminal.excessReturn')" dotColor="#34d399" class="tg-excess">
         <template #actions>
           <span class="panel-tag" v-if="perf?.excess_return != null">{{ (perf.excess_return * 100).toFixed(1) }}% excess</span>
         </template>
@@ -62,7 +62,7 @@
         <div v-else ref="excessRef" class="tg-chart-sm"></div>
       </Panel>
 
-      <Panel title="TOP HOLDINGS" dotColor="#fb923c" class="tg-stock-holdings">
+      <Panel :title="$t('terminal.topHoldings')" dotColor="#fb923c" class="tg-stock-holdings">
         <template #actions>
           <span class="panel-tag" v-if="exposure?.top_holdings?.length">{{ exposure.top_holdings.length }} positions</span>
         </template>
@@ -73,7 +73,7 @@
 
     <!-- Row 4: Factor Scatter + Attribution + Turnover -->
     <div class="tg-row-research">
-      <Panel title="FACTOR SCATTER" dotColor="#818cf8" class="tg-scatter">
+      <Panel :title="$t('terminal.factorScatter')" dotColor="#818cf8" class="tg-scatter">
         <template #actions>
           <span class="panel-tag" v-if="chartData?.factor_scatter?.length">{{ chartData.factor_scatter.length }} factors</span>
         </template>
@@ -81,7 +81,7 @@
         <FactorScatter v-else :scatterData="chartData?.factor_scatter || []" />
       </Panel>
 
-      <Panel title="P&L ATTRIBUTION" dotColor="#34d399" class="tg-attribution">
+      <Panel :title="$t('terminal.pnlAttribution')" dotColor="#34d399" class="tg-attribution">
         <template #actions>
           <span class="panel-tag" v-if="chartData?.attribution?.length">{{ chartData.attribution.length }} factors</span>
         </template>
@@ -89,7 +89,7 @@
         <AttributionWaterfall v-else :attribution="chartData?.attribution || []" />
       </Panel>
 
-      <Panel title="TURNOVER ANALYSIS" dotColor="#a78bfa" class="tg-turnover">
+      <Panel :title="$t('terminal.turnoverAnalysis')" dotColor="#a78bfa" class="tg-turnover">
         <div v-if="loading" class="tg-skeleton-chart-sm"></div>
         <TurnoverChart v-else :turnover="chartData?.turnover || []" />
       </Panel>
@@ -97,7 +97,7 @@
 
     <!-- Row 5: Drawdown Periods -->
     <div class="tg-row-dd">
-      <Panel title="DRAWDOWN PERIODS" dotColor="#f87171" class="tg-dd-table" full>
+      <Panel :title="$t('terminal.drawdownPeriods')" dotColor="#f87171" class="tg-dd-table" full>
         <template #actions>
           <span class="panel-tag neg" v-if="chartData?.drawdown_periods?.length">
             {{ chartData.drawdown_periods.filter(p => !p.recovered).length }} ongoing
@@ -110,11 +110,11 @@
 
     <!-- Row 5b: Factor Correlation + IC Decay -->
     <div class="tg-row-corr">
-      <Panel title="FACTOR CORRELATION" dotColor="#a78bfa" class="tg-corr">
+      <Panel :title="$t('terminal.factorCorrelation')" dotColor="#a78bfa" class="tg-corr">
         <div v-if="loading" class="tg-skeleton-chart-sm"></div>
         <FactorCorrelation v-else :factors="factors" />
       </Panel>
-      <Panel title="IC DECAY CURVE" dotColor="#34d399" class="tg-decay">
+      <Panel :title="$t('terminal.icDecay')" dotColor="#34d399" class="tg-decay">
         <div v-if="loading" class="tg-skeleton-chart-sm"></div>
         <ICDecay v-else :factors="factors" />
       </Panel>
@@ -122,11 +122,11 @@
 
     <!-- Row 6: Monthly Heatmap + Rolling Sharpe -->
     <div class="tg-row-bottom">
-      <Panel title="MONTHLY RETURNS" dotColor="#22d3ee" class="tg-monthly">
+      <Panel :title="$t('terminal.monthlyReturns')" dotColor="#22d3ee" class="tg-monthly">
         <div v-if="loading" class="tg-skeleton-chart-sm"></div>
         <div v-else ref="monthlyRef" class="tg-chart-sm"></div>
       </Panel>
-      <Panel title="ROLLING SHARPE (252D)" dotColor="#fbbf24" class="tg-sharpe">
+      <Panel :title="$t('terminal.rollingSharpe')" dotColor="#fbbf24" class="tg-sharpe">
         <div v-if="loading" class="tg-skeleton-chart-sm"></div>
         <div v-else ref="sharpeRef" class="tg-chart-sm"></div>
       </Panel>
@@ -134,54 +134,54 @@
 
     <!-- Row 7: Walk-Forward + Monte Carlo + Risk Decomposition -->
     <div class="tg-row-advanced">
-      <Panel title="WALK-FORWARD" dotColor="#34d399" class="tg-wf">
+      <Panel :title="$t('terminal.walkForward')" dotColor="#34d399" class="tg-wf">
         <WalkForward :runId="lastRunId" @toast="$emit('toast', $event)" />
       </Panel>
-      <Panel title="MONTE CARLO" dotColor="#fbbf24" class="tg-mc">
+      <Panel :title="$t('terminal.monteCarlo')" dotColor="#fbbf24" class="tg-mc">
         <MonteCarlo :runId="lastRunId" @toast="$emit('toast', $event)" />
       </Panel>
-      <Panel title="RISK DECOMPOSITION" dotColor="#a78bfa" class="tg-rd">
+      <Panel :title="$t('terminal.riskDecomposition')" dotColor="#a78bfa" class="tg-rd">
         <RiskDecomposition :runId="lastRunId" @toast="$emit('toast', $event)" />
       </Panel>
     </div>
 
     <!-- Row 8: Regime Detection + Risk Monitor -->
     <div class="tg-row-regime">
-      <Panel title="MARKET REGIME" dotColor="#22d3ee" class="tg-regime">
+      <Panel :title="$t('terminal.marketRegime')" dotColor="#22d3ee" class="tg-regime">
         <RegimeDetector :runId="lastRunId" @toast="$emit('toast', $event)" />
       </Panel>
-      <Panel title="RISK MONITOR" dotColor="#ef4444" class="tg-riskmon">
+      <Panel :title="$t('terminal.riskGauges')" dotColor="#ef4444" class="tg-riskmon">
         <RiskMonitor @toast="$emit('toast', $event)" />
       </Panel>
     </div>
 
     <!-- Row 9: Multi-Strategy + Data Quality + Report -->
     <div class="tg-row-multi">
-      <Panel title="MULTI-STRATEGY" dotColor="#4da6ff" class="tg-multistrat">
+      <Panel :title="$t('terminal.multiStrategy')" dotColor="#4da6ff" class="tg-multistrat">
         <MultiStrategy @toast="$emit('toast', $event)" />
       </Panel>
-      <Panel title="DATA QUALITY" dotColor="#22c55e" class="tg-dataquality">
+      <Panel :title="$t('terminal.dataQuality')" dotColor="#22c55e" class="tg-dataquality">
         <DataQuality :runId="lastRunId" @toast="$emit('toast', $event)" />
       </Panel>
     </div>
 
     <!-- Row 10: Report Generation -->
     <div class="tg-row-report">
-      <Panel title="REPORT" dotColor="#fbbf24" class="tg-report-panel" full>
+      <Panel :title="$t('terminal.htmlReport')" dotColor="#fbbf24" class="tg-report-panel" full>
         <div class="tg-report-bar">
-          <span class="tg-report-label">Generate a self-contained HTML backtest report with all charts, metrics, and analysis.</span>
+          <span class="tg-report-label">{{ $t('terminal.clickRun') }}</span>
           <button class="tg-report-btn" @click="downloadReport" :disabled="!lastRunId">
             <span v-if="generatingReport" class="tg-report-spinner"></span>
-            <span v-else>Download HTML Report</span>
+            <span v-else>{{ $t('terminal.downloadReport') }}</span>
           </button>
-          <span v-if="reportPath" class="tg-report-path">Saved: {{ reportPath }}</span>
+          <span v-if="reportPath" class="tg-report-path">{{ $t('common.save') }}: {{ reportPath }}</span>
         </div>
       </Panel>
     </div>
 
     <!-- Row 11: System Log -->
     <div class="tg-row-log">
-      <Panel title="SYSTEM LOG" dotColor="#8b9dc0" class="tg-log" full>
+      <Panel :title="$t('terminal.systemLog')" dotColor="#8b9dc0" class="tg-log" full>
         <SystemLog :entries="logEntries" />
       </Panel>
     </div>
@@ -191,45 +191,45 @@
       <div v-if="showRunPanel" class="tg-run-overlay" @click.self="showRunPanel = false">
         <div class="tg-run-panel">
           <div class="tg-run-header">
-            <span>PIPELINE CONFIGURATION</span>
+            <span>{{ $t('terminal.pipeline') }}</span>
             <button class="tg-close-btn" @click="showRunPanel = false">&times;</button>
           </div>
           <div class="tg-run-body">
             <div class="tg-run-row">
               <div class="tg-run-field">
-                <label>Universe</label>
+                <label>{{ locale === 'zh-CN' ? '股票池' : 'Universe' }}</label>
                 <select v-model.number="runConfig.n_stocks">
-                  <option :value="100">100 stocks</option>
-                  <option :value="200">200 stocks</option>
-                  <option :value="300">300 stocks</option>
-                  <option :value="500">500 stocks</option>
+                  <option :value="100">100</option>
+                  <option :value="200">200</option>
+                  <option :value="300">300</option>
+                  <option :value="500">500</option>
                 </select>
               </div>
               <div class="tg-run-field">
-                <label>Optimizer</label>
+                <label>{{ locale === 'zh-CN' ? '优化器' : 'Optimizer' }}</label>
                 <select v-model="runConfig.optimizer">
-                  <option value="equal_weight">Equal Weight</option>
-                  <option value="mean_variance">Mean-Variance</option>
-                  <option value="risk_parity">Risk Parity</option>
+                  <option value="equal_weight">{{ locale === 'zh-CN' ? '等权' : 'Equal Weight' }}</option>
+                  <option value="mean_variance">{{ locale === 'zh-CN' ? '均值方差' : 'Mean-Variance' }}</option>
+                  <option value="risk_parity">{{ locale === 'zh-CN' ? '风险平价' : 'Risk Parity' }}</option>
                 </select>
               </div>
               <div class="tg-run-field">
-                <label>Alpha</label>
+                <label>{{ locale === 'zh-CN' ? 'Alpha' : 'Alpha' }}</label>
                 <select v-model="runConfig.alpha_method">
-                  <option value="equal_weight">Equal Weight</option>
-                  <option value="ic_weighted">IC Weighted</option>
-                  <option value="icir_weighted">ICIR Weighted</option>
+                  <option value="equal_weight">{{ locale === 'zh-CN' ? '等权' : 'Equal Weight' }}</option>
+                  <option value="ic_weighted">{{ locale === 'zh-CN' ? 'IC加权' : 'IC Weighted' }}</option>
+                  <option value="icir_weighted">{{ locale === 'zh-CN' ? 'ICIR加权' : 'ICIR Weighted' }}</option>
                 </select>
               </div>
               <div class="tg-run-field">
-                <label>Frequency</label>
+                <label>{{ locale === 'zh-CN' ? '频率' : 'Frequency' }}</label>
                 <select v-model="runConfig.rebalance_frequency">
-                  <option value="monthly">Monthly</option>
-                  <option value="weekly">Weekly</option>
+                  <option value="monthly">{{ locale === 'zh-CN' ? '月度' : 'Monthly' }}</option>
+                  <option value="weekly">{{ locale === 'zh-CN' ? '周度' : 'Weekly' }}</option>
                 </select>
               </div>
               <div class="tg-run-field">
-                <label>Covariance</label>
+                <label>{{ locale === 'zh-CN' ? '协方差' : 'Covariance' }}</label>
                 <select v-model="runConfig.covariance_method">
                   <option value="ledoit_wolf">Ledoit-Wolf</option>
                   <option value="sample">Sample</option>
@@ -237,10 +237,10 @@
                 </select>
               </div>
               <div class="tg-run-field">
-                <label>Data Source</label>
+                <label>{{ locale === 'zh-CN' ? '数据源' : 'Data Source' }}</label>
                 <select v-model="runConfig.data_source">
-                  <option value="synthetic">Synthetic (fast)</option>
-                  <option value="baostock">Baostock (real A-share)</option>
+                  <option value="synthetic">{{ locale === 'zh-CN' ? '合成数据(快速)' : 'Synthetic (fast)' }}</option>
+                  <option value="baostock">Baostock</option>
                 </select>
               </div>
             </div>
@@ -262,11 +262,11 @@
             </div>
             <div class="tg-run-actions">
               <button class="btn btn-primary" @click="startRun" :disabled="running">
-                <span v-if="!running">&#9654; Run Pipeline</span>
-                <span v-else><span class="status-spinner" style="display:inline-block;"></span> Running...</span>
+                <span v-if="!running">&#9654; {{ locale === 'zh-CN' ? '运行流水线' : 'Run Pipeline' }}</span>
+                <span v-else><span class="status-spinner" style="display:inline-block;"></span> {{ locale === 'zh-CN' ? '运行中...' : 'Running...' }}</span>
               </button>
-              <button class="btn btn-secondary" @click="loadDemo" :disabled="running">&#9889; Demo Data</button>
-              <button v-if="running" class="btn btn-danger" @click="cancelRun">Cancel</button>
+              <button class="btn btn-secondary" @click="loadDemo" :disabled="running">{{ locale === 'zh-CN' ? '示例数据' : 'Demo Data' }}</button>
+              <button v-if="running" class="btn btn-danger" @click="cancelRun">{{ locale === 'zh-CN' ? '取消' : 'Cancel' }}</button>
             </div>
           </div>
         </div>
@@ -300,7 +300,9 @@ import MultiStrategy from './MultiStrategy.vue'
 import DataQuality from './DataQuality.vue'
 import SystemLog from './SystemLog.vue'
 import { runPipeline, getRunStatus, getRunResult, getDemo, createStatusSocket, generateReport } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
 
+const { $t, locale } = useI18n()
 const emit = defineEmits(['toast'])
 
 // State
@@ -319,12 +321,16 @@ const stage = ref('')
 const loading = ref(false)
 
 const stages = ['data', 'factors', 'alpha', 'backtest', 'report', 'done']
-const stageLabels = {
-  data: 'Loading Data', factors: 'Computing Factors', alpha: 'Generating Alpha',
-  backtest: 'Running Backtest', report: 'Building Report', done: 'Complete',
-}
+const stageLabels = computed(() => ({
+  data: locale.value === 'zh-CN' ? '加载数据' : 'Loading Data',
+  factors: locale.value === 'zh-CN' ? '计算因子' : 'Computing Factors',
+  alpha: locale.value === 'zh-CN' ? '生成 Alpha' : 'Generating Alpha',
+  backtest: locale.value === 'zh-CN' ? '运行回测' : 'Running Backtest',
+  report: locale.value === 'zh-CN' ? '生成报告' : 'Building Report',
+  done: locale.value === 'zh-CN' ? '完成' : 'Complete',
+}))
 const stageIdx = computed(() => stages.indexOf(stage.value))
-const stageLabel = computed(() => stageLabels[stage.value] || stage.value)
+const stageLabel = computed(() => stageLabels.value[stage.value] || stage.value)
 
 const runConfig = reactive({
   n_stocks: 300,
@@ -384,7 +390,7 @@ async function startRun() {
   loading.value = true
   progress.value = 0
   stage.value = 'data'
-  log('info', 'Starting pipeline...')
+  log('info', locale.value === 'zh-CN' ? '开始运行流水线...' : 'Starting pipeline...')
 
   try {
     const params = { ...runConfig }
@@ -415,7 +421,7 @@ function startPolling() {
       if (status.status === 'completed') {
         clearInterval(pollTimer)
         running.value = false
-        log('success', 'Pipeline completed')
+        log('success', locale.value === 'zh-CN' ? '流水线完成' : 'Pipeline completed')
 
         try {
           const data = await getRunResult(runId)
@@ -449,14 +455,14 @@ function cancelRun() {
   if (pollTimer) clearInterval(pollTimer)
   running.value = false
   loading.value = false
-  log('warn', 'Pipeline cancelled by user')
+  log('warn', locale.value === 'zh-CN' ? '流水线被用户取消' : 'Pipeline cancelled by user')
   emit('toast', { message: 'Pipeline cancelled', type: 'info' })
 }
 
 async function loadDemo() {
   showRunPanel.value = false
   loading.value = true
-  log('info', 'Loading demo data...')
+  log('info', locale.value === 'zh-CN' ? '加载示例数据...' : 'Loading demo data...')
   try {
     const data = await getDemo()
     applyResults(data)
@@ -704,7 +710,11 @@ function renderCharts() {
       grid: { left: 48, right: 14, top: 10, bottom: 28 },
       xAxis: {
         type: 'category',
-        data: months.map(m => ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][m-1] || m),
+        data: months.map(m => {
+          const en = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+          const zh = ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月']
+          return locale.value === 'zh-CN' ? (zh[m-1] || m) : (en[m-1] || m)
+        }),
         axisLine: { lineStyle: { color: '#1c2d4a' } },
         axisLabel: { color: '#556882', fontSize: 9 },
         axisTick: { show: false },
@@ -746,7 +756,9 @@ function renderCharts() {
       tooltip: {
         ...chartBase.tooltip,
         formatter: p => {
-          const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][p.value[0]]
+          const enM = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+          const zhM = ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月']
+          const m = locale.value === 'zh-CN' ? zhM[p.value[0]] : enM[p.value[0]]
           return `<b>${m} ${years[p.value[1]]}</b><br/>Return: ${p.value[2]}%`
         },
       },
@@ -803,15 +815,15 @@ function exportResults() {
   a.download = `backtest-${new Date().toISOString().slice(0,10)}.json`
   a.click()
   URL.revokeObjectURL(url)
-  log('info', 'Results exported')
+  log('info', locale.value === 'zh-CN' ? '结果已导出' : 'Results exported')
   emit('toast', { message: 'Results exported', type: 'success' })
 }
 
 onMounted(() => {
   window.addEventListener('keydown', onKeydown)
-  log('info', 'Quant Terminal initialized')
-  log('info', 'Shortcuts: R=Run, D=Demo, E=Export, Ctrl+K=Command')
-  log('info', 'Click Demo Data or press D to see results instantly')
+  log('info', locale.value === 'zh-CN' ? '量化终端已初始化' : 'Quant Terminal initialized')
+  log('info', locale.value === 'zh-CN' ? '快捷键: R=运行, D=示例, E=导出, Ctrl+K=命令' : 'Shortcuts: R=Run, D=Demo, E=Export, Ctrl+K=Command')
+  log('info', locale.value === 'zh-CN' ? '点击"示例数据"或按 D 键查看结果' : 'Click Demo Data or press D to see results instantly')
 
   // WebSocket for real-time pipeline status
   try {
@@ -858,93 +870,89 @@ defineExpose({ startRun, loadDemo, showRunPanel, exportResults })
 .terminal-grid {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
+  padding: 4px;
+  overflow-y: auto;
+  overflow-x: hidden;
   height: calc(100vh - 64px);
-  padding: 3px;
-  overflow: hidden;
+  min-height: 0;
 }
 
 /* Row layouts */
 .tg-row-main {
   display: grid;
   grid-template-columns: 3fr 2fr;
-  gap: 3px;
-  flex: 2.5;
-  min-height: 0;
+  gap: 4px;
+  min-height: 300px;
 }
 
 .tg-row-secondary {
   display: grid;
   grid-template-columns: 5fr 4fr 4fr;
-  gap: 3px;
-  flex: 1.8;
-  min-height: 0;
+  gap: 4px;
+  min-height: 220px;
 }
 
 .tg-row-bottom {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 3px;
-  flex: 1.3;
-  min-height: 0;
+  gap: 4px;
+  min-height: 200px;
 }
 
 .tg-row-analytics {
   display: grid;
   grid-template-columns: 5fr 4fr 5fr;
-  gap: 3px;
-  flex: 1.5;
-  min-height: 0;
+  gap: 4px;
+  min-height: 220px;
 }
 
 .tg-row-research {
   display: grid;
   grid-template-columns: 5fr 4fr 4fr;
-  gap: 3px;
-  flex: 1.5;
-  min-height: 0;
+  gap: 4px;
+  min-height: 220px;
 }
 
 .tg-row-dd {
-  flex: 0.6;
-  min-height: 0;
+  min-height: 100px;
 }
 
 .tg-row-corr {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 3px;
-  flex: 1.5;
-  min-height: 0;
+  gap: 4px;
+  min-height: 220px;
 }
 
 .tg-row-advanced {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   gap: 3px;
-  flex: 2;
+  flex: 3.5;
   min-height: 0;
 }
 
 .tg-row-regime {
   display: grid;
   grid-template-columns: 2fr 1fr;
-  gap: 3px;
-  flex: 1.2;
-  min-height: 0;
+  gap: 4px;
+  min-height: 260px;
 }
 
 .tg-row-multi {
   display: grid;
   grid-template-columns: 3fr 2fr;
-  gap: 3px;
-  flex: 1.8;
-  min-height: 0;
+  gap: 4px;
+  min-height: 280px;
 }
 
 .tg-row-report {
-  flex: 0.4;
-  min-height: 0;
+  min-height: 60px;
+}
+
+.tg-row-log {
+  min-height: 100px;
 }
 
 .tg-report-bar {
@@ -953,12 +961,16 @@ defineExpose({ startRun, loadDemo, showRunPanel, exportResults })
   gap: 12px;
   height: 100%;
   padding: 0 12px;
+  overflow: hidden;
 }
 
 .tg-report-label {
   flex: 1;
   font-size: 10px;
   color: #6b7a8d;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tg-report-btn {
@@ -993,10 +1005,6 @@ defineExpose({ startRun, loadDemo, showRunPanel, exportResults })
   font-family: var(--font-mono);
 }
 
-.tg-row-log {
-  flex: 0.6;
-  min-height: 0;
-}
 
 /* Chart containers */
 .tg-chart {
@@ -1051,6 +1059,10 @@ defineExpose({ startRun, loadDemo, showRunPanel, exportResults })
   font-family: var(--font-mono);
   color: var(--green);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
 }
 
 .panel-tag.neg { color: var(--red); }
@@ -1085,8 +1097,9 @@ defineExpose({ startRun, loadDemo, showRunPanel, exportResults })
   font-size: 11px;
   font-weight: 600;
   color: var(--text-muted);
-  letter-spacing: 1px;
+  letter-spacing: 0.5px;
   text-transform: uppercase;
+  overflow: hidden;
 }
 
 .tg-close-btn {

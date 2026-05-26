@@ -2,8 +2,8 @@
   <div>
     <div class="section-header">
       <div>
-        <div class="section-title">Strategy Comparison</div>
-        <div class="section-subtitle">Compare portfolio optimizers side by side</div>
+        <div class="section-title">{{ locale === 'zh-CN' ? '策略对比' : 'Strategy Comparison' }}</div>
+        <div class="section-subtitle">{{ locale === 'zh-CN' ? '并排对比投资组合优化器' : 'Compare portfolio optimizers side by side' }}</div>
       </div>
     </div>
 
@@ -12,36 +12,36 @@
       <div class="card-header">
         <div class="card-title">
           <span class="card-title-dot"></span>
-          Comparison Setup
+          {{ locale === 'zh-CN' ? '对比设置' : 'Comparison Setup' }}
         </div>
-        <span class="tag tag-accent" v-if="selectedOptimizers.length">{{ selectedOptimizers.length }} strategies</span>
+        <span class="tag tag-accent" v-if="selectedOptimizers.length">{{ selectedOptimizers.length }} {{ locale === 'zh-CN' ? '个策略' : 'strategies' }}</span>
       </div>
       <div class="form-row">
         <div class="form-group">
-          <label for="cmp-opt">Optimizers</label>
+          <label for="cmp-opt">{{ locale === 'zh-CN' ? '优化器' : 'Optimizers' }}</label>
           <select id="cmp-opt" v-model="selectedOptimizers" multiple class="select-multiple">
-            <option value="equal_weight">Equal Weight</option>
-            <option value="mean_variance">Mean Variance</option>
-            <option value="risk_parity">Risk Parity</option>
+            <option value="equal_weight">{{ locale === 'zh-CN' ? '等权' : 'Equal Weight' }}</option>
+            <option value="mean_variance">{{ locale === 'zh-CN' ? '均值方差' : 'Mean Variance' }}</option>
+            <option value="risk_parity">{{ locale === 'zh-CN' ? '风险平价' : 'Risk Parity' }}</option>
           </select>
-          <div class="form-hint">Hold Ctrl/Cmd to select multiple</div>
+          <div class="form-hint">{{ locale === 'zh-CN' ? '按住Ctrl/Cmd键多选' : 'Hold Ctrl/Cmd to select multiple' }}</div>
         </div>
         <div class="form-group">
-          <label for="cmp-n">Universe Size</label>
+          <label for="cmp-n">{{ locale === 'zh-CN' ? '股票池规模' : 'Universe Size' }}</label>
           <select id="cmp-n" v-model.number="nStocks">
-            <option :value="100">100 stocks</option>
-            <option :value="200">200 stocks</option>
-            <option :value="300">300 stocks</option>
-            <option :value="500">500 stocks</option>
+            <option :value="100">{{ locale === 'zh-CN' ? '100只股票' : '100 stocks' }}</option>
+            <option :value="200">{{ locale === 'zh-CN' ? '200只股票' : '200 stocks' }}</option>
+            <option :value="300">{{ locale === 'zh-CN' ? '300只股票' : '300 stocks' }}</option>
+            <option :value="500">{{ locale === 'zh-CN' ? '500只股票' : '500 stocks' }}</option>
           </select>
         </div>
       </div>
       <button class="btn btn-primary" :disabled="loading" @click="runCompare">
         <span v-if="loading">
           <span class="status-spinner" style="display:inline-block;"></span>
-          Comparing...
+          {{ locale === 'zh-CN' ? '对比中...' : 'Comparing...' }}
         </span>
-        <span v-else>&#9654; Compare Strategies</span>
+        <span v-else>&#9654; {{ locale === 'zh-CN' ? '开始对比' : 'Compare Strategies' }}</span>
       </button>
     </div>
 
@@ -54,9 +54,9 @@
       <div class="card-header">
         <div class="card-title">
           <span class="card-title-dot"></span>
-          Comparison Results
+          {{ locale === 'zh-CN' ? '对比结果' : 'Comparison Results' }}
         </div>
-        <span class="text-xs text-dim">{{ table.length }} strategies compared</span>
+        <span class="text-xs text-dim">{{ table.length }} {{ locale === 'zh-CN' ? '个策略已对比' : 'strategies compared' }}</span>
       </div>
       <div class="table-container">
         <table>
@@ -82,8 +82,8 @@
     <!-- Empty -->
     <div v-if="!table.length && !loading && !error" class="empty-state">
       <div class="empty-icon">&#9878;</div>
-      <h3>Compare Strategies</h3>
-      <p>Select two or more portfolio optimizers and click "Compare" to see performance differences.</p>
+      <h3>{{ locale === 'zh-CN' ? '对比策略' : 'Compare Strategies' }}</h3>
+      <p>{{ locale === 'zh-CN' ? '选择两个或多个投资组合优化器，然后点击"开始对比"查看性能差异。' : 'Select two or more portfolio optimizers and click "Compare" to see performance differences.' }}</p>
     </div>
   </div>
 </template>
@@ -91,8 +91,10 @@
 <script setup>
 import { ref } from 'vue'
 import { compareStrategies } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
 
 const emit = defineEmits(['toast'])
+const { $t, locale } = useI18n()
 
 const selectedOptimizers = ref(['equal_weight', 'mean_variance', 'risk_parity'])
 const nStocks = ref(300)
@@ -128,10 +130,10 @@ async function runCompare() {
     if (res.table.length) {
       columns.value = Object.keys(res.table[0])
     }
-    emit('toast', { message: `Compared ${res.table.length} strategies`, type: 'success' })
+    emit('toast', { message: (locale.value === 'zh-CN' ? '已对比' : 'Compared ') + res.table.length + (locale.value === 'zh-CN' ? '个策略' : ' strategies'), type: 'success' })
   } catch (e) {
     error.value = e.response?.data?.detail || e.message
-    emit('toast', { message: 'Comparison failed', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '对比失败' : 'Comparison failed', type: 'error' })
   } finally {
     loading.value = false
   }

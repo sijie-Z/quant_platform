@@ -3,33 +3,33 @@
     <!-- Top KPI Strip -->
     <div class="metrics-grid monitor-kpi">
       <div class="metric-card">
-        <div class="metric-label">Total NAV</div>
+        <div class="metric-label">{{ locale === 'zh-CN' ? '总资产净值' : 'Total NAV' }}</div>
         <div class="metric-value text-accent">{{ formatNum(riskOverview.portfolio_value, 0) }}</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Daily P&L</div>
+        <div class="metric-label">{{ locale === 'zh-CN' ? '日盈亏' : 'Daily P&L' }}</div>
         <div class="metric-value" :class="riskOverview.daily_pnl >= 0 ? 'text-green' : 'text-red'">
           {{ formatNum(riskOverview.daily_pnl, 0) }}
         </div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Risk Level</div>
+        <div class="metric-label">{{ locale === 'zh-CN' ? '风险等级' : 'Risk Level' }}</div>
         <div class="metric-value" :style="{ color: riskColor(riskOverview.risk_level) }">
-          {{ riskOverview.risk_level || 'N/A' }}
+          {{ riskOverview.risk_level || (locale === 'zh-CN' ? '无' : 'N/A') }}
         </div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Drawdown</div>
+        <div class="metric-label">{{ locale === 'zh-CN' ? '回撤' : 'Drawdown' }}</div>
         <div class="metric-value text-orange">-{{ (riskOverview.current_drawdown * 100).toFixed(2) }}%</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Capacity Use</div>
+        <div class="metric-label">{{ locale === 'zh-CN' ? '容量使用率' : 'Capacity Use' }}</div>
         <div class="metric-value" :class="capacityGauge.usage_pct > 80 ? 'text-red' : 'text-green'">
           {{ capacityGauge.usage_pct.toFixed(1) }}%
         </div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Avg IS Cost</div>
+        <div class="metric-label">{{ locale === 'zh-CN' ? '平均IS成本' : 'Avg IS Cost' }}</div>
         <div class="metric-value text-purple">{{ tcaSummary.mean_is_bps.toFixed(1) }} <span class="metric-unit">bps</span></div>
       </div>
     </div>
@@ -39,17 +39,17 @@
       <!-- Panel 1: Risk Dashboard (left) -->
       <div class="card monitor-card">
         <div class="card-header">
-          <span class="card-title"><span class="card-title-dot" style="background:#4da6ff"></span> Risk Dashboard</span>
+          <span class="card-title"><span class="card-title-dot" style="background:#4da6ff"></span> {{ locale === 'zh-CN' ? '风险仪表盘' : 'Risk Dashboard' }}</span>
           <span class="tag" :style="{ background: riskColor(riskOverview.risk_level) + '22', color: riskColor(riskOverview.risk_level) }">
-            {{ riskOverview.risk_level || 'GREEN' }}
+            {{ riskOverview.risk_level || (locale === 'zh-CN' ? '绿色' : 'GREEN') }}
           </span>
         </div>
         <div class="card-body">
           <!-- Factor Exposure Radar -->
-          <div class="chart-title">Barra Factor Exposures</div>
+          <div class="chart-title">{{ locale === 'zh-CN' ? 'Barra因子暴露' : 'Barra Factor Exposures' }}</div>
           <div ref="riskRadarRef" class="chart-container-sm"></div>
           <!-- Sector Concentration -->
-          <div class="chart-title mt-2">Sector Concentration</div>
+          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '行业集中度' : 'Sector Concentration' }}</div>
           <div ref="sectorBarRef" class="chart-container-sm"></div>
         </div>
       </div>
@@ -57,13 +57,13 @@
       <!-- Panel 2: TCA Monitor (center) -->
       <div class="card monitor-card">
         <div class="card-header">
-          <span class="card-title"><span class="card-title-dot" style="background:#fb923c"></span> TCA Monitor</span>
-          <span class="tag tag-orange">{{ tcaSummary.n_orders }} orders</span>
+          <span class="card-title"><span class="card-title-dot" style="background:#fb923c"></span> {{ locale === 'zh-CN' ? '交易成本监控' : 'TCA Monitor' }}</span>
+          <span class="tag tag-orange">{{ tcaSummary.n_orders }} {{ locale === 'zh-CN' ? '笔订单' : 'orders' }}</span>
         </div>
         <div class="card-body">
-          <div class="chart-title">Implementation Shortfall Trend</div>
+          <div class="chart-title">{{ locale === 'zh-CN' ? '实现缺口趋势' : 'Implementation Shortfall Trend' }}</div>
           <div ref="tcaLineRef" class="chart-container-sm"></div>
-          <div class="chart-title mt-2">Cost Decomposition</div>
+          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '成本分解' : 'Cost Decomposition' }}</div>
           <div ref="tcaBarRef" class="chart-container-sm"></div>
         </div>
       </div>
@@ -71,15 +71,15 @@
       <!-- Panel 3: Factor Monitor (right) -->
       <div class="card monitor-card">
         <div class="card-header">
-          <span class="card-title"><span class="card-title-dot" style="background:#a78bfa"></span> Factor Monitor</span>
+          <span class="card-title"><span class="card-title-dot" style="background:#a78bfa"></span> {{ locale === 'zh-CN' ? '因子监控' : 'Factor Monitor' }}</span>
           <span v-if="factorStatus.decay_alerts.length" class="tag tag-red">
-            {{ factorStatus.decay_alerts.length }} alerts
+            {{ factorStatus.decay_alerts.length }} {{ locale === 'zh-CN' ? '条告警' : 'alerts' }}
           </span>
         </div>
         <div class="card-body">
-          <div class="chart-title">Rolling IC (60d)</div>
+          <div class="chart-title">{{ locale === 'zh-CN' ? '滚动IC（60天）' : 'Rolling IC (60d)' }}</div>
           <div ref="factorICRef" class="chart-container-sm"></div>
-          <div class="chart-title mt-2">Factor Attribution (bps)</div>
+          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '因子归因（bps）' : 'Factor Attribution (bps)' }}</div>
           <div ref="factorAttrRef" class="chart-container-sm"></div>
         </div>
       </div>
@@ -87,13 +87,13 @@
       <!-- Panel 4: Capacity Gauge (left bottom) -->
       <div class="card monitor-card">
         <div class="card-header">
-          <span class="card-title"><span class="card-title-dot" style="background:#34d399"></span> Capacity Gauge</span>
-          <span class="tag tag-green">{{ formatNum(capacityGauge.current_aum, 0) }} AUM</span>
+          <span class="card-title"><span class="card-title-dot" style="background:#34d399"></span> {{ locale === 'zh-CN' ? '容量仪表盘' : 'Capacity Gauge' }}</span>
+          <span class="tag tag-green">{{ formatNum(capacityGauge.current_aum, 0) }} {{ locale === 'zh-CN' ? '管理规模' : 'AUM' }}</span>
         </div>
         <div class="card-body">
-          <div class="chart-title">Capacity Usage</div>
+          <div class="chart-title">{{ locale === 'zh-CN' ? '容量使用率' : 'Capacity Usage' }}</div>
           <div ref="capacityGaugeRef" class="chart-container-sm"></div>
-          <div class="chart-title mt-2">AUM vs Sharpe Decay</div>
+          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '规模 vs 夏普衰减' : 'AUM vs Sharpe Decay' }}</div>
           <div ref="capacityCurveRef" class="chart-container-sm"></div>
         </div>
       </div>
@@ -101,46 +101,46 @@
       <!-- Panel 5: Config UI (center bottom) -->
       <div class="card monitor-card">
         <div class="card-header">
-          <span class="card-title"><span class="card-title-dot" style="background:#fbbf24"></span> Risk Configuration</span>
+          <span class="card-title"><span class="card-title-dot" style="background:#fbbf24"></span> {{ locale === 'zh-CN' ? '风险配置' : 'Risk Configuration' }}</span>
         </div>
         <div class="card-body">
           <div class="config-form">
             <div class="form-row">
-              <label class="config-label">Max Position %</label>
+              <label class="config-label">{{ locale === 'zh-CN' ? '最大仓位%' : 'Max Position %' }}</label>
               <input type="number" v-model.number="configForm.max_position_pct" min="0.01" max="0.20" step="0.01" class="config-input" />
             </div>
             <div class="form-row">
-              <label class="config-label">Max Sector %</label>
+              <label class="config-label">{{ locale === 'zh-CN' ? '最大行业%' : 'Max Sector %' }}</label>
               <input type="number" v-model.number="configForm.max_sector_pct" min="0.05" max="0.50" step="0.05" class="config-input" />
             </div>
             <div class="form-row">
-              <label class="config-label">Drawdown Halt %</label>
+              <label class="config-label">{{ locale === 'zh-CN' ? '回撤暂停%' : 'Drawdown Halt %' }}</label>
               <input type="number" v-model.number="configForm.max_drawdown_pct" min="0.01" max="0.30" step="0.01" class="config-input" />
             </div>
             <div class="form-row">
-              <label class="config-label">Daily Loss Limit %</label>
+              <label class="config-label">{{ locale === 'zh-CN' ? '日亏损限额%' : 'Daily Loss Limit %' }}</label>
               <input type="number" v-model.number="configForm.max_daily_loss_pct" min="0.005" max="0.10" step="0.005" class="config-input" />
             </div>
             <div class="config-actions">
               <button class="btn btn-primary btn-sm" @click="submitConfig" :disabled="configSaving">
-                {{ configSaving ? 'Saving...' : 'Update Limits' }}
+                {{ configSaving ? (locale === 'zh-CN' ? '保存中...' : 'Saving...') : (locale === 'zh-CN' ? '更新限额' : 'Update Limits') }}
               </button>
             </div>
           </div>
           <!-- Kill Switch -->
           <div class="kill-switch-section mt-3">
-            <div class="kill-switch-label">Emergency Kill Switch</div>
+            <div class="kill-switch-label">{{ locale === 'zh-CN' ? '紧急熔断开关' : 'Emergency Kill Switch' }}</div>
             <button
               class="btn btn-danger kill-btn"
               @click="confirmKillSwitch"
             >
-              {{ killSwitchActive ? 'DEACTIVATE KILL SWITCH' : 'ACTIVATE KILL SWITCH' }}
+              {{ killSwitchActive ? (locale === 'zh-CN' ? '解除熔断开关' : 'DEACTIVATE KILL SWITCH') : (locale === 'zh-CN' ? '激活熔断开关' : 'ACTIVATE KILL SWITCH') }}
             </button>
           </div>
           <!-- Config change log -->
           <div class="config-log mt-3">
-            <div class="chart-title">Recent Changes</div>
-            <div v-if="configLog.length === 0" class="text-muted text-sm">No recent changes</div>
+            <div class="chart-title">{{ locale === 'zh-CN' ? '最近变更' : 'Recent Changes' }}</div>
+            <div v-if="configLog.length === 0" class="text-muted text-sm">{{ locale === 'zh-CN' ? '暂无最近变更' : 'No recent changes' }}</div>
             <div v-for="(log, i) in configLog" :key="i" class="config-log-item">
               <span class="text-muted text-xs">{{ log.time }}</span>
               <span class="text-sm">{{ log.message }}</span>
@@ -152,18 +152,18 @@
       <!-- Panel 6: Factor Alert Table (right bottom) -->
       <div class="card monitor-card">
         <div class="card-header">
-          <span class="card-title"><span class="card-title-dot" style="background:#f87171"></span> Factor Alerts</span>
+          <span class="card-title"><span class="card-title-dot" style="background:#f87171"></span> {{ locale === 'zh-CN' ? '因子告警' : 'Factor Alerts' }}</span>
         </div>
         <div class="card-body">
           <div class="table-container">
             <table>
               <thead>
                 <tr>
-                  <th>Factor</th>
+                  <th>{{ locale === 'zh-CN' ? '因子' : 'Factor' }}</th>
                   <th>IC</th>
                   <th>ICIR</th>
-                  <th>Trend</th>
-                  <th>Status</th>
+                  <th>{{ locale === 'zh-CN' ? '趋势' : 'Trend' }}</th>
+                  <th>{{ locale === 'zh-CN' ? '状态' : 'Status' }}</th>
                 </tr>
               </thead>
               <tbody>
@@ -185,7 +185,7 @@
           </div>
           <!-- Disabled factors -->
           <div v-if="factorStatus.disabled_factors.length" class="mt-2">
-            <div class="text-red text-sm font-bold">Auto-Decay Disabled:</div>
+            <div class="text-red text-sm font-bold">{{ locale === 'zh-CN' ? '自动降权已禁用：' : 'Auto-Decay Disabled:' }}</div>
             <span v-for="name in factorStatus.disabled_factors" :key="name" class="tag tag-red mr-1">{{ name }}</span>
           </div>
         </div>
@@ -195,19 +195,22 @@
     <!-- Kill Switch Confirmation Modal -->
     <div v-if="showKillModal" class="modal-overlay" @click.self="showKillModal = false">
       <div class="modal-content">
-        <div class="modal-title text-red">CONFIRM KILL SWITCH</div>
+        <div class="modal-title text-red">{{ locale === 'zh-CN' ? '确认熔断开关' : 'CONFIRM KILL SWITCH' }}</div>
         <p class="text-secondary">
-          This will immediately {{ killSwitchActive ? 'deactivate' : 'ACTIVATE' }} the Kill Switch,
-          {{ killSwitchActive ? 'resuming' : 'STOPPING ALL' }} order submissions.
+          {{ locale === 'zh-CN' ? '这将立即' : 'This will immediately' }}
+          {{ killSwitchActive ? (locale === 'zh-CN' ? '解除' : 'deactivate') : (locale === 'zh-CN' ? '激活' : 'ACTIVATE') }}
+          {{ locale === 'zh-CN' ? '熔断开关，' : ' the Kill Switch,' }}
+          {{ killSwitchActive ? (locale === 'zh-CN' ? '恢复' : 'resuming') : (locale === 'zh-CN' ? '停止所有' : 'STOPPING ALL') }}
+          {{ locale === 'zh-CN' ? '订单提交。' : ' order submissions.' }}
         </p>
         <div class="form-group mt-2">
-          <label class="config-label">Reason</label>
-          <input type="text" v-model="killReason" class="config-input" placeholder="Reason for action" />
+          <label class="config-label">{{ locale === 'zh-CN' ? '原因' : 'Reason' }}</label>
+          <input type="text" v-model="killReason" class="config-input" :placeholder="locale === 'zh-CN' ? '操作原因' : 'Reason for action'" />
         </div>
         <div class="modal-actions mt-3">
-          <button class="btn btn-ghost" @click="showKillModal = false">Cancel</button>
+          <button class="btn btn-ghost" @click="showKillModal = false">{{ locale === 'zh-CN' ? '取消' : 'Cancel' }}</button>
           <button class="btn btn-danger" @click="executeKillSwitch">
-            {{ killSwitchActive ? 'Deactivate' : 'ACTIVATE' }}
+            {{ killSwitchActive ? (locale === 'zh-CN' ? '解除' : 'Deactivate') : (locale === 'zh-CN' ? '激活' : 'ACTIVATE') }}
           </button>
         </div>
       </div>
@@ -226,8 +229,10 @@ import {
   updateMonitorConfig,
   triggerMonitorKillSwitch,
 } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
 
 const emit = defineEmits(['toast'])
+const { $t, locale } = useI18n()
 
 // ── State ──
 const riskOverview = reactive({
@@ -314,7 +319,7 @@ async function fetchAll() {
     Object.assign(capacityGauge, cap)
     nextTick(() => renderAllCharts())
   } catch (e) {
-    emit('toast', { message: 'Monitor fetch failed', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '监控数据获取失败' : 'Monitor fetch failed', type: 'error' })
   }
 }
 
@@ -487,7 +492,7 @@ function renderCapacityGauge() {
         color: capacityGauge.usage_pct > 80 ? '#f87171' : '#34d399',
         formatter: v => v.toFixed(1) + '%',
       },
-      data: [{ value: capacityGauge.usage_pct, name: 'Capacity Used' }],
+      data: [{ value: capacityGauge.usage_pct, name: locale.value === 'zh-CN' ? '已用容量' : 'Capacity Used' }],
     }],
   })
 }
@@ -515,7 +520,7 @@ function renderCapacityCurve() {
         markLine: {
           silent: true,
           lineStyle: { color: '#f87171', type: 'dashed' },
-          data: [{ yAxis: 0.5, label: { formatter: 'Min Sharpe', color: '#f87171', fontSize: 10 } }],
+          data: [{ yAxis: 0.5, label: { formatter: locale.value === 'zh-CN' ? '最小夏普' : 'Min Sharpe', color: '#f87171', fontSize: 10 } }],
         },
       },
     ],
@@ -529,12 +534,12 @@ async function submitConfig() {
     const result = await updateMonitorConfig(configForm)
     configLog.value.unshift({
       time: new Date().toLocaleTimeString(),
-      message: `Updated: ${result.updated.join(', ')}`,
+      message: (locale.value === 'zh-CN' ? '已更新：' : 'Updated: ') + result.updated.join(', '),
     })
     if (configLog.value.length > 10) configLog.value.pop()
-    emit('toast', { message: 'Config updated', type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '配置已更新' : 'Config updated', type: 'success' })
   } catch (e) {
-    emit('toast', { message: 'Config update failed', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '配置更新失败' : 'Config update failed', type: 'error' })
   } finally {
     configSaving.value = false
   }
@@ -558,7 +563,7 @@ async function executeKillSwitch() {
     })
     emit('toast', { message: result.message, type: result.active ? 'error' : 'success' })
   } catch (e) {
-    emit('toast', { message: 'Kill switch action failed', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '熔断操作失败' : 'Kill switch action failed', type: 'error' })
   }
 }
 

@@ -2,19 +2,19 @@
   <footer class="statusbar">
     <div class="statusbar-left">
       <span class="statusbar-dot" :class="connected ? 'alive' : 'dead'"></span>
-      <span>{{ connected ? 'CONNECTED' : 'DISCONNECTED' }}</span>
+      <span>{{ connected ? $t('statusBar.connected') : $t('statusBar.disconnected') }}</span>
       <span class="statusbar-sep">|</span>
       <span class="text-mono">/api</span>
     </div>
     <div class="statusbar-center">
-      <span class="text-dim">READY</span>
+      <span class="text-dim">{{ locale === 'zh-CN' ? '就绪' : 'READY' }}</span>
     </div>
     <div class="statusbar-right">
       <span class="statusbar-item" @click="$emit('action', 'palette')" title="Command Palette (Ctrl+K)">
         <kbd>Ctrl+K</kbd>
       </span>
       <span class="statusbar-sep">|</span>
-      <span class="statusbar-item">R=Run D=Demo E=Export</span>
+      <span class="statusbar-item">{{ locale === 'zh-CN' ? 'R=运行 D=示例 E=导出' : 'R=Run D=Demo E=Export' }}</span>
       <span class="statusbar-sep">|</span>
       <span class="statusbar-item">{{ currentTime }}</span>
     </div>
@@ -23,6 +23,9 @@
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 defineProps({ connected: { type: Boolean, default: false } })
 defineEmits(['action'])
@@ -31,7 +34,7 @@ const currentTime = ref('')
 let timer = null
 
 function updateTime() {
-  currentTime.value = new Date().toLocaleTimeString('en-US', {
+  currentTime.value = new Date().toLocaleTimeString(locale.value === 'zh-CN' ? 'zh-CN' : 'en-US', {
     hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'
   })
 }
@@ -67,6 +70,9 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer) })
   display: flex;
   align-items: center;
   gap: 8px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .statusbar-dot {

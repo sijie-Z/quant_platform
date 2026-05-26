@@ -9,7 +9,7 @@
               ref="inputRef"
               v-model="query"
               class="palette-input"
-              placeholder="Type a command or search..."
+              :placeholder="locale === 'zh-CN' ? '输入命令或搜索...' : 'Type a command or search...'"
               @keydown.escape="close"
               @keydown.enter="execute"
               @keydown.up.prevent="moveUp"
@@ -34,12 +34,12 @@
               </div>
               <kbd v-if="item.shortcut" class="palette-kbd-sm">{{ item.shortcut }}</kbd>
             </div>
-            <div v-if="!filtered.length" class="palette-empty">No results for "{{ query }}"</div>
+            <div v-if="!filtered.length" class="palette-empty">{{ locale === 'zh-CN' ? '无匹配结果' : 'No results' }} "{{ query }}"</div>
           </div>
           <div class="palette-footer">
-            <span><kbd class="palette-kbd-sm">&#8593;&#8595;</kbd> navigate</span>
-            <span><kbd class="palette-kbd-sm">&#9166;</kbd> select</span>
-            <span><kbd class="palette-kbd-sm">esc</kbd> close</span>
+            <span><kbd class="palette-kbd-sm">&#8593;&#8595;</kbd> {{ locale === 'zh-CN' ? '导航' : 'navigate' }}</span>
+            <span><kbd class="palette-kbd-sm">&#9166;</kbd> {{ locale === 'zh-CN' ? '选择' : 'select' }}</span>
+            <span><kbd class="palette-kbd-sm">esc</kbd> {{ locale === 'zh-CN' ? '关闭' : 'close' }}</span>
           </div>
         </div>
       </div>
@@ -49,6 +49,9 @@
 
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 const props = defineProps({
   modelValue: { type: String, default: 'dashboard' },
@@ -62,22 +65,22 @@ const selected = ref(0)
 const inputRef = ref(null)
 const listRef = ref(null)
 
-const commands = [
-  { id: 'terminal',   icon: '▸', label: 'Terminal',        hint: 'Main backtest dashboard', shortcut: '1', tab: 'terminal' },
-  { id: 'trading',    icon: '⚡', label: 'Live Trading',    hint: 'Paper/Live trading engine', shortcut: '2', tab: 'trading' },
-  { id: 'live',       icon: '◉', label: 'Live Portfolio',  hint: 'Real-time portfolio tracker', shortcut: '3', tab: 'live' },
-  { id: 'oms',        icon: '⊞', label: 'Order Blotter',   hint: 'OMS order management',    shortcut: '4', tab: 'oms' },
-  { id: 'compare',    icon: '⇄', label: 'Compare',         hint: 'Strategy comparison',     shortcut: '5', tab: 'compare' },
-  { id: 'sweep',      icon: '⌖', label: 'Sweep',           hint: 'Parameter grid search',   shortcut: '6', tab: 'sweep' },
-  { id: 'factors',    icon: '≡', label: 'Factors',         hint: 'Factor IC rankings',      shortcut: '7', tab: 'factors' },
-  { id: 'history',    icon: '⏱', label: 'History',         hint: 'Run history',             shortcut: '8', tab: 'history' },
-  { id: 'settings',   icon: '⚙', label: 'Settings',        hint: 'Platform configuration',  shortcut: '9', tab: 'settings' },
-  { id: 'run',        icon: '▶', label: 'Run Pipeline',    hint: 'Start a new backtest',    action: 'run' },
-  { id: 'demo',       icon: '⚡', label: 'Load Demo Data',  hint: 'Load sample data',        action: 'demo' },
-  { id: 'export',     icon: '☐', label: 'Export Results',   hint: 'Download as JSON',        action: 'export' },
-  { id: 'refresh',    icon: '↻', label: 'Refresh',          hint: 'Reload current page',     action: 'refresh' },
-  { id: 'health',     icon: '♥', label: 'Check Backend',    hint: 'Verify API connection',   action: 'health' },
-]
+const commands = computed(() => [
+  { id: 'terminal',   icon: '▸', label: $t('nav.terminal'),        hint: locale.value === 'zh-CN' ? '主回测仪表盘' : 'Main backtest dashboard', shortcut: '1', tab: 'terminal' },
+  { id: 'trading',    icon: '⚡', label: $t('nav.trading'),    hint: locale.value === 'zh-CN' ? '模拟/实盘交易引擎' : 'Paper/Live trading engine', shortcut: '2', tab: 'trading' },
+  { id: 'live',       icon: '◉', label: $t('nav.live'),  hint: locale.value === 'zh-CN' ? '实时组合追踪' : 'Real-time portfolio tracker', shortcut: '3', tab: 'live' },
+  { id: 'oms',        icon: '⊞', label: $t('nav.oms'),   hint: locale.value === 'zh-CN' ? '订单管理' : 'OMS order management',    shortcut: '4', tab: 'oms' },
+  { id: 'compare',    icon: '⇄', label: $t('nav.compare'),         hint: locale.value === 'zh-CN' ? '策略对比' : 'Strategy comparison',     shortcut: '5', tab: 'compare' },
+  { id: 'sweep',      icon: '⌖', label: $t('nav.sweep'),           hint: locale.value === 'zh-CN' ? '参数网格搜索' : 'Parameter grid search',   shortcut: '6', tab: 'sweep' },
+  { id: 'factors',    icon: '≡', label: $t('nav.factors'),         hint: locale.value === 'zh-CN' ? '因子排名' : 'Factor IC rankings',      shortcut: '7', tab: 'factors' },
+  { id: 'history',    icon: '⏱', label: $t('nav.history'),         hint: locale.value === 'zh-CN' ? '运行历史' : 'Run history',             shortcut: '8', tab: 'history' },
+  { id: 'settings',   icon: '⚙', label: $t('nav.settings'),        hint: locale.value === 'zh-CN' ? '平台设置' : 'Platform configuration',  shortcut: '9', tab: 'settings' },
+  { id: 'run',        icon: '▶', label: $t('terminal.runPipeline'),    hint: locale.value === 'zh-CN' ? '开始新回测' : 'Start a new backtest',    action: 'run' },
+  { id: 'demo',       icon: '⚡', label: $t('terminal.demoBtn'),  hint: locale.value === 'zh-CN' ? '加载示例数据' : 'Load sample data',        action: 'demo' },
+  { id: 'export',     icon: '☐', label: $t('terminal.exportBtn'),   hint: locale.value === 'zh-CN' ? '导出为 JSON' : 'Download as JSON',        action: 'export' },
+  { id: 'refresh',    icon: '↻', label: locale.value === 'zh-CN' ? '刷新' : 'Refresh',          hint: locale.value === 'zh-CN' ? '刷新当前页' : 'Reload current page',     action: 'refresh' },
+  { id: 'health',     icon: '♥', label: locale.value === 'zh-CN' ? '检查后端' : 'Check Backend',    hint: locale.value === 'zh-CN' ? '验证API连接' : 'Verify API connection',   action: 'health' },
+])
 
 const filtered = computed(() => {
   if (!query.value.trim()) return commands

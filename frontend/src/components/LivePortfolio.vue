@@ -4,14 +4,14 @@
     <div class="lp-header">
       <div class="lp-title">
         <span class="lp-dot alive"></span>
-        LIVE PORTFOLIO TRACKER
+        {{ locale === 'zh-CN' ? '实时组合追踪' : 'LIVE PORTFOLIO TRACKER' }}
       </div>
       <div class="lp-actions">
         <button class="btn btn-sm btn-secondary" @click="$refs.fileInput.click()">
-          Import CSV
+          {{ locale === 'zh-CN' ? '导入CSV' : 'Import CSV' }}
         </button>
         <button class="btn btn-sm btn-primary" @click="refreshPrices" :disabled="refreshing">
-          {{ refreshing ? 'Loading...' : 'Refresh Prices' }}
+          {{ refreshing ? (locale === 'zh-CN' ? '加载中...' : 'Loading...') : (locale === 'zh-CN' ? '刷新行情' : 'Refresh Prices') }}
         </button>
         <input ref="fileInput" type="file" accept=".csv" style="display:none" @change="onFileUpload" />
       </div>
@@ -20,31 +20,31 @@
     <!-- Summary Cards -->
     <div class="lp-summary" v-if="portfolio">
       <div class="lp-card">
-        <div class="lp-card-label">Total Value</div>
+        <div class="lp-card-label">{{ locale === 'zh-CN' ? '总价值' : 'Total Value' }}</div>
         <div class="lp-card-value lp-accent">{{ formatNumber(portfolio.total_value) }}</div>
       </div>
       <div class="lp-card">
-        <div class="lp-card-label">Daily P&L</div>
+        <div class="lp-card-label">{{ locale === 'zh-CN' ? '日盈亏' : 'Daily P&L' }}</div>
         <div :class="['lp-card-value', portfolio.total_pnl >= 0 ? 'lp-pos' : 'lp-neg']">
           {{ portfolio.total_pnl >= 0 ? '+' : '' }}{{ formatNumber(portfolio.total_pnl) }}
         </div>
       </div>
       <div class="lp-card">
-        <div class="lp-card-label">Daily Return</div>
+        <div class="lp-card-label">{{ locale === 'zh-CN' ? '日收益率' : 'Daily Return' }}</div>
         <div :class="['lp-card-value', portfolio.daily_return_pct >= 0 ? 'lp-pos' : 'lp-neg']">
           {{ portfolio.daily_return_pct >= 0 ? '+' : '' }}{{ portfolio.daily_return_pct?.toFixed(2) }}%
         </div>
       </div>
       <div class="lp-card">
-        <div class="lp-card-label">Positions</div>
+        <div class="lp-card-label">{{ locale === 'zh-CN' ? '持仓数' : 'Positions' }}</div>
         <div class="lp-card-value">{{ portfolio.n_positions }}</div>
       </div>
       <div class="lp-card">
-        <div class="lp-card-label">With Price</div>
+        <div class="lp-card-label">{{ locale === 'zh-CN' ? '有行情' : 'With Price' }}</div>
         <div class="lp-card-value lp-green">{{ portfolio.n_with_price }}</div>
       </div>
       <div class="lp-card" v-if="portfolio.n_no_price > 0">
-        <div class="lp-card-label">No Price</div>
+        <div class="lp-card-label">{{ locale === 'zh-CN' ? '无行情' : 'No Price' }}</div>
         <div class="lp-card-value lp-warn">{{ portfolio.n_no_price }}</div>
       </div>
     </div>
@@ -55,15 +55,15 @@
         <thead>
           <tr>
             <th>#</th>
-            <th>Code</th>
-            <th>Shares</th>
-            <th>Close</th>
-            <th>Prev Close</th>
-            <th>Mkt Value</th>
-            <th>P&L</th>
-            <th>Return</th>
-            <th>Weight</th>
-            <th>P&L Bar</th>
+            <th>{{ locale === 'zh-CN' ? '代码' : 'Code' }}</th>
+            <th>{{ locale === 'zh-CN' ? '持仓' : 'Shares' }}</th>
+            <th>{{ locale === 'zh-CN' ? '收盘价' : 'Close' }}</th>
+            <th>{{ locale === 'zh-CN' ? '昨收' : 'Prev Close' }}</th>
+            <th>{{ locale === 'zh-CN' ? '市值' : 'Mkt Value' }}</th>
+            <th>{{ locale === 'zh-CN' ? '盈亏' : 'P&L' }}</th>
+            <th>{{ locale === 'zh-CN' ? '收益率' : 'Return' }}</th>
+            <th>{{ locale === 'zh-CN' ? '权重' : 'Weight' }}</th>
+            <th>{{ locale === 'zh-CN' ? '盈亏条' : 'P&L Bar' }}</th>
           </tr>
         </thead>
         <tbody>
@@ -98,22 +98,27 @@
     <!-- Empty State -->
     <div v-if="!portfolio && !loading" class="lp-empty">
       <div class="lp-empty-icon">&#9776;</div>
-      <h3>Import Holdings CSV</h3>
-      <p>Upload a CSV file with <code>code,hold_vol</code> columns to track your portfolio in real-time.</p>
-      <button class="btn btn-primary" @click="$refs.fileInput.click()">Import CSV</button>
+      <h3>{{ locale === 'zh-CN' ? '导入持仓CSV' : 'Import Holdings CSV' }}</h3>
+      <p>
+        {{ locale === 'zh-CN' ? '上传包含 ' : 'Upload a CSV file with ' }}<code>code,hold_vol</code>{{ locale === 'zh-CN' ? ' 列的CSV文件以实时追踪您的组合。' : ' columns to track your portfolio in real-time.' }}
+      </p>
+      <button class="btn btn-primary" @click="$refs.fileInput.click()">{{ locale === 'zh-CN' ? '导入CSV' : 'Import CSV' }}</button>
     </div>
 
     <!-- Loading -->
     <div v-if="loading" class="lp-loading">
       <div class="status-spinner" style="width:24px;height:24px;"></div>
-      <span>Fetching real-time prices from baostock...</span>
+      <span>{{ locale === 'zh-CN' ? '正在从Baostock获取实时行情...' : 'Fetching real-time prices from baostock...' }}</span>
     </div>
   </div>
 </template>
 
 <script setup>
 import { ref } from 'vue'
+import { useI18n } from '../i18n/index.js'
 import axios from 'axios'
+
+const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 
@@ -155,7 +160,7 @@ async function onFileUpload(e) {
     const volIdx = headers.findIndex(h => h === 'hold_vol' || h === 'shares' || h === 'volume' || h === 'quantity')
 
     if (codeIdx === -1 || volIdx === -1) {
-      emit('toast', { message: 'CSV must have code and hold_vol columns', type: 'error' })
+      emit('toast', { message: locale.value === 'zh-CN' ? 'CSV文件必须包含code和hold_vol列' : 'CSV must have code and hold_vol columns', type: 'error' })
       loading.value = false
       return
     }
@@ -178,9 +183,9 @@ async function onFileUpload(e) {
     const result = await axios.get('/api/portfolio/live')
     portfolio.value = result.data
 
-    emit('toast', { message: `Imported ${data.length} holdings, got prices for ${portfolio.value.n_with_price}`, type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `已导入 ${data.length} 条持仓，${portfolio.value.n_with_price} 条有行情` : `Imported ${data.length} holdings, got prices for ${portfolio.value.n_with_price}`, type: 'success' })
   } catch (err) {
-    emit('toast', { message: `Import failed: ${err.message}`, type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `导入失败: ${err.message}` : `Import failed: ${err.message}`, type: 'error' })
   } finally {
     loading.value = false
   }
@@ -192,9 +197,9 @@ async function refreshPrices() {
   try {
     const result = await axios.get('/api/portfolio/live')
     portfolio.value = result.data
-    emit('toast', { message: 'Prices updated', type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '行情已更新' : 'Prices updated', type: 'success' })
   } catch (err) {
-    emit('toast', { message: `Refresh failed: ${err.message}`, type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `刷新失败: ${err.message}` : `Refresh failed: ${err.message}`, type: 'error' })
   } finally {
     refreshing.value = false
   }

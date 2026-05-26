@@ -53,6 +53,18 @@ BARRA_FACTORS = [
     "residual_vol",   # idiosyncratic volatility
 ]
 
+# Cross-asset factors: applicable to mixed stock/futures/ETF portfolios
+CROSS_ASSET_FACTORS = [
+    "momentum",       # 12-month return skip last month
+    "volatility",     # 60-day realized volatility
+    "liquidity",      # 20-day average turnover
+    "beta",           # market beta
+    "residual_vol",   # idiosyncratic volatility
+    "basis",          # futures basis (spot - futures price, 0 for equities)
+    "term_structure", # term structure slope (0 for equities)
+    "open_interest",  # open interest change (0 for equities)
+]
+
 
 @dataclass
 class BarraFactorReturn:
@@ -103,6 +115,23 @@ class BarraModel:
         self.factor_covariance: np.ndarray | None = None
         self.specific_risk: pd.Series | None = None
         self._fitted = False
+
+    @classmethod
+    def for_asset_type(cls, asset_type: str = "stock", **kwargs) -> BarraModel:
+        """Factory for asset-type-specific Barra models.
+
+        Args:
+            asset_type: 'stock' for equity-only (default), 'cross' for mixed
+                        stock/futures/ETF, 'future' for futures-only.
+        """
+        if asset_type == "cross":
+            kwargs.setdefault("factor_names", CROSS_ASSET_FACTORS)
+        elif asset_type == "future":
+            kwargs.setdefault("factor_names", [
+                "momentum", "volatility", "liquidity", "beta",
+                "basis", "term_structure", "open_interest",
+            ])
+        return cls(**kwargs)
 
     def _cross_sectional_regression(
         self,

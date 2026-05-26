@@ -4,12 +4,12 @@
       <div class="th-logo">Q</div>
       <div class="th-brand">
         <span class="th-name">QUANT TERMINAL</span>
-        <span class="th-sub">A-Share Multi-Factor Research Platform</span>
+        <span class="th-sub">{{ locale === 'zh-CN' ? 'A股多因子量化研究平台' : 'A-Share Multi-Factor Research Platform' }}</span>
       </div>
       <div class="th-sep"></div>
       <div class="th-status" :class="connected ? 'online' : 'offline'">
         <span class="th-status-dot"></span>
-        {{ connected ? 'CONNECTED' : 'OFFLINE' }}
+        {{ connected ? $t('statusBar.connected') : $t('statusBar.disconnected') }}
       </div>
     </div>
 
@@ -28,10 +28,13 @@
         <span class="th-date">{{ date }}</span>
       </div>
       <div class="th-sep"></div>
-      <button class="th-action-btn" @click="$emit('run')" title="Run Pipeline">
+      <button class="th-action-btn lang-btn" @click="toggleLang" :title="langTitle">
+        <span class="th-icon">{{ locale === 'zh-CN' ? 'EN' : '中' }}</span>
+      </button>
+      <button class="th-action-btn" @click="$emit('run')" :title="$t('terminal.runPipeline')">
         <span class="th-icon">&#9654;</span>
       </button>
-      <button class="th-action-btn" @click="$emit('demo')" title="Load Demo">
+      <button class="th-action-btn" @click="$emit('demo')" :title="$t('terminal.demoBtn')">
         <span class="th-icon">&#9889;</span>
       </button>
       <button class="th-action-btn" @click="$emit('command')" title="Command Palette (Ctrl+K)">
@@ -42,7 +45,10 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale, setLang } = useI18n()
 
 defineProps({
   connected: { type: Boolean, default: false },
@@ -56,10 +62,21 @@ const time = ref('')
 const date = ref('')
 let timer = null
 
+const langTitle = computed(() => locale.value === 'zh-CN' ? 'Switch to English' : '切换到中文')
+
+function toggleLang() {
+  setLang(locale.value === 'zh-CN' ? 'en-US' : 'zh-CN')
+}
+
 function updateClock() {
   const now = new Date()
-  time.value = now.toLocaleTimeString('en-US', { hour12: false })
-  date.value = now.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
+  const isZh = locale.value === 'zh-CN'
+  time.value = now.toLocaleTimeString(isZh ? 'zh-CN' : 'en-US', { hour12: false })
+  date.value = now.toLocaleDateString(isZh ? 'zh-CN' : 'en-US', {
+    weekday: isZh ? 'long' : 'short',
+    month: isZh ? 'long' : 'short',
+    day: 'numeric',
+  })
 }
 
 onMounted(() => {
@@ -108,6 +125,8 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer) })
   display: flex;
   flex-direction: column;
   line-height: 1.1;
+  min-width: 0;
+  max-width: 200px;
 }
 
 .th-name {
@@ -121,6 +140,10 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer) })
   font-size: 9px;
   color: var(--text-dim);
   letter-spacing: 0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
 }
 
 .th-sep {
@@ -172,20 +195,28 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer) })
   border-radius: 6px;
   padding: 2px;
   border: 1px solid var(--border-subtle);
+  overflow: hidden;
+  flex: 1;
+  max-width: 60%;
+  justify-content: center;
 }
 
 .th-view-btn {
-  padding: 5px 14px;
+  padding: 5px 10px;
   border: none;
   background: transparent;
   color: var(--text-dim);
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 600;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.3px;
   text-transform: uppercase;
   cursor: pointer;
   border-radius: 4px;
   transition: all 0.15s ease;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .th-view-btn:hover {

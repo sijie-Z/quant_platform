@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-# Ensure the parent directory (containing quant_platform package) is importable
+# Allow running directly via python main.py (pip install -e . also supported)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quant_platform.utils.config import load_config
@@ -38,7 +38,7 @@ def _resolve_config_path(config_path_arg) -> Path:
 
 
 def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
-    """Load and clean data. Returns (prices, returns, benchmark, metadata, financials)."""
+    """Load and clean data. Returns (prices, returns, benchmark, metadata, financials, turnover)."""
     from quant_platform.data.providers.synthetic import SyntheticDataProvider
     from quant_platform.data.providers.tushare_loader import TushareProvider
     from quant_platform.data.providers.baostock_provider import BaostockDataProvider
@@ -85,10 +85,11 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
         pipeline.benchmark,
         pipeline.metadata,
         pipeline.financials,
+        pipeline.get_turnover(),
     )
 
 
-def _compute_factors(prices, returns, financials, metadata):
+def _compute_factors(prices, returns, financials, metadata, turnover=None, config=None):
     """Compute and process all registered factors. Returns (processed_factors, ic_results, sector_map, fin_unstacked)."""
     from quant_platform.factors.technical import register_all as register_technical
     from quant_platform.factors.fundamental import register_all as register_fundamental
@@ -100,17 +101,29 @@ def _compute_factors(prices, returns, financials, metadata):
     register_fundamental()
     registry = get_registry()
 
+    # Build set of enabled factor names from config (if provided)
+    enabled_factors: set[str] | None = None
+    if config is not None and hasattr(config, 'factors'):
+        enabled_factors = set()
+        enabled_factors.update(getattr(config.factors, 'enabled_technicals', ()))
+        enabled_factors.update(getattr(config.factors, 'enabled_fundamentals', ()))
+
     fin_unstacked = financials.unstack("asset") if financials is not None else None
 
     raw_factors = {}
     for factor_name in registry.list_all():
+        if enabled_factors is not None and factor_name not in enabled_factors:
+            continue
         cls = registry.get(factor_name)
         inst = cls()
         try:
+            kwargs = {}
+            if turnover is not None:
+                kwargs["turnover"] = turnover
             if inst.category.value == "fundamental" and fin_unstacked is not None:
-                result = inst.run(prices, fin_unstacked)
+                result = inst.run(prices, fin_unstacked, **kwargs)
             else:
-                result = inst.run(prices)
+                result = inst.run(prices, **kwargs)
             raw_factors[result.name] = result.values
         except Exception as e:
             logger.warning("Failed to compute %s: %s", factor_name, e)
@@ -118,7 +131,7 @@ def _compute_factors(prices, returns, financials, metadata):
     logger.info("Computed %d factors: %s", len(raw_factors), list(raw_factors.keys()))
 
     sector_map = metadata.get("sector", {}) if metadata is not None else {}
-    mcap = fin_unstacked["market_cap"] if fin_unstacked is not None else None
+    mcap = fin_unstacked.get("market_cap") if fin_unstacked is not None else None
 
     processed_factors = {}
     for name, factor in raw_factors.items():
@@ -204,9 +217,7 @@ def cmd_run(args) -> int:
     cache = PipelineCache(args.cache_dir)
     use_cache = not args.force and not args.no_cache
 
-    config = load_config(args.config)
-    global logger
-    logger = setup_logging()
+    config = load_config(raw=raw_config)
 
     logger.info("=" * 60)
     logger.info("Quant Platform: Starting full pipeline run")
@@ -224,9 +235,10 @@ def cmd_run(args) -> int:
 
     if data_tuple is not None:
         prices, returns, benchmark, metadata, financials = data_tuple
+        turnover = None
         logger.info("Data loaded from cache")
     else:
-        prices, returns, benchmark, metadata, financials = _load_data(config)
+        prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_baostock=args.use_baostock)
         if use_cache:
             cache.save_stage("data", cache_key,
                              (prices, returns, benchmark, metadata, financials))
@@ -236,7 +248,7 @@ def cmd_run(args) -> int:
     # ------------------------------------------------------------------
     logger.info("[2/6] Computing factors...")
     processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
-        prices, returns, financials, metadata)
+        prices, returns, financials, metadata, turnover, config=config)
 
     for name, summary in ic_results.items():
         logger.info("  %-20s Rank IC=%.4f  ICIR=%.2f", name, summary["mean_ic"], summary["icir"])
@@ -281,9 +293,6 @@ def cmd_analyze(args) -> int:
     Loads saved CSV files (daily_returns.csv, benchmark_returns.csv,
     weights_history.csv) and regenerates the full analysis dashboard.
     """
-    global logger
-    logger = setup_logging()
-
     results_dir = Path(args.results_dir)
     if not results_dir.exists():
         logger.error("Results directory not found: %s", results_dir)
@@ -353,9 +362,6 @@ def cmd_compare(args) -> int:
     """Compare multiple strategy configurations side by side."""
     import pandas as pd
 
-    global logger
-    logger = setup_logging()
-
     optimizers = args.optimizers.split(",") if args.optimizers else [
         "equal_weight", "mean_variance", "risk_parity"
     ]
@@ -366,9 +372,9 @@ def cmd_compare(args) -> int:
     config.universe.n_stocks = min(config.universe.n_stocks, 300)
 
     # Load data once, reuse across optimizers
-    prices, returns, benchmark, metadata, financials = _load_data(config, use_tushare=False)
+    prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_tushare=False)
     processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
-        prices, returns, financials, metadata)
+        prices, returns, financials, metadata, turnover, config=config)
     signal = _generate_signal(config, processed_factors, returns)
 
     results_table = []
@@ -416,9 +422,6 @@ def cmd_sweep(args) -> int:
     import itertools
     import pandas as pd
 
-    global logger
-    logger = setup_logging()
-
     config = load_config(args.config)
 
     optimizers = args.optimizers.split(",") if args.optimizers else [
@@ -444,9 +447,9 @@ def cmd_sweep(args) -> int:
         config.universe.n_stocks = n_stocks
 
         try:
-            prices, returns, benchmark, metadata, financials = _load_data(config, use_tushare=False)
+            prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_tushare=False)
             processed_factors, _ic_results, sector_map, fin_unstacked = _compute_factors(
-                prices, returns, financials, metadata)
+                prices, returns, financials, metadata, turnover, config=config)
             signal = _generate_signal(config, processed_factors, returns)
             bt_results = _run_backtest(
                 config, signal, prices, returns, benchmark,
@@ -491,7 +494,6 @@ def cmd_cache(args) -> int:
     from quant_platform.utils.cache import PipelineCache
 
     cache = PipelineCache(args.cache_dir)
-    logger = setup_logging()
 
     if args.subcommand == "list":
         entries = cache.list_cached()
@@ -535,15 +537,16 @@ def cmd_ml(args) -> int:
     if args.subcommand == "train":
         from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
 
-        data_result = _load_data(config)
-        factors_result = _compute_factors(data_result, config)
+        prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
+        processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+            prices, returns, financials, metadata, turnover, config=config)
 
         ml_config = MLSignalConfig(
             model_type=args.model,
             n_splits=args.splits,
         )
         gen = MLSignalGenerator(config=ml_config)
-        perf = gen.train(factors_result.processed_factors, factors_result.forward_returns)
+        perf = gen.train(processed_factors, returns)
 
         print("=" * 60)
         print(f"  ML MODEL TRAINING — {args.model.upper()}")
@@ -563,12 +566,13 @@ def cmd_ml(args) -> int:
     elif args.subcommand == "signal":
         from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
 
-        data_result = _load_data(config)
-        factors_result = _compute_factors(data_result, config)
+        prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
+        processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+            prices, returns, financials, metadata, turnover, config=config)
 
         ml_config = MLSignalConfig(model_type=args.model)
         gen = MLSignalGenerator(config=ml_config)
-        signal = gen.generate(factors_result.processed_factors, factors_result.forward_returns)
+        signal = gen.generate(processed_factors, returns)
 
         # Show top/bottom 10 stocks by signal
         last_signal = signal.iloc[-1].dropna().sort_values()
@@ -643,22 +647,23 @@ def cmd_profile(args) -> int:
 
     # Stage 1: Data
     t0 = time.perf_counter()
-    data_result = _load_data(config)
+    prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
     timings["1_data"] = time.perf_counter() - t0
 
     # Stage 2: Factors
     t0 = time.perf_counter()
-    factors_result = _compute_factors(data_result, config)
+    processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+        prices, returns, financials, metadata, turnover, config=config)
     timings["2_factors"] = time.perf_counter() - t0
 
     # Stage 3: Alpha
     t0 = time.perf_counter()
-    signal = _generate_signal(factors_result, config)
+    signal = _generate_signal(config, processed_factors, returns)
     timings["3_alpha"] = time.perf_counter() - t0
 
     # Stage 4: Backtest
     t0 = time.perf_counter()
-    _run_backtest(signal, data_result, config)
+    _run_backtest(config, signal, prices, returns, benchmark, sector_map, fin_unstacked)
     timings["4_backtest"] = time.perf_counter() - t0
 
     total = time.perf_counter() - total_start
@@ -676,6 +681,66 @@ def cmd_profile(args) -> int:
     return 0
 
 
+def cmd_trade(args) -> int:
+    """Execute live trading via LiveRunner (Paper or QMT)."""
+    from quant_platform.trading.live_runner import LiveRunner
+
+    broker_type = args.broker
+    universe = [c.strip() for c in args.universe.split(",")] if args.universe else [
+        "600519", "000858", "000001", "002001", "300750",
+    ]
+
+    print("=" * 60)
+    print("  LIVE TRADING RUNNER")
+    print("=" * 60)
+    print(f"  Broker:    {broker_type}")
+    print(f"  Universe:  {len(universe)} stocks")
+    print(f"  Days:      {args.days}")
+    print(f"  Capital:   {args.cash:,.0f} CNY")
+    print(f"  DualTrack: {not args.no_dual_track}")
+    print("=" * 60)
+
+    runner = LiveRunner(
+        broker_type=broker_type,
+        initial_cash=args.cash,
+        dual_track=not args.no_dual_track,
+    )
+    runner.set_universe(universe)
+
+    report = runner.run(days=args.days, seed=args.seed)
+    d = report.to_dict()
+
+    print(f"\nSession: {d['session_id']}")
+    print(f"  Broker:         {d.get('broker_type', broker_type)}")
+    print(f"  Days traded:    {d['days_traded']}")
+    print(f"  Total orders:   {d['total_orders']}")
+    print(f"  Total fills:    {d['total_fills']}")
+    print(f"  Initial:        {d['initial_capital']:,.0f} CNY")
+    print(f"  Final:          {d['final_value']:,.0f} CNY")
+    print(f"  Return:         {d['total_return_pct']:.2f}%")
+    print(f"  Annualized:     {d['annualized_return_pct']:.2f}%")
+    print(f"  Sharpe:         {d['sharpe_ratio']:.2f}")
+    print(f"  Max Drawdown:   {d['max_drawdown_pct']:.2f}%")
+    print(f"  Avg Volume:     {d['avg_daily_volume']:,.0f} CNY")
+    return 0
+
+
+def _resolve_qmt_kwargs(config) -> dict:
+    """Extract QMT kwargs from config, resolving password from env."""
+    import os
+    kwargs: dict[str, Any] = {}
+    if hasattr(config, "execution") and hasattr(config.execution, "qmt"):
+        qmt = config.execution.qmt
+        kwargs["account"] = qmt.account
+        kwargs["server"] = qmt.server
+        kwargs["mode"] = qmt.mode
+        kwargs["data_server"] = qmt.data_server or qmt.server
+        password = qmt.password or os.environ.get("QMT_PASSWORD", "")
+        if password:
+            kwargs["password"] = password
+    return kwargs
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="A-Share Multi-Factor Quant Platform",
@@ -687,12 +752,30 @@ def main() -> int:
     run_parser = subparsers.add_parser("run", help="Run full pipeline")
     run_parser.add_argument("--config", "-c", type=str, default=None,
                             help="Path to config YAML file")
+    run_parser.add_argument("--use-baostock", action="store_true",
+                            help="Use Baostock real A-share data instead of synthetic")
     run_parser.add_argument("--force", "-f", action="store_true",
                             help="Force recomputation, bypass cache")
     run_parser.add_argument("--no-cache", action="store_true",
                             help="Disable caching entirely")
     run_parser.add_argument("--cache-dir", type=str, default=".quant_cache",
                             help="Cache directory path")
+
+    # trade
+    trade_parser = subparsers.add_parser("trade", help="Run live trading (Paper or QMT)")
+    trade_parser.add_argument("--broker", "-b", type=str, default="simulated",
+                            choices=["simulated", "paper", "qmt", "qmt_sim"],
+                            help="Broker type")
+    trade_parser.add_argument("--universe", "-u", type=str, default=None,
+                            help="Comma-separated stock codes (default: 5 blue chips)")
+    trade_parser.add_argument("--days", "-d", type=int, default=30,
+                            help="Number of days to simulate")
+    trade_parser.add_argument("--cash", type=float, default=10_000_000,
+                            help="Initial capital in CNY")
+    trade_parser.add_argument("--seed", "-s", type=int, default=42,
+                            help="Random seed for price generation")
+    trade_parser.add_argument("--no-dual-track", action="store_true",
+                            help="Disable PaperBroker parallel tracking")
 
     # analyze
     analyze_parser = subparsers.add_parser("analyze", help="Analyze existing results")
@@ -762,8 +845,13 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    # Configure logging once — all child loggers inherit handlers from root
+    setup_logging()
+
     if args.command == "run":
         return cmd_run(args)
+    elif args.command == "trade":
+        return cmd_trade(args)
     elif args.command == "analyze":
         return cmd_analyze(args)
     elif args.command == "compare":

@@ -16,6 +16,9 @@
 
 <script setup>
 import { ref } from 'vue'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 const icons = { success: '✓', error: '✕', info: 'ℹ', warning: '⚠' }
 const toasts = ref([])

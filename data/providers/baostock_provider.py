@@ -23,6 +23,7 @@ CACHE_DIR = Path(__file__).parent.parent.parent / ".cache" / "baostock"
 
 def _to_bs_code(code: str) -> str:
     """Convert 6-digit code to baostock format (sh.600000 / sz.000001)."""
+    code = str(code).zfill(6)
     code_int = int(code)
     if code_int >= 600000:
         return f"sh.{code}"
@@ -31,7 +32,7 @@ def _to_bs_code(code: str) -> str:
 
 def _from_bs_code(bs_code: str) -> str:
     """Convert baostock code to 6-digit format."""
-    return bs_code.split(".")[-1]
+    return bs_code.split(".")[-1].zfill(6)
 
 
 class BaostockDataProvider(DataProvider):
@@ -69,12 +70,20 @@ class BaostockDataProvider(DataProvider):
     def _load_cache(self, key: str) -> pd.DataFrame | None:
         if not self._cache_enabled:
             return None
+        # Try parquet first
         path = self._cache_path(key)
         if path.exists():
             try:
                 return pd.read_parquet(path)
             except Exception:
-                return None
+                pass
+        # Fallback to CSV
+        csv_path = path.with_suffix(".csv")
+        if csv_path.exists():
+            try:
+                return pd.read_csv(csv_path, index_col=[0, 1], parse_dates=[0])
+            except Exception:
+                pass
         return None
 
     def _save_cache(self, key: str, df: pd.DataFrame):
@@ -109,7 +118,7 @@ class BaostockDataProvider(DataProvider):
             try:
                 rs = bs.query_history_k_data_plus(
                     bs_code,
-                    "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg",
+                    "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg,peTTM,pbMRQ",
                     start_date=start_date,
                     end_date=end_date,
                     frequency="d",
@@ -128,17 +137,18 @@ class BaostockDataProvider(DataProvider):
             return pd.DataFrame()
 
         cols = ["date", "code", "open", "high", "low", "close",
-                "preclose", "volume", "amount", "turn", "pctChg"]
+                "preclose", "volume", "amount", "turn", "pctChg", "peTTM", "pbMRQ"]
         df = pd.DataFrame(all_rows, columns=cols)
         df["code"] = df["code"].apply(_from_bs_code)
 
         # Convert to numeric
         for c in ["open", "high", "low", "close", "preclose", "volume",
-                   "amount", "turn", "pctChg"]:
+                   "amount", "turn", "pctChg", "peTTM", "pbMRQ"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index(["date", "code"]).sort_index()
+        df.index.names = ["date", "asset"]
         df = df[df["close"] > 0]
 
         self._save_cache(cache_key, df)
@@ -254,6 +264,7 @@ class BaostockDataProvider(DataProvider):
         if len(df.columns) >= 5:
             df = df.rename(columns={0: "code"})
             df = df.set_index("code")
+            df.index.name = "asset"
 
         self._save_cache(cache_key, df)
         return df
@@ -306,7 +317,7 @@ class BaostockDataProvider(DataProvider):
         self._login()
         import baostock as bs
 
-        codes = self._get_major_stocks_list()[:200]
+        codes = self._get_major_stocks_list()[:500]
         rows = []
 
         for code in codes:
@@ -316,7 +327,7 @@ class BaostockDataProvider(DataProvider):
                 while rs.error_code == "0" and rs.next():
                     row = rs.get_row_data()
                     if row:
-                        rows.append([code] + list(row[:5]))
+                        rows.append([code] + list(row[1:]))
             except Exception:
                 continue
 
@@ -326,8 +337,52 @@ class BaostockDataProvider(DataProvider):
         df = pd.DataFrame(rows, columns=["code", "code_name", "ipoDate",
                                           "outDate", "type", "status"])
         df = df.set_index("code")
+
+        # Map Baostock fields to pipeline-expected columns
+        df["is_st"] = df["status"].apply(
+            lambda x: x in ("2", "ST", "PT", "*ST") if isinstance(x, str) else False)
+        df["listing_date"] = pd.to_datetime(df["ipoDate"], errors="coerce")
+        df["delisting_date"] = pd.to_datetime(df["outDate"], errors="coerce")
+
+        # Get real industry data
+        df["sector"] = "Unknown"
+        try:
+            industry_map = self._get_industry_map()
+            df["sector"] = df.index.map(lambda x: industry_map.get(x, "Unknown"))
+        except Exception:
+            pass
+
         self._save_cache(cache_key, df)
         return df
+
+    def _get_industry_map(self) -> dict[str, str]:
+        """Get industry classification for all stocks."""
+        cache_key = "industry_map"
+        cached = self._load_cache(cache_key)
+        if cached is not None:
+            return dict(zip(cached.index, cached["industry"]))
+
+        self._login()
+        import baostock as bs
+
+        rs = bs.query_stock_industry()
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+
+        if not rows:
+            return {}
+
+        df = pd.DataFrame(rows, columns=rs.fields)
+        df["code"] = df["code"].apply(_from_bs_code)
+        df = df.set_index("code")
+
+        # Extract industry code (e.g., "J66货币金融服务" -> "J66")
+        df["industry"] = df["industry"].apply(
+            lambda x: x[:3] if isinstance(x, str) and len(x) >= 3 else "Unknown")
+
+        self._save_cache(cache_key, df[["industry"]])
+        return dict(zip(df.index, df["industry"]))
 
     def close(self):
         """Logout from baostock."""

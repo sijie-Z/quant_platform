@@ -183,9 +183,11 @@ class RealTimeRiskEngine:
         max_order_freq_per_min: int = 50,
         auto_hedge: bool = True,
         hedge_threshold: float = 0.1,  # Hedge when delta > 10% of capital
+        asset_universe=None,
     ):
         # Greeks calculator
         self.greeks_calc = GreeksCalculator()
+        self._asset_universe = asset_universe
 
         # Limits
         self._limits: dict[str, RiskLimit] = {}
@@ -274,8 +276,13 @@ class RealTimeRiskEngine:
         quantity = fill.get("quantity", 0)
         timestamp = fill.get("timestamp_ns", time.time_ns())
 
-        # Update equity (simplified)
-        notional = price * quantity
+        # Update equity (simplified, cross-asset multiplier)
+        multiplier = 1.0
+        if self._asset_universe is not None:
+            inst = self._asset_universe.get(symbol)
+            if inst is not None:
+                multiplier = inst.multiplier
+        notional = price * quantity * multiplier
         if side == "sell":
             self._current_equity += notional
         else:

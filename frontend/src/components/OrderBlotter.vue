@@ -4,14 +4,14 @@
     <div class="oms-header">
       <div class="oms-title">
         <span class="oms-dot"></span>
-        ORDER MANAGEMENT SYSTEM
+        {{ locale === 'zh-CN' ? '订单管理系统' : 'ORDER MANAGEMENT SYSTEM' }}
       </div>
       <div class="oms-actions">
         <button class="btn btn-sm btn-secondary" @click="showNewOrder = !showNewOrder">
-          {{ showNewOrder ? 'Close' : 'New Order' }}
+          {{ showNewOrder ? (locale === 'zh-CN' ? '关闭' : 'Close') : (locale === 'zh-CN' ? '新建订单' : 'New Order') }}
         </button>
         <button class="btn btn-sm btn-secondary" @click="refreshAll" :disabled="loading">
-          {{ loading ? 'Loading...' : 'Refresh' }}
+          {{ loading ? (locale === 'zh-CN' ? '加载中...' : 'Loading...') : (locale === 'zh-CN' ? '刷新' : 'Refresh') }}
         </button>
       </div>
     </div>
@@ -20,38 +20,38 @@
     <div v-if="showNewOrder" class="oms-form">
       <div class="oms-form-row">
         <div class="oms-field">
-          <label>Ticker</label>
+          <label>{{ locale === 'zh-CN' ? '股票代码' : 'Ticker' }}</label>
           <input v-model="newOrder.ticker" placeholder="600519" class="oms-input" />
         </div>
         <div class="oms-field">
-          <label>Side</label>
+          <label>{{ locale === 'zh-CN' ? '方向' : 'Side' }}</label>
           <select v-model="newOrder.side" class="oms-input">
-            <option value="buy">Buy</option>
-            <option value="sell">Sell</option>
+            <option value="buy">{{ locale === 'zh-CN' ? '买入' : 'Buy' }}</option>
+            <option value="sell">{{ locale === 'zh-CN' ? '卖出' : 'Sell' }}</option>
           </select>
         </div>
         <div class="oms-field">
-          <label>Quantity</label>
+          <label>{{ locale === 'zh-CN' ? '数量' : 'Quantity' }}</label>
           <input v-model.number="newOrder.quantity" type="number" step="100" min="100" placeholder="1000" class="oms-input" />
         </div>
         <div class="oms-field">
-          <label>Type</label>
+          <label>{{ locale === 'zh-CN' ? '类型' : 'Type' }}</label>
           <select v-model="newOrder.order_type" class="oms-input">
-            <option value="market">Market</option>
-            <option value="limit">Limit</option>
+            <option value="market">{{ locale === 'zh-CN' ? '市价单' : 'Market' }}</option>
+            <option value="limit">{{ locale === 'zh-CN' ? '限价单' : 'Limit' }}</option>
           </select>
         </div>
         <div class="oms-field" v-if="newOrder.order_type === 'limit'">
-          <label>Limit Price</label>
+          <label>{{ locale === 'zh-CN' ? '限价' : 'Limit Price' }}</label>
           <input v-model.number="newOrder.limit_price" type="number" step="0.01" class="oms-input" />
         </div>
         <div class="oms-field">
-          <label>Strategy</label>
+          <label>{{ locale === 'zh-CN' ? '策略' : 'Strategy' }}</label>
           <input v-model="newOrder.strategy" placeholder="alpha_v1" class="oms-input" />
         </div>
         <div class="oms-field oms-field-btn">
           <button class="btn btn-primary" @click="submitOrder" :disabled="submitting">
-            {{ submitting ? 'Sending...' : 'Submit Order' }}
+            {{ submitting ? (locale === 'zh-CN' ? '发送中...' : 'Sending...') : (locale === 'zh-CN' ? '提交订单' : 'Submit Order') }}
           </button>
         </div>
       </div>
@@ -60,31 +60,31 @@
     <!-- Summary Cards -->
     <div class="oms-summary" v-if="positions.length || tca.total_orders">
       <div class="oms-card" v-if="tca.total_orders">
-        <div class="oms-card-label">Total Orders</div>
+        <div class="oms-card-label">{{ locale === 'zh-CN' ? '总订单数' : 'Total Orders' }}</div>
         <div class="oms-card-value">{{ tca.total_orders }}</div>
       </div>
       <div class="oms-card" v-if="tca.total_orders">
-        <div class="oms-card-label">Total Volume</div>
+        <div class="oms-card-label">{{ locale === 'zh-CN' ? '总成交量' : 'Total Volume' }}</div>
         <div class="oms-card-value oms-accent">{{ formatNum(tca.total_volume) }}</div>
       </div>
       <div class="oms-card" v-if="tca.total_orders">
-        <div class="oms-card-label">Cost (bps)</div>
+        <div class="oms-card-label">{{ locale === 'zh-CN' ? '成本(bps)' : 'Cost (bps)' }}</div>
         <div class="oms-card-value oms-warn">{{ tca.cost_bps?.toFixed(1) }}</div>
       </div>
       <div class="oms-card" v-if="tca.total_orders">
-        <div class="oms-card-label">Commission</div>
+        <div class="oms-card-label">{{ locale === 'zh-CN' ? '佣金' : 'Commission' }}</div>
         <div class="oms-card-value">{{ formatNum(tca.total_commission) }}</div>
       </div>
       <div class="oms-card" v-if="tca.total_orders">
-        <div class="oms-card-label">Stamp Tax</div>
+        <div class="oms-card-label">{{ locale === 'zh-CN' ? '印花税' : 'Stamp Tax' }}</div>
         <div class="oms-card-value">{{ formatNum(tca.total_tax) }}</div>
       </div>
       <div class="oms-card" v-if="tca.total_orders">
-        <div class="oms-card-label">Slippage</div>
+        <div class="oms-card-label">{{ locale === 'zh-CN' ? '滑点' : 'Slippage' }}</div>
         <div class="oms-card-value">{{ formatNum(tca.total_slippage) }}</div>
       </div>
       <div class="oms-card" v-if="positions.length">
-        <div class="oms-card-label">Positions</div>
+        <div class="oms-card-label">{{ locale === 'zh-CN' ? '持仓数' : 'Positions' }}</div>
         <div class="oms-card-value oms-green">{{ positions.length }}</div>
       </div>
     </div>
@@ -92,15 +92,15 @@
     <!-- Tabs -->
     <div class="oms-tabs">
       <button :class="['oms-tab', { active: tab === 'blotter' }]" @click="tab = 'blotter'">
-        Order Blotter
+        {{ locale === 'zh-CN' ? '订单簿' : 'Order Blotter' }}
         <span class="oms-badge" v-if="blotter.length">{{ blotter.length }}</span>
       </button>
       <button :class="['oms-tab', { active: tab === 'positions' }]" @click="tab = 'positions'">
-        Positions
+        {{ locale === 'zh-CN' ? '持仓' : 'Positions' }}
         <span class="oms-badge" v-if="positions.length">{{ positions.length }}</span>
       </button>
       <button :class="['oms-tab', { active: tab === 'tca' }]" @click="tab = 'tca'">
-        TCA Analysis
+        {{ locale === 'zh-CN' ? '交易成本分析' : 'TCA Analysis' }}
       </button>
     </div>
 
@@ -109,19 +109,19 @@
       <table class="oms-tbl" v-if="blotter.length">
         <thead>
           <tr>
-            <th>Order ID</th>
-            <th>Ticker</th>
-            <th>Side</th>
-            <th>Type</th>
-            <th>Qty</th>
-            <th>Avg Price</th>
-            <th>Filled</th>
-            <th>Commission</th>
-            <th>Tax</th>
-            <th>Slippage</th>
-            <th>Status</th>
-            <th>Strategy</th>
-            <th>Time</th>
+            <th>{{ locale === 'zh-CN' ? '订单ID' : 'Order ID' }}</th>
+            <th>{{ locale === 'zh-CN' ? '代码' : 'Ticker' }}</th>
+            <th>{{ locale === 'zh-CN' ? '方向' : 'Side' }}</th>
+            <th>{{ locale === 'zh-CN' ? '类型' : 'Type' }}</th>
+            <th>{{ locale === 'zh-CN' ? '数量' : 'Qty' }}</th>
+            <th>{{ locale === 'zh-CN' ? '均价' : 'Avg Price' }}</th>
+            <th>{{ locale === 'zh-CN' ? '已成交' : 'Filled' }}</th>
+            <th>{{ locale === 'zh-CN' ? '佣金' : 'Commission' }}</th>
+            <th>{{ locale === 'zh-CN' ? '印花税' : 'Tax' }}</th>
+            <th>{{ locale === 'zh-CN' ? '滑点' : 'Slippage' }}</th>
+            <th>{{ locale === 'zh-CN' ? '状态' : 'Status' }}</th>
+            <th>{{ locale === 'zh-CN' ? '策略' : 'Strategy' }}</th>
+            <th>{{ locale === 'zh-CN' ? '时间' : 'Time' }}</th>
           </tr>
         </thead>
         <tbody>
@@ -146,8 +146,8 @@
       </table>
       <div v-else class="oms-empty">
         <div class="oms-empty-icon">&#9776;</div>
-        <h3>No Orders</h3>
-        <p>Create an order to start paper trading. Orders flow through PENDING → SUBMITTED → FILLED lifecycle.</p>
+        <h3>{{ locale === 'zh-CN' ? '暂无订单' : 'No Orders' }}</h3>
+        <p>{{ locale === 'zh-CN' ? '创建订单以开始模拟交易。订单生命周期为 PENDING → SUBMITTED → FILLED。' : 'Create an order to start paper trading. Orders flow through PENDING → SUBMITTED → FILLED lifecycle.' }}</p>
       </div>
     </div>
 
@@ -157,15 +157,15 @@
         <thead>
           <tr>
             <th>#</th>
-            <th>Ticker</th>
-            <th>Quantity</th>
-            <th>Avg Cost</th>
-            <th>Current Price</th>
-            <th>Market Value</th>
-            <th>Unrealized P&L</th>
-            <th>P&L %</th>
-            <th>Weight</th>
-            <th>Realized P&L</th>
+            <th>{{ locale === 'zh-CN' ? '代码' : 'Ticker' }}</th>
+            <th>{{ locale === 'zh-CN' ? '持仓数量' : 'Quantity' }}</th>
+            <th>{{ locale === 'zh-CN' ? '均价' : 'Avg Cost' }}</th>
+            <th>{{ locale === 'zh-CN' ? '现价' : 'Current Price' }}</th>
+            <th>{{ locale === 'zh-CN' ? '市值' : 'Market Value' }}</th>
+            <th>{{ locale === 'zh-CN' ? '浮动盈亏' : 'Unrealized P&L' }}</th>
+            <th>{{ locale === 'zh-CN' ? '盈亏%' : 'P&L %' }}</th>
+            <th>{{ locale === 'zh-CN' ? '权重' : 'Weight' }}</th>
+            <th>{{ locale === 'zh-CN' ? '已实现盈亏' : 'Realized P&L' }}</th>
           </tr>
         </thead>
         <tbody>
@@ -191,8 +191,8 @@
       </table>
       <div v-else class="oms-empty">
         <div class="oms-empty-icon">&#9734;</div>
-        <h3>No Positions</h3>
-        <p>Fill an order to start building positions. The OMS tracks avg cost, P&L, and weights.</p>
+        <h3>{{ locale === 'zh-CN' ? '暂无持仓' : 'No Positions' }}</h3>
+        <p>{{ locale === 'zh-CN' ? '成交订单以建立持仓。OMS追踪均价、盈亏和权重。' : 'Fill an order to start building positions. The OMS tracks avg cost, P&L, and weights.' }}</p>
       </div>
     </div>
 
@@ -200,38 +200,38 @@
     <div v-if="tab === 'tca'" class="oms-tca">
       <div v-if="tca.total_orders" class="oms-tca-grid">
         <div class="oms-tca-item">
-          <div class="oms-tca-label">Buy Orders</div>
+          <div class="oms-tca-label">{{ locale === 'zh-CN' ? '买单数' : 'Buy Orders' }}</div>
           <div class="oms-tca-value oms-pos">{{ tca.buy_orders }}</div>
         </div>
         <div class="oms-tca-item">
-          <div class="oms-tca-label">Sell Orders</div>
+          <div class="oms-tca-label">{{ locale === 'zh-CN' ? '卖单数' : 'Sell Orders' }}</div>
           <div class="oms-tca-value oms-neg">{{ tca.sell_orders }}</div>
         </div>
         <div class="oms-tca-item">
-          <div class="oms-tca-label">Avg Order Size</div>
+          <div class="oms-tca-label">{{ locale === 'zh-CN' ? '平均订单规模' : 'Avg Order Size' }}</div>
           <div class="oms-tca-value">{{ formatNum(tca.avg_order_size) }}</div>
         </div>
         <div class="oms-tca-item">
-          <div class="oms-tca-label">Total Cost (bps)</div>
+          <div class="oms-tca-label">{{ locale === 'zh-CN' ? '总成本(bps)' : 'Total Cost (bps)' }}</div>
           <div class="oms-tca-value oms-warn">{{ tca.cost_bps?.toFixed(1) }}</div>
         </div>
         <div class="oms-tca-item">
-          <div class="oms-tca-label">Commission / Volume</div>
+          <div class="oms-tca-label">{{ locale === 'zh-CN' ? '佣金/成交量' : 'Commission / Volume' }}</div>
           <div class="oms-tca-value">{{ tca.total_volume ? ((tca.total_commission / tca.total_volume) * 10000).toFixed(2) : '0' }} bps</div>
         </div>
         <div class="oms-tca-item">
-          <div class="oms-tca-label">Tax / Volume</div>
+          <div class="oms-tca-label">{{ locale === 'zh-CN' ? '印花税/成交量' : 'Tax / Volume' }}</div>
           <div class="oms-tca-value">{{ tca.total_volume ? ((tca.total_tax / tca.total_volume) * 10000).toFixed(2) : '0' }} bps</div>
         </div>
         <div class="oms-tca-item">
-          <div class="oms-tca-label">Slippage / Volume</div>
+          <div class="oms-tca-label">{{ locale === 'zh-CN' ? '滑点/成交量' : 'Slippage / Volume' }}</div>
           <div class="oms-tca-value">{{ tca.total_volume ? ((tca.total_slippage / tca.total_volume) * 10000).toFixed(2) : '0' }} bps</div>
         </div>
       </div>
       <div v-else class="oms-empty">
         <div class="oms-empty-icon">&#8776;</div>
-        <h3>No Trade Data</h3>
-        <p>TCA (Trade Cost Analysis) shows commission, tax, and slippage breakdown in basis points.</p>
+        <h3>{{ locale === 'zh-CN' ? '暂无交易数据' : 'No Trade Data' }}</h3>
+        <p>{{ locale === 'zh-CN' ? 'TCA（交易成本分析）展示佣金、印花税和滑点明细。' : 'TCA (Trade Cost Analysis) shows commission, tax, and slippage breakdown in basis points.' }}</p>
       </div>
     </div>
   </div>
@@ -239,7 +239,10 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
+import { useI18n } from '../i18n/index.js'
 import { createOrder, fillOrder, getBlotter, getPositions, getTCA } from '../api/index.js'
+
+const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 
@@ -272,7 +275,7 @@ function formatTime(t) {
 
 async function submitOrder() {
   if (!newOrder.value.ticker) {
-    emit('toast', { message: 'Ticker is required', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '请输入股票代码' : 'Ticker is required', type: 'error' })
     return
   }
   submitting.value = true
@@ -292,15 +295,15 @@ async function submitOrder() {
         order_id: order.order_id,
         price: newOrder.value.limit_price || 100 + Math.random() * 50,
       })
-      emit('toast', { message: `Order ${order.order_id} filled`, type: 'success' })
+      emit('toast', { message: locale.value === 'zh-CN' ? `订单 ${order.order_id} 已成交` : `Order ${order.order_id} filled`, type: 'success' })
     } else {
-      emit('toast', { message: `Order ${order.order_id} created (${order.status})`, type: 'success' })
+      emit('toast', { message: locale.value === 'zh-CN' ? `订单 ${order.order_id} 已创建 (${order.status})` : `Order ${order.order_id} created (${order.status})`, type: 'success' })
     }
 
     await refreshAll()
     showNewOrder.value = false
   } catch (err) {
-    emit('toast', { message: `Order failed: ${err.response?.data?.detail || err.message}`, type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `订单提交失败: ${err.response?.data?.detail || err.message}` : `Order failed: ${err.response?.data?.detail || err.message}`, type: 'error' })
   } finally {
     submitting.value = false
   }

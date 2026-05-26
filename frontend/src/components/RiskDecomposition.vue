@@ -3,11 +3,11 @@
     <div class="rd-header">
       <div class="rd-title">
         <span class="rd-dot"></span>
-        FACTOR RISK DECOMPOSITION
+        {{ locale === 'zh-CN' ? '因子风险分解' : 'FACTOR RISK DECOMPOSITION' }}
       </div>
       <div class="rd-actions">
         <button class="btn btn-sm btn-primary" @click="decompose" :disabled="loading">
-          {{ loading ? 'Analyzing...' : 'Decompose Risk' }}
+          {{ loading ? (locale === 'zh-CN' ? '分析中...' : 'Analyzing...') : (locale === 'zh-CN' ? '分解风险' : 'Decompose Risk') }}
         </button>
       </div>
     </div>
@@ -16,19 +16,19 @@
       <!-- Summary -->
       <div class="rd-summary">
         <div class="rd-card">
-          <div class="rd-card-label">Total Risk</div>
+          <div class="rd-card-label">{{ locale === 'zh-CN' ? '总风险' : 'Total Risk' }}</div>
           <div class="rd-card-value">{{ result.total_risk_pct?.toFixed(1) }}%</div>
         </div>
         <div class="rd-card">
-          <div class="rd-card-label">Factor Risk</div>
+          <div class="rd-card-label">{{ locale === 'zh-CN' ? '因子风险' : 'Factor Risk' }}</div>
           <div class="rd-card-value rd-accent">{{ result.factor_risk_pct?.toFixed(1) }}%</div>
         </div>
         <div class="rd-card">
-          <div class="rd-card-label">Idiosyncratic</div>
+          <div class="rd-card-label">{{ locale === 'zh-CN' ? '特质风险' : 'Idiosyncratic' }}</div>
           <div class="rd-card-value">{{ result.idiosyncratic_risk_pct?.toFixed(1) }}%</div>
         </div>
         <div class="rd-card">
-          <div class="rd-card-label">R-Squared</div>
+          <div class="rd-card-label">{{ locale === 'zh-CN' ? 'R平方' : 'R-Squared' }}</div>
           <div class="rd-card-value rd-accent">{{ (result.r_squared * 100)?.toFixed(1) }}%</div>
         </div>
       </div>
@@ -41,13 +41,13 @@
         <table class="rd-tbl">
           <thead>
             <tr>
-              <th>Factor</th>
-              <th>Risk Share %</th>
-              <th>Return (bps)</th>
-              <th>Beta</th>
-              <th>t-stat</th>
-              <th>Type</th>
-              <th>Risk Bar</th>
+              <th>{{ locale === 'zh-CN' ? '因子' : 'Factor' }}</th>
+              <th>{{ locale === 'zh-CN' ? '风险占比%' : 'Risk Share %' }}</th>
+              <th>{{ locale === 'zh-CN' ? '收益（基点）' : 'Return (bps)' }}</th>
+              <th>{{ locale === 'zh-CN' ? 'Beta' : 'Beta' }}</th>
+              <th>{{ locale === 'zh-CN' ? 't统计量' : 't-stat' }}</th>
+              <th>{{ locale === 'zh-CN' ? '类型' : 'Type' }}</th>
+              <th>{{ locale === 'zh-CN' ? '风险条' : 'Risk Bar' }}</th>
             </tr>
           </thead>
           <tbody>
@@ -61,7 +61,7 @@
               <td class="rd-mono">{{ f.t_stat?.toFixed(2) }}</td>
               <td>
                 <span :class="['rd-type', f.contribution === 'alpha' ? 'rd-type-alpha' : 'rd-type-factor']">
-                  {{ f.contribution }}
+                  {{ f.contribution === 'alpha' ? (locale === 'zh-CN' ? 'ALPHA' : 'alpha') : (locale === 'zh-CN' ? '因子' : 'factor') }}
                 </span>
               </td>
               <td class="rd-bar-cell">
@@ -82,8 +82,8 @@
     <!-- Empty State -->
     <div v-if="!result && !loading" class="rd-empty">
       <div class="rd-empty-icon">&#9670;</div>
-      <h3>Factor Risk Decomposition</h3>
-      <p>Run a pipeline first, then decompose portfolio risk into systematic factor exposure and idiosyncratic alpha.</p>
+      <h3>{{ locale === 'zh-CN' ? '因子风险分解' : 'Factor Risk Decomposition' }}</h3>
+      <p>{{ locale === 'zh-CN' ? '请先运行流水线，然后将组合风险分解为系统性因子暴露和特质性Alpha。' : 'Run a pipeline first, then decompose portfolio risk into systematic factor exposure and idiosyncratic alpha.' }}</p>
     </div>
   </div>
 </template>
@@ -92,6 +92,9 @@
 import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import { decomposeRisk } from '../api/index.js'
+import { useI18n } from '../i18n/index.js'
+
+const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 const props = defineProps({ runId: { type: String, default: '' } })
@@ -104,7 +107,7 @@ let resizeObs = null
 
 async function decompose() {
   if (!props.runId) {
-    emit('toast', { message: 'Run a pipeline first', type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '请先运行流水线' : 'Run a pipeline first', type: 'error' })
     return
   }
   loading.value = true
@@ -112,9 +115,9 @@ async function decompose() {
     result.value = await decomposeRisk({ run_id: props.runId })
     await nextTick()
     renderChart()
-    emit('toast', { message: 'Risk decomposition completed', type: 'success' })
+    emit('toast', { message: locale.value === 'zh-CN' ? '风险分解已完成' : 'Risk decomposition completed', type: 'success' })
   } catch (e) {
-    emit('toast', { message: `Decomposition failed: ${e.response?.data?.detail || e.message}`, type: 'error' })
+    emit('toast', { message: locale.value === 'zh-CN' ? `分解失败：${e.response?.data?.detail || e.message}` : `Decomposition failed: ${e.response?.data?.detail || e.message}`, type: 'error' })
   } finally {
     loading.value = false
   }
@@ -138,7 +141,7 @@ function renderChart() {
       axisPointer: { type: 'shadow' },
       formatter: (params) => {
         const p = params[0]
-        return `${p.name}<br/>Risk Share: <b>${p.value.toFixed(1)}%</b>`
+        return `${p.name}<br/>${locale.value === 'zh-CN' ? '风险占比：' : 'Risk Share: '}<b>${p.value.toFixed(1)}%</b>`
       },
     },
     grid: { top: 8, right: 16, bottom: 40, left: 100 },
