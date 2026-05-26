@@ -188,7 +188,8 @@ class LegacyEventBus:
             self._metrics = {"published": 0, "delivered": 0, "errors": 0, "dead_letters": 0}
 
 
-# Backward-compatible alias — tests that create `EventBus()` still work
+# Backward-compatible aliases — tests that import `Event` / `EventBus` still work
+Event = LegacyEvent
 EventBus = LegacyEventBus
 
 
