@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QuantPlatform - A股多因子量化交易平台</title>
+<title>QuantPlatform — A股多因子量化交易平台</title>
 <style>
 /* ── Reset & Base ── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -36,7 +36,6 @@ body {
   overflow-x: hidden;
 }
 
-/* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-track { background: var(--bg-primary); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
@@ -93,8 +92,9 @@ nav .nav-links a:hover { color: var(--accent-blue); }
 .hero .subtitle {
   font-size: 1.2rem;
   color: var(--text-secondary);
-  max-width: 700px;
+  max-width: 800px;
   margin: 0 auto 2rem;
+  line-height: 1.8;
 }
 
 /* ── Stats Bar ── */
@@ -106,9 +106,7 @@ nav .nav-links a:hover { color: var(--accent-blue); }
   padding: 2rem;
 }
 
-.stat-item {
-  text-align: center;
-}
+.stat-item { text-align: center; }
 
 .stat-value {
   font-family: var(--font-mono);
@@ -164,6 +162,25 @@ section {
 .arch-diagram .green { color: var(--accent-green); }
 .arch-diagram .yellow { color: var(--accent-yellow); }
 .arch-diagram .purple { color: var(--accent-purple); }
+.arch-diagram .red { color: var(--accent-red); }
+
+/* ── Module Tags ── */
+.feature-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 2rem;
+}
+
+.feature-tag {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 4px 12px;
+  border-radius: 20px;
+  background: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.2);
+  color: var(--accent-cyan);
+}
 
 /* ── Module Cards ── */
 .module-grid {
@@ -281,10 +298,7 @@ section {
   z-index: 1;
 }
 
-.flow-content {
-  flex: 1;
-  padding-bottom: 2rem;
-}
+.flow-content { flex: 1; padding-bottom: 2rem; }
 
 .flow-content h3 {
   font-size: 1.1rem;
@@ -306,14 +320,14 @@ section {
   border-radius: 4px;
 }
 
-/* ── Comparison Table ── */
-.comparison-table {
+/* ── Capability Table ── */
+.cap-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.9rem;
 }
 
-.comparison-table th {
+.cap-table th {
   background: var(--bg-card);
   color: var(--text-primary);
   font-weight: 700;
@@ -322,17 +336,15 @@ section {
   border-bottom: 2px solid var(--border);
 }
 
-.comparison-table td {
+.cap-table td {
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--border);
   color: var(--text-secondary);
 }
 
-.comparison-table tr:hover td {
-  background: var(--bg-card);
-}
+.cap-table tr:hover td { background: var(--bg-card); }
 
-.comparison-table .status {
+.level-tag {
   display: inline-block;
   padding: 2px 10px;
   border-radius: 12px;
@@ -340,9 +352,9 @@ section {
   font-weight: 600;
 }
 
-.status-matched { background: rgba(16, 185, 129, 0.15); color: var(--accent-green); }
-.status-close { background: rgba(245, 158, 11, 0.15); color: var(--accent-yellow); }
-.status-gap { background: rgba(239, 68, 68, 0.15); color: var(--accent-red); }
+.level-production { background: rgba(16, 185, 129, 0.15); color: var(--accent-green); }
+.level-research { background: rgba(245, 158, 11, 0.15); color: var(--accent-yellow); }
+.level-differentiated { background: rgba(139, 92, 246, 0.15); color: var(--accent-purple); }
 
 /* ── Code Block ── */
 .code-block {
@@ -430,7 +442,6 @@ footer a:hover { text-decoration: underline; }
   nav .nav-links { display: none; }
 }
 
-/* ── Animations ── */
 @keyframes fadeInUp {
   from { opacity: 0; transform: translateY(20px); }
   to { opacity: 1; transform: translateY(0); }
@@ -454,11 +465,7 @@ footer a:hover { text-decoration: underline; }
   gap: 8px;
 }
 
-.terminal-dot {
-  width: 12px; height: 12px;
-  border-radius: 50%;
-}
-
+.terminal-dot { width: 12px; height: 12px; border-radius: 50%; }
 .terminal-dot.red { background: #ff5f56; }
 .terminal-dot.yellow { background: #ffbd2e; }
 .terminal-dot.green { background: #27c93f; }
@@ -482,6 +489,30 @@ footer a:hover { text-decoration: underline; }
 .terminal-body .output { color: #8b949e; }
 .terminal-body .success { color: var(--accent-green); }
 .terminal-body .info { color: var(--accent-cyan); }
+
+/* ── Pitfall Grid ── */
+.pitfall-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 1rem;
+}
+
+.pitfall-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.pitfall-item .pitfall-title {
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+}
+
+.pitfall-item .pitfall-desc {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
 </style>
 </head>
 <body>
@@ -490,258 +521,354 @@ footer a:hover { text-decoration: underline; }
 <nav>
   <div class="logo">QuantPlatform <span>v2.0</span></div>
   <div class="nav-links">
-    <a href="#architecture">Architecture</a>
-    <a href="#modules">Modules</a>
-    <a href="#dataflow">Data Flow</a>
-    <a href="#comparison">Jane Street</a>
-    <a href="#quickstart">Quick Start</a>
+    <a href="#architecture">架构</a>
+    <a href="#capabilities">能力</a>
+    <a href="#modules">模块</a>
+    <a href="#dataflow">数据流</a>
+    <a href="#quickstart">快速开始</a>
     <a href="https://github.com/sijie-Z/quant-platform">GitHub</a>
   </div>
 </nav>
 
 <!-- ── Hero ── -->
 <div class="hero">
-  <h1>A-Share Multi-Factor Quant Platform</h1>
+  <h1>A股多因子量化交易平台</h1>
   <p class="subtitle">
-    A 股多因子量化研究 + 交易平台。从数据到回测到实盘的完整流水线。
-    面向量化开发面试，展示机构级架构设计能力。
+    从数据到回测到实盘的完整量化流水线 —— 事件驱动架构 · 实时风控熔断 · 多因子信号 · 实盘交易引擎<br>
+    面向量化开发岗位面试，展示机构级架构设计与A股实盘工程能力
   </p>
 
   <div class="stats-bar">
     <div class="stat-item">
       <div class="stat-value">1077</div>
-      <div class="stat-label">Unit Tests</div>
+      <div class="stat-label">单元测试</div>
     </div>
     <div class="stat-item">
-      <div class="stat-value">88</div>
-      <div class="stat-label">Python Modules</div>
+      <div class="stat-value">96</div>
+      <div class="stat-label">Python模块</div>
     </div>
     <div class="stat-item">
-      <div class="stat-value">29K+</div>
-      <div class="stat-label">Lines of Python</div>
+      <div class="stat-value">37</div>
+      <div class="stat-label">Vue组件</div>
     </div>
     <div class="stat-item">
-      <div class="stat-value">91</div>
-      <div class="stat-label">REST API Endpoints</div>
+      <div class="stat-value">30K+</div>
+      <div class="stat-label">Python代码行</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value">97</div>
+      <div class="stat-label">API端点</div>
     </div>
     <div class="stat-item">
       <div class="stat-value">15</div>
-      <div class="stat-label">Alpha Factors</div>
+      <div class="stat-label">Alpha因子</div>
     </div>
   </div>
 </div>
 
 <!-- ── Architecture ── -->
 <section id="architecture">
-  <h2 class="section-title">System Architecture</h2>
-  <p class="section-subtitle">Event-driven architecture — all components communicate through EventBus, all state persisted in SQLite.</p>
+  <h2 class="section-title">架构概览</h2>
+  <p class="section-subtitle">事件驱动架构 — 所有组件通过EventBus通信，所有状态通过SQLite持久化</p>
 
   <div class="arch-diagram">
     <pre>
-                         ┌─────────────────────────────────────────────────────────────┐
-                         │              <span class="highlight">Core Architecture (core/)</span>                      │
-                         │   AsyncEventBus · Store · StateMachine · AuditLog           │
-                         │   Scheduler · MessageBus(Local/Redis/Kafka) · Services      │
-                         └────────────────────────────┬────────────────────────────────┘
-                                                      │ <span class="green">All components communicate via EventBus</span>
-                                                      │ <span class="green">All state persisted via Store (SQLite WAL)</span>
-     ┌────────────────────────────────────────────────┼────────────────────────────────────────────┐
-     │                                                │                                            │
-     ▼                                                ▼                                            ▼
-<span class="yellow">Data Layer</span>           <span class="yellow">Factor Engine</span>             <span class="yellow">Alpha Model</span>              <span class="yellow">Portfolio Optimizer</span>
- Synthetic               10 Technical                IC/ICIR Weighted           Equal Weight
- Tushare                 5 Fundamental               ML Signal (XGBoost/LGBM)   Mean Variance
- Baostock                Cython Hot Paths            LLM Sentiment              Risk Parity
- PostgreSQL              IC Monitor + Decay
- WebSocket L2            Graph Network Factor
- Realtime Fundamentals
-     │                        │                           │                            │
-     └────────────────────────┴───────────────────────────┴────────────────────────────┘
-                                                          │
-                                                          ▼
-     ┌────────────────────────────────────────────────────────────────────────────────┐
-     │                              <span class="purple">Execution & Risk Layer</span>                             │
-     │                                                                                │
-     │  <span class="highlight">Order Book</span>          <span class="highlight">Backtest Engine</span>         <span class="highlight">Risk Engine</span>          <span class="highlight">Execution</span>   │
-     │  Red-Black Tree       Tick-Level Event        Per-tick Greeks          TWAP      │
-     │  Price-Time FIFO      Market Impact           Pre-Trade Check          VWAP      │
-     │  IOC/FOK/Partial      TWAP/VWAP Algo          Auto Delta-Hedge        Iceberg   │
-     │  VPIN Metrics         3 Impact Models          Kill Switch             SmartRouter│
-     │                                        12 Stress Scenarios                        │
-     └────────────────────────────────────────────────────────────────────────────────┘
-                                                          │
-                                                          ▼
-     ┌────────────────────────────────────────────────────────────────────────────────┐
-     │                            <span class="green">Live Trading & Monitoring</span>                             │
-     │                                                                                │
-     │   Trading Engine          Web Dashboard           Monitoring                    │
-     │   AKShare Realtime        FastAPI (91 endpoints)  Prometheus + Grafana          │
-     │   Paper Trading           Vue 3 + ECharts         16 Dashboard Panels           │
-     │   QMT/xtquant Live        WebSocket Push          Structured Logging            │
-     └────────────────────────────────────────────────────────────────────────────────┘
+                        ┌─────────────────────────────────────────────┐
+                        │         <span class="highlight">核心架构层 (core/)</span>                  │
+                        │  EventBus · Store · StateMachine · Audit   │
+                        │  Scheduler · RiskMonitor · CircuitBreaker  │
+                        └──────────────┬──────────────────────────────┘
+                                       │ <span class="green">所有组件通过EventBus通信</span>
+                                       │ <span class="green">所有状态通过Store持久化</span>
+    ┌──────────────────────────────────┼──────────────────────────────────┐
+    v                                  v                                  v
+ <span class="yellow">数据层</span>           <span class="yellow">因子引擎</span>          <span class="yellow">Alpha模型</span>           <span class="yellow">组合优化</span>
+ 合成数据            10技术因子           IC/ICIR加权           EW/MVO/RP
+ Tushare            5基本面因子          XGBoost/LightGBM     cvxpy
+ Baostock           IC监控+衰减          LLM情绪因子
+ PostgreSQL         图网络因子
+ WebSocket L2
+ 实时基本面
+    │                  │                    │                     │
+    └──────────────────┴────────────────────┴─────────────────────┘
+                                              │
+                                              v
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                         <span class="purple">执行与风控层</span>                              │
+    │                                                                     │
+    │  <span class="highlight">回测引擎</span>         <span class="highlight">风险管理</span>         <span class="highlight">执行层</span>          <span class="highlight">合规运营</span>     │
+    │  向量化月频         VaR/CVaR          TWAP/VWAP           合规导出    │
+    │  Walk-Forward       Barra 10因子      Iceberg/SmartRouter  NAV计算    │
+    │  蒙特卡洛           实时风控Kill       PaperBroker v2      投资者门户  │
+    │  并行参数扫描       压力测试           TCA分析                        │
+    └─────────────────────────────────────────────────────────────────────┘
+                                              │
+                                              v
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                        <span class="green">实盘交易与监控</span>                              │
+    │                                                                     │
+    │  实盘交易引擎        Web界面              监控                       │
+    │  AKShare实时行情     FastAPI (97端点)      Prometheus + Grafana       │
+    │  Paper Trading       Vue 3 + ECharts       16面板                     │
+    │  QMT/xtquant实盘     WebSocket推送         结构化日志                   │
+    └─────────────────────────────────────────────────────────────────────┘
     </pre>
   </div>
 </section>
 
+<!-- ── Capabilities ── -->
+<section id="capabilities">
+  <h2 class="section-title">核心能力</h2>
+  <p class="section-subtitle">从事件驱动到实盘交易，覆盖机构级量化平台所需的全部能力</p>
+
+  <table class="cap-table">
+    <thead>
+      <tr>
+        <th>能力</th>
+        <th>实现</th>
+        <th>级别</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>事件驱动架构</td>
+        <td>EventBus: topic pub/sub + 通配符 + 拦截器 + 死信队列 + WAL</td>
+        <td><span class="level-tag level-production">机构级</span></td>
+      </tr>
+      <tr>
+        <td>实时风控熔断</td>
+        <td>RiskMonitor下单前检查 + 5级风险等级 + Kill Switch一键熔断</td>
+        <td><span class="level-tag level-production">机构级</span></td>
+      </tr>
+      <tr>
+        <td>多因子信号引擎</td>
+        <td>15因子(10技术+5基本面) + ICIR加权 + ML信号(XGBoost/LightGBM)</td>
+        <td><span class="level-tag level-research">研究级</span></td>
+      </tr>
+      <tr>
+        <td>实盘交易引擎</td>
+        <td>AKShare实时行情 → 多因子信号 → 风控预检 → Paper/QMT实盘</td>
+        <td><span class="level-tag level-production">生产级</span></td>
+      </tr>
+      <tr>
+        <td>A股陷阱全处理</td>
+        <td>10大A股实盘陷阱：复权/停牌/ST/T+1/幸存者偏差/涨跌停/成本/手数/除权/行业</td>
+        <td><span class="level-tag level-production">生产级</span></td>
+      </tr>
+      <tr>
+        <td>未来函数零容忍</td>
+        <td>Point-in-time IC加权 + Walk-Forward折内重算 + 合成数据真实IC水平</td>
+        <td><span class="level-tag level-production">生产级</span></td>
+      </tr>
+      <tr>
+        <td>Barra风险模型</td>
+        <td>10因子横截面回归 + Ledoit-Wolf收缩 + 风险归因分解</td>
+        <td><span class="level-tag level-production">机构级</span></td>
+      </tr>
+      <tr>
+        <td>IC自动衰减监控</td>
+        <td>滚动IC/ICIR + 衰减检测 + 半衰期估计 + 自适应权重 + 三级告警</td>
+        <td><span class="level-tag level-production">机构级</span></td>
+      </tr>
+      <tr>
+        <td>跨资产接口</td>
+        <td>Instrument统一抽象，支持股票/ETF/期货/期权，per-instrument参数</td>
+        <td><span class="level-tag level-production">机构级</span></td>
+      </tr>
+      <tr>
+        <td>LLM增强选股</td>
+        <td>财经新闻情感因子(Strategy模式) + RAG研究Agent</td>
+        <td><span class="level-tag level-differentiated">差异化</span></td>
+      </tr>
+      <tr>
+        <td>增强Paper Trading</td>
+        <td>延迟模拟/随机部分成交/撤单失败/L2回放/延迟套利检测</td>
+        <td><span class="level-tag level-production">生产级</span></td>
+      </tr>
+      <tr>
+        <td>Web实时监控</td>
+        <td>Bloomberg Terminal风格仪表盘 + WebSocket实时推送 + Grafana监控</td>
+        <td><span class="level-tag level-production">生产级</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
 <!-- ── Modules ── -->
 <section id="modules">
-  <h2 class="section-title">Core Modules</h2>
-  <p class="section-subtitle">17 new source files (~5,000 lines) + 132 new tests — all integrated into the existing system.</p>
+  <h2 class="section-title">核心模块</h2>
+  <p class="section-subtitle">96个Python模块，覆盖从数据到执行的完整流水线</p>
 
   <div class="module-grid">
 
-    <!-- EventBus v2 -->
     <div class="module-card">
       <div class="card-header">
         <div class="card-icon" style="background: rgba(6,182,212,0.15); color: var(--accent-cyan);">⚡</div>
         <div>
-          <div class="card-title">AsyncEventBus v2</div>
-          <div class="card-tag">core/event_bus_v2.py</div>
+          <div class="card-title">事件驱动核心</div>
+          <div class="card-tag">core/</div>
         </div>
       </div>
-      <div class="card-desc">High-performance async event bus with per-handler queues, backpressure, and WAL event sourcing.</div>
+      <div class="card-desc">EventBus解耦所有组件，SQLite持久化全部状态，状态机管理生命周期</div>
       <ul class="card-features">
-        <li>asyncio.Queue per handler — no cross-blocking</li>
-        <li>Backpressure: queue full → publisher waits, never drops</li>
-        <li>P50/P99/P999 latency histogram per handler</li>
-        <li>Dead letter queue with exponential backoff retry</li>
-        <li>Write-ahead log (WAL) for crash recovery</li>
-        <li>Auto-detect sync/async handlers</li>
+        <li>EventBus: topic pub/sub, 通配符匹配, 拦截器, 死信队列</li>
+        <li>Store: SQLite WAL模式, 8张表, 线程安全</li>
+        <li>StateMachine: 8生命周期状态, 合法转换强制校验</li>
+        <li>AuditLog: 三路输出(SQLite+EventBus+Logger)</li>
+        <li>跨资产抽象: Instrument/AssetUniverse, 股票/ETF/期货/期权</li>
+        <li>Scheduler: A股开市时间检测, 自动状态切换</li>
       </ul>
     </div>
 
-    <!-- Order Book -->
     <div class="module-card">
       <div class="card-header">
         <div class="card-icon" style="background: rgba(16,185,129,0.15); color: var(--accent-green);">📊</div>
         <div>
-          <div class="card-title">Real Order Book (LOB)</div>
-          <div class="card-tag">execution/order_book.py</div>
+          <div class="card-title">数据层</div>
+          <div class="card-tag">data/</div>
         </div>
       </div>
-      <div class="card-desc">Realistic limit order book with price-time priority matching, replacing naive simulated exchange.</div>
+      <div class="card-desc">多源数据流水线，支持合成/Synthetic/Tushare/Baostock/PostgreSQL/WebSocket/Level2</div>
       <ul class="card-features">
-        <li>Sorted bid/ask price levels (red-black tree pattern)</li>
-        <li>FIFO queue at each level (price-time priority)</li>
-        <li>IOC / FOK / partial fill support</li>
-        <li>L1/L2/L3 market data snapshots</li>
-        <li>VPIN microstructure metrics</li>
-        <li>Spread, depth imbalance analytics</li>
+        <li>合成数据: 500只/5年/可复现/嵌入式Alpha</li>
+        <li>Baostock: 免费A股数据, 实时行情, 无需API Key</li>
+        <li>WebSocket: 东方财富/新浪实时行情推送</li>
+        <li>Level 2: 10档盘口+逐笔成交+VWAP+微观结构因子</li>
+        <li>实时基本面: PE/PB/ROE/ROA, TTL缓存, 选股器</li>
+        <li>数据质量: 8项检查+严重性分级+质量报告</li>
       </ul>
     </div>
 
-    <!-- Market Impact -->
     <div class="module-card">
       <div class="card-header">
-        <div class="card-icon" style="background: rgba(245,158,11,0.15); color: var(--accent-yellow);">💥</div>
+        <div class="card-icon" style="background: rgba(245,158,11,0.15); color: var(--accent-yellow);">📈</div>
         <div>
-          <div class="card-title">Market Impact Models</div>
-          <div class="card-tag">execution/market_impact.py</div>
+          <div class="card-title">因子引擎</div>
+          <div class="card-tag">factors/</div>
         </div>
       </div>
-      <div class="card-desc">Three classic market impact models with weighted ensemble for execution cost estimation.</div>
+      <div class="card-desc">15个因子(10技术+5基本面) + 横截面处理 + 评估体系 + 图网络因子</div>
       <ul class="card-features">
-        <li>Almgren-Chriss: temporary + permanent impact</li>
-        <li>Square-Root: industry standard (impact ∝ √(Q/V))</li>
-        <li>Kyle's Lambda: informed trading model</li>
-        <li>CompositeImpactModel: weighted ensemble</li>
-        <li>ExecutionCostCalculator: impact + commission + tax</li>
+        <li>10技术因子: 动量/波动率/换手/RSI/MACD/振幅</li>
+        <li>5基本面因子: 市值/PB/PE/ROE/资产增长</li>
+        <li>处理流水线: 缩尾→标准化→中性化</li>
+        <li>IC评估: Rank IC/ICIR/分位数收益/衰减曲线</li>
+        <li>IC自动衰减: 滚动监控→自动降权→自动恢复</li>
+        <li>图网络因子: PageRank/特征向量/介数/度</li>
       </ul>
     </div>
 
-    <!-- Tick Backtest -->
     <div class="module-card">
       <div class="card-header">
-        <div class="card-icon" style="background: rgba(139,92,246,0.15); color: var(--accent-purple);">⏱️</div>
+        <div class="card-icon" style="background: rgba(139,92,246,0.15); color: var(--accent-purple);">🧠</div>
         <div>
-          <div class="card-title">Tick-Level Backtester</div>
-          <div class="card-tag">backtest/tick_engine.py</div>
+          <div class="card-title">Alpha模型</div>
+          <div class="card-tag">alpha/</div>
         </div>
       </div>
-      <div class="card-desc">Event-driven tick replay with real LOB matching and market impact simulation.</div>
+      <div class="card-desc">IC/ICIR加权 + XGBoost/LightGBM ML信号 + 市场状态检测因子</div>
       <ul class="card-features">
-        <li>Event-driven tick replay (not vectorized)</li>
-        <li>Real order book matching per tick</li>
-        <li>Market impact simulation (3 models)</li>
-        <li>TWAP / VWAP execution algorithms</li>
-        <li>Per-tick risk checks</li>
+        <li>3种合成: 等权/IC加权/ICIR加权</li>
+        <li>ML信号: XGBoost/LightGBM + Walk-Forward CV</li>
+        <li>SHAP可解释性: 因子贡献可视化</li>
+        <li>市场状态因子: CompositeRegimeDetector</li>
+        <li>Point-in-time: 严格因果, 零未来函数</li>
+        <li>自动重训练: 每季度自动重新拟合</li>
       </ul>
     </div>
 
-    <!-- Greeks -->
-    <div class="module-card">
-      <div class="card-header">
-        <div class="card-icon" style="background: rgba(239,68,68,0.15); color: var(--accent-red);">📐</div>
-        <div>
-          <div class="card-title">Options Greeks</div>
-          <div class="card-tag">risk/greeks.py</div>
-        </div>
-      </div>
-      <div class="card-desc">Black-Scholes full Greeks calculator with portfolio aggregation and auto delta-hedge.</div>
-      <ul class="card-features">
-        <li>Black-Scholes: Delta/Gamma/Vega/Theta/Rho</li>
-        <li>math.erf for N() — no scipy dependency</li>
-        <li>Portfolio Greeks aggregation</li>
-        <li>Dollar Greeks (delta/gamma in $)</li>
-        <li>Auto delta-hedge order generation</li>
-      </ul>
-    </div>
-
-    <!-- Realtime Risk -->
     <div class="module-card">
       <div class="card-header">
         <div class="card-icon" style="background: rgba(239,68,68,0.15); color: var(--accent-red);">🛡️</div>
         <div>
-          <div class="card-title">Real-Time Risk Engine</div>
-          <div class="card-tag">risk/realtime_engine.py</div>
+          <div class="card-title">回测引擎</div>
+          <div class="card-tag">backtest/</div>
         </div>
       </div>
-      <div class="card-desc">Per-tick risk monitoring with pre-trade checks, auto-hedge, and kill switch.</div>
+      <div class="card-desc">向量化月频回测 + Walk-Forward验证 + 蒙特卡洛模拟 + 并行参数扫描</div>
       <ul class="card-features">
-        <li>Pre-trade check: simulate fill before sending</li>
-        <li>Multi-dimensional limits (7 types)</li>
-        <li>5-level risk escalation: GREEN → KILL</li>
-        <li>Auto delta-hedge when threshold exceeded</li>
-        <li>12 stress test scenarios</li>
-        <li>Kill switch: emergency flatten all</li>
+        <li>向量化回测: 月频调仓, 日频持仓漂移</li>
+        <li>A股成本: 佣金0.03%+印花税0.1%+滑点</li>
+        <li>Walk-Forward: 滚动/扩展OOS, 折内重算信号</li>
+        <li>蒙特卡洛: Block Bootstrap, 置信区间</li>
+        <li>并行扫描: ProcessPoolExecutor参数网格</li>
+        <li>容量估算: 参与率限制+AUM-收益曲线</li>
       </ul>
     </div>
 
-    <!-- Cython -->
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(239,68,68,0.15); color: var(--accent-red);">🔒</div>
+        <div>
+          <div class="card-title">风险管理</div>
+          <div class="card-tag">risk/</div>
+        </div>
+      </div>
+      <div class="card-desc">实时风控熔断 + Barra 10因子风险模型 + VaR/压力测试 + 行情状态检测</div>
+      <ul class="card-features">
+        <li>CircuitBreaker: 仓位/行业/亏损/回撤限额</li>
+        <li>5级风险: GREEN→YELLOW→ORANGE→RED→KILL</li>
+        <li>Kill Switch: 一键熔断, 紧急平仓</li>
+        <li>Barra: 10因子横截面回归+风险归因</li>
+        <li>VaR/CVaR: 历史/参数/蒙特卡洛三种方法</li>
+        <li>压力测试: 2008/2015/2020三大危机场景</li>
+      </ul>
+    </div>
+
     <div class="module-card">
       <div class="card-header">
         <div class="card-icon" style="background: rgba(6,182,212,0.15); color: var(--accent-cyan);">⚙️</div>
         <div>
-          <div class="card-title">Cython Hot Paths</div>
-          <div class="card-tag">utils/cyext/</div>
+          <div class="card-title">执行层</div>
+          <div class="card-tag">execution/</div>
         </div>
       </div>
-      <div class="card-desc">4 compute-intensive functions accelerated with Cython, with pure Python fallback.</div>
+      <div class="card-desc">OMS订单管理 + TWAP/VWAP/Iceberg执行算法 + TCA分析 + PaperBroker v2</div>
       <ul class="card-features">
-        <li>rolling_momentum: log returns with typed memoryviews</li>
-        <li>rolling_volatility: Welford single-pass algorithm</li>
-        <li>rank_ic: Spearman Rank IC with C-level sort</li>
-        <li>zscore_cross_section: online normalization</li>
-        <li>Auto-detect: Cython → Python fallback</li>
+        <li>OMS: 订单全生命周期(PENDING→FILLED)</li>
+        <li>TWAP/VWAP/Iceberg: 三种机构级执行算法</li>
+        <li>TCA: Implementation Shortfall/VWAP分解</li>
+        <li>PaperBroker v2: 延迟/部分成交/撤单失败模拟</li>
+        <li>L2回放: 真实盘口数据回放测试</li>
+        <li>SmartRouter: 按ADV自动选择执行算法</li>
       </ul>
     </div>
 
-    <!-- Message Bus -->
     <div class="module-card">
       <div class="card-header">
-        <div class="card-icon" style="background: rgba(139,92,246,0.15); color: var(--accent-purple);">🔗</div>
+        <div class="card-icon" style="background: rgba(16,185,129,0.15); color: var(--accent-green);">💰</div>
         <div>
-          <div class="card-title">Distributed Message Bus</div>
-          <div class="card-tag">core/message_bus.py</div>
+          <div class="card-title">实盘交易</div>
+          <div class="card-tag">trading/</div>
         </div>
       </div>
-      <div class="card-desc">Pluggable message bus abstraction with Local, Redis, and Kafka backends.</div>
+      <div class="card-desc">AKShare实时行情 → 多因子信号 → 风控预检 → 下单 → 实时P&L → WebSocket推送</div>
       <ul class="card-features">
-        <li>MessageBus ABC with health_check()</li>
-        <li>LocalBus: asyncio.Queue (dev/test)</li>
-        <li>RedisBus: Pub/Sub with pattern matching</li>
-        <li>KafkaBus: aiokafka with consumer groups</li>
-        <li>ServiceRegistry: discover + heartbeat</li>
+        <li>SimulatedBroker: A股T+1/佣金/印花税全模拟</li>
+        <li>QMTBroker: xtquant实盘接口, 支持国金/华鑫等券商</li>
+        <li>多因子信号: 动量+低波+RSI+MACD复合</li>
+        <li>实盘试跑: 双轨执行+每日报告+SessionReport</li>
+        <li>WebSocket推送: EventBus→前端实时交易事件</li>
+        <li>开盘前自检: 5项检查, 失败阻断发单</li>
+      </ul>
+    </div>
+
+    <div class="module-card">
+      <div class="card-header">
+        <div class="card-icon" style="background: rgba(139,92,246,0.15); color: var(--accent-purple);">🤖</div>
+        <div>
+          <div class="card-title">LLM增强</div>
+          <div class="card-tag">agent/</div>
+        </div>
+      </div>
+      <div class="card-desc">财经新闻情感因子 + RAG研究Agent，展示Agent/RAG技能到量化的迁移</div>
+      <ul class="card-features">
+        <li>LLMSentimentFactor: 新闻标题→情绪因子</li>
+        <li>Strategy模式: KeywordAnalyzer↔OpenAI</li>
+        <li>30条中文财经模板: 看涨/看跌/中性</li>
+        <li>RAG Agent: 研报分析+因子假设+归因叙述</li>
+        <li>JSON本地缓存: TTL机制, 减少API调用</li>
+        <li>集成Alpha Pipeline: 第16个因子</li>
       </ul>
     </div>
 
@@ -750,400 +877,307 @@ footer a:hover { text-decoration: underline; }
 
 <!-- ── Data Flow ── -->
 <section id="dataflow">
-  <h2 class="section-title">Data Flow</h2>
-  <p class="section-subtitle">One complete pipeline execution: <code>python main.py run</code></p>
+  <h2 class="section-title">数据流</h2>
+  <p class="section-subtitle">一次完整的流水线执行：<code>python main.py run</code></p>
 
   <div class="flow-container">
     <div class="flow-step">
       <div class="flow-number" style="background: rgba(6,182,212,0.15); color: var(--accent-cyan);">1</div>
       <div class="flow-content">
-        <h3>Data Loading</h3>
-        <p><code>DataProvider</code> → <code>DataPipeline</code> (clean/align/filter ST/suspended) → prices, returns, benchmark, metadata, financials. Supports Synthetic / Tushare / Baostock / PostgreSQL.</p>
+        <h3>数据加载</h3>
+        <p><code>DataProvider</code> → <code>DataPipeline</code> (清洗/对齐/过滤ST/停牌) → prices, returns, benchmark, financials。支持合成数据 / Tushare / Baostock / PostgreSQL。</p>
       </div>
     </div>
     <div class="flow-step">
       <div class="flow-number" style="background: rgba(16,185,129,0.15); color: var(--accent-green);">2</div>
       <div class="flow-content">
-        <h3>Factor Computation</h3>
-        <p><code>FactorEngine</code> computes 15 factors → cross-sectional processing (winsorize → zscore → neutralize) → IC evaluation. Cython hot paths for performance.</p>
+        <h3>因子计算</h3>
+        <p><code>FactorEngine</code> 计算15个因子 → 横截面处理(缩尾→标准化→中性化) → IC评估。Numba JIT加速热路径。</p>
       </div>
     </div>
     <div class="flow-step">
       <div class="flow-number" style="background: rgba(245,158,11,0.15); color: var(--accent-yellow);">3</div>
       <div class="flow-content">
-        <h3>Alpha Signal</h3>
-        <p><code>AlphaPipeline</code> combines factors (ICIR-weighted) → cross-sectional rank normalization → signal. Optional: ML signal (XGBoost/LGBM) or LLM sentiment.</p>
+        <h3>Alpha信号</h3>
+        <p><code>AlphaPipeline</code> 因子合成(ICIR加权) → 横截面排名归一化 → 信号。支持XGBoost/LightGBM ML信号和LLM情绪因子。</p>
       </div>
     </div>
     <div class="flow-step">
       <div class="flow-number" style="background: rgba(139,92,246,0.15); color: var(--accent-purple);">4</div>
       <div class="flow-content">
-        <h3>Portfolio Optimization</h3>
-        <p>Covariance estimation (Ledoit-Wolf/EWMA) → <code>PortfolioOptimizer</code> (EW/MVO/RiskParity) → target weights with constraints (long-only, max weight, sector, turnover, lot size).</p>
+        <h3>组合优化</h3>
+        <p>协方差估计(Ledoit-Wolf/EWMA) → <code>PortfolioOptimizer</code> (EW/MVO/RP) → 目标权重，满足纯多头/上限/行业/换手/手数约束。</p>
       </div>
     </div>
     <div class="flow-step">
       <div class="flow-number" style="background: rgba(59,130,246,0.15); color: var(--accent-blue);">5</div>
       <div class="flow-content">
-        <h3>Backtest</h3>
-        <p><code>BacktestEngine</code> multi-period simulation → daily weight drift → rebalance with costs (commission 0.03% + stamp tax 0.1% + slippage). Optional: tick-level engine with LOB matching + market impact.</p>
+        <h3>回测</h3>
+        <p><code>BacktestEngine</code> 多期模拟 → 日频持仓漂移 → 调仓扣费(佣金0.03%+印花税0.1%+滑点)。可选Walk-Forward/蒙特卡洛/并行扫描。</p>
       </div>
     </div>
     <div class="flow-step">
       <div class="flow-number" style="background: rgba(239,68,68,0.15); color: var(--accent-red);">6</div>
       <div class="flow-content">
-        <h3>Risk Analysis & Report</h3>
-        <p>VaR/CVaR → Stress tests (2008/2015/2020) → Barra decomposition → Regime detection → HTML report with ECharts + KPI + factor analysis + risk metrics.</p>
+        <h3>风险分析与报告</h3>
+        <p>VaR/CVaR → 压力测试(2008/2015/2020) → Barra分解 → 行情检测 → HTML报告(ECharts+KPI+因子+风险)。</p>
       </div>
-    </div>
-  </div>
-</section>
-
-<!-- ── Jane Street Comparison ── -->
-<section id="comparison">
-  <h2 class="section-title">vs Jane Street</h2>
-  <p class="section-subtitle">Architecture patterns are aligned. Remaining gaps are physical limits, not code.</p>
-
-  <table class="comparison-table">
-    <thead>
-      <tr>
-        <th>Dimension</th>
-        <th>This Project</th>
-        <th>Jane Street</th>
-        <th>Gap</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>Event Bus</td>
-        <td>AsyncEventBus (backpressure + DLQ + WAL)</td>
-        <td>Similar architecture</td>
-        <td><span class="status status-matched">Matched</span></td>
-      </tr>
-      <tr>
-        <td>Order Book</td>
-        <td>Red-black tree + FIFO + IOC/FOK + VPIN</td>
-        <td>Similar architecture</td>
-        <td><span class="status status-matched">Matched</span></td>
-      </tr>
-      <tr>
-        <td>Backtest</td>
-        <td>Tick-level event-driven + market impact</td>
-        <td>Tick-level event-driven</td>
-        <td><span class="status status-matched">Matched</span></td>
-      </tr>
-      <tr>
-        <td>Risk Engine</td>
-        <td>Per-tick Greeks + pre-trade + Kill Switch</td>
-        <td>Per-tick pre-trade + auto-hedge</td>
-        <td><span class="status status-matched">Matched</span></td>
-      </tr>
-      <tr>
-        <td>Factor Compute</td>
-        <td>Cython hot paths</td>
-        <td>C++/Rust</td>
-        <td><span class="status status-close">Close</span></td>
-      </tr>
-      <tr>
-        <td>Latency</td>
-        <td>~10ms (Python)</td>
-        <td>~10μs (OCaml + FPGA + DPDK)</td>
-        <td><span class="status status-gap">1000x</span></td>
-      </tr>
-      <tr>
-        <td>Type Safety</td>
-        <td>Runtime (Python)</td>
-        <td>Compile-time (OCaml)</td>
-        <td><span class="status status-gap">Fundamental</span></td>
-      </tr>
-      <tr>
-        <td>Data</td>
-        <td>Level 2 (10-level book)</td>
-        <td>Level 3 (all orders/cancels)</td>
-        <td><span class="status status-gap">Resource</span></td>
-      </tr>
-      <tr>
-        <td>Strategy</td>
-        <td>Monthly multi-factor stock selection</td>
-        <td>Microsecond market-making + arb</td>
-        <td><span class="status status-gap">Category</span></td>
-      </tr>
-    </tbody>
-  </table>
-</section>
-
-<!-- ── Quick Start ── -->
-<section id="quickstart">
-  <h2 class="section-title">Quick Start</h2>
-  <p class="section-subtitle">Get up and running in 3 commands.</p>
-
-  <div class="terminal">
-    <div class="terminal-header">
-      <div class="terminal-dot red"></div>
-      <div class="terminal-dot yellow"></div>
-      <div class="terminal-dot green"></div>
-      <div class="terminal-title">Terminal</div>
-    </div>
-    <div class="terminal-body">
-<span class="comment"># 1. Clone the repo</span>
-<span class="prompt">$</span> git clone https://github.com/sijie-Z/quant-platform.git
-<span class="prompt">$</span> cd quant-platform
-
-<span class="comment"># 2. Install dependencies</span>
-<span class="prompt">$</span> pip install -r requirements.txt
-
-<span class="comment"># 3. Run full pipeline (synthetic data, ~3 minutes)</span>
-<span class="prompt">$</span> python main.py run --force
-
-<span class="output">INFO | [1/6] Loading data... (500 stocks, 5 years)
-INFO | [2/6] Computing factors... (15 factors)
-INFO | [3/6] Generating alpha signal...
-INFO | [4/6] Portfolio optimization...
-INFO | [5/6] Running backtest...
-INFO | [6/6] Generating report...</span>
-<span class="success">INFO | Results saved to: ./results/</span>
-
-<span class="comment"># 4. Run tests (610 tests)</span>
-<span class="prompt">$</span> pytest tests/ -v
-<span class="success">610 passed in 217s</span>
-
-<span class="comment"># 5. Start web dashboard</span>
-<span class="prompt">$</span> python main.py web
-<span class="info">FastAPI + Vue 3 → http://localhost:8000</span>
-    </div>
-  </div>
-
-  <div style="margin-top: 2rem;">
-    <h3 style="margin-bottom: 1rem;">More Commands</h3>
-    <div class="code-block">
-      <div class="code-header">CLI Reference</div>
-      <pre>
-<span class="comment"># Baostock real data (free, no API key)</span>
-python main.py run --use-baostock
-
-<span class="comment"># Strategy comparison</span>
-python main.py compare --optimizers equal_weight,mean_variance,risk_parity
-
-<span class="comment"># Parameter grid search</span>
-python main.py sweep --optimizers equal_weight,mean_variance --frequencies monthly,weekly
-
-<span class="comment"># ML Alpha signal</span>
-python main.py ml train --model lightgbm
-python main.py ml signal --model xgboost
-
-<span class="comment"># LLM research agent</span>
-python main.py research report
-
-<span class="comment"># Performance profiling</span>
-python main.py profile</pre>
-    </div>
-  </div>
-</section>
-
-<!-- ── Tech Stack ── -->
-<section>
-  <h2 class="section-title">Tech Stack</h2>
-  <p class="section-subtitle">Production-grade technologies across the full stack.</p>
-
-  <div class="tech-grid">
-    <div class="tech-item">
-      <div class="tech-name">Python 3.10+</div>
-      <div class="tech-desc">Core language</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">asyncio</div>
-      <div class="tech-desc">Async event bus</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">Cython</div>
-      <div class="tech-desc">Hot path acceleration</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">Numba</div>
-      <div class="tech-desc">6 JIT kernels</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">Pandas / NumPy</div>
-      <div class="tech-desc">Data processing</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">cvxpy</div>
-      <div class="tech-desc">Portfolio optimization</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">XGBoost / LightGBM</div>
-      <div class="tech-desc">ML alpha signals</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">FastAPI</div>
-      <div class="tech-desc">REST API (91 endpoints)</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">Vue 3 + ECharts</div>
-      <div class="tech-desc">Bloomberg-style dashboard</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">SQLite WAL</div>
-      <div class="tech-desc">State persistence</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">PostgreSQL</div>
-      <div class="tech-desc">Production storage</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">Redis / Kafka</div>
-      <div class="tech-desc">Message bus backends</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">Prometheus + Grafana</div>
-      <div class="tech-desc">Monitoring (16 panels)</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">Docker</div>
-      <div class="tech-desc">Container deployment</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">GitHub Actions</div>
-      <div class="tech-desc">CI/CD (Py 3.10/3.11/3.12)</div>
-    </div>
-    <div class="tech-item">
-      <div class="tech-name">AKShare</div>
-      <div class="tech-desc">Real-time A-share data</div>
     </div>
   </div>
 </section>
 
 <!-- ── A-Share Pitfalls ── -->
 <section>
-  <h2 class="section-title">A-Share Pitfalls Handled</h2>
-  <p class="section-subtitle">10 real-world A-share traps that every quant must handle. We handle all of them.</p>
+  <h2 class="section-title">A股实盘陷阱处理</h2>
+  <p class="section-subtitle">10个A股特有的实盘陷阱，每个都有显式代码处理。面试必考。</p>
 
-  <div class="module-grid" style="grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));">
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">1. Forward Adjustment</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">Tushare qfq; synthetic data generates adj_factor for price continuity across dividends.</div>
+  <div class="pitfall-grid">
+    <div class="pitfall-item">
+      <div class="pitfall-title">1. 复权</div>
+      <div class="pitfall-desc">Tushare前复权(qfq)；合成数据生成adj_factor，计算close_adj</div>
     </div>
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">2. Suspension</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">Short suspension (≤30d) forward-fill; long suspension removed from universe.</div>
+    <div class="pitfall-item">
+      <div class="pitfall-title">2. 停牌</div>
+      <div class="pitfall-desc">短停牌(≤30天)前向填充；长停牌移出股票池</div>
     </div>
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">3. Survivorship Bias</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">Track listing/delisting dates; point-in-time universe construction.</div>
+    <div class="pitfall-item">
+      <div class="pitfall-title">3. 幸存者偏差</div>
+      <div class="pitfall-desc">跟踪上市/退市日期，时间点股票池构建，不偷看未来</div>
     </div>
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">4. Price Limits</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">Daily returns capped at ±10%; limit-up/down flags prevent impossible fills.</div>
+    <div class="pitfall-item">
+      <div class="pitfall-title">4. 涨跌停</div>
+      <div class="pitfall-desc">日收益截断±10%；涨跌停标记；成本模型额外滑点</div>
     </div>
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">5. ST Stocks</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">is_st flag; excluded by default (±5% limits, high delisting risk).</div>
+    <div class="pitfall-item">
+      <div class="pitfall-title">5. ST股票</div>
+      <div class="pitfall-desc">is_st标记，默认排除(±5%涨跌停/高退市风险/低流动性)</div>
     </div>
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">6. T+1 Rule</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">Monthly rebalance naturally avoids; daily uses shift(-1) for next-day execution.</div>
+    <div class="pitfall-item">
+      <div class="pitfall-title">6. T+1</div>
+      <div class="pitfall-desc">月频调仓天然规避；日频用shift(-1)次日执行</div>
     </div>
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">7. Transaction Costs</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">Commission 0.03% bilateral + stamp tax 0.1% sell-only + slippage model.</div>
+    <div class="pitfall-item">
+      <div class="pitfall-title">7. 交易成本</div>
+      <div class="pitfall-desc">佣金0.03%双边 + 印花税0.1%仅卖出 + 滑点(固定/比例)</div>
     </div>
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">8. Lot Size</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">Optimizer rounds down to 100-share multiples (1 lot = 100 shares).</div>
+    <div class="pitfall-item">
+      <div class="pitfall-title">8. 手数限制</div>
+      <div class="pitfall-desc">100股=1手，优化器向下取整到整手倍数</div>
     </div>
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">9. Ex-Dividend</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">Forward adjustment embeds dividend adjustments into historical prices.</div>
+    <div class="pitfall-item">
+      <div class="pitfall-title">9. 除权除息</div>
+      <div class="pitfall-desc">前复权将分红调整嵌入历史价格，价格连续</div>
     </div>
-    <div class="module-card" style="padding: 1rem;">
-      <div style="font-weight:700; margin-bottom:0.25rem;">10. Sector Drift</div>
-      <div style="font-size:0.85rem; color:var(--text-secondary);">Latest sector classification; dynamic neutralization handles reclassifications.</div>
+    <div class="pitfall-item">
+      <div class="pitfall-title">10. 行业漂移</div>
+      <div class="pitfall-desc">取最新行业分类；动态中性化处理行业重分类</div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Quick Start ── -->
+<section id="quickstart">
+  <h2 class="section-title">快速开始</h2>
+  <p class="section-subtitle">三步启动完整量化流水线</p>
+
+  <div class="terminal">
+    <div class="terminal-header">
+      <div class="terminal-dot red"></div>
+      <div class="terminal-dot yellow"></div>
+      <div class="terminal-dot green"></div>
+      <div class="terminal-title">终端</div>
+    </div>
+    <div class="terminal-body">
+<span class="comment"># 1. 安装依赖</span>
+<span class="prompt">$</span> pip install -r requirements.txt
+
+<span class="comment"># 2. 运行完整流水线（合成数据，无需API key，约3分钟）</span>
+<span class="prompt">$</span> python main.py run --force
+
+<span class="output">INFO | [1/6] 数据加载... (500只股票, 5年)
+INFO | [2/6] 因子计算... (15个因子)
+INFO | [3/6] Alpha信号生成...
+INFO | [4/6] 组合优化...
+INFO | [5/6] 回测执行...
+INFO | [6/6] 报告生成...</span>
+<span class="success">INFO | 结果已保存: ./results/</span>
+
+<span class="comment"># 3. 运行所有测试</span>
+<span class="prompt">$</span> pytest tests/ -v
+<span class="success">1077 passed</span>
+    </div>
+  </div>
+
+  <div style="margin-top: 2rem;">
+    <h3 style="margin-bottom: 1rem;">更多命令</h3>
+    <div class="code-block">
+      <div class="code-header">CLI 参考</div>
+      <pre>
+<span class="comment"># Baostock 实盘数据（免费，无需API key）</span>
+python main.py run --use-baostock
+
+<span class="comment"># 策略对比（3种优化器）</span>
+python main.py compare --optimizers equal_weight,mean_variance,risk_parity
+
+<span class="comment"># 参数网格搜索</span>
+python main.py sweep --optimizers equal_weight,mean_variance --frequencies monthly,weekly
+
+<span class="comment"># ML Alpha信号</span>
+python main.py ml train --model lightgbm
+python main.py ml signal --model xgboost
+
+<span class="comment"># Paper Trading（默认，30天仿真）</span>
+python main.py trade --broker paper --days 60
+
+<span class="comment"># QMT实盘（需miniQMT + xtquant）</span>
+export QMT_PASSWORD="your_sim_password"
+python main.py trade --broker qmt --days 30
+
+<span class="comment"># LLM研究Agent</span>
+python main.py research report
+
+<span class="comment"># 启动Web服务</span>
+python main.py web</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ── Tech Stack ── -->
+<section>
+  <h2 class="section-title">技术栈</h2>
+  <p class="section-subtitle">全栈生产级技术选型</p>
+
+  <div class="tech-grid">
+    <div class="tech-item">
+      <div class="tech-name">Python 3.10+</div>
+      <div class="tech-desc">核心语言</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">asyncio</div>
+      <div class="tech-desc">事件驱动</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Numba</div>
+      <div class="tech-desc">6个JIT内核加速</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Pandas/NumPy</div>
+      <div class="tech-desc">数据处理</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">cvxpy</div>
+      <div class="tech-desc">组合优化</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">XGBoost/LightGBM</div>
+      <div class="tech-desc">ML Alpha信号</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">FastAPI</div>
+      <div class="tech-desc">REST API (97端点)</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Vue 3 + ECharts</div>
+      <div class="tech-desc">Bloomberg风格仪表盘</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">SQLite WAL</div>
+      <div class="tech-desc">状态持久化</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">PostgreSQL</div>
+      <div class="tech-desc">生产级存储</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">AKShare</div>
+      <div class="tech-desc">A股实时行情</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">WebSocket</div>
+      <div class="tech-desc">实时推送</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Prometheus+Grafana</div>
+      <div class="tech-desc">监控 (16面板)</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Docker</div>
+      <div class="tech-desc">容器化部署</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">GitHub Actions</div>
+      <div class="tech-desc">CI/CD</div>
+    </div>
+    <div class="tech-item">
+      <div class="tech-name">Redis/Kafka</div>
+      <div class="tech-desc">可插拔消息队列</div>
     </div>
   </div>
 </section>
 
 <!-- ── Project Structure ── -->
 <section>
-  <h2 class="section-title">Project Structure</h2>
-  <p class="section-subtitle">84 Python modules organized by domain.</p>
+  <h2 class="section-title">项目结构</h2>
+  <p class="section-subtitle">96个Python模块按领域组织</p>
 
   <div class="code-block">
-    <div class="code-header">File Tree</div>
+    <div class="code-header">文件树</div>
     <pre>
 quant_platform/
-├── main.py                          <span class="comment"># CLI entry point</span>
-├── app.py                           <span class="comment"># FastAPI application</span>
-├── CLAUDE.md                        <span class="comment"># Full architecture docs</span>
-├── INTERVIEW_CHEATSHEET.md          <span class="comment"># Interview prep (12 topics)</span>
-├── JANE_STREET_GAP_ANALYSIS.md      <span class="comment"># Gap analysis vs Jane Street</span>
+├── main.py                     <span class="comment"># CLI入口</span>
+├── app.py                      <span class="comment"># FastAPI应用</span>
+├── CLAUDE.md                   <span class="comment"># 完整架构文档</span>
+├── BEGINNER_GUIDE.md           <span class="comment"># 量化新手入门</span>
 │
-├── core/                            <span class="comment"># ★ Core Architecture</span>
-│   ├── event_bus_v2.py              <span class="comment"># AsyncEventBus (backpressure+DLQ+WAL)</span>
-│   ├── events.py                    <span class="comment"># Event bus bridge (backward compat)</span>
-│   ├── message_bus.py               <span class="comment"># Distributed bus (Local/Redis/Kafka)</span>
-│   ├── store.py                     <span class="comment"># SQLite persistence (WAL, 8 tables)</span>
-│   ├── state_machine.py             <span class="comment"># 8-state lifecycle</span>
-│   ├── audit.py                     <span class="comment"># Compliance audit trail</span>
-│   └── scheduler.py                 <span class="comment"># A-share market hours</span>
+├── core/                       <span class="comment"># ★ 核心架构层</span>
+│   ├── events.py               <span class="comment"># EventBus: topic pub/sub, 通配符, 死信队列</span>
+│   ├── store.py                <span class="comment"># SQLite持久化: WAL模式, 8张表</span>
+│   ├── state_machine.py        <span class="comment"># 状态机: 8生命周期状态</span>
+│   ├── scheduler.py            <span class="comment"># 交易调度: A股开市时间</span>
+│   ├── audit.py                <span class="comment"># 合规审计: 三路输出</span>
+│   ├── context.py              <span class="comment"># 多租户上下文</span>
+│   └── instrument.py           <span class="comment"># 跨资产抽象: 股票/ETF/期货/期权</span>
 │
-├── data/                            <span class="comment"># Data Layer</span>
-│   └── providers/                   <span class="comment"># Synthetic/Tushare/Baostock/PG/WS/L2</span>
+├── data/                       <span class="comment"># 数据层 (8个数据源提供者)</span>
+├── factors/                    <span class="comment"># 因子引擎 (15因子)</span>
+├── alpha/                      <span class="comment"># Alpha模型 (IC/ICIR/ML/Regime)</span>
+├── portfolio/                  <span class="comment"># 组合优化 (EW/MVO/RP)</span>
+├── backtest/                   <span class="comment"># 回测引擎 (向量化/WalkForward/MC/并行)</span>
+├── execution/                  <span class="comment"># 执行层 (OMS/算法/TCA/PaperBroker)</span>
+├── risk/                       <span class="comment"># 风险管理 (VaR/Barra/风控/压力/行情)</span>
+├── trading/                    <span class="comment"># 实盘交易 (Broker/Engine/LiveRunner)</span>
+├── strategy/                   <span class="comment"># 多策略管理 (Multi-Pod)</span>
+├── compliance/                 <span class="comment"># 合规导出 (CSV/Excel)</span>
+├── operations/                 <span class="comment"># 基金运营 (NAV/投资者门户)</span>
+├── agent/                      <span class="comment"># LLM增强 (情感因子/RAG)</span>
+├── api/                        <span class="comment"># FastAPI (97端点)</span>
+├── frontend/                   <span class="comment"># Vue 3 (37组件)</span>
+├── monitoring/                 <span class="comment"># Grafana (16面板)</span>
+├── utils/                      <span class="comment"># 工具 (Numba/缓存/配置/指标)</span>
 │
-├── factors/                         <span class="comment"># Factor Engine (15 factors)</span>
-│   ├── technical.py                 <span class="comment"># 10 technical factors</span>
-│   ├── fundamental.py               <span class="comment"># 5 fundamental factors</span>
-│   ├── network.py                   <span class="comment"># Graph network factor</span>
-│   └── ic_monitor.py                <span class="comment"># IC decay monitoring</span>
-│
-├── alpha/                           <span class="comment"># Alpha Model (IC/ICIR/ML/LLM)</span>
-├── portfolio/                       <span class="comment"># Portfolio Optimization (EW/MVO/RP)</span>
-│
-├── backtest/                        <span class="comment"># Backtest Engine</span>
-│   ├── engine.py                    <span class="comment"># Vectorized monthly</span>
-│   └── tick_engine.py               <span class="comment"># ★ Tick-level event-driven</span>
-│
-├── execution/                       <span class="comment"># Execution Layer</span>
-│   ├── order_book.py                <span class="comment"># ★ Real LOB (FIFO+IOC/FOK+VPIN)</span>
-│   └── market_impact.py             <span class="comment"># ★ Impact models (AC/SR/Kyle)</span>
-│
-├── risk/                            <span class="comment"># Risk Management</span>
-│   ├── realtime_engine.py           <span class="comment"># ★ Real-time risk (Greeks+pre-trade)</span>
-│   ├── greeks.py                    <span class="comment"># ★ Black-Scholes Greeks</span>
-│   └── barra.py                     <span class="comment"># Barra 10-factor model</span>
-│
-├── trading/                         <span class="comment"># Live Trading</span>
-│   ├── broker.py                    <span class="comment"># SimulatedBroker (LOB) + QMTBroker</span>
-│   └── engine.py                    <span class="comment"># Trading engine (EventBus+Risk+LOB)</span>
-│
-├── services/                        <span class="comment"># Microservice skeletons</span>
-├── agent/                           <span class="comment"># LLM modules</span>
-├── utils/                           <span class="comment"># Utilities</span>
-│   └── cyext/                       <span class="comment"># ★ Cython hot paths (3 .pyx)</span>
-│
-├── api/                             <span class="comment"># FastAPI (91 endpoints)</span>
-├── frontend/                        <span class="comment"># Vue 3 + ECharts</span>
-├── monitoring/                      <span class="comment"># Grafana dashboard (16 panels)</span>
-│
-└── tests/                           <span class="comment"># 610 unit tests</span>
-    ├── test_core/                   <span class="comment"># EventBus(38) + Store(16) + SM(15) + ...</span>
-    ├── test_execution/              <span class="comment"># OrderBook(22) + OMS(17) + Impact(10)</span>
-    ├── test_risk/                   <span class="comment"># RealTimeRisk(12) + Greeks(8) + ...</span>
-    ├── test_backtest/               <span class="comment"># TickEngine(15) + Cost(4) + ...</span>
-    └── test_utils/                  <span class="comment"># Cython(18) + Numba + Cache + ...</span></pre>
+└── tests/                      <span class="comment"># 1077个单元测试</span>
+    ├── test_core/              <span class="comment"># 核心架构 (137测试)</span>
+    ├── test_data/              <span class="comment"># 数据层 (105测试)</span>
+    ├── test_factors/           <span class="comment"># 因子引擎 (95测试)</span>
+    ├── test_execution/         <span class="comment"># 执行层 (94测试)</span>
+    ├── test_trading/           <span class="comment"># 实盘交易 (112测试)</span>
+    ├── test_risk/              <span class="comment"># 风险管理 (51测试)</span>
+    └── ...</pre>
   </div>
 </section>
 
 <!-- ── Footer ── -->
 <footer>
   <p>
-    Built for quantitative development interviews.
+    面向量化开发岗位面试构建。
     <br>
     <a href="https://github.com/sijie-Z/quant-platform">GitHub</a> ·
-    <a href="https://github.com/sijie-Z/quant-platform/blob/main/CLAUDE.md">Architecture Docs</a> ·
-    <a href="https://github.com/sijie-Z/quant-platform/blob/main/INTERVIEW_CHEATSHEET.md">Interview Prep</a>
+    <a href="https://github.com/sijie-Z/quant-platform/blob/main/CLAUDE.md">完整架构文档</a> ·
+    <a href="https://github.com/sijie-Z/quant-platform/blob/main/INTERVIEW_CHEATSHEET.md">面试指南</a> ·
+    <a href="https://github.com/sijie-Z/quant-platform/blob/main/BEGINNER_GUIDE.md">新手入门</a>
   </p>
   <p style="margin-top: 1rem; color: var(--text-muted);">
-    "Architecture patterns are aligned with Jane Street. The remaining gaps are physical limits, not code."
+    事件驱动核心 · 多因子信号 · 实时风控 · 实盘交易
   </p>
 </footer>
 
