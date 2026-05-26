@@ -10,17 +10,14 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.12"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
 
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -38,25 +35,19 @@ jobs:
 
       - name: Make quant_platform importable
         run: |
-          # Source code lives at repo root; imports use `quant_platform.xxx`.
-          # CI checkout dir is named with hyphen (quant-platform), not underscore.
-          # Create a symlink so Python can resolve `import quant_platform`.
           ln -s "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/../quant_platform"
           echo "PYTHONPATH=$GITHUB_WORKSPACE/.." >> "$GITHUB_ENV"
 
       - name: Lint with ruff
         continue-on-error: true
-        run: |
-          ruff check . --output-format=concise || true
+        run: ruff check . --output-format=concise || true
 
       - name: Type check with mypy
-        run: |
-          mypy quant_platform/ --config-file=pyproject.toml
         continue-on-error: true
+        run: mypy quant_platform/ --config-file=pyproject.toml
 
       - name: Run tests
-        run: |
-          pytest tests/ -v --tb=short --cov=. --cov-report=xml --cov-report=term-missing
+        run: pytest tests/ -v --tb=short --cov=. --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
@@ -100,4 +91,3 @@ jobs:
           sleep 5
           curl -f http://localhost:8000/api/health || exit 1
           docker stop test-container
-
