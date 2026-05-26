@@ -741,7 +741,7 @@ def _build_chart_data(
 
     monthly = None
     if len(sr) >= 21:
-        monthly_ret = sr.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+        monthly_ret = sr.resample("M").apply(lambda x: (1 + x).prod() - 1)
         monthly_ret.index = monthly_ret.index.to_period("M")
         mdf = monthly_ret.groupby([monthly_ret.index.year, monthly_ret.index.month]).first().unstack()
         if not mdf.empty:
