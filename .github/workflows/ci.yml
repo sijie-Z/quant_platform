@@ -46,6 +46,20 @@ jobs:
         continue-on-error: true
         run: mypy quant_platform/ --config-file=pyproject.toml
 
+      - name: Diagnose environment
+        run: |
+          echo "=== PYTHONPATH ==="
+          echo "$PYTHONPATH"
+          echo "=== Symlink ==="
+          ls -la "$GITHUB_WORKSPACE/../quant_platform"
+          echo "=== Python import test ==="
+          python -c "import quant_platform; print('OK:', quant_platform.__file__)"
+          python -c "from quant_platform.core.events import EventBus; print('EventBus OK')"
+          echo "=== Pytest collection ==="
+          pytest tests/ --collect-only -q 2>&1 | tail -20
+          echo "=== Pytest version ==="
+          pytest --version
+
       - name: Run tests
         run: pytest tests/ -v --tb=short
 

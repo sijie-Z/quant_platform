@@ -37,6 +37,7 @@ python-dotenv==1.0.0
 # Testing
 pytest==7.4.3
 pytest-cov==7.1.0
+pytest-asyncio==0.21.2
 
 # Compliance export
 openpyxl==3.1.5

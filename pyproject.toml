@@ -99,7 +99,9 @@ minversion = "7.0"
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "asyncio: marks tests as async",
 ]
+asyncio_mode = "auto"
 filterwarnings = [
     "ignore::DeprecationWarning:dateutil.*",
     "ignore::DeprecationWarning:pytz.*",
