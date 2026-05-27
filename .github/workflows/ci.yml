@@ -92,6 +92,6 @@ jobs:
       - name: Verify container starts
         run: |
           docker run -d --name test-container -p 8000:8000 quant-platform:latest
-          sleep 5
+          sleep 15
           curl -f http://localhost:8000/api/health || exit 1
           docker stop test-container
