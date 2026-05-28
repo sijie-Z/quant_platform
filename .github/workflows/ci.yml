@@ -29,12 +29,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install -e .
           pip install ruff==0.15.12 mypy==1.14.1
-
-      - name: Make quant_platform importable
-        run: |
-          ln -s "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/../quant_platform"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/.." >> "$GITHUB_ENV"
 
       - name: Lint with ruff
         continue-on-error: true
@@ -44,22 +40,14 @@ jobs:
         continue-on-error: true
         run: mypy quant_platform/ --config-file=pyproject.toml
 
-      - name: Diagnose environment
-        run: |
-          echo "=== PYTHONPATH ==="
-          echo "$PYTHONPATH"
-          echo "=== Symlink ==="
-          ls -la "$GITHUB_WORKSPACE/../quant_platform"
-          echo "=== Python import test ==="
-          python -c "import quant_platform; print('OK:', quant_platform.__file__)"
-          python -c "from quant_platform.core.events import EventBus; print('EventBus OK')"
-          echo "=== Pytest collection ==="
-          pytest tests/ --collect-only -q 2>&1 | tail -20
-          echo "=== Pytest version ==="
-          pytest --version
+      - name: Run tests with coverage
+        run: pytest tests/ -v --tb=short --cov=quant_platform --cov-report=term-missing --cov-report=xml
 
-      - name: Run tests
-        run: pytest tests/ -v --tb=short
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
 
   build-frontend:
     runs-on: ubuntu-latest
