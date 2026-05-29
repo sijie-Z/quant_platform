@@ -175,3 +175,29 @@ pip install -r requirements.txt
 pip install -e .  # 使 quant_platform 可导入
 python main.py web
 ```
+
+---
+
+## 架构决策记录
+
+### EventBus vs MessageBus
+
+两套事件系统，各自解决不同的问题：
+
+| 特性 | EventBus (core/events.py) | MessageBus (core/message_bus.py) |
+|------|--------------------------|----------------------------------|
+| 范围 | 进程内，同步 | 跨进程/跨机器，异步 |
+| 后端 | 内存 dict | Local/Redis/Kafka |
+| 使用方 | Engine/Store/Scheduler | services/ 微服务 |
+| 场景 | 核心组件通信 | 生产分布式部署 |
+
+**演进路径**：
+```
+开发: EventBus (进程内)
+       ↓
+过渡: EventBus + MessageBus(Local)
+       ↓
+生产: MessageBus(Kafka) 微服务
+```
+
+`services/` 目录是未来的微服务骨架，目前不强制使用。当需要多进程部署时，将核心组件拆成独立服务即可。
