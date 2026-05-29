@@ -10,6 +10,9 @@ Architecture:
 Every decision flows through the event bus.
 Every state is persisted in SQLite.
 Every transition is logged for compliance.
+
+Signal generation uses the same alpha pipeline as backtest research.
+See trading/signal_generator.py for details.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from quant_platform.trading.broker import (
     OrderStatus,
     SimulatedBroker,
 )
+from quant_platform.trading.signal_generator import LiveSignalGenerator
 from quant_platform.utils.logging import get_logger
 
 try:
@@ -110,9 +114,11 @@ class LiveTradingEngine:
         state_machine: PortfolioStateMachine | None = None,
         audit: AuditLog | None = None,
         risk_monitor: RiskMonitor | None = None,
+        signal_generator: LiveSignalGenerator | None = None,
         rebalance_interval: int = 300,
         n_stocks: int = 50,
         min_trade_value: float = 1000,
+        min_signal_score: float = 0.3,
         tenant_id: str = "default",
     ):
         self._broker = broker
@@ -125,9 +131,11 @@ class LiveTradingEngine:
             max_drawdown=0.15,
             auto_hedge=False,
         )
+        self._signal_generator = signal_generator or LiveSignalGenerator()
         self._rebalance_interval = rebalance_interval
         self._n_stocks = n_stocks
         self._min_trade_value = min_trade_value
+        self._min_signal_score = min_signal_score
         self._tenant_id = tenant_id
 
         # Set tenant context for this engine instance
@@ -477,64 +485,44 @@ class LiveTradingEngine:
             logger.warning("Price fetch failed: %s", e)
 
     def _generate_signals(self) -> list[TradeSignal]:
+        """Generate signals using the same alpha pipeline as backtest research.
+
+        Uses LiveSignalGenerator which reuses factor classes from factors/technical.py
+        and AlphaPipeline from alpha/pipeline.py — identical to the research pipeline.
+        """
         signals = []
         if len(self._price_history) < 20:
             return signals
 
-        # Build rolling price DataFrame for factor computation
+        # Build rolling price DataFrame from the price history buffer
         import pandas as pd
+
         codes_with_data = [c for c, p in self._price_history.items() if len(p) >= 20]
         if not codes_with_data:
             return signals
 
+        # Align all price histories to the same length
         min_len = min(len(self._price_history[c]) for c in codes_with_data)
         price_df = pd.DataFrame(
             {c: self._price_history[c][-min_len:] for c in codes_with_data}
         )
 
-        # Multi-factor composite: momentum(3M) + volatility(20d) + RSI(14d) + MACD
-        factor_scores = pd.DataFrame(index=price_df.columns)
+        # Feed into the shared signal generator
+        self._signal_generator.update_prices(price_df)
+        signal_scores = self._signal_generator.generate()
 
-        # Factor 1: 3-month momentum (positive = bullish)
-        if min_len >= 63:
-            mom = price_df.iloc[-1] / price_df.iloc[-63] - 1
-            factor_scores['momentum'] = mom.rank(pct=True)
-        else:
-            mom = price_df.iloc[-1] / price_df.iloc[max(-min_len, -20)] - 1
-            factor_scores['momentum'] = mom.rank(pct=True)
-
-        # Factor 2: Low volatility (negative = lower vol is better)
-        ret = price_df.pct_change()
-        vol = ret.iloc[-20:].std()
-        factor_scores['low_vol'] = (-vol).rank(pct=True)
-
-        # Factor 3: RSI mean-reversion (oversold = buy signal)
-        delta = price_df.diff()
-        gain = delta.clip(lower=0).iloc[-14:].mean()
-        loss = (-delta).clip(lower=0).iloc[-14:].mean()
-        loss = loss.replace(0, np.nan)
-        rsi = 100 - 100 / (1 + gain / loss)
-        factor_scores['rsi_contrarian'] = (-rsi).rank(pct=True)  # Buy oversold
-
-        # Factor 4: MACD signal
-        ema12 = price_df.ewm(span=12).mean()
-        ema26 = price_df.ewm(span=26).mean()
-        macd = ema12 - ema26
-        macd_signal = macd.iloc[-1].rank(pct=True)
-        factor_scores['macd'] = macd_signal
-
-        # Equal-weight composite score
-        composite = factor_scores.mean(axis=1)
-        composite = composite.dropna().sort_values(ascending=False)
-
-        if composite.empty:
+        if not signal_scores:
             return signals
 
-        # Select top N stocks with positive composite score
-        target_codes = set()
-        for code in composite.index[:self._n_stocks]:
-            if composite[code] > 0.3:  # Minimum threshold
-                target_codes.add(code)
+        # Sort by signal score descending, take top N
+        sorted_codes = sorted(signal_scores, key=signal_scores.get, reverse=True)
+        target_codes = set(
+            c for c in sorted_codes[:self._n_stocks]
+            if signal_scores[c] >= self._min_signal_score
+        )
+
+        if not target_codes:
+            return signals
 
         target_weight = 1.0 / max(len(target_codes), 1)
         positions = {p.code: p for p in self._broker.get_positions()}
@@ -547,8 +535,8 @@ class LiveTradingEngine:
                 signals.append(TradeSignal(
                     code=code, side=OrderSide.BUY,
                     target_weight=target_weight, current_weight=0,
-                    signal_strength=float(composite.get(code, 0)),
-                    reason=f"multi_factor_score={composite.get(code, 0):.3f}",
+                    signal_strength=float(signal_scores.get(code, 0)),
+                    reason=f"signal_score={signal_scores.get(code, 0):.3f}",
                 ))
 
         # Sell removed positions
@@ -562,7 +550,7 @@ class LiveTradingEngine:
                     signal_strength=0, reason="removed_from_universe",
                 ))
 
-        # Rebalance existing positions
+        # Rebalance existing positions (drift > 2%)
         for code in target_codes & current_codes:
             if code in self._current_prices:
                 pos = positions[code]

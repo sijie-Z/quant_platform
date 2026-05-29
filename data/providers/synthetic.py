@@ -7,6 +7,11 @@ Generates realistic synthetic data for ~500 stocks over 5 years, including:
 - Suspension periods and price limits
 
 All randomness is seeded for reproducibility.
+
+CRITICAL: embedded_alpha defaults to False.
+- False: Pure noise returns. No predictable patterns. Safe for research.
+- True: Embeds momentum/value/size alpha. For DEMO/INTERVIEW only.
+  Never use embedded_alpha=True to validate strategy performance.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ class SyntheticDataProvider(DataProvider):
         market_vol: float = 0.012,        # ~19% annual vol
         sector_vol_scale: float = 0.3,
         idio_vol_scale: float = 0.7,
+        embedded_alpha: bool = False,
     ):
         self.n_stocks = n_stocks
         self.start_date = pd.Timestamp(start_date)
@@ -45,6 +51,7 @@ class SyntheticDataProvider(DataProvider):
         self.market_vol = market_vol
         self.sector_vol_scale = sector_vol_scale
         self.idio_vol_scale = idio_vol_scale
+        self.embedded_alpha = embedded_alpha
 
         # Internal caches
         self._prices: pd.DataFrame | None = None
@@ -214,68 +221,63 @@ class SyntheticDataProvider(DataProvider):
             + idio_returns
         )
 
-        # --- Embedded alpha: create predictive structure ---
-        # Asset-level characteristics (static for simplicity)
-        base_pb = np.clip(self.rng.lognormal(np.log(2.0), 0.6, size=n_assets), 0.5, 10.0)
-        base_mcap = self.rng.lognormal(np.log(5e9), 0.8, size=n_assets)
+        # --- Embedded alpha: create predictive structure (demo only) ---
+        # WARNING: This embeds predictable return patterns into synthetic data.
+        # For production research, set embedded_alpha=False so returns are pure noise
+        # (market + sector + idiosyncratic only). The embedded alpha is intended
+        # ONLY for interview demos and integration tests.
+        total_returns = base_returns.copy()
 
-        # Value signal: low PB = higher expected return (inverse-PB rank)
-        value_signal = -np.log(base_pb)  # higher for cheap stocks
-        value_signal = (value_signal - value_signal.mean()) / value_signal.std()
+        if self.embedded_alpha:
+            # Asset-level characteristics (static for simplicity)
+            base_pb = np.clip(self.rng.lognormal(np.log(2.0), 0.6, size=n_assets), 0.5, 10.0)
+            base_mcap = self.rng.lognormal(np.log(5e9), 0.8, size=n_assets)
 
-        # Size signal: small cap = higher expected return
-        size_signal = -np.log(base_mcap)
-        size_signal = (size_signal - size_signal.mean()) / size_signal.std()
+            # Value signal: low PB = higher expected return (inverse-PB rank)
+            value_signal = -np.log(base_pb)
+            value_signal = (value_signal - value_signal.mean()) / value_signal.std()
 
-        # Build cumulative returns iteratively, adding momentum alpha
-        # We simulate prices alongside returns to compute rolling momentum
-        cumulative_base = np.zeros((n_dates, n_assets))
-        cumulative_base[0] = base_returns[0]
-        for t in range(1, n_dates):
-            cumulative_base[t] = cumulative_base[t - 1] + base_returns[t]
+            # Size signal: small cap = higher expected return
+            size_signal = -np.log(base_mcap)
+            size_signal = (size_signal - size_signal.mean()) / size_signal.std()
 
-        # Compute past 21-day return (momentum) at each date
-        momentum_1m = np.zeros((n_dates, n_assets))
-        for t in range(21, n_dates):
-            momentum_1m[t] = cumulative_base[t - 1] - cumulative_base[t - 21]
+            # Build cumulative returns iteratively for momentum computation
+            cumulative_base = np.zeros((n_dates, n_assets))
+            cumulative_base[0] = base_returns[0]
+            for t in range(1, n_dates):
+                cumulative_base[t] = cumulative_base[t - 1] + base_returns[t]
 
-        # Normalize momentum cross-sectionally
-        for t in range(21, n_dates):
-            row = momentum_1m[t]
-            valid = ~np.isnan(row)
-            if valid.sum() < 30:
-                continue
-            mu, std = row[valid].mean(), row[valid].std()
-            if std > 1e-10:
-                momentum_1m[t] = (row - mu) / std
+            # Compute past 21-day return (momentum) at each date
+            momentum_1m = np.zeros((n_dates, n_assets))
+            for t in range(21, n_dates):
+                momentum_1m[t] = cumulative_base[t - 1] - cumulative_base[t - 21]
 
-        # Alpha return = weighted combination of signals
-        # Target IC ~0.015-0.02: realistic A-share levels.
-        # Momentum is the dominant signal; value/size are weaker.
-        # Signal-to-noise ~1:2 — real markets have more noise than signal.
-        alpha_return = np.zeros((n_dates, n_assets))
+            # Normalize momentum cross-sectionally
+            for t in range(21, n_dates):
+                row = momentum_1m[t]
+                valid = ~np.isnan(row)
+                if valid.sum() < 30:
+                    continue
+                mu, std = row[valid].mean(), row[valid].std()
+                if std > 1e-10:
+                    momentum_1m[t] = (row - mu) / std
 
-        for t in range(21, n_dates):
-            # Momentum alpha (moderate, realistic A-share level)
-            alpha_return[t] += 0.015 * momentum_1m[t]
+            # Alpha return = weighted combination of signals
+            alpha_return = np.zeros((n_dates, n_assets))
 
-            # Value alpha
-            value_weight = min(1.0, t / 63)
-            alpha_return[t] += 0.008 * value_signal * value_weight
+            for t in range(21, n_dates):
+                alpha_return[t] += 0.015 * momentum_1m[t]      # Momentum
+                value_weight = min(1.0, t / 63)
+                alpha_return[t] += 0.008 * value_signal * value_weight      # Value
+                alpha_return[t] += 0.005 * size_signal * value_weight       # Size
 
-            # Size alpha
-            alpha_return[t] += 0.005 * size_signal * value_weight
+            # Scale to realistic IC level
+            raw_std = np.nanstd(alpha_return[21:])
+            if raw_std > 1e-10:
+                alpha_return *= 0.0003 / raw_std
 
-        # Scale to ~0.0008/day cross-sectional std → IC ~0.04-0.05
-        raw_std = np.nanstd(alpha_return[21:])
-        if raw_std > 1e-10:
-            alpha_return *= 0.0003 / raw_std
-
-        # Add modest noise (signal-to-noise ~2:1)
-        alpha_noise = self.rng.normal(0, 0.0006, size=(n_dates, n_assets))
-        alpha_return += alpha_noise
-
-        total_returns = base_returns + alpha_return
+            alpha_noise = self.rng.normal(0, 0.0006, size=(n_dates, n_assets))
+            total_returns = base_returns + alpha_return + alpha_noise
 
         # Apply price limits (±10%) — truncate returns
         total_returns = np.clip(total_returns, -0.10, 0.10)

@@ -10,6 +10,9 @@ universe:
 
 # --- Data ---
 data:
+  provider: "synthetic"    # synthetic, tushare, baostock, postgres
+  synthetic:
+    embedded_alpha: false  # false=pure noise for research; true=embedded patterns for demo
   start_date: "2021-01-01"
   end_date: "2025-12-31"
   frequency: "daily"       # daily, weekly, monthly
@@ -73,8 +76,9 @@ backtest:
 costs:
   commission: 0.0003       # 0.03% per trade
   stamp_tax: 0.001          # 0.1% on sell only (A-share)
-  slippage: 0.001           # 0.1% slippage
-  slippage_model: "fixed"   # fixed or proportional
+  slippage: 0.001           # 0.1% slippage (baseline bps)
+  slippage_model: "impact"  # fixed, proportional, or impact (market impact model)
+  impact_model: "composite" # composite, almgren_chriss, square_root
 
 # --- Risk ---
 risk:
