@@ -38,22 +38,31 @@ def _resolve_config_path(config_path_arg) -> Path:
 
 
 def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
-    """Load and clean data. Returns (prices, returns, benchmark, metadata, financials, turnover)."""
+    """Load and clean data. Returns (prices, returns, benchmark, metadata, financials, turnover).
+
+    Respects the config.data.provider setting:
+    - "baostock":  Baostock free A-share data (default, no API key needed)
+    - "tushare":   Tushare Pro (requires TUSHARE_TOKEN env var)
+    - "postgres":  PostgreSQL stored data
+    - "synthetic": Synthetic data (for testing only)
+    """
     from quant_platform.data.pipeline import DataPipeline
     from quant_platform.data.providers.baostock_provider import BaostockDataProvider
     from quant_platform.data.providers.synthetic import SyntheticDataProvider
     from quant_platform.data.providers.tushare_loader import TushareProvider
 
     provider = None
+    configured_provider = getattr(config.data, 'provider', 'synthetic')
 
-    if use_baostock:
+    # Try configured provider first
+    if configured_provider == "baostock" or use_baostock:
         try:
             provider = BaostockDataProvider()
             logger.info("Using Baostock real data provider (free, no API key)")
         except Exception as e:
-            logger.warning("Baostock unavailable (%s), trying Tushare...", e)
+            logger.warning("Baostock unavailable (%s)", e)
 
-    if provider is None and use_tushare:
+    if provider is None and (configured_provider == "tushare" or use_tushare):
         try:
             provider = TushareProvider(
                 start_date=config.data.start_date,
@@ -61,13 +70,27 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
             )
             logger.info("Using Tushare real data provider")
         except (RuntimeError, ImportError) as e:
-            logger.warning("Tushare unavailable (%s), falling back to synthetic data", e)
+            logger.warning("Tushare unavailable (%s), falling back...", e)
 
+    if provider is None and configured_provider == "postgres":
+        try:
+            from quant_platform.data.providers.postgres_provider import PostgresDataProvider
+            provider = PostgresDataProvider()
+            logger.info("Using PostgreSQL data provider")
+        except Exception as e:
+            logger.warning("PostgreSQL unavailable (%s), falling back...", e)
+
+    # Final fallback: synthetic
     if provider is None:
+        from quant_platform.data.providers.synthetic import DEFAULT_EMBEDDED_ALPHA
+        embedded = getattr(config.data.synthetic, 'embedded_alpha', False)
+        if configured_provider != "synthetic":
+            logger.warning("Configured provider '%s' unavailable, falling back to synthetic", configured_provider)
         provider = SyntheticDataProvider(
             n_stocks=config.universe.n_stocks,
             start_date=config.data.start_date,
             end_date=config.data.end_date,
+            embedded_alpha=embedded,
         )
 
     pipeline = DataPipeline(
@@ -729,6 +752,105 @@ def cmd_trade(args) -> int:
     return 0
 
 
+def cmd_walkforward(args) -> int:
+    """Walk-forward validation: the gold standard for overfitting control.
+
+    Each fold recomputes factor weights using only train-period data.
+    This eliminates look-ahead from IC/ICIR weighting.
+    """
+    import pandas as pd
+
+    config = load_config(_resolve_config_path(args.config))
+
+    print("=" * 70)
+    print("  WALK-FORWARD VALIDATION")
+    print("=" * 70)
+    print(f"  Method:    {args.method}")
+    print(f"  Folds:     {args.folds}")
+    print(f"  Train:     {args.train_days} days")
+    print(f"  Test:      {args.test_days} days")
+    print("=" * 70)
+
+    # Load data
+    prices, returns, benchmark, metadata, financials, turnover = _load_data(
+        config, use_baostock=args.use_baostock
+    )
+    print(f"  Data:      {len(prices)} days, {len(prices.columns)} assets")
+
+    # Compute factors (full period, for initial signal)
+    processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+        prices, returns, financials, metadata, turnover, config=config
+    )
+
+    # Generate full-period signal (used as reference)
+    signal = _generate_signal(config, processed_factors, returns)
+
+    # Run walk-forward with per-fold signal recomputation
+    from quant_platform.backtest.walkforward import WalkForwardValidator
+
+    validator = WalkForwardValidator(
+        train_period=args.train_days,
+        test_period=args.test_days,
+        step_size=args.test_days,
+        mode=args.method,
+    )
+
+    engine_kwargs = {
+        "initial_capital": config.backtest.initial_capital,
+        "rebalance_frequency": config.backtest.rebalance_frequency,
+        "benchmark": config.backtest.benchmark,
+    }
+
+    results = validator.run(
+        signal=signal,
+        prices=prices,
+        returns=returns,
+        benchmark_returns=benchmark,
+        sector_map=sector_map,
+        financials=fin_unstacked,
+        engine_kwargs=engine_kwargs,
+        factors=processed_factors,
+        alpha_kwargs={
+            "method": config.alpha.method,
+            "lookback": config.alpha.lookback,
+            "min_icir": config.alpha.min_icir,
+        },
+    )
+
+    # Print results
+    fold_metrics = results.get("fold_metrics", [])
+    print("\n" + "=" * 70)
+    print("  WALK-FORWARD RESULTS (OOS)")
+    print("=" * 70)
+
+    for i, m in enumerate(fold_metrics):
+        print(f"\n  Fold {i+1}:")
+        print(f"    OOS Sharpe:  {m.get('sharpe_ratio', 0):.3f}")
+        print(f"    Ann. Ret:    {m.get('annual_return', 0)*100:.2f}%")
+        print(f"    Max DD:      {m.get('max_drawdown', 0)*100:.2f}%")
+        print(f"    Sortino:     {m.get('sortino_ratio', 0):.3f}")
+
+    agg = results.get("aggregate_metrics", {})
+    print("\n" + "-" * 70)
+    print(f"  OOS Mean Sharpe:    {agg.get('sharpe_ratio', 0):.3f}")
+    print(f"  Info Ratio:         {agg.get('information_ratio', 0):.3f}")
+    print(f"  Annual Return:      {agg.get('annual_return', 0)*100:.2f}%")
+    print(f"  Max Drawdown:       {agg.get('max_drawdown', 0)*100:.2f}%")
+    print(f"  Folds:              {len(fold_metrics)}")
+    print("=" * 70)
+
+    sharpe = agg.get('sharpe_ratio', 0)
+    if sharpe < 0.5:
+        print("\n  WARNING: Low OOS Sharpe — likely overfitting.")
+        print("  Try: fewer factors, longer training window, equal-weight combination.")
+    elif sharpe < 1.0:
+        print("\n  NOTE: Moderate OOS Sharpe. Promising but needs more validation.")
+    else:
+        print("\n  Good OOS Sharpe. Consider forward testing (paper trading).")
+
+    return 0
+
+
 def _resolve_qmt_kwargs(config) -> dict:
     """Extract QMT kwargs from config, resolving password from env."""
     import os
@@ -843,6 +965,22 @@ def main() -> int:
     research_analyze.add_argument("--results-dir", "-r", type=str, default="./results",
                                   help="Results directory")
 
+    # walkforward (standalone)
+    wf_parser = subparsers.add_parser("walkforward", help="Walk-forward validation")
+    wf_parser.add_argument("--config", "-c", type=str, default=None,
+                           help="Path to config YAML file")
+    wf_parser.add_argument("--folds", type=int, default=6,
+                           help="Number of walk-forward folds")
+    wf_parser.add_argument("--method", type=str, default="expanding",
+                           choices=["expanding", "rolling"],
+                           help="Walk-forward method")
+    wf_parser.add_argument("--train-days", type=int, default=504,
+                           help="Training window length in days")
+    wf_parser.add_argument("--test-days", type=int, default=126,
+                           help="Test window length in days")
+    wf_parser.add_argument("--use-baostock", action="store_true",
+                           help="Use Baostock data")
+
     # profile
     profile_parser = subparsers.add_parser("profile", help="Profile pipeline performance")
     profile_parser.add_argument("--config", "-c", type=str, default=None, help="Config path")
@@ -871,6 +1009,8 @@ def main() -> int:
         return cmd_ml(args)
     elif args.command == "research":
         return cmd_research(args)
+    elif args.command == "walkforward":
+        return cmd_walkforward(args)
     elif args.command == "profile":
         return cmd_profile(args)
     else:

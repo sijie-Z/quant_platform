@@ -11,7 +11,14 @@ class UniverseConfig:
 
 
 @dataclass
+class SyntheticConfig:
+    embedded_alpha: bool = False
+
+
+@dataclass
 class DataConfig:
+    provider: str = "baostock"  # synthetic, baostock, tushare, postgres
+    synthetic: SyntheticConfig = field(default_factory=SyntheticConfig)
     start_date: str = "2021-01-01"
     end_date: str = "2025-12-31"
     frequency: str = "daily"
@@ -71,7 +78,8 @@ class CostsConfig:
     commission: float = 0.0003
     stamp_tax: float = 0.001
     slippage: float = 0.001
-    slippage_model: str = "fixed"
+    slippage_model: str = "impact"  # fixed, proportional, impact
+    impact_model: str = "composite"  # composite, almgren_chriss, square_root
 
 
 @dataclass
