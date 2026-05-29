@@ -144,6 +144,14 @@ class BaostockDataProvider(DataProvider):
                    "amount", "turn", "pctChg", "peTTM", "pbMRQ"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
+        # Rename to standard column names
+        df.rename(columns={
+            "turn": "turnover",
+            "pctChg": "pct_chg",
+            "peTTM": "pe_ttm",
+            "pbMRQ": "pb_mrq",
+        }, inplace=True)
+
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index(["date", "code"]).sort_index()
         df.index.names = ["date", "asset"]

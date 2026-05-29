@@ -54,6 +54,10 @@ class DataPipeline:
                      self.start_date.date(), self.end_date.date())
 
         self.metadata = self.provider.get_metadata()
+        # Ensure date columns are datetime (Baostock returns strings)
+        for col in ["listing_date", "delisting_date"]:
+            if col in self.metadata.columns:
+                self.metadata[col] = pd.to_datetime(self.metadata[col], errors="coerce")
         self._filter_universe()
 
         self.prices = self.provider.get_prices(
