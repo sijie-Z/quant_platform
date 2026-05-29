@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code
 COPY . .
 
+# Install the package so imports work
+RUN pip install --no-cache-dir -e .
+
 # Build frontend
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
     && cd frontend && npm ci && npm run build \

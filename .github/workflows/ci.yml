@@ -79,6 +79,17 @@ jobs:
       - name: Verify container starts
         run: |
           docker run -d --name test-container -p 8000:8000 quant-platform:latest
-          sleep 15
-          curl -f http://localhost:8000/api/health || exit 1
-          docker stop test-container
+          # Retry health check up to 12 times (2 min total)
+          for i in $(seq 1 12); do
+            sleep 10
+            if curl -sf http://localhost:8000/api/health > /dev/null 2>&1; then
+              echo "Health check passed!"
+              docker stop test-container
+              exit 0
+            fi
+            echo "Attempt $i/12 — not ready yet..."
+          done
+          echo "Container logs:"
+          docker logs test-container 2>&1 || true
+          docker stop test-container || true
+          exit 1
