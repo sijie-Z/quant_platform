@@ -16,8 +16,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code
 COPY . .
 
-# Install the package so imports work
-RUN pip install --no-cache-dir -e .
+# Make quant_platform importable: the repo root IS the package,
+# but since the directory is named 'app' (not 'quant_platform'),
+# we create a symlink so `import quant_platform` resolves.
+RUN ln -sf /app /quant_platform
+ENV PYTHONPATH=/:/app
 
 # Build frontend
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
