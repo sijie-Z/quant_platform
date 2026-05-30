@@ -26,7 +26,11 @@ classifiers = [
 quant = "main:main"
 
 [tool.setuptools.packages.find]
-include = ["quant_platform*"]
+# The repo root IS the quant_platform package; subpackages (core, data, ...)
+# are discovered directly. Using include=["*"] because find_packages returns
+# subpackage names (core, data) without the "quant_platform." prefix, so
+# "quant_platform*" would match nothing.
+include = ["*"]
 
 # ---------------------------------------------------------------------------
 # ruff — fast Python linter (replaces flake8 + isort + autoflake)

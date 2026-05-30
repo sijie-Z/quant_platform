@@ -16,9 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code
 COPY . .
 
-# Make quant_platform importable: the repo root IS the package,
-# but since the directory is named 'app' (not 'quant_platform'),
-# we create a symlink so `import quant_platform` resolves.
+# Editable install for CLI entry points and pip metadata
+RUN pip install -e . --no-deps
+
+# Symlink so `import quant_platform` resolves in any context:
+# WORKDIR=/app, but the package is named quant_platform, so we make
+# /quant_platform → /app available via PYTHONPATH=/.
 RUN ln -sf /app /quant_platform
 ENV PYTHONPATH=/:/app
 
