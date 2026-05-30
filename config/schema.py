@@ -135,6 +135,24 @@ class QMTConfig:
 
 
 @dataclass
+class ScreenRuleConfig:
+    """Single screening condition."""
+    factor: str = ""
+    operator: str = "gt"    # gt, gte, lt, lte, eq, ne, between
+    value: float | list[float] = 0.0
+
+
+@dataclass
+class ScreenerConfig:
+    """Boolean factor screening configuration."""
+    enabled: bool = False
+    rules: list[ScreenRuleConfig] = field(default_factory=list)
+    logic: str = "and"       # and | or
+    min_stocks: int = 5
+    max_stocks: int = 200
+
+
+@dataclass
 class ExecutionConfig:
     """Execution layer configuration (broker, QMT, etc.)."""
     broker_type: str = "simulated"  # simulated, paper, qmt
@@ -166,4 +184,5 @@ class Config:
     risk: RiskConfig = field(default_factory=RiskConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     instruments: list[InstrumentConfig] = field(default_factory=list)
+    screener: ScreenerConfig = field(default_factory=ScreenerConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)

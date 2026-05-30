@@ -278,10 +278,50 @@ def cmd_run(args) -> int:
         logger.info("  %-20s Rank IC=%.4f  ICIR=%.2f", name, summary["mean_ic"], summary["icir"])
 
     # ------------------------------------------------------------------
-    # 3. Alpha Signal
+    # 3. Alpha Signal (or Screener mode)
     # ------------------------------------------------------------------
-    logger.info("[3/6] Generating alpha signal...")
-    signal = _generate_signal(config, processed_factors, returns)
+    screener_enabled = getattr(config, 'screener', None) and config.screener.enabled
+
+    if screener_enabled:
+        logger.info("[3/6] Running Factor Screener (boolean rules)...")
+        from quant_platform.portfolio.screener import FactorScreener, ScreenConfig
+        from quant_platform.portfolio.screener import ScreenRule
+
+        # Build screener from config rules
+        rules = []
+        for r in config.screener.rules:
+            rules.append(ScreenRule(
+                factor=r.factor,
+                operator=r.operator,
+                value=r.value,
+            ))
+        screener_config = ScreenConfig(
+            enabled=True,
+            rules=rules,
+            logic=config.screener.logic,
+            min_stocks=config.screener.min_stocks,
+            max_stocks=config.screener.max_stocks,
+        )
+        screener = FactorScreener(screener_config)
+        qualifiers = screener.screen(processed_factors)
+
+        if not qualifiers:
+            logger.warning("Screener returned no qualifying stocks — skipping backtest")
+            print("\n  SCREENER RESULT: No stocks matched the rules.\n")
+            return 0
+
+        # Build equal-weight signal from qualifying stocks
+        import pandas as pd
+        logger.info("Screener: %d qualifying stocks — using equal weight", len(qualifiers))
+        signal = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        for date in signal.index:
+            w = 1.0 / len(qualifiers)
+            for asset in qualifiers:
+                if asset in signal.columns:
+                    signal.loc[date, asset] = w
+    else:
+        logger.info("[3/6] Generating alpha signal...")
+        signal = _generate_signal(config, processed_factors, returns)
 
     # ------------------------------------------------------------------
     # 4-5. Portfolio + Backtest
@@ -663,6 +703,133 @@ def cmd_research(args) -> int:
         return 1
 
 
+def cmd_screen(args) -> int:
+    """Run factor screener: boolean-rule stock selection.
+
+    Computes factors for the configured universe, then applies user-defined
+    screen rules. Prints qualifying stocks with their factor values.
+    """
+    import json
+    from datetime import datetime
+
+    import pandas as pd
+
+    from quant_platform.portfolio.screener import (
+        FactorScreener,
+        ScreenRule,
+    )
+
+    config = load_config(_resolve_config_path(args.config))
+
+    # Parse rules from CLI arg or use config defaults
+    rules: list[ScreenRule] = []
+    if args.rules:
+        for rule_str in args.rules.split(","):
+            rule_str = rule_str.strip()
+            if not rule_str:
+                continue
+            # Format: factor_name=operator:value  e.g. pe_ratio=lt:30
+            if "=" in rule_str:
+                factor_expr = rule_str.split("=", 1)
+                factor_name = factor_expr[0].strip()
+                rest = factor_expr[1].strip()
+                if ":" in rest:
+                    op, val_str = rest.split(":", 1)
+                    try:
+                        val = float(val_str)
+                    except ValueError:
+                        val = val_str
+                    rules.append(ScreenRule(factor=factor_name, operator=op, value=val))
+                else:
+                    logger.warning("Invalid rule format (expected op:val): %s", rule_str)
+            else:
+                logger.warning("Invalid rule format (expected factor=op:val): %s", rule_str)
+    else:
+        # Use config rules
+        for r in config.screener.rules:
+            rules.append(ScreenRule(factor=r.factor, operator=r.operator, value=r.value))
+
+    if not rules:
+        print("No screen rules defined. Use --rules or configure screener.rules in config.")
+        return 1
+
+    # Load data & compute factors
+    print("Loading data...")
+    prices, returns, benchmark, metadata, financials, turnover = _load_data(
+        config, use_baostock=args.use_baostock
+    )
+    print(f"  Data: {len(prices)} days, {len(prices.columns)} assets")
+
+    print("Computing factors...")
+    processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+        prices, returns, financials, metadata, turnover, config=config,
+    )
+
+    # Run screener
+    screener = FactorScreener({
+        "enabled": True,
+        "rules": [{"factor": r.factor, "operator": r.operator, "value": r.value}
+                  for r in rules],
+        "logic": args.logic or config.screener.logic,
+        "min_stocks": args.min_stocks or config.screener.min_stocks,
+        "max_stocks": args.max_stocks or config.screener.max_stocks,
+    })
+    qualifiers = screener.screen(processed_factors, rules)
+
+    # Build output table
+    if qualifiers:
+        # Get latest factor values for qualifying stocks
+        last_date = next(iter(processed_factors.values())).index[-1]
+        print(f"\n{'='*80}")
+        print(f"  SCREENER RESULTS — {last_date}")
+        print(f"{'='*80}")
+        print(f"  Rules: {', '.join(str(r.factor) + ' ' + r.operator + ' ' + str(r.value) for r in rules)}")
+        print(f"  Logic: {args.logic or config.screener.logic}")
+        print(f"  Passing: {len(qualifiers)} / {len(next(iter(processed_factors.values())).columns)} stocks")
+        print(f"{'='*80}\n")
+
+        # Build detail DataFrame
+        detail_rows = []
+        for asset in qualifiers:
+            row = {"code": asset}
+            for r in rules:
+                if r.factor in processed_factors:
+                    df = processed_factors[r.factor]
+                    if last_date in df.index:
+                        row[r.factor] = round(df.loc[last_date, asset], 4)
+            detail_rows.append(row)
+
+        df_out = pd.DataFrame(detail_rows)
+
+        # Print table
+        pd.set_option("display.max_rows", 120)
+        pd.set_option("display.width", 200)
+        pd.set_option("display.max_columns", 20)
+        print(df_out.to_string(index=False))
+
+        # Save to CSV if requested
+        if args.output:
+            df_out.to_csv(args.output, index=False)
+            print(f"\n  Saved to: {args.output}")
+
+        # Print summary stats
+        print(f"\n  {'─'*60}")
+        print(f"  Total qualifying stocks: {len(qualifiers)}")
+        for r in rules:
+            if r.factor in processed_factors:
+                df = processed_factors[r.factor]
+                if last_date in df.index:
+                    vals = df.loc[last_date, qualifiers].dropna()
+                    print(f"  {r.factor}: mean={vals.mean():.4f}  "
+                          f"min={vals.min():.4f}  max={vals.max():.4f}")
+        print(f"  {'─'*60}\n")
+    else:
+        print("\n  No stocks matched the screen rules.\n")
+        return 1
+
+    return 0
+
+
 def cmd_profile(args) -> int:
     """Profile pipeline performance — shows time per stage."""
     import time
@@ -981,6 +1148,23 @@ def main() -> int:
     wf_parser.add_argument("--use-baostock", action="store_true",
                            help="Use Baostock data")
 
+    # screen
+    screen_parser = subparsers.add_parser("screen", help="Screen stocks using boolean factor rules")
+    screen_parser.add_argument("--config", "-c", type=str, default=None,
+                               help="Path to config YAML file")
+    screen_parser.add_argument("--rules", "-r", type=str, default=None,
+                               help='Rules: "factor=op:value,factor=op:value" e.g. "pe_ratio=lt:30,roe=gt:0.15"')
+    screen_parser.add_argument("--logic", "-l", type=str, default=None,
+                               choices=["and", "or"], help="Rule combination logic")
+    screen_parser.add_argument("--output", "-o", type=str, default=None,
+                               help="Save results to CSV")
+    screen_parser.add_argument("--min-stocks", type=int, default=None,
+                               help="Minimum qualifying stocks (auto-relax)")
+    screen_parser.add_argument("--max-stocks", type=int, default=None,
+                               help="Maximum qualifying stocks (cap with scoring)")
+    screen_parser.add_argument("--use-baostock", action="store_true",
+                               help="Use Baostock real data")
+
     # profile
     profile_parser = subparsers.add_parser("profile", help="Profile pipeline performance")
     profile_parser.add_argument("--config", "-c", type=str, default=None, help="Config path")
@@ -1011,6 +1195,8 @@ def main() -> int:
         return cmd_research(args)
     elif args.command == "walkforward":
         return cmd_walkforward(args)
+    elif args.command == "screen":
+        return cmd_screen(args)
     elif args.command == "profile":
         return cmd_profile(args)
     else:

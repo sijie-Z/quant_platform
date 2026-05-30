@@ -428,3 +428,38 @@ class FundamentalRankRequest(BaseModel):
 class FundamentalRankResponse(BaseModel):
     metric: str
     ranked: list[dict[str, Any]]
+
+
+# --- Screener schemas ---
+
+class ScreenRuleRequest(BaseModel):
+    """A single screening rule from the API request."""
+    factor: str = Field(..., description="Factor name, e.g. 'pe_ratio'")
+    operator: Literal["gt", "gte", "lt", "lte", "eq", "ne", "between"] = Field(
+        ..., description="Comparison operator"
+    )
+    value: float | list[float] = Field(..., description="Threshold value or [lo, hi]")
+
+
+class ScreenRequest(BaseModel):
+    rules: list[ScreenRuleRequest] = Field(..., description="List of screening rules")
+    logic: Literal["and", "or"] = Field(default="and", description="Rule combination logic")
+    date: str | None = Field(default=None, description="Target date YYYY-MM-DD (latest if None)")
+    min_stocks: int = Field(default=5, ge=1, le=500, description="Minimum stocks (auto-relax)")
+    max_stocks: int = Field(default=200, ge=1, le=1000, description="Maximum stocks (score cap)")
+    config: str | None = Field(default=None, description="Config file path")
+
+
+class ScreenStockInfo(BaseModel):
+    code: str
+    factors: dict[str, float]
+
+
+class ScreenResponse(BaseModel):
+    date: str
+    logic: str
+    num_rules: int
+    total_stocks: int
+    qualifying_stocks: int
+    rules: list[str]
+    results: list[ScreenStockInfo]

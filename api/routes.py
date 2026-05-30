@@ -50,6 +50,9 @@ from quant_platform.api.schemas import (
     RunRequest,
     RunResult,
     RunStatus,
+    ScreenRequest,
+    ScreenResponse,
+    ScreenStockInfo,
     StressTestItem,
     SweepRequest,
     SweepResult,
@@ -1897,6 +1900,83 @@ def _detect_regime(result: dict) -> dict:
 
     regime["history"] = regime_history[-30:]  # Last 30 months
     return regime
+
+
+# ---------------------------------------------------------------------------
+# Screener: Boolean Factor Screening
+# ---------------------------------------------------------------------------
+
+@router.post("/screen", response_model=ScreenResponse)
+async def screen_stocks(req: ScreenRequest):
+    """Screen stocks using boolean factor rules.
+
+    Computes factors for the configured universe then applies user-defined
+    rules (e.g. "pe_ratio < 30 AND roe > 0.15"). Returns qualifying stocks
+    with their factor values.
+    """
+    from quant_platform.portfolio.screener import (
+        FactorScreener,
+        ScreenRule,
+    )
+
+    config = _load_config(req.config)
+
+    n_stocks = getattr(req, 'n_stocks', None)
+    if n_stocks is not None:
+        config.universe.n_stocks = n_stocks
+    use_baostock = getattr(req, 'use_baostock', False)
+
+    try:
+        prices, returns, benchmark, metadata, financials, turnover = _load_data(
+            config, use_baostock=use_baostock
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Data load failed: {e}")
+
+    try:
+        processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+            prices, returns, financials, metadata, turnover, config=config,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Factor computation failed: {e}")
+
+    rules = []
+    for r in req.rules:
+        rules.append(ScreenRule(factor=r.factor, operator=r.operator, value=r.value))
+
+    screener = FactorScreener({
+        "enabled": True,
+        "rules": [{"factor": r.factor, "operator": r.operator, "value": r.value}
+                  for r in rules],
+        "logic": req.logic,
+        "min_stocks": req.min_stocks,
+        "max_stocks": req.max_stocks,
+    })
+    qualifiers = screener.screen(processed_factors, rules, date=req.date)
+
+    target_date = req.date or str(next(iter(processed_factors.values())).index[-1])
+    results = []
+    for asset in qualifiers:
+        factor_vals = {}
+        for r in rules:
+            if r.factor in processed_factors:
+                df = processed_factors[r.factor]
+                try:
+                    val = float(df.loc[pd.Timestamp(target_date), asset])
+                    factor_vals[r.factor] = round(val, 6)
+                except (KeyError, TypeError):
+                    pass
+        results.append(ScreenStockInfo(code=asset, factors=factor_vals))
+
+    return ScreenResponse(
+        date=target_date,
+        logic=req.logic,
+        num_rules=len(rules),
+        total_stocks=len(next(iter(processed_factors.values())).columns),
+        qualifying_stocks=len(qualifiers),
+        rules=[f"{r.factor} {r.operator} {r.value}" for r in rules],
+        results=results,
+    )
 
 
 # ---------------------------------------------------------------------------

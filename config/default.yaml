@@ -136,6 +136,21 @@ instruments: []
   #   stamp_tax_rate: 0.0
   #   t_plus: 0
 
+# --- Screener (Boolean Factor Screening) ---
+# When enabled, replaces the alpha+optimizer pipeline with simple boolean
+# screening. Stocks that pass ALL (or ANY) rules are equal-weighted.
+# Useful for quick "conditions-based" stock selection.
+screener:
+  enabled: false
+  rules:
+    # Each rule: factor name + operator + threshold
+    # Supported operators: gt, gte, lt, lte, eq, ne, between
+    - {factor: "pe_ratio", operator: "lt", value: 30}
+    - {factor: "roe", operator: "gt", value: 0.15}
+  logic: "and"             # and | or
+  min_stocks: 5            # Auto-relax rules if fewer pass
+  max_stocks: 200          # Cap via multi-factor scoring if more pass
+
 # --- Execution ---
 execution:
   broker_type: "simulated"     # simulated, paper, qmt
