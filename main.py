@@ -243,6 +243,13 @@ def cmd_run(args) -> int:
 
     config = load_config(raw=raw_config)
 
+    # Auto-save config version before running
+    from quant_platform.utils.version_manager import VersionManager
+    vm = VersionManager()
+    desc = args.description or f"Run: alpha={config.alpha.method} optimizer={config.portfolio.optimizer}"
+    version_id = vm.save(raw_config, description=desc)
+    logger.info("Config auto-saved as version %s", version_id)
+
     logger.info("=" * 60)
     logger.info("Quant Platform: Starting full pipeline run")
     logger.info("  Config: %s  Cache key: %s  Use cache: %s",
@@ -830,6 +837,71 @@ def cmd_screen(args) -> int:
     return 0
 
 
+def cmd_config(args) -> int:
+    """Manage configuration versions: list, show, diff, rollback."""
+    from quant_platform.utils.version_manager import VersionManager
+
+    vm = VersionManager()
+
+    if args.subcommand == "list":
+        versions = vm.list()
+        if not versions:
+            print("No config versions saved yet.")
+            print("  Run 'python main.py run' to auto-save the first version.")
+            return 0
+
+        print(f"{'ID':<6} {'Timestamp':<22} {'Description'}")
+        print("-" * 80)
+        for v in versions:
+            desc = (v.description[:60] + "..") if len(v.description) > 62 else v.description
+            print(f"{v.id:<6} {v.timestamp:<22} {desc}")
+        print(f"\n{len(versions)} versions total.")
+
+    elif args.subcommand == "show":
+        try:
+            config = vm.show(args.version)
+            import yaml
+            print(yaml.dump(config, default_flow_style=False, allow_unicode=True))
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            return 1
+
+    elif args.subcommand == "diff":
+        try:
+            diff_text = vm.diff(args.v1, args.v2)
+            if diff_text:
+                print(diff_text)
+            else:
+                print("Configs are identical.")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            return 1
+
+    elif args.subcommand == "rollback":
+        target = args.target
+        try:
+            vm.rollback(args.version, target_path=target)
+            print(f"Config rolled back to {args.version}.")
+            if target:
+                print(f"  Target: {target}")
+            else:
+                print("  Target: config/default.yaml")
+            print("  Run 'python main.py run' to verify.")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            return 1
+
+    elif args.subcommand == "delete":
+        confirm = args.force or input(f"Delete {args.version}? [y/N] ").lower() == "y"
+        if confirm:
+            vm.delete(args.version)
+            print(f"Deleted {args.version}.")
+        else:
+            print("Cancelled.")
+
+    return 0
+
+
 def cmd_profile(args) -> int:
     """Profile pipeline performance — shows time per stage."""
     import time
@@ -1054,6 +1126,8 @@ def main() -> int:
                             help="Disable caching entirely")
     run_parser.add_argument("--cache-dir", type=str, default=".quant_cache",
                             help="Cache directory path")
+    run_parser.add_argument("--description", "-d", type=str, default=None,
+                            help="Optional description for this run (saved in config version)")
 
     # trade
     trade_parser = subparsers.add_parser("trade", help="Run live trading (Paper or QMT)")
@@ -1165,6 +1239,25 @@ def main() -> int:
     screen_parser.add_argument("--use-baostock", action="store_true",
                                help="Use Baostock real data")
 
+    # config
+    config_parser = subparsers.add_parser("config", help="Manage configuration versions")
+    config_sub = config_parser.add_subparsers(dest="subcommand", help="Config action")
+
+    config_list = config_sub.add_parser("list", help="List all config versions")
+    config_show = config_sub.add_parser("show", help="Show config for a version")
+    config_show.add_argument("version", type=str, help="Version ID (e.g. v3)")
+    config_diff = config_sub.add_parser("diff", help="Diff two config versions")
+    config_diff.add_argument("v1", type=str, help="First version (before)")
+    config_diff.add_argument("v2", type=str, help="Second version (after)")
+    config_rollback = config_sub.add_parser("rollback", help="Restore a version as active config")
+    config_rollback.add_argument("version", type=str, help="Version ID to restore (e.g. v3)")
+    config_rollback.add_argument("--target", "-t", type=str, default=None,
+                                  help="Target config path (default: config/default.yaml)")
+    config_delete = config_sub.add_parser("delete", help="Delete a config version")
+    config_delete.add_argument("version", type=str, help="Version ID to delete")
+    config_delete.add_argument("--force", "-f", action="store_true",
+                                help="Skip confirmation")
+
     # profile
     profile_parser = subparsers.add_parser("profile", help="Profile pipeline performance")
     profile_parser.add_argument("--config", "-c", type=str, default=None, help="Config path")
@@ -1197,6 +1290,8 @@ def main() -> int:
         return cmd_walkforward(args)
     elif args.command == "screen":
         return cmd_screen(args)
+    elif args.command == "config":
+        return cmd_config(args)
     elif args.command == "profile":
         return cmd_profile(args)
     else:
