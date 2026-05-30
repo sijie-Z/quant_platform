@@ -39,13 +39,7 @@ jobs:
           pip install ruff==0.15.12 mypy==1.14.1
 
       - name: Make quant_platform importable
-        run: |
-          # Symlink: creates ../quant_platform → quant-platform so Python can
-          # find the package. PYTHONPATH=.. then lets 'import quant_platform'
-          # resolve.  This is needed because the repo dir is 'quant-platform'
-          # (hyphen) but the package is 'quant_platform' (underscore).
-          ln -sf "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/../quant_platform"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/.." >> "$GITHUB_ENV"
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE/.." >> "$GITHUB_ENV"
 
       - name: Lint with ruff
         continue-on-error: true
