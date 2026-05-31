@@ -518,6 +518,117 @@ class BreakoutProximityFactor(BaseFactor):
         proximity = (prices - low) / rng.replace(0, float("nan"))
         return proximity.clip(0, 1)
 
+
+
+# ---------------------------------------------------------------------------
+# Pure Volatility Factor  (inspired by Dongwu Securities research)
+# ---------------------------------------------------------------------------
+
+
+class PureVolatilityFactor(BaseFactor):
+    """Pure idiosyncratic volatility: FF3 residuals orthogonalized.
+
+    Methodology (from Dongwu Securities research report):
+    1. Rolling 20-day FF3 regression → residual returns
+    2. Idiosyncratic vol = std(residual) over 20 days
+    3. Orthogonalize against turnover → remove trading-activity noise
+    4. AR(30) filter → remove serial correlation in factor values
+
+    The resulting 'pure volatility' factor isolates the fundamental
+    component of idiosyncratic risk, removing both trading noise
+    and cross-period information leakage.
+
+    Higher values = higher idiosyncratic risk = expected lower returns
+    (the IVOL anomaly: high IVOL stocks tend to underperform).
+    """
+    category = FactorCategory.TECHNICAL
+
+    def __init__(self, window: int = 20, ar_lags: int = 30, name: str = "pure_volatility"):
+        super().__init__({'window': window, 'ar_lags': ar_lags})
+        self._window = window
+        self._ar_lags = ar_lags
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def compute(self, prices: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        ret = prices.pct_change(fill_method=None)
+
+        # Rolling 20-day FF3 regression per asset
+        # FF3 factors: market (excess return), SMB, HML
+        # For simplicity, use market return (equal-weight cross-section)
+        # as the single factor. Full FF3 would need market cap data.
+        market_ret = ret.mean(axis=1)
+
+        # Rolling regression: ret_i = alpha + beta * market_ret + epsilon
+        # Then IVOL = std(epsilon) over the window
+        def _rolling_ivol(x):
+            y = x.values
+            m = market_ret.reindex(x.index).values
+            if len(y) < self._window or np.std(m) < 1e-10:
+                return np.nan
+            # Simple OLS: beta = cov(y,m) / var(m)
+            beta = np.cov(y, m)[0, 1] / np.var(m)
+            resid = y - beta * m
+            return float(np.std(resid, ddof=2))
+
+        ivol = ret.rolling(self._window).apply(_rolling_ivol, raw=False)
+
+        # Orthogonalize against turnover (if available)
+        turnover = kwargs.get('turnover')
+        if turnover is not None and not turnover.empty:
+            # Regress IVOL ~ turnover per date cross-section
+            # Return residuals = turnover-orthogonalized IVOL
+            aligned = ivol.align(turnover, join='inner')
+            ivol_aligned = aligned[0]
+            turn_aligned = aligned[1]
+
+            result = ivol_aligned.copy()
+            for date in ivol_aligned.index:
+                row_ivol = ivol_aligned.loc[date].dropna()
+                row_turn = turn_aligned.loc[date].reindex(row_ivol.index).dropna()
+                common = row_ivol.index.intersection(row_turn.index)
+                if len(common) < 10:
+                    continue
+                y = row_ivol[common].values
+                x = row_turn[common].values
+                if np.std(x) < 1e-10:
+                    continue
+                beta = np.cov(y, x)[0, 1] / np.var(x)
+                resid = y - beta * x
+                result.loc[date, common] = resid
+
+            ivol = result
+
+        # AR(lags) filter to remove serial correlation
+        # Fit AR model per asset and return residuals
+        result = ivol.copy()
+        for asset in ivol.columns:
+            series = ivol[asset].dropna().values
+            if len(series) < self._ar_lags + 10:
+                continue
+            # Simple AR fit: X_t = sum(phi_i * X_{t-i}) + epsilon
+            # Using least squares
+            T = len(series)
+            X = np.column_stack([
+                series[self._ar_lags - 1 - i: T - 1 - i]
+                for i in range(self._ar_lags)
+            ])
+            y = series[self._ar_lags:]
+            if X.shape[0] < self._ar_lags + 5:
+                continue
+            try:
+                phi = np.linalg.lstsq(X, y, rcond=None)[0]
+                pred = X @ phi
+                resid_ar = y - pred
+                result.loc[ivol.index[ivol.notna().any(axis=1)][self._ar_lags:], asset] = resid_ar
+            except np.linalg.LinalgError:
+                continue
+
+        return result
+
 def register_all():
     registry = get_registry()
     for cls in [
@@ -531,5 +642,6 @@ def register_all():
         TrendStageFactor,
         MAConvergenceFactor,
         BreakoutProximityFactor,
+        PureVolatilityFactor,
     ]:
         registry.register(cls)
