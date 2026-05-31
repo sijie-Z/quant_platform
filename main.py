@@ -840,6 +840,72 @@ def cmd_screen(args) -> int:
     return 0
 
 
+def cmd_execute(args) -> int:
+    """Execute full pipeline: factors -> signal -> orders -> fills -> positions."""
+    config = load_config(_resolve_config_path(args.config))
+
+    print("Loading data...")
+    prices, returns, benchmark, metadata, financials, turnover = _load_data(
+        config, use_baostock=args.use_baostock
+    )
+    print(f"  Data: {len(prices)} days, {len(prices.columns)} assets")
+
+    print("Computing factors...")
+    processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+        prices, returns, financials, metadata, turnover, config=config,
+    )
+
+    print("Generating signal...")
+    signal = _generate_signal(config, processed_factors, returns, prices=prices, volume=turnover)
+
+    print("Setting up execution engine...")
+    from quant_platform.execution.engine import ExecutionEngine, OrderSide
+    from quant_platform.strategy.multi_strategy import MultiStrategyManager, StrategyConfig
+    from quant_platform.strategy.portfolio_orchestrator import PortfolioOrchestrator
+
+    ms = MultiStrategyManager(total_capital=1_000_000)
+    strat_id = ms.add_strategy(StrategyConfig(
+        name="test_strat", optimizer=config.portfolio.optimizer,
+        allocation_pct=1.0, is_active=True,
+    ))
+    orchestrator = PortfolioOrchestrator(ms)
+
+    # Get latest prices
+    last_prices = prices.iloc[-1].to_dict()
+    orchestrator._last_prices.update(last_prices)
+
+    last_date = str(prices.index[-1])[:10]
+    print(f"Processing signal for {last_date}...")
+    orchestrator.on_signal(last_date, signal, strategy_id=strat_id)
+
+    print("Executing rebalance...")
+    orders = orchestrator.rebalance()
+    print(f"  Created {len(orders)} orders")
+
+    print("Processing fills...")
+    orchestrator.process_fills(last_prices)
+
+    summary = orchestrator.portfolio_summary()
+    print()
+    print("=" * 70)
+    print("  EXECUTION RESULT")
+    print("=" * 70)
+    print(f"  Date:          {last_date}")
+    print(f"  Positions:     {summary['n_positions']}")
+    print(f"  Cash:          {summary['cash_available']:,.2f}")
+    print(f"  Position Val:  {summary['positions_value']:,.2f}")
+    print(f"  Unrealized PnL:{summary['unrealized_pnl']:+,.2f}")
+    print(f"  Realized PnL:  {summary['realized_pnl']:+,.2f}")
+    print(f"  Total PnL:     {summary['total_pnl']:+,.2f}")
+    print(f"  Alerts:        {summary['alerts']}")
+    print("-" * 70)
+    for p in summary['positions'][:10]:
+        print(f"  {p['ticker']:<8} {p['quantity']:>5} @ {p['avg_cost']:<8.2f} = {p['market_value']:>10.2f}  PnL:{p['unrealized_pnl']:>+8.2f}")
+    if len(summary['positions']) > 10:
+        print(f"  ... and {len(summary['positions']) - 10} more")
+    print("=" * 70)
+    return 0
+
 def cmd_config(args) -> int:
     """Manage configuration versions: list, show, diff, rollback."""
     from quant_platform.utils.version_manager import VersionManager
@@ -1297,6 +1363,11 @@ def main() -> int:
     la_parser.add_argument("--use-baostock", action="store_true",
                            help="Use Baostock real data")
 
+    # execute
+    exec_parser = subparsers.add_parser("execute", help="Full pipeline: factors -> signal -> orders -> fills")
+    exec_parser.add_argument("--config", "-c", type=str, default=None, help="Config path")
+    exec_parser.add_argument("--use-baostock", action="store_true", help="Use Baostock data")
+
     # profile
     profile_parser = subparsers.add_parser("profile", help="Profile pipeline performance")
     profile_parser.add_argument("--config", "-c", type=str, default=None, help="Config path")
@@ -1329,6 +1400,8 @@ def main() -> int:
         return cmd_walkforward(args)
     elif args.command == "screen":
         return cmd_screen(args)
+    elif args.command == "execute":
+        return cmd_execute(args)
     elif args.command == "config":
         return cmd_config(args)
     elif args.command == "profile":
