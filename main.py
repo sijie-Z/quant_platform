@@ -93,6 +93,25 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
             embedded_alpha=embedded,
         )
 
+    # Optional: wrap in ValidatedProvider for cross-source validation
+    validated = getattr(config.data, 'validated', False)
+    if validated and configured_provider != "synthetic":
+        try:
+            from quant_platform.data.providers.adata_provider import AdataProvider
+            from quant_platform.data.providers.validated_provider import ValidatedProvider
+
+            secondary = AdataProvider()
+            # Quick test if adata works
+            _ = secondary.get_metadata()
+
+            provider = ValidatedProvider(
+                providers={"primary": provider, "secondary": secondary},
+                primary="primary",
+            )
+            logger.info("Multi-source validation enabled: primary + adata")
+        except Exception:
+            logger.info("Secondary provider (adata) unavailable — running without validation")
+
     pipeline = DataPipeline(
         provider=provider,
         start_date=config.data.start_date,

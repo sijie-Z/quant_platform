@@ -17,7 +17,8 @@ class SyntheticConfig:
 
 @dataclass
 class DataConfig:
-    provider: str = "baostock"  # synthetic, baostock, tushare, postgres
+    provider: str = "baostock"
+    validated: bool = False  # synthetic, baostock, tushare, postgres
     synthetic: SyntheticConfig = field(default_factory=SyntheticConfig)
     start_date: str = "2021-01-01"
     end_date: str = "2025-12-31"

@@ -11,6 +11,7 @@ universe:
 # --- Data ---
 data:
   provider: "synthetic"    # synthetic, tushare, baostock, postgres
+  validated: false     # Cross-source validation (requires 2+ providers)
   synthetic:
     embedded_alpha: false  # false=pure noise for research; true=embedded patterns for demo
   start_date: "2021-01-01"
