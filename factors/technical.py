@@ -629,6 +629,72 @@ class PureVolatilityFactor(BaseFactor):
 
         return result
 
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe resonance factor  (inspired by a-share-signal)
+# ---------------------------------------------------------------------------
+
+
+class MultiTimeframeResonanceFactor(BaseFactor):
+    """Multi-timeframe resonance: trend alignment across daily/weekly/monthly.
+
+    Checks whether price trends across 3 timeframes are aligned.
+    High resonance = daily, weekly, and monthly trends all point same direction.
+    Low resonance = timeframes conflict, choppy price action expected.
+
+    Score [0, 1]:
+      1.0 = perfect alignment (all 3 timeframes bullish or bearish)
+      0.0 = complete conflict (daily and monthly opposite)
+    """
+    category = FactorCategory.TECHNICAL
+
+    def __init__(self, name: str = "mtf_resonance"):
+        super().__init__()
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def compute(self, prices, **kwargs):
+        # Daily trend: 20-day MA slope
+        daily_ma = prices.rolling(20).mean()
+        daily_slope = (daily_ma - daily_ma.shift(5)) / daily_ma.shift(5).replace(0, float("nan"))
+
+        # Weekly trend: approximate via 60-day MA slope
+        weekly_ma = prices.rolling(60).mean()
+        weekly_slope = (weekly_ma - weekly_ma.shift(15)) / weekly_ma.shift(15).replace(0, float("nan"))
+
+        # Monthly trend: approximate via 120-day MA slope
+        monthly_ma = prices.rolling(120).mean()
+        monthly_slope = (monthly_ma - monthly_ma.shift(30)) / monthly_ma.shift(30).replace(0, float("nan"))
+
+        # Direction: 1 = bullish, -1 = bearish, 0 = flat
+        def _direction(slope: pd.DataFrame) -> pd.DataFrame:
+            d = pd.DataFrame(0.0, index=slope.index, columns=slope.columns)
+            d[slope > 0.001] = 1.0
+            d[slope < -0.001] = -1.0
+            return d
+
+        d_dir = _direction(daily_slope)
+        w_dir = _direction(weekly_slope)
+        m_dir = _direction(monthly_slope)
+
+        # Resonance: how many timeframes agree
+        agreement = d_dir + w_dir + m_dir
+
+        # Map to [0, 1] score
+        # 3 or -3 = all agree = 1.0
+        # 1 or -1 = 2 agree, 1 flat = 0.7
+        # 0 = conflict = 0.0
+        score = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        score[agreement.abs() >= 3] = 1.0
+        score[agreement.abs() == 2] = 0.7
+        score[agreement.abs() == 1] = 0.3
+
+        return score
+
 def register_all():
     registry = get_registry()
     for cls in [
@@ -643,5 +709,6 @@ def register_all():
         MAConvergenceFactor,
         BreakoutProximityFactor,
         PureVolatilityFactor,
+        MultiTimeframeResonanceFactor,
     ]:
         registry.register(cls)

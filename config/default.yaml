@@ -37,6 +37,7 @@ factors:
     ma_convergence: {enabled: true}
     breakout_proximity: {enabled: true, params: {period: 20}}
     pure_volatility: {enabled: true, params: {window: 20, ar_lags: 30}}
+    mtf_resonance: {enabled: true}
 
   # Fundamental factors
   fundamental:
