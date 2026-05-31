@@ -71,6 +71,9 @@ class AlphaPipeline:
 
         if self.method == "equal_weight":
             raw = combine_equal_weight(factors)
+        elif self.method == "vote":
+            from quant_platform.alpha.combination import combine_vote
+            raw = combine_vote(factors)
         elif self.method == "ic_weighted":
             raw = combine_ic_weighted(factors, forward_returns, self.lookback)
         elif self.method == "icir_weighted":

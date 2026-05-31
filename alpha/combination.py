@@ -252,3 +252,44 @@ def _weighted_sum(
         raise ValueError("No valid factors to combine")
 
     return result
+
+
+def combine_vote(
+    factors: dict[str, pd.DataFrame],
+    long_threshold: float = 0.5,
+    short_threshold: float = -0.5,
+    tie_breaker: str = "equal_weight",
+) -> pd.DataFrame:
+    """Ensemble voting combination - each factor votes long/short/pass.
+
+    Inspired by FinRL DRL ensemble strategy. More robust to outlier factors.
+    """
+    if not factors:
+        raise ValueError("No factors provided")
+
+    aligned = _align_factors(factors)
+    n_factors = len(aligned)
+
+    votes = None
+    for name, df in aligned.items():
+        mean = df.mean(axis=1)
+        std = df.std(axis=1, ddof=0).replace(0, float("nan"))
+        z = df.sub(mean, axis=0).div(std, axis=0)
+
+        vote = pd.DataFrame(0, index=df.index, columns=df.columns, dtype=float)
+        vote[z > long_threshold] = 1.0
+        vote[z < short_threshold] = -1.0
+
+        if votes is None:
+            votes = vote
+        else:
+            votes = votes + vote
+
+    signal = votes / n_factors
+    signal = signal.clip(-1, 1) * 0.5
+
+    logger.info(
+        "Vote combination: %d factors, thresholds=(%.2f, %.2f)",
+        n_factors, long_threshold, short_threshold,
+    )
+    return signal
