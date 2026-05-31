@@ -457,6 +457,36 @@ class CandleSoftnessFactor(BaseFactor):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# Trend Stage factor  (inspired by a-share-trend-strategy)
+# ---------------------------------------------------------------------------
+
+
+class TrendStageFactor(BaseFactor):
+    """Trend stage: where price sits in its historical range.
+    Maps to 'fish head/body/tail' trend stages:
+      0-30:   Early stage (鱼头)
+      30-70:  Mid stage (鱼身)
+      70-100: Late stage (鱼尾)
+    """
+    category = FactorCategory.TECHNICAL
+    def __init__(self, period: int = 120, name: str = "trend_stage"):
+        super().__init__({'period': period})
+        self._period = period
+        self._name = name
+    @property
+    def name(self) -> str:
+        return self._name
+    def compute(self, prices, **kwargs):
+        high = prices.rolling(self._period).max()
+        low = prices.rolling(self._period).min()
+        rng = high - low
+        stage = (prices - low) / rng.replace(0, float("nan")) * 100
+        return stage.clip(0, 100)
+
+
 class MAConvergenceFactor(BaseFactor):
     """MA convergence: how tightly MA5/MA10/MA20 are clustered.
 
@@ -624,7 +654,7 @@ class PureVolatilityFactor(BaseFactor):
                 pred = X @ phi
                 resid_ar = y - pred
                 result.loc[ivol.index[ivol.notna().any(axis=1)][self._ar_lags:], asset] = resid_ar
-            except np.linalg.LinalgError:
+            except np.linalg.LinAlgError:
                 continue
 
         return result

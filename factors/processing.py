@@ -41,7 +41,7 @@ def winsorize(
         winsorize_pandas,
     )
 
-    if HAS_NUMBA and factor.shape[1] >= 10:
+    if isinstance(factor, pd.DataFrame) and factor.ndim == 2 and HAS_NUMBA and factor.shape[1] >= 10:
         return winsorize_numba(factor, lower, upper)
 
     return winsorize_pandas(factor, lower, upper)
@@ -67,6 +67,8 @@ def standardize(
         return zscore_numba(factor)
 
     elif method == "rank":
+        if isinstance(factor, pd.Series):
+            factor = factor.to_frame("factor")
         result = factor.copy()
         for date in factor.index:
             row = result.loc[date]
@@ -100,6 +102,8 @@ def neutralize(
     Returns:
         Neutralized factor values (residuals).
     """
+    if isinstance(factor, pd.Series):
+        factor = factor.to_frame('factor')
     result = factor.copy()
 
     for date in factor.index:
@@ -159,6 +163,8 @@ def process_factor(
 
     Applies winsorization -> standardization -> neutralization in order.
     """
+    if isinstance(factor, pd.Series):
+        factor = factor.to_frame('factor')
     result = factor.copy()
 
     if winsorize_enabled:

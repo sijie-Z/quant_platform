@@ -82,7 +82,6 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
 
     # Final fallback: synthetic
     if provider is None:
-        from quant_platform.data.providers.synthetic import DEFAULT_EMBEDDED_ALPHA
         embedded = getattr(config.data.synthetic, 'embedded_alpha', False)
         if configured_provider != "synthetic":
             logger.warning("Configured provider '%s' unavailable, falling back to synthetic", configured_provider)
