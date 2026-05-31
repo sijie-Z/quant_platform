@@ -905,6 +905,31 @@ def cmd_config(args) -> int:
     return 0
 
 
+def cmd_check_lookahead(args) -> int:
+    """Run lookahead bias detection on the factor pipeline."""
+    config = load_config(_resolve_config_path(args.config))
+    from quant_platform.risk.lookahead_detector import LookaheadDetector
+
+    print("Loading data...")
+    prices, returns, benchmark, metadata, financials, turnover = _load_data(
+        config, use_baostock=args.use_baostock
+    )
+
+    detector = LookaheadDetector(
+        threshold=args.threshold,
+        max_check_dates=args.max_dates,
+    )
+    result = detector.detect(prices, returns, financials, metadata, config)
+    detector.print_report(result)
+
+    suggestions = detector.suggest_fixes(result)
+    if suggestions:
+        print("Suggested fixes:")
+        for s in suggestions:
+            print(f"  - {s}")
+    return 1 if result["has_bias"] else 0
+
+
 def cmd_profile(args) -> int:
     """Profile pipeline performance — shows time per stage."""
     import time
@@ -1260,6 +1285,17 @@ def main() -> int:
     config_delete.add_argument("version", type=str, help="Version ID to delete")
     config_delete.add_argument("--force", "-f", action="store_true",
                                 help="Skip confirmation")
+
+    # lookahead
+    la_parser = subparsers.add_parser("check-lookahead", help="Detect lookahead bias in factor pipeline")
+    la_parser.add_argument("--config", "-c", type=str, default=None,
+                           help="Path to config YAML file")
+    la_parser.add_argument("--threshold", type=float, default=1e-4,
+                           help="Signal diff threshold for bias detection")
+    la_parser.add_argument("--max-dates", type=int, default=20,
+                           help="Maximum number of dates to check")
+    la_parser.add_argument("--use-baostock", action="store_true",
+                           help="Use Baostock real data")
 
     # profile
     profile_parser = subparsers.add_parser("profile", help="Profile pipeline performance")
