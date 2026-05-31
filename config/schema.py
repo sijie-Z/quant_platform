@@ -168,7 +168,7 @@ class FactorsConfig:
         "momentum_1m", "momentum_3m", "momentum_6m", "momentum_12m",
         "volatility_20d", "volatility_60d",
         "turnover_20d", "rsi_14d", "amplitude_20d", "macd",
-        "efficiency_ratio", "breakout_ignition",
+        "efficiency_ratio", "breakout_ignition", "trend_stage",
         "kmid", "klen", "kup", "klow", "ksft",
     )
     enabled_fundamentals: tuple[str, ...] = (

@@ -460,5 +460,6 @@ def register_all():
         CandleMidpointFactor, CandleLengthFactor,
         CandleUpperShadowFactor, CandleLowerShadowFactor,
         CandleSoftnessFactor,
+        TrendStageFactor,
     ]:
         registry.register(cls)

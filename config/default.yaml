@@ -32,6 +32,7 @@ factors:
     amplitude_20d: {enabled: true, params: {period: 20}}
     efficiency_ratio: {enabled: true, params: {period: 20}}
     breakout_ignition: {enabled: true, params: {return_window: 3, reference_window: 20}}
+    trend_stage: {enabled: true, params: {period: 120}}
 
   # Fundamental factors
   fundamental:
