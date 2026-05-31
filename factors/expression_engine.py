@@ -384,3 +384,73 @@ def create_expression_factors(
     for name, expr in expressions.items():
         factors.append(ExpressionFactor(name=name, expression=expr))
     return factors
+
+# ---------------------------------------------------------------------------
+# Factor filter utilities  (inspired by Zipline's Factor.top/.bottom/.percentile_between)
+# ---------------------------------------------------------------------------
+
+
+def top(computed_factor, n):
+    """Filter for the top n assets (highest factor values) per date."""
+    rank = computed_factor.rank(axis=1, ascending=False, method='min', na_option='keep')
+    return (rank <= n).astype(float)
+
+
+def bottom(computed_factor, n):
+    """Filter for the bottom n assets (lowest factor values) per date."""
+    rank = computed_factor.rank(axis=1, ascending=True, method='min', na_option='keep')
+    return (rank <= n).astype(float)
+
+
+def percentile_between(computed_factor, min_pct, max_pct):
+    """Filter for assets within a percentile range per date."""
+    pct = computed_factor.rank(axis=1, pct=True, method='min', na_option='keep')
+    return ((pct >= min_pct) & (pct <= max_pct)).astype(float)
+
+
+class ScreenFilter:
+    """Composable filter for alpha signal screening. Inspired by Zipline."""
+
+    def __init__(self, mask=None):
+        self._mask = mask
+
+    @classmethod
+    def from_top(cls, factor_df, n):
+        return cls(top(factor_df, n))
+
+    @classmethod
+    def from_bottom(cls, factor_df, n):
+        return cls(bottom(factor_df, n))
+
+    @classmethod
+    def from_percentile(cls, factor_df, lo, hi):
+        return cls(percentile_between(factor_df, lo, hi))
+
+    def __and__(self, other):
+        if self._mask is None:
+            return ScreenFilter(other._mask)
+        if other._mask is None:
+            return ScreenFilter(self._mask)
+        return ScreenFilter((self._mask & other._mask).astype(float))
+
+    def __or__(self, other):
+        if self._mask is None:
+            return ScreenFilter(other._mask)
+        if other._mask is None:
+            return ScreenFilter(self._mask)
+        return ScreenFilter((self._mask | other._mask).astype(float))
+
+    def __invert__(self):
+        if self._mask is None:
+            return ScreenFilter(None)
+        return ScreenFilter((1.0 - self._mask))
+
+    def apply(self, signal):
+        """Apply this filter as a screen. Failed assets get zero signal."""
+        if self._mask is None:
+            return signal
+        common_dates = signal.index.intersection(self._mask.index)
+        common_cols = signal.columns.intersection(self._mask.columns)
+        result = signal.loc[common_dates, common_cols].copy()
+        result *= self._mask.loc[common_dates, common_cols]
+        return result

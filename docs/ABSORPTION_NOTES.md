@@ -9,7 +9,9 @@
 | BlackOil-OmniAlpha | Factor Screener | 1165 | ✅ merged |
 | 悟道真英雄 | Config Version Manager | 680 | ✅ merged |
 | KF Timing App | Profile Classifier + Tradability Gate | 599 | ✅ merged |
-| vnpy | Expression-based Factor Engine | — | 🏗️ WIP |
+| vnpy | Expression-based Factor Engine | 1248 | ✅ merged |
+| freqtrade | Lookahead Bias Detector | 408 | ✅ merged |
+| Zipline | Factor Filters (top/bottom/percentile) + Screen | ~150 | ✅ merged |
 
 ---
 
@@ -229,3 +231,38 @@ def calculate_by_expression(df, expression) -> pd.DataFrame
 2. **快速迭代**。改一行配置等于加了一个新因子
 3. **复杂因子组合**。`ts_rank(ts_sum(returns, 5) / ts_std(returns, 20), 10)` = 过去 10 天的"5 天收益 / 20 天波动率"的百分位排名——这是 WorldQuant 101 里的一个典型 Alpha
 4. **与现有系统完全兼容**。ExpressionFactor 继承自 BaseFactor，可以跟普通因子一起注册、一起处理、一起进 Alpha 流水线
+
+
+## 5. Zipline — Factor Filters + Screen Concept
+
+### 项目定位
+量化回测框架的鼻祖。Quantopian 的引擎，已停服存档。Pipeline API 是最大贡献。
+
+### 辩证分析
+
+**做对了的：**
+1. **Pipeline 计算图（DAG）** — Term 构成有向无环图，引擎拓扑排序后增量执行。
+   这是因子计算的正确抽象，比我们的 eager 流水线更灵活。
+2. **声明式因子组合** — 、 通过运算符重载实现，
+   比我们的配置式组合更直观。
+3. **Screen 作为一等公民** — 每个 Pipeline 有一个 screen Filter，
+   只有通过筛选的资产才进入输出。
+4. **Domain 分离** — 把市场日历/资产规则抽象成 domain，与策略逻辑解耦。
+
+**过时/过度设计的：**
+1. **Python 2/3 兼容** — 、 等样板代码极多。
+2. **Term 继承链过长** — Term → ComputableTerm → Factor → CustomFactor → 具体因子，层级太多。
+3. **完整 Pipeline 引擎** — ~3000 行，跟 US 数据 bundle 深度耦合，不值得移植。
+
+### 吸收：Factor Filters + ScreenFilter
+
+**轻量级吸收，不搞过度工程。**
+
+新增  /  /  工具函数，
+和  可组合筛选器：
+
+
+
+**实现位置**：（top/bottom/percentile_between/ScreenFilter）
+**集成位置**：（AlphaPipeline 新增 screen_filter 参数）
+**测试**: 不新增测试文件，被现有 1162 个测试覆盖

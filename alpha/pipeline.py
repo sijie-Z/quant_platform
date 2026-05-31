@@ -7,6 +7,7 @@ The signal pipeline:
 """
 
 from __future__ import annotations
+from typing import Any
 
 import pandas as pd
 
@@ -35,12 +36,14 @@ class AlphaPipeline:
         min_icir: float = 0.0,
         tradability_gate: bool = False,
         min_tradability: float = 0.3,
+        screen_filter: Any | None = None,
     ):
         self.method = method
         self.lookback = lookback
         self.min_icir = min_icir
         self.tradability_gate = tradability_gate
         self.min_tradability = min_tradability
+        self.screen_filter = screen_filter
 
     def run(
         self,
@@ -100,6 +103,12 @@ class AlphaPipeline:
                     "Tradability gate applied: min_tradability=%.2f",
                     self.min_tradability,
                 )
+
+        # Optional: screen filter (Zipline-style)
+        if self.screen_filter is not None:
+            signal = self.screen_filter.apply(signal)
+            logger.info("Screen filter applied: %.1f%% of entries kept",
+                        (signal != 0).mean().mean() * 100)
 
         logger.info("Alpha signal generated: method=%s, shape=%s", self.method, signal.shape)
         return signal
