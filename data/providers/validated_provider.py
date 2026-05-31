@@ -84,33 +84,58 @@ class ValidatedProvider(DataProvider):
         end_date: str,
         fields: list[str] | None = None,
     ) -> pd.DataFrame:
+        return self.get_validated_prices(start_date, end_date, fields).values
+
+    def get_validated_prices(
+        self,
+        start_date: str,
+        end_date: str,
+        fields: list[str] | None = None,
+    ) -> ValidatedResult:
+        """Get prices with full validation result (incl. confidence score)."""
         return self._validate(
             "get_prices",
             {"start_date": start_date, "end_date": end_date, "fields": fields},
             self.price_deviation,
-        ).values
+        )
 
     def get_financials(
         self,
         start_date: str,
         end_date: str,
     ) -> pd.DataFrame:
+        return self.get_validated_financials(start_date, end_date).values
+
+    def get_validated_financials(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> ValidatedResult:
+        """Get financials with full validation result."""
         return self._validate(
             "get_financials",
             {"start_date": start_date, "end_date": end_date},
             self.fin_deviation,
-        ).values
+        )
 
     def get_benchmark(
         self,
         start_date: str,
         end_date: str,
     ) -> pd.Series:
+        return self.get_validated_benchmark(start_date, end_date).values
+
+    def get_validated_benchmark(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> ValidatedResult:
+        """Get benchmark with full validation result."""
         return self._validate(
             "get_benchmark",
             {"start_date": start_date, "end_date": end_date},
             self.price_deviation,
-        ).values
+        )
 
     def get_metadata(self) -> pd.DataFrame:
         return self.providers[self.primary].get_metadata()
