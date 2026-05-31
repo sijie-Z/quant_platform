@@ -354,6 +354,129 @@ def assess_st_risk(df: pd.DataFrame) -> STRiskReport:
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Buffett Owner Earnings calculation
+# ---------------------------------------------------------------------------
+
+
+def owner_earnings(
+    net_income: float,
+    depreciation: float,
+    maintenance_capex: float,
+    working_capital_change: float = 0.0,
+) -> dict:
+    """Calculate Buffett-style Owner Earnings.
+
+    Owner Earnings = Net Income + Depreciation - Maintenance CapEx +/- WC Change
+
+    This differs from FCF (CFO - CapEx) in that it uses maintenance capex
+    rather than total capex. Buffett argues that growth capex should be
+    excluded because it's discretionary — only the capex needed to KEEP
+    the current business running should be deducted.
+
+    Args:
+        net_income: Reported net income.
+        depreciation: Depreciation & amortization (non-cash expense).
+        maintenance_capex: CapEx required to maintain current operations.
+            If unavailable, use total capex * 0.7 as rough estimate.
+        working_capital_change: Change in working capital (+ = cash used).
+
+    Returns:
+        Dict with owner_earnings, fcf, margin_of_safety_ratio.
+    """
+    oe = net_income + depreciation - maintenance_capex - working_capital_change
+    fcf = net_income + depreciation - maintenance_capex - working_capital_change
+
+    return {
+        "owner_earnings": round(oe, 2),
+        "fcf_equivalent": round(fcf, 2),
+        "maintenance_capex_ratio": round(maintenance_capex / max(abs(net_income), 1), 2),
+        "earnings_quality": "high" if oe > 0 and oe > net_income * 0.5 else "low",
+    }
+
+
+def estimate_maintenance_capex(total_capex: float, depreciation: float) -> float:
+    """Estimate maintenance capex from total capex and depreciation.
+
+    Buffett's heuristic: if a company's total capex consistently exceeds
+    depreciation, the excess is growth capex. If capex < depreciation,
+    the business is slowly liquidating.
+
+    Args:
+        total_capex: Total capital expenditures.
+        depreciation: Depreciation & amortization.
+
+    Returns:
+            Estimated maintenance capex.
+    """
+    if total_capex <= depreciation:
+        return total_capex
+    # Excess over depreciation is growth capex
+    return depreciation + (total_capex - depreciation) * 0.3
+
+
+def moat_score(
+    gross_margin_stability: float,
+    roe_avg: float,
+    debt_equity: float,
+    pricing_power: bool = False,
+) -> dict:
+    """Rough moat assessment from financial data.
+
+    Not a precise measure — Buffett would never use a numerical score.
+    But useful for quick screening.
+
+    Args:
+        gross_margin_stability: Std dev of gross margin over 5 years
+            (lower = more stable = stronger pricing power).
+        roe_avg: Average ROE over 5 years.
+        debt_equity: Debt-to-equity ratio.
+        pricing_power: If True, company can pass cost increases to customers.
+
+    Returns:
+        Dict with score [0, 10], label, and reasoning.
+    """
+    score = 5.0  # start at neutral
+
+    # Margin stability
+    if gross_margin_stability < 0.02:
+        score += 2.0
+    elif gross_margin_stability < 0.05:
+        score += 1.0
+    elif gross_margin_stability > 0.10:
+        score -= 1.0
+
+    # ROE
+    if roe_avg > 0.20:
+        score += 2.0
+    elif roe_avg > 0.15:
+        score += 1.0
+    elif roe_avg < 0.10:
+        score -= 1.0
+
+    # Low debt
+    if debt_equity < 0.3:
+        score += 1.0
+    elif debt_equity > 1.0:
+        score -= 1.0
+
+    # Pricing power
+    if pricing_power:
+        score += 1.0
+
+    score = max(0, min(10, score))
+    if score >= 8:
+        label = "宽护城河"
+    elif score >= 6:
+        label = "窄护城河"
+    elif score >= 4:
+        label = "无明显护城河"
+    else:
+        label = "护城河薄弱"
+
+    return {"score": round(score, 1), "label": label, "max_score": 10}
+
 # ---------------------------------------------------------------------------
 # Module 3: Original lightweight health checks
 # ---------------------------------------------------------------------------
