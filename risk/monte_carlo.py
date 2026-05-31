@@ -237,3 +237,55 @@ class MonteCarloSimulator:
             "paths": all_paths.tolist()[:50],
             "terminal_values": terminal_values.tolist(),
         }
+    # ------------------------------------------------------------------
+    # Trade-shuffle Monte Carlo  (inspired by Jesse)
+    # ------------------------------------------------------------------
+
+    def analyze_trade_sequence(
+        self,
+        trades: list[dict],
+        n_shuffles: int = 1000,
+    ) -> dict:
+        """Shuffle trade sequence to test if trade timing drives results."""
+        from quant_platform.backtest.metrics import (
+            annualized_return,
+            annualized_volatility,
+        )
+
+        returns = np.array(
+            [t.get('return_pct', 0) for t in trades if 'return_pct' in t],
+            dtype=float,
+        )
+        if len(returns) < 10:
+            return {
+                "error": f"Need >=10 trades, got {len(returns)}",
+                "original_sharpe": None,
+                "stability_score": None,
+            }
+
+        orig_arr = pd.Series(returns)
+        orig_ret = float(annualized_return(orig_arr))
+        orig_vol = float(annualized_volatility(orig_arr))
+        orig_sharpe = orig_ret / orig_vol if orig_vol > 0 else 0.0
+
+        shuffled_sharpes = np.zeros(n_shuffles)
+        for i in range(n_shuffles):
+            s = self.rng.permutation(returns)
+            s_arr = pd.Series(s)
+            s_ret = float(annualized_return(s_arr))
+            s_vol = float(annualized_volatility(s_arr))
+            shuffled_sharpes[i] = s_ret / s_vol if s_vol > 0 else 0.0
+
+        cv = float(np.std(shuffled_sharpes) / max(abs(np.mean(shuffled_sharpes)), 1e-6))
+        stability_score = float(np.clip(1.0 / (1.0 + cv), 0, 1))
+        return {
+            "n_trades": len(returns),
+            "n_shuffles": n_shuffles,
+            "original_sharpe": round(orig_sharpe, 4),
+            "mean_shuffled": round(float(np.mean(shuffled_sharpes)), 4),
+            "std_shuffled": round(float(np.std(shuffled_sharpes)), 4),
+            "sharpe_5pct": round(float(np.percentile(shuffled_sharpes, 5)), 4),
+            "sharpe_95pct": round(float(np.percentile(shuffled_sharpes, 95)), 4),
+            "stability_score": round(stability_score, 4),
+        }
+
