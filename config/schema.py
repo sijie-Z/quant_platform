@@ -169,6 +169,7 @@ class FactorsConfig:
         "volatility_20d", "volatility_60d",
         "turnover_20d", "rsi_14d", "amplitude_20d", "macd",
         "efficiency_ratio", "breakout_ignition",
+        "kmid", "klen", "kup", "klow", "ksft",
     )
     enabled_fundamentals: tuple[str, ...] = (
         "log_market_cap", "pb_ratio", "pe_ratio", "roe", "asset_growth",

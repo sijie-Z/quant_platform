@@ -358,6 +358,98 @@ class MACDFactor(BaseFactor):
 # Register all technical factors
 # ---------------------------------------------------------------------------
 
+
+
+# ---------------------------------------------------------------------------
+# K-Line candlestick features  (inspired by Qlib Alpha158)
+# ---------------------------------------------------------------------------
+
+
+class CandleMidpointFactor(BaseFactor):
+    """KMID: (close - open) / open. Positive = green candle."""
+    category = FactorCategory.TECHNICAL
+
+    @property
+    def name(self) -> str:
+        return "kmid"
+
+    def compute(self, prices, **kwargs):
+        o = kwargs.get("open")
+        c = prices
+        if o is not None:
+            return (c - o) / o.replace(0, float("nan"))
+        return prices.pct_change(fill_method=None)
+
+
+class CandleLengthFactor(BaseFactor):
+    """KLEN: (high - low) / open. Intraday range."""
+    category = FactorCategory.TECHNICAL
+
+    @property
+    def name(self) -> str:
+        return "klen"
+
+    def compute(self, prices, **kwargs):
+        h = kwargs.get("high")
+        l = kwargs.get("low")
+        o = kwargs.get("open")
+        if h is not None and l is not None and o is not None:
+            return (h - l) / o.replace(0, float("nan"))
+        return prices.pct_change(fill_method=None).abs()
+
+
+class CandleUpperShadowFactor(BaseFactor):
+    """KUP: (high - max(open, close)) / open. Upper wick."""
+    category = FactorCategory.TECHNICAL
+
+    @property
+    def name(self) -> str:
+        return "kup"
+
+    def compute(self, prices, **kwargs):
+        h = kwargs.get("high")
+        o = kwargs.get("open")
+        c = prices
+        if h is not None and o is not None:
+            upper = h - pd.concat([o, c], axis=1).max(axis=1)
+            return upper / o.replace(0, float("nan"))
+        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+
+
+class CandleLowerShadowFactor(BaseFactor):
+    """KLOW: (min(open, close) - low) / open. Lower wick."""
+    category = FactorCategory.TECHNICAL
+
+    @property
+    def name(self) -> str:
+        return "klow"
+
+    def compute(self, prices, **kwargs):
+        l = kwargs.get("low")
+        o = kwargs.get("open")
+        c = prices
+        if l is not None and o is not None:
+            lower = pd.concat([o, c], axis=1).min(axis=1) - l
+            return lower / o.replace(0, float("nan"))
+        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+
+
+class CandleSoftnessFactor(BaseFactor):
+    """KSFT: (2*close - high - low) / open. Close in range."""
+    category = FactorCategory.TECHNICAL
+
+    @property
+    def name(self) -> str:
+        return "ksft"
+
+    def compute(self, prices, **kwargs):
+        h = kwargs.get("high")
+        l = kwargs.get("low")
+        o = kwargs.get("open")
+        c = prices
+        if h is not None and l is not None and o is not None:
+            return (2 * c - h - l) / o.replace(0, float("nan"))
+        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
 def register_all():
     registry = get_registry()
     for cls in [
@@ -365,5 +457,8 @@ def register_all():
         Volatility20D, Volatility60D,
         TurnoverFactor, RSIFactor, AmplitudeFactor, MACDFactor,
         EfficiencyRatioFactor, BreakoutIgnitionFactor,
+        CandleMidpointFactor, CandleLengthFactor,
+        CandleUpperShadowFactor, CandleLowerShadowFactor,
+        CandleSoftnessFactor,
     ]:
         registry.register(cls)
