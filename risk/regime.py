@@ -257,3 +257,72 @@ class CompositeRegimeDetector:
             "trend": trend_result,
             "correlation": corr_result,
         }
+
+    def get_execution_params(self, returns: pd.Series | None = None) -> dict:
+        """Get regime-adaptive execution parameters.
+
+        Inspired by stock-trader-ai's regime-adaptive stop-loss and
+        position sizing. Returns different parameters based on the
+        current market regime.
+
+        Returns:
+            Dict with keys:
+                regime: Current overall regime.
+                max_position_pct: Max single position as % of portfolio.
+                max_total_positions: Max number of simultaneous positions.
+                stop_loss_pct: Stop-loss threshold.
+                take_profit_pct: Take-profit threshold.
+                max_leverage: Max leverage.
+                risk_multiplier: Scale factor [0,1] for position sizing.
+        """
+        if returns is not None:
+            result = self.detect(returns)
+        else:
+            result = self.detect()
+
+        overall = result["overall_regime"]
+
+        if overall == "risk_off":
+            params = {
+                "regime": "bear",
+                "max_position_pct": 0.03,
+                "max_total_positions": 3,
+                "stop_loss_pct": -0.04,
+                "take_profit_pct": 0.10,
+                "max_leverage": 1.0,
+                "risk_multiplier": 0.4,
+            }
+        elif overall == "cautious":
+            params = {
+                "regime": "range",
+                "max_position_pct": 0.05,
+                "max_total_positions": 5,
+                "stop_loss_pct": -0.07,
+                "take_profit_pct": 0.15,
+                "max_leverage": 1.0,
+                "risk_multiplier": 0.6,
+            }
+        elif overall == "neutral":
+            params = {
+                "regime": "range",
+                "max_position_pct": 0.07,
+                "max_total_positions": 6,
+                "stop_loss_pct": -0.08,
+                "take_profit_pct": 0.20,
+                "max_leverage": 1.2,
+                "risk_multiplier": 0.8,
+            }
+        else:  # risk_on
+            params = {
+                "regime": "bull",
+                "max_position_pct": 0.10,
+                "max_total_positions": 8,
+                "stop_loss_pct": -0.10,
+                "take_profit_pct": 0.25,
+                "max_leverage": 1.5,
+                "risk_multiplier": 1.0,
+            }
+
+        params["composite_risk_score"] = result["composite_risk_score"]
+        params["recommendation"] = result["recommendation"]
+        return params
