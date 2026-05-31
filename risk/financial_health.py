@@ -477,6 +477,80 @@ def moat_score(
 
     return {"score": round(score, 1), "label": label, "max_score": 10}
 
+
+# ---------------------------------------------------------------------------
+# Capital cycle analysis  (inspired by 资本周期方法论)
+# ---------------------------------------------------------------------------
+
+
+def capital_cycle_stage(
+    capex: list[float],
+    depreciation: list[float],
+    revenue: list[float] | None = None,
+) -> dict:
+    """Analyze capital cycle stage from Capex/Depreciation ratio.
+
+    The capital cycle framework (资本周期方法论) tracks whether a company
+    is in the investment or harvesting phase of its capacity cycle.
+
+    Stages:
+      Expansion (投资扩张期):   Capex/D&A > 1.5, rising
+      Peak (产能高峰):          Capex/D&A peaks, revenue growth decelerates
+      Harvest (产能消化期):     Capex/D&A < 1.0, falling
+      Trough (产能出清期):      Capex/D&A at low, competitors exiting
+      Re-invest (再投资期):      Capex/D&A rising from trough
+
+    Args:
+        capex: List of annual capital expenditure values (recent first).
+        depreciation: List of annual depreciation values (recent first).
+        revenue: Optional list of annual revenue for growth context.
+
+    Returns:
+        Dict with stage, ratio, trend, and description.
+    """
+    if len(capex) < 3 or len(depreciation) < 3:
+        return {"stage": "数据不足", "ratio": None, "trend": ""}
+
+    ratios = [c / max(d, 1) for c, d in zip(capex, depreciation)]
+    current = ratios[0]
+    prev = ratios[1]
+    trend = "rising" if current > prev else "falling"
+
+    # Revenue growth context
+    rev_growth = None
+    if revenue and len(revenue) >= 2:
+        rev_growth = (revenue[0] - revenue[1]) / abs(revenue[1]) if revenue[1] != 0 else 0
+
+    if current > 1.5 and trend == "rising":
+        stage = "投资扩张期"
+        desc = f"Capex/折旧比 {current:.1f} 且上升中，公司正处于大规模资本投入阶段。"
+        if rev_growth and rev_growth > 0.15:
+            desc += "营收高速增长，投入有回报支撑。"
+        else:
+            desc += "⚠️ 营收增速未匹配，警惕过度投资。"
+    elif current > 1.5 and trend == "falling":
+        stage = "产能投产期"
+        desc = f"Capex/折旧比 {current:.1f} 但已从高位回落，前期投入开始转固。关注产能利用率爬坡。"
+    elif 1.0 <= current <= 1.5:
+        stage = "稳态期"
+        desc = f"Capex/折旧比 {current:.1f}，维持性资本开支为主，产能与需求基本匹配。"
+    elif current < 1.0 and trend == "falling" and (current < ratios[-1] * 0.8 if len(ratios) > 2 else False):
+        stage = "产能出清期"
+        desc = f"Capex/折旧比 {current:.1f} 且持续下降，行业产能出清中，竞争者可能退出。"
+    elif current < 1.0 and trend == "rising" and prev < 1.0:
+        stage = "再投资早期"
+        desc = f"Capex/折旧比 {current:.1f} 从低点回升，可能是行业见底信号。关注需求是否实质性复苏。"
+    else:
+        stage = "产能消化期"
+        desc = f"Capex/折旧比 {current:.1f}，投资低于折旧，公司在消化前期产能。"
+
+    return {
+        "stage": stage,
+        "ratio": round(current, 2),
+        "trend": trend,
+        "description": desc,
+        "ratios_history": [round(r, 2) for r in ratios],
+    }
 # ---------------------------------------------------------------------------
 # Module 3: Original lightweight health checks
 # ---------------------------------------------------------------------------
