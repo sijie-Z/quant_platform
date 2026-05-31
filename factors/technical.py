@@ -450,6 +450,74 @@ class CandleSoftnessFactor(BaseFactor):
         if h is not None and l is not None and o is not None:
             return (2 * c - h - l) / o.replace(0, float("nan"))
         return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+
+
+# ---------------------------------------------------------------------------
+# MA Convergence factor  (inspired by a-share-hybrid-strategy)
+# ---------------------------------------------------------------------------
+
+
+class MAConvergenceFactor(BaseFactor):
+    """MA convergence: how tightly MA5/MA10/MA20 are clustered.
+
+    When moving averages are bunched closely together (<1.5% gap), it
+    signals a coiling pattern — the stock is building energy for a
+    breakout. High convergence + low volatility = impending move.
+
+    Score [0, 1] where:
+      1.0 = extremely tight (all MAs within 1.5%)
+      0.0 = wide separation (gap > 5%)
+    """
+    category = FactorCategory.TECHNICAL
+
+    @property
+    def name(self) -> str:
+        return "ma_convergence"
+
+    def compute(self, prices, **kwargs):
+        ma5 = prices.rolling(5).mean()
+        ma10 = prices.rolling(10).mean()
+        ma20 = prices.rolling(20).mean()
+
+        gap1 = (ma5 - ma10).abs() / ma10 * 100
+        gap2 = (ma10 - ma20).abs() / ma20 * 100
+        max_gap = pd.concat([gap1, gap2], axis=1).max(axis=1)
+
+        # Convert gap % to score: 0% gap = 1.0, >=5% gap = 0.0
+        score = 1.0 - (max_gap.clip(0, 5) / 5.0)
+        return score
+
+
+class BreakoutProximityFactor(BaseFactor):
+    """Breakout proximity: distance from current price to N-day high.
+
+    Measures how close price is to breaking out of its range.
+    Value [0, 1] where:
+      1.0 = price is AT or above the N-day high (imminent/actual breakout)
+      0.5 = price is halfway between the low and high of the range
+      0.0 = price is at the N-day low
+
+    When this is high (>0.9) AND MA convergence is also high, it's a
+    strong breakout signal.
+    """
+    category = FactorCategory.TECHNICAL
+
+    def __init__(self, period: int = 20, name: str = "breakout_proximity"):
+        super().__init__({'period': period})
+        self._period = period
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def compute(self, prices, **kwargs):
+        high = prices.rolling(self._period).max()
+        low = prices.rolling(self._period).min()
+        rng = high - low
+        proximity = (prices - low) / rng.replace(0, float("nan"))
+        return proximity.clip(0, 1)
+
 def register_all():
     registry = get_registry()
     for cls in [
@@ -461,5 +529,7 @@ def register_all():
         CandleUpperShadowFactor, CandleLowerShadowFactor,
         CandleSoftnessFactor,
         TrendStageFactor,
+        MAConvergenceFactor,
+        BreakoutProximityFactor,
     ]:
         registry.register(cls)
