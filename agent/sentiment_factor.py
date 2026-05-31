@@ -11,7 +11,7 @@ Key design decisions for production-readiness:
 - Deterministic scoring prompts for reproducibility
 
 For interview demo: uses a keyword-based sentiment analyzer as the default
-"simulated LLM" backend, with the option to swap in a real OpenAI API call.
+"simulated LLM" backend, with the option to swap in a real DeepSeek/LLM API call.
 This demonstrates the architecture without requiring an API key.
 """
 
@@ -100,7 +100,7 @@ class LLMSentimentFactor(BaseFactor):
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gpt-4o-mini",
+        model: str = "deepseek-chat",
         use_real_llm: bool = False,
         lookback_days: int = 5,
         cache_dir: str | None = None,
@@ -108,9 +108,9 @@ class LLMSentimentFactor(BaseFactor):
     ):
         """
         Args:
-            api_key: OpenAI API key. If None, uses OPENAI_API_KEY env var.
-            model: LLM model to use.
-            use_real_llm: If True, calls OpenAI API. If False, uses keyword analyzer.
+            api_key: DeepSeek API key. If None, uses DEEPSEEK_API_KEY env var.
+            model: LLM model to use (default: deepseek-chat).
+            use_real_llm: If True, calls DeepSeek/LLM API. If False, uses keyword analyzer.
             lookback_days: How many past days of news to aggregate.
             cache_dir: Directory for sentiment cache.
             name: Factor name.
@@ -121,7 +121,7 @@ class LLMSentimentFactor(BaseFactor):
             "lookback_days": lookback_days,
         })
         self._name = name
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
         self.model = model
         self.use_real_llm = use_real_llm
         self.lookback_days = lookback_days
@@ -161,7 +161,7 @@ class LLMSentimentFactor(BaseFactor):
         logger.info(
             "LLM Sentiment Factor: %d assets x %d dates, backend=%s",
             n_assets, n_dates,
-            "OpenAI" if self.use_real_llm else "Keyword (simulated)",
+            "DeepSeek" if self.use_real_llm else "Keyword (simulated)",
         )
 
         # Generate per-stock news headlines (deterministic based on asset + date)
@@ -367,10 +367,11 @@ class KeywordSentimentAnalyzer(SentimentAnalyzer):
 
 
 class OpenAISentimentAnalyzer(SentimentAnalyzer):
-    """Real OpenAI API sentiment analyzer.
+    """DeepSeek/LLM API sentiment analyzer (OpenAI-compatible).
 
-    Sends headlines to GPT-4o-mini with a structured prompt asking for
-    a sentiment score. Includes rate limiting and retry logic.
+    Sends headlines to DeepSeek-Chat with a structured prompt asking for
+    sentiment scores. Uses OpenAI-compatible API; any compatible provider
+    (DeepSeek, Moonshot, etc.) works. Default: DeepSeek-Chat.
     """
 
     SYSTEM_PROMPT = """You are a financial sentiment analyst for Chinese A-share stocks.
@@ -383,15 +384,16 @@ Analyze the given news headline and output ONLY a single number between -1.0 and
 
 Output format: just the number, e.g. "0.6" or "-0.3". Nothing else."""
 
-    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+    def __init__(self, api_key: str, model: str = "deepseek-chat"):
         self.api_key = api_key
         self.model = model
         self._client = None
+        self._api_base = "https://api.deepseek.com/v1"
         self._request_count = 0
         self._last_request_time = 0.0
 
     def analyze(self, headline: str, asset: str = "") -> float:
-        """Call OpenAI API for sentiment analysis."""
+        """Call DeepSeek API for sentiment analysis."""
         # Rate limiting: max 50 requests per second
         elapsed = time.monotonic() - self._last_request_time
         if elapsed < 0.02:  # 50 req/s
@@ -400,7 +402,7 @@ Output format: just the number, e.g. "0.6" or "-0.3". Nothing else."""
         try:
             from openai import OpenAI
             if self._client is None:
-                self._client = OpenAI(api_key=self.api_key)
+                self._client = OpenAI(api_key=self.api_key, base_url=self._api_base)
 
             response = self._client.chat.completions.create(
                 model=self.model,

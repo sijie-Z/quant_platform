@@ -73,7 +73,7 @@ class ResearchAgent:
 
     Modes:
     - keyword: Zero-cost keyword extraction (default, for demo)
-    - llm: Real OpenAI API calls (requires api_key)
+    - llm: Real DeepSeek/LLM API calls (requires DEEPSEEK_API_KEY)
 
     Examples:
         # Analyze a research report
@@ -99,11 +99,11 @@ class ResearchAgent:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gpt-4o-mini",
+        model: str = "deepseek-chat",
         mode: Literal["keyword", "llm"] = "keyword",
         cache_dir: str | None = None,
     ):
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
         self.model = model
         self.mode = mode if not (mode == "llm" and not self.api_key) else "keyword"
         self.cache_dir = Path(cache_dir) if cache_dir else Path("./.agent_cache")
@@ -486,7 +486,7 @@ Output ONLY valid JSON array."""
 
         from openai import OpenAI
         if self._client is None:
-            self._client = OpenAI(api_key=self.api_key)
+            self._client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
 
         response = self._client.chat.completions.create(
             model=self.model,
