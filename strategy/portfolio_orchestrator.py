@@ -27,9 +27,11 @@ from quant_platform.core.events import get_event_bus
 from quant_platform.execution.engine import (
     ExecutionEngine,
     OrderSide,
+)
+from quant_platform.execution.models import (
+    OrderStatus,
     OrderType,
 )
-from quant_platform.execution.models import OrderStatus
 from quant_platform.strategy.multi_strategy import (
     MultiStrategyManager,
     StrategyConfig,
@@ -53,11 +55,13 @@ class PortfolioOrchestrator:
         exec_engine: ExecutionEngine | None = None,
         lot_size: int = 100,
         t_plus: int = 1,
+        risk_monitor=None,
     ):
         self.multi_strategy = multi_strategy
         self.exec_engine = exec_engine or ExecutionEngine()
         self.lot_size = lot_size
-        self.t_plus = t_plus  # A-share T+1 settlement
+        self.t_plus = t_plus
+        self.risk_monitor = risk_monitor  # A-share T+1 settlement
 
         # Track positions per strategy (strategy_id -> {ticker: target_qty})
         self._targets: dict[str, dict[str, int]] = {}
@@ -181,6 +185,19 @@ class PortfolioOrchestrator:
                         quantity=self._round_lot(buy_qty),
                         strategy=strategy_id,
                     )
+                    # Pre-trade risk check
+                    if self.risk_monitor is not None:
+                        check = self.risk_monitor.check_pre_trade(
+                            ticker=ticker,
+                            quantity=order.quantity,
+                            price=price,
+                            side=OrderSide.BUY,
+                        )
+                        if not check.get('approved', True):
+                            logger.warning('Order blocked by risk: %s', check.get('reason', ''))
+                            order.notes = f'Risk blocked: {check.get("reason", "")}'
+                            self.exec_engine.reject_order(order)
+                            continue
                     self.exec_engine.submit_order(order)
                     self._cash_locked += order.quantity * price
 
