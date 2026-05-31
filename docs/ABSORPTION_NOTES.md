@@ -266,3 +266,17 @@ def calculate_by_expression(df, expression) -> pd.DataFrame
 **实现位置**：（top/bottom/percentile_between/ScreenFilter）
 **集成位置**：（AlphaPipeline 新增 screen_filter 参数）
 **测试**: 不新增测试文件，被现有 1162 个测试覆盖
+
+
+## 6. Backtrader
+
+### Absorption: print_summary
+
+Backtrader-style formatted performance output added to metrics.py.
+Clean, professional summary table for backtest results.
+
+### Design takeaways (not code-implemented)
+
+1. Analyzer plugin pattern - decouple analysis from engine
+2. Sizer pattern - separate position sizing from strategy logic  
+3. Cerebro orchestrator - unified addstrategy/adddata/addanalyzer/run pattern

@@ -174,3 +174,71 @@ def all_metrics(
         metrics["excess_return"] = metrics["total_return"] - metrics["benchmark_total_return"]
 
     return metrics
+
+# ---------------------------------------------------------------------------
+# Pretty-print summary (inspired by backtrader's cerebro.run output)
+# ---------------------------------------------------------------------------
+
+
+def print_summary(metrics):
+    """Print a formatted backtest performance summary, backtrader-style."""
+    lines = [
+        ('=' * 70, ''),
+        ('  BACKTEST PERFORMANCE SUMMARY', ''),
+        ('=' * 70, ''),
+    ]
+
+    sections = [
+        ('Returns', [
+            ('Total Return', 'total_return', '{:+.2%}'),
+            ('Annual Return', 'annual_return', '{:+.2%}'),
+            ('Benchmark Return', 'benchmark_total_return', '{:+.2%}'),
+            ('Excess Return', 'excess_return', '{:+.2%}'),
+        ]),
+        ('Risk', [
+            ('Annual Volatility', 'annual_volatility', '{:.2%}'),
+            ('Max Drawdown', 'max_drawdown', '{:.2%}'),
+            ('Tracking Error', 'tracking_error', '{:.2%}'),
+        ]),
+        ('Risk-Adjusted', [
+            ('Sharpe Ratio', 'sharpe_ratio', '{:.3f}'),
+            ('Sortino Ratio', 'sortino_ratio', '{:.3f}'),
+            ('Calmar Ratio', 'calmar_ratio', '{:.3f}'),
+            ('Information Ratio', 'information_ratio', '{:.3f}'),
+        ]),
+        ('Trading Stats', [
+            ('Win Rate', 'win_rate', '{:.1%}'),
+            ('Profit/Loss Ratio', 'profit_loss_ratio', '{:.3f}'),
+            ('Total Days', 'total_days', '{:.0f}'),
+            ('Max DD Peak', 'max_drawdown_peak', '{}'),
+            ('Max DD Trough', 'max_drawdown_trough', '{}'),
+        ]),
+    ]
+
+    has_benchmark = 'benchmark_total_return' in metrics
+
+    for section_name, items in sections:
+        displayed = [(l, k, f) for l, k, f in items
+                     if k in metrics and metrics[k] is not None]
+        if not displayed:
+            continue
+        if not has_benchmark and any('benchmark' in k or 'excess' in k or 'tracking' in k
+                                      for _, k, _ in displayed):
+            continue
+
+        lines.append((f'  {section_name}', ''))
+        for label, key, fmt in displayed:
+            val = metrics.get(key)
+            if val is None:
+                continue
+            try:
+                formatted = fmt.format(val)
+            except (ValueError, TypeError):
+                formatted = str(val)
+            lines.append((f'    {label:<22}', formatted))
+
+    lines.append(('=' * 70, ''))
+    lines.append(('', ''))
+
+    for parts in lines:
+        print(''.join(parts))
