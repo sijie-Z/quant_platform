@@ -40,6 +40,8 @@ class AlphaConfig:
     method: str = "icir_weighted"
     lookback: int = 252
     min_icir: float = 0.0
+    tradability_gate: bool = False
+    min_tradability: float = 0.3
 
 
 @dataclass
@@ -166,6 +168,7 @@ class FactorsConfig:
         "momentum_1m", "momentum_3m", "momentum_6m", "momentum_12m",
         "volatility_20d", "volatility_60d",
         "turnover_20d", "rsi_14d", "amplitude_20d", "macd",
+        "efficiency_ratio", "breakout_ignition",
     )
     enabled_fundamentals: tuple[str, ...] = (
         "log_market_cap", "pb_ratio", "pe_ratio", "roe", "asset_growth",

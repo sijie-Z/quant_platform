@@ -210,7 +210,7 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
     )
 
 
-def _generate_signal(config, processed_factors, returns):
+def _generate_signal(config, processed_factors, returns, prices=None, volume=None):
     """Generate alpha signal from processed factors."""
     from quant_platform.alpha.pipeline import AlphaPipeline
 
@@ -218,8 +218,10 @@ def _generate_signal(config, processed_factors, returns):
         method=config.alpha.method,
         lookback=config.alpha.lookback,
         min_icir=config.alpha.min_icir,
+        tradability_gate=getattr(config.alpha, 'tradability_gate', False),
+        min_tradability=getattr(config.alpha, 'min_tradability', 0.3),
     )
-    return alpha_pipe.run(processed_factors, returns)
+    return alpha_pipe.run(processed_factors, returns, prices=prices, volume=volume)
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +330,8 @@ def cmd_run(args) -> int:
                     signal.loc[date, asset] = w
     else:
         logger.info("[3/6] Generating alpha signal...")
-        signal = _generate_signal(config, processed_factors, returns)
+        signal = _generate_signal(config, processed_factors, returns,
+                                  prices=prices, volume=turnover)
 
     # ------------------------------------------------------------------
     # 4-5. Portfolio + Backtest

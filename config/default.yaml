@@ -30,6 +30,8 @@ factors:
     turnover_20d: {enabled: true, params: {period: 20}}
     rsi_14d: {enabled: true, params: {period: 14}}
     amplitude_20d: {enabled: true, params: {period: 20}}
+    efficiency_ratio: {enabled: true, params: {period: 20}}
+    breakout_ignition: {enabled: true, params: {return_window: 3, reference_window: 20}}
 
   # Fundamental factors
   fundamental:
@@ -50,6 +52,8 @@ alpha:
   method: "equal_weight"  # equal_weight, ic_weighted, icir_weighted
   lookback: 252            # Days for IC/ICIR estimation
   min_icir: 0.0            # Minimum ICIR to include factor
+  tradability_gate: false  # Per-stock profile-based signal filtering
+  min_tradability: 0.3     # Threshold [0,1] for tradability gate
 
 # --- Portfolio ---
 portfolio:

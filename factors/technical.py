@@ -201,6 +201,129 @@ class AmplitudeFactor(BaseFactor):
 
 
 # ---------------------------------------------------------------------------
+# Efficiency Ratio factor  (inspired by KF Timing App)
+# ---------------------------------------------------------------------------
+
+class EfficiencyRatioFactor(BaseFactor):
+    """Efficiency Ratio: trend quality measure from KF Timing App.
+
+    ER = |return(period)| / sum(|daily_return|) over period
+
+    Values in [0, 1]:
+    - 1.0 = perfect trend (price goes straight up or down)
+    - 0.0 = pure noise (price ends where it started, high total path)
+
+    This measures "trend quality" vs our momentum factors which measure
+    "trend magnitude". A high-ER stock has smooth persistent movement.
+    A low-ER stock is choppy even if total return is similar.
+    """
+
+    category = FactorCategory.TECHNICAL
+
+    def __init__(self, period: int = 20, name: str = "efficiency_ratio"):
+        super().__init__({"period": period})
+        self._period = period
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def compute(self, prices: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        log_prices = np.log(prices.clip(lower=1e-8))
+
+        # Net direction over period
+        direction = log_prices.diff(self._period).abs()
+
+        # Total path length (sum of absolute daily differences)
+        daily_diff = log_prices.diff().abs()
+        volatility = daily_diff.rolling(self._period).sum()
+
+        er = direction / volatility.replace(0, np.nan)
+        return er.clip(0, 1)
+
+
+# ---------------------------------------------------------------------------
+# Breakout Ignition factor  (inspired by KF Timing App)
+# ---------------------------------------------------------------------------
+
+class BreakoutIgnitionFactor(BaseFactor):
+    """Breakout Ignition: simultaneous return shock + volume shock.
+
+    Signals stocks experiencing an abnormal price move accompanied by
+    abnormal volume — classic breakout pattern.
+
+    The factor is 1 (ignition detected) when:
+    1. Return z-score over past N days > threshold (return shock)
+    2. Recent volume / average volume > threshold (volume shock)
+
+    This is a composite signal factor, not a rankable continuous factor.
+    """
+
+    category = FactorCategory.TECHNICAL
+
+    def __init__(
+        self,
+        return_window: int = 3,
+        reference_window: int = 20,
+        volume_short_window: int = 3,
+        volume_long_window: int = 20,
+        return_z_threshold: float = 1.5,
+        volume_ratio_threshold: float = 1.5,
+        name: str = "breakout_ignition",
+    ):
+        super().__init__({
+            "return_window": return_window,
+            "reference_window": reference_window,
+            "volume_short_window": volume_short_window,
+            "volume_long_window": volume_long_window,
+            "return_z_threshold": return_z_threshold,
+            "volume_ratio_threshold": volume_ratio_threshold,
+        })
+        self._ret_win = return_window
+        self._ref_win = reference_window
+        self._vol_short = volume_short_window
+        self._vol_long = volume_long_window
+        self._ret_z = return_z_threshold
+        self._vol_ratio = volume_ratio_threshold
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def compute(self, prices: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        turnover_data = kwargs.get("turnover")
+        volume: pd.DataFrame | None = None
+
+        if turnover_data is not None:
+            volume = turnover_data
+        else:
+            # Use price change magnitude as volume proxy
+            volume = prices.pct_change(fill_method=None).abs()
+
+        # Return shock: z-score of k-period return vs history
+        ret = prices.pct_change(fill_method=None)
+        k_ret = ret.rolling(self._ret_win).apply(
+            lambda x: (1 + x).prod() - 1 if len(x) == self._ret_win else 0
+        )
+        ref_mean = k_ret.rolling(self._ref_win).mean()
+        ref_std = k_ret.rolling(self._ref_win).std().replace(0, np.nan)
+        ret_z = (k_ret - ref_mean) / ref_std
+        ret_shock = ret_z.abs() >= self._ret_z
+
+        # Volume shock: recent / baseline
+        vol_short_ma = volume.rolling(self._vol_short).mean()
+        vol_long_ma = volume.rolling(self._vol_long).mean()
+        vol_ratio = vol_short_ma / vol_long_ma.replace(0, np.nan)
+        vol_shock = vol_ratio >= self._vol_ratio
+
+        # Composite: both conditions must hold
+        ignition = (ret_shock & vol_shock).astype(float)
+        return ignition
+
+
+# ---------------------------------------------------------------------------
 # MACD factor
 # ---------------------------------------------------------------------------
 
@@ -241,5 +364,6 @@ def register_all():
         Momentum1M, Momentum3M, Momentum6M, Momentum12M,
         Volatility20D, Volatility60D,
         TurnoverFactor, RSIFactor, AmplitudeFactor, MACDFactor,
+        EfficiencyRatioFactor, BreakoutIgnitionFactor,
     ]:
         registry.register(cls)
