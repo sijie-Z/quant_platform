@@ -269,3 +269,56 @@ def ic_decay(
         decay[period] = ic.mean() if len(ic) > 0 else np.nan
 
     return pd.Series(decay, name="ic_decay")
+# ---------------------------------------------------------------------------
+# Alphalens-compatible export  (industry standard factor analysis)
+# ---------------------------------------------------------------------------
+
+
+def to_alphalens(
+    factor: pd.DataFrame,
+    forward_returns: pd.DataFrame,
+    group_map: pd.Series | None = None,
+    group_labels: dict | None = None,
+    quantiles: int = 5,
+) -> pd.DataFrame:
+    """Format factor data for Alphalens analysis.
+
+    Converts our (date x asset) factor and forward returns into the
+    multi-indexed DataFrame that alphalens.utils.get_clean_factor_and_forward_returns
+    expects. This lets users run:
+
+        import alphalens
+        factor_data = to_alphalens(my_factor, forward_returns)
+        alphalens.tears.create_full_tear_sheet(factor_data)
+
+    Args:
+        factor: (date x asset) factor values.
+        forward_returns: (date x asset) forward returns.
+        group_map: Optional Series mapping asset -> group name.
+        group_labels: Optional dict mapping group key -> display name.
+        quantiles: Number of quantiles for Alphalens.
+
+    Returns:
+        MultiIndex DataFrame (date, asset) with columns:
+            factor, 1D forward return, group (optional).
+    """
+    # Alphalens requires a MultiIndex (date, asset) with columns:
+    #   factor, <forward_return_period>, group (optional)
+
+    # Stack both DataFrames: (date x asset) -> MultiIndex (date, asset)
+    factor_stacked = factor.stack().rename("factor")
+    ret_stacked = forward_returns.stack().rename("1D")
+
+    result = pd.DataFrame({"factor": factor_stacked, "1D": ret_stacked})
+
+    # Add group info
+    if group_map is not None:
+        # group_map is Series(asset -> group)
+        result["group"] = result.index.get_level_values("asset").map(group_map)
+
+    result = result.dropna(subset=["factor", "1D"])
+
+    # Alphalens also expects an asset_name column
+    result["asset_name"] = result.index.get_level_values("asset")
+
+    return result
