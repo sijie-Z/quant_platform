@@ -42,3 +42,4 @@ pytest-asyncio==0.21.2
 
 # Compliance export
 openpyxl==3.1.5
+adata>=1.0.0
