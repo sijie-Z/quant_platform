@@ -75,5 +75,12 @@
     "description": "Run: alpha=equal_weight optimizer=mean_variance",
     "run_id": "",
     "config_hash": "858f7bbc1f3b"
+  },
+  "v12": {
+    "id": "v12",
+    "timestamp": "2026-06-01T18:28:28",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "858f7bbc1f3b"
   }
 }
