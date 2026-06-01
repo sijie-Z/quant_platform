@@ -47,5 +47,33 @@
     "description": "Run: alpha=equal_weight optimizer=mean_variance",
     "run_id": "",
     "config_hash": "8419271ce570"
+  },
+  "v8": {
+    "id": "v8",
+    "timestamp": "2026-06-01T12:27:52",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "8419271ce570"
+  },
+  "v9": {
+    "id": "v9",
+    "timestamp": "2026-06-01T12:36:45",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "8419271ce570"
+  },
+  "v10": {
+    "id": "v10",
+    "timestamp": "2026-06-01T12:59:07",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "8419271ce570"
+  },
+  "v11": {
+    "id": "v11",
+    "timestamp": "2026-06-01T13:13:02",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "858f7bbc1f3b"
   }
 }

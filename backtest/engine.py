@@ -93,6 +93,11 @@ class BacktestEngine:
             self.benchmark_returns = benchmark_returns
 
         rebalance_dates = self._get_rebalance_dates(signal.index)
+        logger.info("Backtest: %d rebalance dates from %s to %s (freq=%s)",
+                     len(rebalance_dates),
+                     str(rebalance_dates[0])[:10] if rebalance_dates else "N/A",
+                     str(rebalance_dates[-1])[:10] if rebalance_dates else "N/A",
+                     self.rebalance_frequency)
 
         self.weights_history = {}
         prev_weights = None
@@ -102,7 +107,14 @@ class BacktestEngine:
 
             sig = signal.loc[rdate].dropna()
             if len(sig) < 10:
-                continue
+                logger.debug("Rebalance %s: only %d signals — using equal weight fallback",
+                              str(rdate)[:10], len(sig))
+                if rdate in prices.index:
+                    valid_assets = prices.loc[rdate].dropna().index
+                    if len(valid_assets) >= 10:
+                        sig = pd.Series(1.0, index=valid_assets)
+                if len(sig) < 10:
+                    continue
 
             # Estimate covariance matrix
             lookback_end = returns.index.get_indexer([rdate], method="ffill")[0]
