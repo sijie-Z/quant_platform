@@ -43,6 +43,33 @@
 
 ---
 
+## 研究成果：Alpha Discovery v1
+
+### 研究链（3 轮 Ablation Study）
+
+```
+26 原始因子
+    ↓ Factor Ranking — 识别 12 个噪音因子 |IC| < 0.005 (ABLATION-001)
+8 个因子有实际预测力（Top 8 Sharpe +0.464 vs All 26 Sharpe -0.779）
+    ↓ Correlation Clustering — 8 因子 = 4 个独立 Alpha 簇 (ABLATION-002)
+短期反转、中期趋势、长期趋势、流动性
+    ↓ Representative Selection (ABLATION-003)
+4 个代表因子解释 Top 8 的 82% 收益（Sharpe 0.381 vs 0.464）
+```
+
+### Alpha 分类体系
+
+| 独立信号 | 代表因子 | IC | 含义 |
+|---------|---------|-----|------|
+| 短期反转/超买超卖 | rsi_14d | 0.021 | RSI 均值回归 |
+| 中期趋势 | trend_stage | 0.021 | 价格在 120 日历史区间位置 |
+| 长期趋势 | momentum_12m | 0.013 | 12 月累计收益（跳过 1 月） |
+| 流动性 | turnover_20d | 0.011 | 换手率/关注度 |
+
+**详细研究成果**：[docs/research/](docs/research/)
+
+---
+
 ## 目录
 
 - [验证状态](#验证状态)
