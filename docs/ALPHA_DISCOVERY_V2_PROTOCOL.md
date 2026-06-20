@@ -294,7 +294,46 @@ Step 9           [可选] 解冻协议 / 进入 Discovery v3
 
 ---
 
-## 10. 风险控制
+## 10. Protocol Amendments
+
+### Amendment #1 — RQ4: Why Does Sign Flip Work?
+
+**日期**：2026-06-21
+**触发条件**：Cross-Validation 发现真实 A 股中全部 4 个簇方向错误
+
+**研究问题 4（RQ4）**：Sign Flip 在真实 A 股中为何有效？是普遍性的均值回归性质，还是样本特定的现象？
+
+**假设**：
+- **H₀**：翻转效果在年份和市场状态间一致（IC_flipped ≈ −IC_original 对所有子集成立）
+- **H₁**：翻转效果存在时变性或 Regime Dependency
+
+#### 实验 4.1 — IC Sign 逐年稳定性
+
+使用 Cross-Validation 已生成的逐年数据，提取每个簇每年的 IC 符号和数值：
+
+| 年份 | A IC | A Flip IC | B IC | B Flip IC | ... |
+|------|------|-----------|------|-----------|-----|
+
+判定规则：如果某簇的 IC 符号在 ≥6/8 年份中为负，则判定该簇存在**方向性错误**。
+
+#### 实验 4.2 — Sign Flip 的 Regime Dependency
+
+将真实 A 股（2018-2025）按 Bull/Bear/Sideways 分解，计算每个 regime 下各簇翻转前后的 IC 和 Sharpe。
+
+重点关注：翻转效果是否集中在特定 regime（如 Bear 市场）？
+
+#### 实验 4.3 — Flip Magnitude 一致性
+
+计算 `flip_ratio = IC_flipped / |IC_original|`。如果 flip_ratio ≈ 1.0 且方向相反，说明 IC 完全可逆——这是"纯方向性错误"的铁证。如果 flip_ratio < 0.5，说明方向错误只是部分原因，信噪比低也是关键。
+
+#### 判定规则
+
+- 如果 flip_ratio > 0.8 且符号翻转在 ≥75% 子集中成立：**H₀ 被拒绝，确认纯方向性错误**
+- 如果 flip_ratio < 0.5 或符号翻转不稳定：**H₀ 未被拒绝，方向错误+信噪比问题共同作用**
+
+---
+
+## 11. 风险控制
 
 | 风险 | 应对 |
 |------|------|
