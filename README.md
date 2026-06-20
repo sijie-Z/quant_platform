@@ -43,28 +43,53 @@
 
 ---
 
-## 研究成果：Alpha Discovery v1
+## 研究成果
 
-### 研究链（3 轮 Ablation Study）
+### 完整研究链（10 步）
 
 ```
-26 原始因子
-    ↓ Factor Ranking — 识别 12 个噪音因子 |IC| < 0.005 (ABLATION-001)
-8 个因子有实际预测力（Top 8 Sharpe +0.464 vs All 26 Sharpe -0.779）
-    ↓ Correlation Clustering — 8 因子 = 4 个独立 Alpha 簇 (ABLATION-002)
-短期反转、中期趋势、长期趋势、流动性
-    ↓ Representative Selection (ABLATION-003)
-4 个代表因子解释 Top 8 的 82% 收益（Sharpe 0.381 vs 0.464）
+[Step 1]   v1.0 — 平台验证
+              Oracle IC=1.0, Known Alpha Recovery
+              → 平台计算正确性确认
+[Step 2]   Discovery v1 — 因子池污染
+              Top 8 Sharpe +0.46 vs All 26 -0.78
+              → 加入噪声因子降低整体 Alpha
+[Step 3]   Discovery v2 — 合成数据 Alpha 结构
+              3 簇有效, 方向正确, 逐年稳定
+[Step 4]   Cross-Validation — 合成 ≠ 真实 A 股
+              方向全反, 趋势因子在 A 股系统性失效
+[Step 5]   RQ4 — Sign Flip 分析
+              4/5 簇 8/8 年 IC 为负 (100%)
+              → 方向性错误的铁证
+[Step 6]   Market Structure v3 — A 股结构测绘
+              IC(H) 全部 10 个时间尺度为负
+              → 纯均值回归市场, 80d 反转最强
+[Step 7]   RQ5b — Theory-Execution Gap 合上
+              S=40/H=80 反转 Sharpe +0.45
+              → 信号方向对的, 持有期匹配就能赚钱
+[Step 8]   Regime Discovery v4 — 状态依赖
+              α = Signal × I(方向性市场)
+              → Bull/Bear 有效, Sideways 无效
+[Step 9]   ExecutionAdapter + RQ6 — 执行边界
+              80d ≠ 4×20d, 月频全负 Sharpe
+              → 时间分解非线性, 信息损失不可逆
+[Step 10]  RQ7 — Sampling Phase Diagram
+              35/35 (f,H) 单元全负
+              → Phase Collapse: 固定频率采样破坏信号结构
 ```
 
-### Alpha 分类体系
+### 终局结论
 
-| 独立信号 | 代表因子 | IC | 含义 |
-|---------|---------|-----|------|
-| 短期反转/超买超卖 | rsi_14d | 0.021 | RSI 均值回归 |
-| 中期趋势 | trend_stage | 0.021 | 价格在 120 日历史区间位置 |
-| 长期趋势 | momentum_12m | 0.013 | 12 月累计收益（跳过 1 月） |
-| 流动性 | turnover_20d | 0.011 | 换手率/关注度 |
+A 股存在可预测的 40-80d 反转结构（Sharpe +0.45），但该结构是连续时间相位现象。在固定频率、无相位感知的执行策略下，信号因 aliasing 和相位错位系统性崩溃。
+
+### 研究状态
+
+| 研究层 | 状态 | 核心发现 |
+|--------|------|---------|
+| Signal Existence | ✅ 完成 | A 股反转 Alpha 存在 |
+| Market Structure | ✅ 完成 | IC(H) 全负, 80d 最优 |
+| Execution Boundary | ⚠️ 已证明 | 月频系统结构性失败 |
+| Control Policy | ❌ 未探索 | 相位感知执行未知 |
 
 **详细研究成果**：[docs/research/](docs/research/)
 
