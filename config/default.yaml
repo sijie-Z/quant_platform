@@ -13,7 +13,8 @@ data:
   provider: "synthetic"    # synthetic, tushare, baostock, postgres
   validated: false     # Cross-source validation (requires 2+ providers)
   synthetic:
-    embedded_alpha: true   # false=pure noise; true=embedded patterns for demo
+    embedded_alpha: true       # false=pure noise; true=embedded patterns for demo
+    alpha_strength: 0.03       # predictive alpha strength: 0=off, 0.03=weak, 0.06=normal, 0.12=strong
   start_date: "2021-01-01"
   end_date: "2025-12-31"
   frequency: "daily"       # daily, weekly, monthly
@@ -55,7 +56,8 @@ factors:
 
 # --- Alpha Model ---
 alpha:
-  method: "equal_weight"  # equal_weight, ic_weighted, icir_weighted
+  method: "icir_weighted"  # equal_weight, ic_weighted, icir_weighted
+  # Ablation #001: Top 8 vs All 26 差距 1.24 Sharpe -> 等权融合所有因子会显著稀释 Alpha
   lookback: 252            # Days for IC/ICIR estimation
   min_icir: 0.0            # Minimum ICIR to include factor
   tradability_gate: false  # Per-stock profile-based signal filtering

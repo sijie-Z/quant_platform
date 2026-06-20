@@ -98,6 +98,11 @@ def information_ratio(
     benchmark_returns: pd.Series,
 ) -> float:
     """Information ratio = mean excess return / std excess return (annualized)."""
+    # Handle duplicate index labels (can happen from walk-forward fold concat)
+    if strategy_returns.index.duplicated().any():
+        strategy_returns = strategy_returns.groupby(strategy_returns.index).mean()
+    if benchmark_returns.index.duplicated().any():
+        benchmark_returns = benchmark_returns.groupby(benchmark_returns.index).mean()
     aligned = pd.DataFrame({"strategy": strategy_returns, "benchmark": benchmark_returns}).dropna()
     excess = aligned["strategy"] - aligned["benchmark"]
     if len(excess) < 2:
@@ -114,6 +119,11 @@ def tracking_error(
     benchmark_returns: pd.Series,
 ) -> float:
     """Annualized tracking error."""
+    # Handle duplicate index labels (can happen from walk-forward fold concat)
+    if strategy_returns.index.duplicated().any():
+        strategy_returns = strategy_returns.groupby(strategy_returns.index).mean()
+    if benchmark_returns.index.duplicated().any():
+        benchmark_returns = benchmark_returns.groupby(benchmark_returns.index).mean()
     aligned = pd.DataFrame({"strategy": strategy_returns, "benchmark": benchmark_returns}).dropna()
     excess = aligned["strategy"] - aligned["benchmark"]
     return excess.std() * np.sqrt(TRADING_DAYS_PER_YEAR)

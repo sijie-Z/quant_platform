@@ -106,6 +106,10 @@ def neutralize(
         factor = factor.to_frame('factor')
     result = factor.copy()
 
+    # Ensure sector_map is a pandas Series (not dict)
+    if sector_map is not None and isinstance(sector_map, dict):
+        sector_map = pd.Series(sector_map)
+
     for date in factor.index:
         row = result.loc[date].copy()
         valid_mask = row.notna()

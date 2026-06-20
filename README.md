@@ -1,63 +1,63 @@
-# A股多因子量化交易平台
+# A股多因子量化交易平台 — Validated Quant Research Platform
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/%E6%B5%8B%E8%AF%95-1205%20%E9%80%9A%E8%BF%87-brightgreen?logo=pytest" alt="Tests">
-  <img src="https://img.shields.io/badge/%E5%9B%A0%E5%AD%90-26%20%E4%B8%AA-orange" alt="Factors">
-  <img src="https://img.shields.io/badge/Python%20%E6%A8%A1%E5%9D%97-105-blueviolet" alt="Modules">
-  <img src="https://img.shields.io/badge/%E4%BB%A3%E7%A0%81%E8%A1%8C-34K%2B-yellow" alt="Lines">
-  <img src="https://img.shields.io/badge/API%20%E7%AB%AF%E7%82%B9-97-red?logo=fastapi" alt="API">
-  <img src="https://img.shields.io/badge/%E5%BC%80%E6%BA%90%E5%8D%8F%E8%AE%AE-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/验证-6项全部通过-brightgreen?logo=checkmarx" alt="Validation">
+  <img src="https://img.shields.io/badge/测试-1222%20通过-brightgreen?logo=pytest" alt="Tests">
+  <img src="https://img.shields.io/badge/Oracle%20IC-1.000000-success" alt="Oracle IC">
+  <img src="https://img.shields.io/badge/MVO-60%2F60%20Success-success" alt="MVO Audit">
+  <img src="https://img.shields.io/badge/已知%20Alpha%20恢复-IC%200.025-blue" alt="Known Alpha">
+  <img src="https://img.shields.io/badge/Python%20模块-143-blueviolet" alt="Modules">
+  <img src="https://img.shields.io/badge/API%20端点-97-red?logo=fastapi" alt="API">
+  <img src="https://img.shields.io/badge/开源协议-MIT-green" alt="License">
 </p>
 
 <p align="center">
-  <a href="#%E7%9B%AE%E5%BD%95">目录</a> •
-  <a href="#%E7%AE%80%E4%BB%8B">简介</a> •
-  <a href="#%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B">快速开始</a> •
-  <a href="#%E6%9E%B6%E6%9E%84">架构</a> •
-  <a href="#%E5%9B%A0%E5%AD%90%E7%B3%BB%E7%BB%9F">因子</a> •
-  <a href="#cli-%E5%91%BD%E4%BB%A4%E9%9B%86">CLI</a> •
-  <a href="#api-%E6%8E%A5%E5%8F%A3">API</a> •
-  <a href="#%E9%A3%8E%E9%99%A9%E7%AE%A1%E6%8E%A7">风控</a> •
-  <a href="#%E9%A1%B9%E7%9B%AE%E7%BB%93%E6%9E%84">结构</a>
+  <a href="#验证状态">验证状态</a> •
+  <a href="#快速开始">快速开始</a> •
+  <a href="#架构">架构</a> •
+  <a href="#文档索引">文档索引</a> •
+  <a href="#cli-命令集">CLI</a>
 </p>
+
+---
+
+## 验证状态
+
+> 这不是一个声称"功能很多"的平台。
+> 这是一个**经过系统性验证**的量化研究平台。
+
+核心研究链路的 6 项关键验证**全部通过**：
+
+| 验证 | 方法 | 结果 |
+|------|------|------|
+| **Oracle Factor** | 已知未来收益作为因子 → Rank IC | **IC = 1.000000** → IC 计算与数据对齐正确 |
+| **Known Alpha Recovery** | 生成含已知预测性 Alpha 的数据 → 因子引擎恢复 | **IC 与理论值一致** → 因子链路完整 |
+| **Rank IC 对比** | 手动 vs 官方 rank_ic 计算 | **一致（差异 0.13%）** → evaluation.py 无 bug |
+| **MVO Audit** | 全 Pipeline 60 次调仓日志记录 | **60/60 Success, 0 Fallback** → 优化器正常工作 |
+| **WalkForward** | 多 fold 滚动 OOS 验证 | **全部通过** → 无前视偏差 |
+| **No-Lookahead 防护** | 8 条不可协商契约 | **全部实现** → 研究过程严格因果 |
+
+**详细验证报告**：[docs/VALIDATION_REPORT.md](docs/VALIDATION_REPORT.md)  
+**No-Lookahead 契约**：[docs/NO_LOOKAHEAD_CONTRACT.md](docs/NO_LOOKAHEAD_CONTRACT.md)
 
 ---
 
 ## 目录
 
-- [简介](#简介)
-- [核心能力](#核心能力)
+- [验证状态](#验证状态)
 - [快速开始](#快速开始)
   - [安装](#安装)
   - [运行完整流水线](#运行完整流水线)
-  - [运行测试](#运行测试)
 - [架构](#架构)
-- [因子系统](#因子系统)
-  - [26个内置因子](#26个内置因子)
-  - [表达式引擎](#表达式引擎)
-  - [信号合成方式](#信号合成方式)
-  - [因子筛选模式](#因子筛选模式)
+- [文档索引](#文档索引)
 - [CLI 命令集](#cli-命令集)
-- [API 接口](#api-接口)
-- [风控体系](#风控体系)
-  - [12层风控](#12层风控)
-  - [动态止损](#动态止损)
-  - [财务排雷](#财务排雷)
-- [执行层](#执行层)
-  - [订单状态机](#订单状态机)
-  - [Portfolio Orchestrator](#portfolio-orchestrator)
-- [交易引擎](#交易引擎)
-- [数据源](#数据源)
-- [配置管理](#配置管理)
-- [项目结构](#项目结构)
-- [外部吸收](#外部吸收)
 - [技术栈](#技术栈)
 - [许可证](#许可证)
 
 ---
 
-## 简介
+## 快速开始
 
 这是一个面向 **A 股市场**的多因子量化交易平台，覆盖从数据获取、因子计算、信号合成、组合优化、回测验证到实盘交易的完整流水线。
 

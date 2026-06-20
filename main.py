@@ -83,6 +83,7 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
     # Final fallback: synthetic
     if provider is None:
         embedded = getattr(config.data.synthetic, 'embedded_alpha', False)
+        alpha_strength = getattr(config.data.synthetic, 'alpha_strength', 0.03)
         if configured_provider != "synthetic":
             logger.warning("Configured provider '%s' unavailable, falling back to synthetic", configured_provider)
         provider = SyntheticDataProvider(
@@ -90,6 +91,7 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
             start_date=config.data.start_date,
             end_date=config.data.end_date,
             embedded_alpha=embedded,
+            alpha_strength=alpha_strength,
         )
 
     # Optional: wrap in ValidatedProvider for cross-source validation
@@ -303,6 +305,28 @@ def cmd_run(args) -> int:
 
     for name, summary in ic_results.items():
         logger.info("  %-20s Rank IC=%.4f  ICIR=%.2f", name, summary["mean_ic"], summary["icir"])
+
+    # Save factor evaluations to Factor Research Store if requested
+    if getattr(args, 'save_factors', False):
+        try:
+            from quant_platform.factors.store import FactorResearchStore, FactorEvalRecord
+            fs = FactorResearchStore()
+            saved = 0
+            for name, summary in ic_results.items():
+                fs.save_evaluation(FactorEvalRecord(
+                    factor_name=name,
+                    signal_date=config.data.end_date,
+                    rank_ic=summary["mean_ic"],
+                    pearson_ic=summary.get("pearson_ic", 0),
+                    icir=summary["icir"],
+                    coverage=summary.get("coverage", 0),
+                    n_assets=summary.get("n_assets", 0),
+                    run_id=f"run_{config.data.start_date}_{config.data.end_date}",
+                ))
+                saved += 1
+            logger.info("Saved %d factor evaluations to Factor Research Store", saved)
+        except Exception as e:
+            logger.warning("Failed to save factor evaluations: %s", e)
 
     # ------------------------------------------------------------------
     # 3. Alpha Signal (or Screener mode)
@@ -688,8 +712,33 @@ def cmd_ml(args) -> int:
         return 1
 
 
+def _cmd_research_validate(args) -> int:
+    """Run Research Validation Sprint."""
+    from quant_platform.strategy.research_validation import ResearchValidator
+
+    n_stocks = args.n_stocks if args.n_stocks > 0 else 200
+    validator = ResearchValidator(
+        n_stocks=n_stocks,
+        timeout_seconds=args.timeout,
+    )
+
+    if args.mode == "quick":
+        report = validator.run_quick(
+            max_factors=args.max_factors,
+            max_folds=args.max_folds,
+            n_symbols=n_stocks,
+        )
+    else:
+        report = validator.run_full(max_folds=args.max_folds)
+
+    print(report.print_report())
+    return 0 if report.summary.get("overall") != "needs_review" else 1
+
+
 def cmd_research(args) -> int:
-    """LLM research agent operations."""
+    """LLM research agent and validation operations."""
+    if args.subcommand == "validate":
+        return _cmd_research_validate(args)
     if args.subcommand == "report":
         import json
         from pathlib import Path
@@ -1103,6 +1152,324 @@ def cmd_trade(args) -> int:
     return 0
 
 
+def cmd_factor_store(args) -> int:
+    """Factor Research Store operations."""
+    from quant_platform.factors.store import FactorResearchStore, FactorDefinition
+    from quant_platform.factors.registry import get_registry
+
+    store = FactorResearchStore()
+
+    if args.subcommand == "stats":
+        stats = store.get_stats()
+        print("\n=== Factor Research Store ===")
+        for key, value in stats.items():
+            print(f"  {key}: {value}")
+        return 0
+
+    elif args.subcommand == "rank":
+        ranking = store.get_factor_ranking()
+        print(f"\n=== Factor Ranking by Health Score ===")
+        print(f"  {'Rank':<4} {'Factor':<25} {'IC':<10} {'ICIR':<8} {'Coverage':<10} {'Health':<8}")
+        print(f"  {'-'*4} {'-'*25} {'-'*10} {'-'*8} {'-'*10} {'-'*8}")
+        for i, f in enumerate(ranking[:getattr(args, 'limit', 20)]):
+            print(f"  {i+1:<4} {f['factor_name']:<25} {f['ic_mean']:<10.6f} {f['icir']:<8.4f} {f['coverage']:<10.4f} {f['health_score']:<8.4f}")
+        return 0
+
+    elif args.subcommand == "register-all":
+        # Register all factors into registry first
+        from quant_platform.factors.technical import register_all as register_technical
+        from quant_platform.factors.fundamental import register_all as register_fundamental
+        register_technical()
+        register_fundamental()
+        registry = get_registry()
+        factor_names = registry.list_all()
+        count = 0
+        for name in factor_names:
+            cls = registry.get(name)
+            inst = cls()
+            try:
+                store.save_definition(FactorDefinition(
+                    name=inst.name,
+                    category=inst.category.value,
+                    description=inst.__doc__ or "",
+                    higher_is_better=True,
+                    params=inst.params,
+                ))
+                count += 1
+            except Exception as e:
+                logger.warning("Failed to register %s: %s", name, e)
+        print(f"Registered {count}/{len(factor_names)} factors")
+        return 0
+
+    elif args.subcommand == "history":
+        factor = getattr(args, 'factor', '')
+        if not factor:
+            print("Please specify --factor")
+            return 1
+        limit = getattr(args, 'limit', 50)
+        evals = store.get_evaluation_history(factor, limit=limit)
+        print(f"\n=== Evaluation History: {factor} ===")
+        print(f"  Records: {len(evals)}")
+        if evals:
+            print(f"  {'Date':<12} {'Rank IC':<10} {'ICIR':<8} {'Coverage':<10} {'N':<6}")
+            print(f"  {'-'*12} {'-'*10} {'-'*8} {'-'*10} {'-'*6}")
+            for e in evals[:20]:
+                print(f"  {e.signal_date:<12} {e.rank_ic:<10.4f} {e.icir:<8.4f} {e.coverage:<10.4f} {e.n_assets:<6}")
+        return 0
+
+    elif args.subcommand == "walkforward-summary":
+        factor = getattr(args, 'factor', '')
+        if not factor:
+            print("Please specify --factor")
+            return 1
+        summary = store.get_walk_forward_summary(factor)
+        if summary:
+            print(f"\n=== Walk-Forward Summary: {factor} ===")
+            for key, value in summary.items():
+                print(f"  {key}: {value}")
+        else:
+            print(f"No walk-forward data for {factor}")
+        return 0
+
+    elif args.subcommand == "clear":
+        confirm = input("Clear ALL factor store data? (y/N): ")
+        if confirm.lower() == 'y':
+            store.clear()
+            print("Factor store cleared")
+        return 0
+
+    else:
+        print("Unknown subcommand. Use: stats, rank, register-all, history, walkforward-summary, clear")
+        return 1
+
+
+def cmd_gate(args) -> int:
+    """Run Strategy Evaluation Gates on the current pipeline results.
+
+    Integrates IC results, walk-forward, backtest metrics, and data coverage
+    into a unified PASS/WARNING/FAIL/REJECTED gate report.
+    """
+    from quant_platform.strategy.gates import GateRunner, GateConfig
+
+    config = load_config(_resolve_config_path(args.config))
+
+    # Build gate config with optional overrides
+    gate_config = GateConfig()
+    if args.min_ic is not None:
+        gate_config.minimum_ic = args.min_ic
+    if args.max_dd is not None:
+        gate_config.maximum_drawdown = args.max_dd
+
+    # Load data
+    prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
+    n_assets_total = len(prices.columns)
+
+    # Compute factors and IC results
+    processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+        prices, returns, financials, metadata, turnover, config=config)
+
+    # Estimate factor params count
+    from quant_platform.factors.technical import register_all as register_technical
+    from quant_platform.factors.fundamental import register_all as register_fundamental
+    from quant_platform.factors.registry import get_registry
+    register_technical()
+    register_fundamental()
+    n_params = 0
+    for name in get_registry().list_all():
+        try:
+            inst = get_registry().get(name)()
+            n_params += len(inst.params)
+        except Exception:
+            pass
+    n_factors = len(processed_factors)
+
+    # Check for saved walk-forward results
+    wf_result = None
+    try:
+        from pathlib import Path
+        import glob
+        wf_files = glob.glob(str(Path(config.output.results_dir) / "walkforward*.json"))
+        if wf_files:
+            import json
+            with open(wf_files[-1]) as f:
+                wf_result = json.load(f)
+    except Exception:
+        pass
+
+    # Run gates
+    runner = GateRunner(gate_config)
+    report = runner.run(
+        strategy_name=args.strategy,
+        ic_results=ic_results,
+        wf_results=wf_result,
+        n_factors=n_factors,
+        n_params=n_params,
+        n_assets_total=n_assets_total,
+        n_assets_with_data=n_assets_total,
+    )
+
+    print(report.print_report())
+
+    # Return non-zero for FAIL/REJECTED
+    if report.overall_status in ("FAIL", "REJECTED"):
+        return 1
+    return 0
+
+
+def cmd_strategy(args) -> int:
+    """Manage Strategy DSL definitions."""
+    from quant_platform.strategy.dsl import (
+        StrategyDefinition, validate_strategy, dsl_to_config_overrides,
+    )
+    from quant_platform.strategy.registry import StrategyRegistry
+    from quant_platform.factors.technical import register_all as register_technical
+    from quant_platform.factors.fundamental import register_all as register_fundamental
+
+    registry = StrategyRegistry()
+
+    if args.subcommand == "list":
+        strategies = registry.list_strategies()
+        print(f"\n=== Registered Strategies ({len(strategies)}) ===")
+        print(f"  {'Name':<30} {'Version':<10} {'Created':<20}")
+        print(f"  {'-'*30} {'-'*10} {'-'*20}")
+        for s in strategies:
+            print(f"  {s['name']:<30} {s['version']:<10} {s.get('created_at',''):<20}")
+        return 0
+
+    elif args.subcommand == "show":
+        name = args.name
+        if not name:
+            print("Please specify --name")
+            return 1
+        version = args.version if args.version else ""
+        s = registry.get(name, version)
+        if s is None:
+            print(f"Strategy '{name}' not found")
+            return 1
+        import yaml
+        print(f"\n=== {s.name} v{s.version} ===")
+        print(yaml.dump(s.to_dict(), default_flow_style=False, allow_unicode=True))
+        return 0
+
+    elif args.subcommand == "validate":
+        s = StrategyDefinition.from_yaml(args.file)
+        register_technical()
+        register_fundamental()
+        result = validate_strategy(s, check_factors_exist=True)
+        print(f"\n=== Validation: {s.name} v{s.version} ===")
+        if result.valid:
+            print("  Status: VALID")
+        else:
+            print("  Status: INVALID")
+        for err in result.errors:
+            print(f"  ERROR: {err}")
+        for warn in result.warnings:
+            print(f"  WARNING: {warn}")
+        return 0 if result.valid else 1
+
+    elif args.subcommand == "register":
+        s = StrategyDefinition.from_yaml(args.file)
+        register_technical()
+        register_fundamental()
+        result = validate_strategy(s, check_factors_exist=True)
+        if not result.valid:
+            print(f"Cannot register: validation failed for {s.name}")
+            for err in result.errors:
+                print(f"  ERROR: {err}")
+            return 1
+        registry.save(s)
+        print(f"Registered: {s.name} v{s.version}")
+        return 0
+
+    elif args.subcommand == "run":
+        strategy = None
+        if args.file:
+            strategy = StrategyDefinition.from_yaml(args.file)
+        elif args.name:
+            strategy = registry.get(args.name, args.version or "")
+
+        if strategy is None:
+            print("Please specify --name or --file")
+            return 1
+
+        register_technical()
+        register_fundamental()
+        result = validate_strategy(strategy, check_factors_exist=True)
+        if not result.valid:
+            print(f"Cannot run: validation failed for {strategy.name}")
+            for err in result.errors:
+                print(f"  ERROR: {err}")
+            return 1
+
+        # Load base config
+        config = load_config(_resolve_config_path(getattr(args, 'config', None)))
+
+        # Apply DSL overrides to config for factor enablement
+        if not hasattr(config, 'factors') or config.factors is None:
+            from types import SimpleNamespace
+            config.factors = SimpleNamespace()
+        config.factors.enabled_technicals = list(strategy.factor_weights.keys())
+        config.factors.enabled_fundamentals = []
+
+        # Override portfolio settings
+        if strategy.portfolio_method:
+            config.portfolio.optimizer = strategy.portfolio_method
+
+        # Run pipeline
+        prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
+        processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+            prices, returns, financials, metadata, turnover, config=config)
+        signal = _generate_signal(config, processed_factors, returns)
+        bt_result = _run_backtest(config, signal, prices, returns, benchmark,
+                                   sector_map, financials)
+
+        # Generate report
+        from quant_platform.reporting.dashboard import DashboardGenerator
+        from pathlib import Path
+
+        report_path = Path(config.output.results_dir)
+        report_path.mkdir(parents=True, exist_ok=True)
+        dg = DashboardGenerator(strategy.name, output_dir=str(report_path))
+        report = dg.generate(bt_result)
+        print(report)
+        logger.info("Strategy run complete: %s v%s", strategy.name, strategy.version)
+
+        # Record run
+        import uuid
+        registry.record_run(
+            strategy_name=strategy.name,
+            strategy_version=strategy.version,
+            run_id=uuid.uuid4().hex[:12],
+            config=strategy.to_dict(),
+            summary=bt_result.get("summary", {}),
+        )
+        return 0
+
+    elif args.subcommand == "history":
+        name = args.name if args.name else ""
+        history = registry.get_run_history(name, limit=20)
+        if not history:
+            print("No run history found")
+            return 0
+        print(f"\n=== Run History{f' for {name}' if name else ''} ===")
+        print(f"  {'Run ID':<16} {'Strategy':<20} {'Version':<10} {'Time':<20}")
+        print(f"  {'-'*16} {'-'*20} {'-'*10} {'-'*20}")
+        for h in history:
+            print(f"  {h['run_id']:<16} {h['strategy_name']:<20} {h['strategy_version']:<10} {h.get('started_at',''):<20}")
+        return 0
+
+    elif args.subcommand == "stats":
+        stats = registry.get_stats()
+        print("\n=== Strategy Registry Stats ===")
+        for key, value in stats.items():
+            print(f"  {key}: {value}")
+        return 0
+
+    else:
+        print("Unknown subcommand. Use: list, show, validate, register, run, history, stats")
+        return 1
+
+
 def cmd_walkforward(args) -> int:
     """Walk-forward validation: the gold standard for overfitting control.
 
@@ -1240,6 +1607,8 @@ def main() -> int:
                             help="Cache directory path")
     run_parser.add_argument("--description", "-d", type=str, default=None,
                             help="Optional description for this run (saved in config version)")
+    run_parser.add_argument("--save-factors", action="store_true",
+                            help="Save factor values and evaluation history to Factor Research Store")
 
     # trade
     trade_parser = subparsers.add_parser("trade", help="Run live trading (Paper or QMT)")
@@ -1312,11 +1681,36 @@ def main() -> int:
     ml_signal.add_argument("--config", "-c", type=str, default=None, help="Config path")
 
     # research
-    research_parser = subparsers.add_parser("research", help="LLM research agent")
+    research_parser = subparsers.add_parser("research", help="LLM research agent and validation")
     research_sub = research_parser.add_subparsers(dest="subcommand", help="Research action")
     research_analyze = research_sub.add_parser("report", help="Analyze backtest results with LLM")
     research_analyze.add_argument("--results-dir", "-r", type=str, default="./results",
                                   help="Results directory")
+    research_validate = research_sub.add_parser("validate", help="Run Research Validation Sprint")
+    research_validate.add_argument("--mode", type=str, default="quick",
+                                    choices=["quick", "full"], help="Validation mode")
+    research_validate.add_argument("--max-factors", type=int, default=3,
+                                    help="Max factors to evaluate (quick mode)")
+    research_validate.add_argument("--max-folds", type=int, default=2,
+                                    help="Max walk-forward folds")
+    research_validate.add_argument("--n-stocks", type=int, default=0,
+                                    help="Number of stocks (0 = use config default)")
+    research_validate.add_argument("--timeout", type=int, default=600,
+                                    help="Timeout in seconds")
+
+    # factor-store
+    fs_parser = subparsers.add_parser("factor-store", help="Factor Research Store operations")
+    fs_sub = fs_parser.add_subparsers(dest="subcommand", help="Factor Store action")
+    fs_sub.add_parser("stats", help="Show store statistics")
+    fs_rank = fs_sub.add_parser("rank", help="Rank factors by health score")
+    fs_rank.add_argument("--limit", type=int, default=20, help="Number of top factors")
+    fs_reg = fs_sub.add_parser("register-all", help="Register all available factors from registry")
+    fs_hist = fs_sub.add_parser("history", help="Show evaluation history for a factor")
+    fs_hist.add_argument("--factor", type=str, default="", help="Factor name")
+    fs_hist.add_argument("--limit", type=int, default=50, help="Number of records")
+    fs_wf = fs_sub.add_parser("walkforward-summary", help="Show walk-forward summary for a factor")
+    fs_wf.add_argument("--factor", type=str, required=True, help="Factor name")
+    fs_clear = fs_sub.add_parser("clear", help="Clear all factor store data (for testing)")
 
     # walkforward (standalone)
     wf_parser = subparsers.add_parser("walkforward", help="Walk-forward validation")
@@ -1333,6 +1727,17 @@ def main() -> int:
                            help="Test window length in days")
     wf_parser.add_argument("--use-baostock", action="store_true",
                            help="Use Baostock data")
+
+    # strategy gates
+    gate_parser = subparsers.add_parser("gate", help="Run Strategy Evaluation Gates")
+    gate_parser.add_argument("--config", "-c", type=str, default=None,
+                              help="Path to config YAML file")
+    gate_parser.add_argument("--strategy", type=str, default="default",
+                              help="Strategy name for the report")
+    gate_parser.add_argument("--min-ic", type=float, default=None,
+                              help="Override minimum IC threshold")
+    gate_parser.add_argument("--max-dd", type=float, default=None,
+                              help="Override maximum drawdown threshold")
 
     # screen
     screen_parser = subparsers.add_parser("screen", help="Screen stocks using boolean factor rules")
@@ -1381,6 +1786,26 @@ def main() -> int:
     la_parser.add_argument("--use-baostock", action="store_true",
                            help="Use Baostock real data")
 
+    # strategy DSL
+    strat_parser = subparsers.add_parser("strategy", help="Manage Strategy DSL definitions")
+    strat_sub = strat_parser.add_subparsers(dest="subcommand", help="Strategy action")
+    strat_sub.add_parser("list", help="List all registered strategies")
+    strat_show = strat_sub.add_parser("show", help="Show strategy definition")
+    strat_show.add_argument("--name", type=str, default="", help="Strategy name")
+    strat_show.add_argument("--version", type=str, default="", help="Version (optional)")
+    strat_validate = strat_sub.add_parser("validate", help="Validate a strategy file")
+    strat_validate.add_argument("file", type=str, help="Path to strategy YAML file")
+    strat_register = strat_sub.add_parser("register", help="Register a strategy from file")
+    strat_register.add_argument("file", type=str, help="Path to strategy YAML file")
+    strat_run = strat_sub.add_parser("run", help="Run a strategy (pipeline execution)")
+    strat_run.add_argument("--name", type=str, default="", help="Strategy name")
+    strat_run.add_argument("--version", type=str, default="", help="Version")
+    strat_run.add_argument("--file", type=str, default="", help="Path to strategy YAML file (overrides name)")
+    strat_run.add_argument("--force", "-f", action="store_true", help="Bypass cache")
+    strat_history = strat_sub.add_parser("history", help="Show strategy run history")
+    strat_history.add_argument("--name", type=str, default="", help="Strategy name (optional)")
+    strat_sub.add_parser("stats", help="Show registry statistics")
+
     # execute
     exec_parser = subparsers.add_parser("execute", help="Full pipeline: factors -> signal -> orders -> fills")
     exec_parser.add_argument("--config", "-c", type=str, default=None, help="Config path")
@@ -1416,6 +1841,8 @@ def main() -> int:
         return cmd_research(args)
     elif args.command == "walkforward":
         return cmd_walkforward(args)
+    elif args.command == "factor-store":
+        return cmd_factor_store(args)
     elif args.command == "screen":
         return cmd_screen(args)
     elif args.command == "execute":
@@ -1424,6 +1851,10 @@ def main() -> int:
         return cmd_config(args)
     elif args.command == "profile":
         return cmd_profile(args)
+    elif args.command == "gate":
+        return cmd_gate(args)
+    elif args.command == "strategy":
+        return cmd_strategy(args)
     else:
         parser.print_help()
         return 1

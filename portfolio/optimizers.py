@@ -182,21 +182,30 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
             )
 
         solved = False
+        used_solver = "none"
+        problem = None
         for solver in [cp.ECOS, cp.SCS]:
             try:
                 problem = cp.Problem(objective, constraints_list)
                 problem.solve(solver=solver, verbose=False)
                 if w.value is not None:
                     solved = True
+                    used_solver = str(solver)
                     break
-            except Exception:
+            except Exception as e:
+                logger.debug("MVO solver %s failed: %s", str(solver), e)
                 continue
 
         if not solved:
-            logger.warning("MVO solver failed, falling back to equal weight")
+            status = problem.status if problem is not None else "N/A"
+            logger.warning("MVO FAILED — fallback to equal weight (solver=%s, n=%d, status=%s)",
+                           used_solver, n, status)
             return EqualWeightOptimizer(self.constraints).optimize(
                 signal, cov_matrix, prices, prev_weights, sector_map
             )
+
+        logger.info("MVO SUCCESS: solver=%s n=%d status=%s w_min=%.4f w_max=%.4f",
+                     used_solver, n, problem.status, w.value.min(), w.value.max())
 
         weights = pd.Series(w.value, index=assets)
         weights = weights.clip(lower=0)

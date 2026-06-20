@@ -411,8 +411,9 @@ class CandleUpperShadowFactor(BaseFactor):
         o = kwargs.get("open")
         c = prices
         if h is not None and o is not None:
-            upper = h - pd.concat([o, c], axis=1).max(axis=1)
-            return upper / o.replace(0, float("nan"))
+            import numpy as np
+            upper = h - np.maximum(o.values, c.values)
+            return pd.DataFrame(upper, index=prices.index, columns=prices.columns) / o.replace(0, float("nan"))
         return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
 
 
@@ -429,8 +430,9 @@ class CandleLowerShadowFactor(BaseFactor):
         o = kwargs.get("open")
         c = prices
         if l is not None and o is not None:
-            lower = pd.concat([o, c], axis=1).min(axis=1) - l
-            return lower / o.replace(0, float("nan"))
+            import numpy as np
+            lower = np.minimum(o.values, c.values) - l.values if hasattr(l, 'values') else (np.minimum(o, c) - l)
+            return pd.DataFrame(lower, index=prices.index, columns=prices.columns) / o.replace(0, float("nan"))
         return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
 
 

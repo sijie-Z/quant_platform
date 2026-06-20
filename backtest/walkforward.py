@@ -220,8 +220,10 @@ class WalkForwardValidator:
         if not oos_returns_list:
             raise ValueError("All walk-forward folds failed")
 
-        oos_returns = pd.concat(oos_returns_list)
+        oos_returns = pd.concat(oos_returns_list)[~pd.concat(oos_returns_list).index.duplicated(keep="first")].sort_index()
         oos_benchmark = pd.concat(oos_benchmark_list) if oos_benchmark_list else None
+        if oos_benchmark is not None and oos_benchmark.index.duplicated().any():
+            oos_benchmark = oos_benchmark[~oos_benchmark.index.duplicated(keep="first")].sort_index()
 
         aggregate = all_metrics(oos_returns, oos_benchmark)
 
