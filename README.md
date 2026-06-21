@@ -7,7 +7,7 @@
   <img src="https://img.shields.io/badge/Oracle%20IC-1.000000-success" alt="Oracle IC">
   <img src="https://img.shields.io/badge/MVO-60%2F60%20Success-success" alt="MVO Audit">
   <img src="https://img.shields.io/badge/已知%20Alpha%20恢复-IC%200.025-blue" alt="Known Alpha">
-  <img src="https://img.shields.io/badge/Python%20模块-143-blueviolet" alt="Modules">
+  <img src="https://img.shields.io/badge/Python%20模块-156-blueviolet" alt="Modules">
   <img src="https://img.shields.io/badge/API%20端点-97-red?logo=fastapi" alt="API">
   <img src="https://img.shields.io/badge/开源协议-MIT-green" alt="License">
 </p>
