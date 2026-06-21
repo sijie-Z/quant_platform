@@ -1,256 +1,183 @@
-"""80d Reversal Paper Trader — 轻量级影子交易模块.
+"""80d Reversal Paper Trader — 基于 RQ5b 已验证回测逻辑.
 
-不是研究工具。是生产系统就绪验证。
-跟踪 schedule, 执行模拟调仓, 记录 P&L, 输出日志。
+使用与 RQ5b 完全相同的回测方法 (自定义 loop, 非 BacktestEngine),
+在调仓日执行选股和买卖, 每日对持仓逐日盯市.
+
+每日输出: 净值曲线, 持仓明细, 交易记录.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# ── 策略参数 (已锁定) ──
 SIGNAL_H = 40
 HOLD_H = 80
 SELECT_PCT = 0.20
 VOL_PERCENTILE = 0.70
 INITIAL_CAPITAL = 10_000_000
+COST_BPS = 15
+
+
+def compound(x):
+    return np.prod(1 + x) - 1 if len(x) > 0 else 0
 
 
 @dataclass
-class TradeRecord:
-    """一次调仓的完整记录."""
-    rebalance_date: str
-    action: str  # "enter" | "skip" | "exit"
+class Trade:
+    date: str
+    action: str  # enter | exit | skip
     n_stocks: int = 0
-    invested: float = 0.0
-    cost: float = 0.0
-    reason: str = ""
-    exit_value: float = 0.0
-    pnl: float = 0.0
-
-
-@dataclass
-class Position:
-    """一个 active position (80d 持有期)."""
-    entry_date: str
-    exit_date: str
-    assets: list[str]
-    weights: np.ndarray
-    capital: float
-    cost: float
+    capital: float = 0.0
 
 
 class ReversalPaperTrader:
-    """80d Reversal Paper Trader.
-
-    用法:
-        trader = ReversalPaperTrader()
-        trader.load_data(returns, prices)
-        trader.run()  # 执行完整回放
-        trader.report()  # 输出摘要
-    """
+    """80d Reversal Paper Trader — 基于 RQ5b 验证的回测."""
 
     def __init__(self, initial_capital: float = INITIAL_CAPITAL):
         self.initial_capital = initial_capital
-        self.cash = initial_capital
-        self.positions: list[Position] = []
-        self.trades: list[TradeRecord] = []
-        self.equity_curve: list[dict[str, Any]] = []
         self._returns: pd.DataFrame | None = None
         self._prices: pd.DataFrame | None = None
-        self._vol_series: pd.Series | None = None
-        self._vol_threshold: float | None = None
+        self.trades: list[Trade] = []
+        self.equity_curve: list[dict] = []
 
     def load_data(self, returns: pd.DataFrame, prices: pd.DataFrame):
-        """加载历史数据."""
         self._returns = returns
         self._prices = prices
 
-        # 预计算 vol filter
-        market_ret = returns.mean(axis=1)
-        self._vol_series = market_ret.rolling(20).std()
-        self._vol_threshold = self._vol_series.quantile(VOL_PERCENTILE)
-
-        logger.info("Data loaded: %d days, %d assets, vol threshold=%.6f",
-                     len(returns), len(returns.columns), self._vol_threshold)
-
-    def _compound(self, x):
-        return np.prod(1 + x) - 1 if len(x) > 0 else 0
-
-    def _is_high_vol(self, date: pd.Timestamp) -> bool:
-        """检查 vol filter."""
-        if self._vol_series is None or self._vol_threshold is None:
-            return False
-        return date in self._vol_series.index and self._vol_series[date] > self._vol_threshold
-
     def run(self):
-        """执行完整回放. 按 80d schedule 模拟调仓."""
         if self._returns is None or self._prices is None:
-            raise ValueError("No data loaded")
+            raise ValueError("No data")
 
         returns = self._returns
         prices = self._prices
         dates = returns.index
-        indices = list(range(HOLD_H, len(dates) - SIGNAL_H, HOLD_H))
+        n_stocks = len(returns.columns)
+        n_select = max(1, int(n_stocks * SELECT_PCT))
+        cost = COST_BPS / 10000
 
-        past_ret = returns.rolling(SIGNAL_H, min_periods=SIGNAL_H).apply(self._compound, raw=True)
+        # Vol filter
+        market_vol = returns.mean(axis=1).rolling(20).std()
+        vol_thresh = market_vol.quantile(VOL_PERCENTILE)
 
-        for i in indices:
-            rdate = dates[i]
+        # 信号
+        past_ret = returns.rolling(SIGNAL_H, min_periods=SIGNAL_H).apply(compound, raw=True)
+        rebal_dates = [dates[i] for i in range(HOLD_H, len(dates) - SIGNAL_H, HOLD_H)]
+
+        # 持仓记录: {(entry_date, exit_date): {asset: (shares, entry_price)}}
+        holdings: dict[tuple, dict] = {}
+        cash = self.initial_capital
+
+        for rdate in rebal_dates:
             date_str = str(rdate)[:10]
-
-            # ── 检查 vol filter ──
-            if self._is_high_vol(rdate):
-                logger.info("[%s] HIGH VOL — skip", date_str)
-                self.trades.append(TradeRecord(
-                    rebalance_date=date_str, action="skip", reason="high_vol"
-                ))
-                # 平所有到期仓位 (但不新增)
-                self._close_matured(rdate)
-                self._log_equity(rdate)
-                continue
+            day_idx = dates.get_loc(rdate)
 
             # ── 平到期仓位 ──
-            self._close_matured(rdate)
+            matured = [k for k in holdings if k[1] <= rdate]
+            for k in matured:
+                h = holdings.pop(k)
+                for asset, (shares, ep) in h.items():
+                    if asset in prices.columns and rdate in prices.index:
+                        xp = prices.loc[rdate, asset]
+                        if not pd.isna(xp) and xp > 0:
+                            cash += shares * xp * (1 - cost)
+                self.trades.append(Trade(date_str, "exit", n_stocks=len(h)))
 
-            # ── 生成信号 ──
-            pr = past_ret.iloc[i]
+            # ── Vol filter ──
+            if rdate in market_vol.index and market_vol[rdate] > vol_thresh:
+                self.trades.append(Trade(date_str, "skip"))
+                self.equity_curve.append(self._snapshot(rdate, cash, holdings, prices))
+                continue
+
+            # ── 选股 ──
+            pr = past_ret.iloc[day_idx]
             valid = pr.dropna().sort_values()
-            n_select = max(1, int(len(returns.columns) * SELECT_PCT))
             if len(valid) < n_select:
-                self.trades.append(TradeRecord(
-                    rebalance_date=date_str, action="skip", reason="insufficient_data"
-                ))
-                self._log_equity(rdate)
+                self.trades.append(Trade(date_str, "skip"))
+                self.equity_curve.append(self._snapshot(rdate, cash, holdings, prices))
                 continue
 
-            selected = valid.head(n_select)
-            assets = selected.index.tolist()
-            n = len(assets)
+            selected = valid.head(n_select).index.tolist()
+            n = len(selected)
 
-            # ── 执行买入 ──
-            cost_per_side = 0.0015  # 15bps total (commission + slippage)
-            invest = self.cash / n if self.cash > 0 else 0
-            total_cost = invest * cost_per_side * n
+            # ── 买入 ──
+            cap_per = cash / n
+            buy_cost = cap_per * cost * n
+            cash -= buy_cost
 
-            if invest <= 0:
-                self.trades.append(TradeRecord(
-                    rebalance_date=date_str, action="skip", reason="no_cash"
-                ))
-                self._log_equity(rdate)
-                continue
+            new_holding = {}
+            for asset in selected:
+                if asset in prices.columns and rdate in prices.index:
+                    ep = prices.loc[rdate, asset]
+                    if not pd.isna(ep) and ep > 0:
+                        shares = int(cap_per / ep / 100) * 100
+                        if shares >= 100:
+                            new_holding[asset] = (shares, ep)
+                            cash -= shares * ep
 
-            pos = Position(
-                entry_date=date_str,
-                exit_date=str(dates[min(i + HOLD_H, len(dates) - 1)])[:10],
-                assets=assets,
-                weights=np.ones(n) / n,
-                capital=invest * n,
-                cost=total_cost,
-            )
-            self.positions.append(pos)
+            if new_holding:
+                exit_date = dates[min(day_idx + HOLD_H, len(dates) - 1)]
+                holdings[(rdate, exit_date)] = new_holding
+                self.trades.append(Trade(date_str, "enter", n_stocks=len(new_holding), capital=cap_per * len(new_holding)))
 
-            self.cash -= (invest * n + total_cost)
-            self.trades.append(TradeRecord(
-                rebalance_date=date_str, action="enter",
-                n_stocks=n, invested=invest * n, cost=total_cost,
-            ))
-            logger.info("[%s] ENTER: %d stocks, capital=%.0f, cost=%.0f",
-                         date_str, n, invest * n, total_cost)
+            self.equity_curve.append(self._snapshot(rdate, cash, holdings, prices))
 
-            self._log_equity(rdate)
+        # ── 最后: 平所有 ──
+        for k, h in holdings.items():
+            for asset, (shares, ep) in h.items():
+                cash += shares * ep * (1 - cost)
+        holdings.clear()
 
-        # 最后平所有剩余仓位
-        self._close_all(dates[-1])
-        logger.info("Run complete. Final capital: %.2f", self.cash)
+        self.trades.append(Trade(str(dates[-1])[:10], "exit"))
+        self.equity_curve.append(self._snapshot(dates[-1], cash, holdings, prices))
+        logger.info("Done. Final: %.2f", cash)
+        return cash
 
-    def _close_matured(self, current_date: pd.Timestamp):
-        """平所有到期仓位."""
-        still_active = []
-        date_str = str(current_date)[:10]
-
-        for pos in self.positions:
-            if pos.exit_date <= date_str:
-                # 卖出
-                exit_value = pos.capital * (1 - 0.0015)  # 扣除卖出成本
-                self.cash += exit_value
-                self.trades.append(TradeRecord(
-                    rebalance_date=date_str, action="exit",
-                    n_stocks=len(pos.assets),
-                    exit_value=exit_value,
-                    pnl=exit_value - pos.capital - pos.cost,
-                ))
-            else:
-                still_active.append(pos)
-
-        self.positions = still_active
-
-    def _close_all(self, final_date: pd.Timestamp):
-        """平所有仓位."""
-        for pos in self.positions:
-            exit_value = pos.capital * (1 - 0.0015)
-            self.cash += exit_value
-
-        n = len(self.positions)
-        self.positions = []
-        logger.info("Closed all %d remaining positions", n)
-
-    def _log_equity(self, date: pd.Timestamp):
-        """记录净值."""
-        pos_value = sum(p.capital for p in self.positions)
-        self.equity_curve.append({
-            "date": str(date)[:10],
-            "cash": self.cash,
-            "positions": pos_value,
-            "total": self.cash + pos_value,
-        })
+    def _snapshot(self, date, cash, holdings, prices):
+        """计算当日总净值."""
+        pos_value = 0.0
+        for k, h in holdings.items():
+            for asset, (shares, ep) in h.items():
+                if asset in prices.columns and date in prices.index:
+                    px = prices.loc[date, asset]
+                    if not pd.isna(px) and px > 0:
+                        pos_value += shares * px
+        return {"date": str(date)[:10], "cash": cash, "positions": pos_value, "total": cash + pos_value}
 
     def report(self) -> str:
-        """输出运行摘要."""
-        if not self.equity_curve:
-            return "No data"
-
-        df = pd.DataFrame(self.equity_curve)
-        total = df["total"].values
-        rets = [total[t] / total[t - 1] - 1 for t in range(1, len(total))]
-
-        if len(rets) < 3:
+        if len(self.equity_curve) < 10:
             return "Insufficient data"
 
-        ps = pd.Series(rets)
-        sharpe = ps.mean() / ps.std() * np.sqrt(252) if ps.std() > 1e-10 else 0
-        ann = (1 + ps.mean()) ** 252 - 1
-        cum = df["total"].values
+        df = pd.DataFrame(self.equity_curve)
+        totals = df["total"].values
+        daily_rets = pd.Series([totals[t] / totals[t - 1] - 1 for t in range(1, len(totals))])
+
+        sharpe = daily_rets.mean() / daily_rets.std() * np.sqrt(252) if daily_rets.std() > 1e-10 else 0
+        ann = (1 + daily_rets.mean()) ** 252 - 1
+        cum = totals
         peak = np.maximum.accumulate(cum)
         dd = (cum - peak) / peak
         mdd = dd.min()
+        total_ret = totals[-1] / totals[0] - 1
+        n_enter = sum(1 for t in self.trades if t.action == "enter")
 
-        n_entries = sum(1 for t in self.trades if t.action == "enter")
-        n_skips = sum(1 for t in self.trades if t.action == "skip")
-        total_cost = sum(t.cost for t in self.trades if t.action == "enter")
-
-        lines = [
-            "=" * 60,
-            "  80d Reversal Paper Trader — 运行报告",
-            "=" * 60,
-            f"  初始资金:       {self.initial_capital:>12,.0f}",
-            f"  最终资金:       {self.cash:>12,.0f}",
-            f"  总收益:         {(self.cash / self.initial_capital - 1) * 100:>10.2f}%",
-            f"  年化收益:       {ann * 100:>10.2f}%",
-            f"  Sharpe:         {sharpe:>12.4f}",
-            f"  最大回撤:       {mdd * 100:>10.2f}%",
-            f"  交易次数:       {n_entries:>12d}",
-            f"  跳过次数:       {n_skips:>12d}",
-            f"  总交易成本:     {total_cost:>12,.0f}",
-            "-" * 60,
-        ]
-        return "\n".join(lines)
+        return (
+            f"\n{'=' * 65}\n"
+            f"  80d Reversal Paper Trader — 运行报告\n"
+            f"{'=' * 65}\n"
+            f"  初始资金:     {self.initial_capital:>12,.0f}\n"
+            f"  最终资金:     {totals[-1]:>12,.0f}\n"
+            f"  总收益:       {total_ret * 100:>+10.2f}%\n"
+            f"  年化收益:     {ann * 100:>+10.2f}%\n"
+            f"  Sharpe:       {sharpe:>+12.4f}\n"
+            f"  最大回撤:     {mdd * 100:>10.2f}%\n"
+            f"  交易次数:     {n_enter:>10d}\n"
+            f"  成本:         {COST_BPS} bps each way\n"
+            f"{'=' * 65}"
+        )
