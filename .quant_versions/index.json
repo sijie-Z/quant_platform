@@ -82,5 +82,138 @@
     "description": "Run: alpha=equal_weight optimizer=mean_variance",
     "run_id": "",
     "config_hash": "858f7bbc1f3b"
+  },
+  "v13": {
+    "id": "v13",
+    "timestamp": "2026-06-17T22:37:57",
+    "description": "Run: alpha=icir_weighted optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "6a9015ff71ef"
+  },
+  "v14": {
+    "id": "v14",
+    "timestamp": "2026-06-18T21:04:50",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "858f7bbc1f3b"
+  },
+  "v15": {
+    "id": "v15",
+    "timestamp": "2026-06-18T21:25:43",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "858f7bbc1f3b"
+  },
+  "v16": {
+    "id": "v16",
+    "timestamp": "2026-06-20T00:14:33",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v17": {
+    "id": "v17",
+    "timestamp": "2026-06-20T00:20:27",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v18": {
+    "id": "v18",
+    "timestamp": "2026-06-20T00:20:28",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v19": {
+    "id": "v19",
+    "timestamp": "2026-06-20T00:20:34",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v20": {
+    "id": "v20",
+    "timestamp": "2026-06-20T00:21:16",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v21": {
+    "id": "v21",
+    "timestamp": "2026-06-20T00:27:58",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v22": {
+    "id": "v22",
+    "timestamp": "2026-06-20T00:40:46",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v23": {
+    "id": "v23",
+    "timestamp": "2026-06-20T00:49:53",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v24": {
+    "id": "v24",
+    "timestamp": "2026-06-20T00:57:10",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v25": {
+    "id": "v25",
+    "timestamp": "2026-06-20T01:05:39",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v26": {
+    "id": "v26",
+    "timestamp": "2026-06-20T01:11:15",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v27": {
+    "id": "v27",
+    "timestamp": "2026-06-20T10:35:41",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v28": {
+    "id": "v28",
+    "timestamp": "2026-06-20T10:38:31",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v29": {
+    "id": "v29",
+    "timestamp": "2026-06-20T10:41:42",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v30": {
+    "id": "v30",
+    "timestamp": "2026-06-20T10:46:09",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
+  },
+  "v31": {
+    "id": "v31",
+    "timestamp": "2026-06-20T10:50:33",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "",
+    "config_hash": "faa9846f3834"
   }
 }

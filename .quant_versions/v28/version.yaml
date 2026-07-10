@@ -1,0 +1,151 @@
+alpha:
+  lookback: 252
+  method: equal_weight
+  min_icir: 0.0
+  min_tradability: 0.3
+  tradability_gate: false
+backtest:
+  benchmark: equal_weight
+  initial_capital: 10000000
+  rebalance_frequency: monthly
+costs:
+  commission: 0.0003
+  impact_model: composite
+  slippage: 0.001
+  slippage_model: impact
+  stamp_tax: 0.001
+data:
+  end_date: '2025-12-31'
+  frequency: daily
+  provider: synthetic
+  start_date: '2021-01-01'
+  synthetic:
+    alpha_strength: 0.03
+    embedded_alpha: true
+  validated: false
+execution:
+  broker_type: simulated
+  qmt:
+    account: ''
+    data_server: ''
+    mode: sim
+    password: ''
+    server: localhost:58610
+factors:
+  fundamental:
+    asset_growth:
+      enabled: true
+    log_market_cap:
+      enabled: true
+    pb_ratio:
+      enabled: true
+    pe_ratio:
+      enabled: true
+    roe:
+      enabled: true
+  processing:
+    neutralize:
+      by:
+      - sector
+      - log_market_cap
+      enabled: true
+    standardize:
+      enabled: true
+      method: zscore
+    winsorize:
+      enabled: true
+      lower: 0.01
+      upper: 0.99
+  technical:
+    amplitude_20d:
+      enabled: true
+      params:
+        period: 20
+    breakout_ignition:
+      enabled: true
+      params:
+        reference_window: 20
+        return_window: 3
+    breakout_proximity:
+      enabled: true
+      params:
+        period: 20
+    efficiency_ratio:
+      enabled: true
+      params:
+        period: 20
+    ma_convergence:
+      enabled: true
+    momentum_12m:
+      enabled: true
+      exclude_recent: 21
+      params:
+        period: 252
+    momentum_1m:
+      enabled: true
+      params:
+        period: 21
+    momentum_3m:
+      enabled: true
+      params:
+        period: 63
+    momentum_6m:
+      enabled: true
+      params:
+        period: 126
+    mtf_resonance:
+      enabled: true
+    pure_volatility:
+      enabled: true
+      params:
+        ar_lags: 30
+        window: 20
+    rsi_14d:
+      enabled: true
+      params:
+        period: 14
+    trend_stage:
+      enabled: true
+      params:
+        period: 120
+    turnover_20d:
+      enabled: true
+      params:
+        period: 20
+    volatility_20d:
+      enabled: true
+      params:
+        period: 20
+    volatility_60d:
+      enabled: true
+      params:
+        period: 60
+instruments: []
+output:
+  plot_format: png
+  results_dir: ./results
+  save_plots: true
+portfolio:
+  optimizer: mean_variance
+  risk_aversion: 1.0
+risk:
+  stress_scenarios:
+  - 2008_financial_crisis
+  - 2015_ashare_crash
+  - 2020_covid_crash
+screener:
+  enabled: false
+  logic: and
+  max_stocks: 200
+  min_stocks: 5
+  rules:
+  - factor: pe_ratio
+    operator: lt
+    value: 30
+  - factor: roe
+    operator: gt
+    value: 0.15
+universe:
+  exclude_st: true
+  exclude_suspended: true
+  n_stocks: 500
