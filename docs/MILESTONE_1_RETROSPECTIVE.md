@@ -19,6 +19,19 @@
 3. **"ROE 从季度财务指标 API 能提供可用的横截面排序"** → ❌ 伪。IC=0.0017 统计上不可与零区分。季度 carry-forward ROE 在 CSI300 内没有区分度。
 4. **"v0.1 需要 6 个 Protocol"** → ❌ 伪。M1 实际只用了 UniverseProvider + MarketDataProvider + Evaluator。FactorProtocol 没被用过（直接用了 FactorRegistry），Broker/LLM 都没有消费者。6 个里有 3 个未使用。
 
+## 复盘总结
+
+| 你问的四个问题 | 结论 |
+|-------------|------|
+| **Registry 用 JSON 保存 Trust Metadata 是否足够？** | 3 次 Run 用单条 SQL 就能回答所有跨 Run 知识查询，够用。超过 20-50 次 Run 后可能需要结构化索引，那是 M3 以后的问题。 |
+| **Report Generator 是否需要模板系统？** | 不需要。报告从 Registry 字段逐字生成，WARNING 由 `pit=false` 自动推导，零手工，零硬编码。现状足够。 |
+| **6 个 Protocol 是否真的足够？** | 够，甚至多余。实际被消费者使用的只有 3 个（UniverseProvider / MarketDataProvider / Evaluator），其余 3 个（Broker / LLM / FactorProtocol）没有消费者——正确，不应该提前抽象。 |
+| **"Run 不抽象 Runner" 是否一直成立？** | 成立。3 个 Factor = 3 个独立脚本，零共享抽象，零 PipelineManager。第四因子只需新增 1 个文件，路径复用性的证据确凿。 |
+
+## M1 结论
+
+Milestone 1 已验证完毕并已锁存。`v0.1-research-os` tag 不可回改。所有后续工作围绕这个稳定基线构建，架构变化通过新 ADR 和新版本 tag 演化。
+
 ## 不该做的事
 
 1. **设计 Factor Registry table** — 现有的 `lab/registry/__init__.py RunStore` 已经够用。M1 不需要单独的 factor_registry 表或 FactorProtocol。
