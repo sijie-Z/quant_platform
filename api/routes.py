@@ -1988,16 +1988,17 @@ _risk_monitor = None
 
 
 def _get_risk_monitor():
+    """Return the process-wide RiskMonitor.
+
+    This previously built its own instance with an explicit RiskLimits(...)
+    whose five values are identical to the dataclass defaults, so routing it
+    through the shared singleton does not change any limit -- it only makes
+    /api/risk/* act on the same object the engine checks.
+    """
     global _risk_monitor
     if _risk_monitor is None:
-        from quant_platform.risk.circuit_breaker import RiskLimits, RiskMonitor
-        _risk_monitor = RiskMonitor(RiskLimits(
-            max_single_position_pct=0.05,
-            max_sector_pct=0.30,
-            max_daily_loss_pct=0.03,
-            max_drawdown_pct=0.15,
-            kill_drawdown_pct=0.25,
-        ))
+        from quant_platform.risk.circuit_breaker import get_risk_monitor
+        _risk_monitor = get_risk_monitor()
     return _risk_monitor
 
 
