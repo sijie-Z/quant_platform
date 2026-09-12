@@ -9,9 +9,15 @@
 
 # Python virtualenvs & caches — CRITICAL: a host .venv copied into a Linux
 # image contains foreign binaries and can shadow the container's own packages.
-.venv/
-venv/
-env/
+# Patterns are matched with Go's filepath.Match: a trailing slash does NOT
+# behave like it does in .gitignore, so `.venv*/` silently matched nothing and
+# a 649 MB Windows venv stayed in the context. Use bare globs.
+.venv
+.venv*
+venv
+venv*
+env
+env*
 __pycache__/
 *.py[cod]
 *.egg-info/
