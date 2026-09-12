@@ -120,8 +120,8 @@ def _get_risk():
     global _core_risk
     if _core_risk is None:
         try:
-            from quant_platform.risk.circuit_breaker import RiskMonitor
-            _core_risk = RiskMonitor()
+            from quant_platform.risk.circuit_breaker import get_risk_monitor
+            _core_risk = get_risk_monitor()
         except Exception:
             pass
     return _core_risk
