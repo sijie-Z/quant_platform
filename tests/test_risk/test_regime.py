@@ -97,3 +97,29 @@ class TestCompositeDetector:
         detector = CompositeRegimeDetector()
         result = detector.detect(sample_returns, sample_prices, sample_returns_matrix)
         assert "correlation" in result
+
+    def test_execution_params_are_returned(self, sample_returns, sample_prices):
+        """Regression: this forwarded no arguments to detect() and always raised."""
+        params = CompositeRegimeDetector().get_execution_params(sample_returns, sample_prices)
+        assert params["regime"] in ["bear", "range", "bull"]
+        assert set(params) == {
+            "regime",
+            "max_position_pct",
+            "max_total_positions",
+            "stop_loss_pct",
+            "take_profit_pct",
+            "max_leverage",
+            "risk_multiplier",
+            "composite_risk_score",
+            "recommendation",
+        }
+        assert 0 < params["risk_multiplier"] <= 1
+        assert 0 <= params["composite_risk_score"] <= 1
+
+    def test_execution_params_accept_correlation_matrix(
+        self, sample_returns, sample_prices, sample_returns_matrix
+    ):
+        params = CompositeRegimeDetector().get_execution_params(
+            sample_returns, sample_prices, sample_returns_matrix
+        )
+        assert params["max_total_positions"] >= 1

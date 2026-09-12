@@ -14,10 +14,10 @@ sys.path.insert(0, str(_project_root.parent))
 
 # 直接 import router (加入 regime_router 路径)
 sys.path.insert(0, str(_project_root / "regime_router"))
+import numpy as np
+import pandas as pd
 from router import RegimeRouterStub
 
-import pandas as pd
-import numpy as np
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import setup_logging
@@ -70,7 +70,7 @@ def main():
     # 与 RQ5b 结果对照
     print()
     print("  RQ5b 对照 (S=40, H=80):")
-    print(f"    RQ5b 自定义回测 Sharpe: 0.4503")
+    print("    RQ5b 自定义回测 Sharpe: 0.4503")
     print(f"    本系统引擎回测 Sharpe: {summary.get('sharpe_ratio', 0):.4f}")
     print()
 

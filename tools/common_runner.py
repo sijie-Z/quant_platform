@@ -13,20 +13,34 @@
 
 from __future__ import annotations
 
-import sys, os, time, traceback, json
+import json
+import os
+import sys
+import time
+import traceback
 from pathlib import Path
 
 # Flat-layout requires D:/Desktop on sys.path before importing quant_platform
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # D:/Desktop
 sys.path.insert(0, "D:/Desktop")
 
-import numpy as np, pandas as pd, akshare as ak  # noqa: E402
-
+import akshare as ak  # noqa: E402
+import numpy as np
+import pandas as pd
 from quant_platform.factors.evaluation import ic_summary  # noqa: E402
-from quant_platform.factors.technical import Momentum12M, Volatility20D, Volatility60D, Momentum1M, Momentum3M, Momentum6M, RSIFactor, MACDFactor, TurnoverFactor  # noqa: E402
+from quant_platform.factors.technical import (  # noqa: E402
+    MACDFactor,
+    Momentum1M,
+    Momentum3M,
+    Momentum6M,
+    Momentum12M,
+    RSIFactor,
+    TurnoverFactor,
+    Volatility20D,
+    Volatility60D,
+)
 from quant_platform.lab.registry import DEFAULT_DB, RunStore  # noqa: E402
 from quant_platform.lab.reports import generate_report  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # 因子目录 — 每个因子是一个 compute(prices, rets) -> (date x asset) DataFrame 的函数

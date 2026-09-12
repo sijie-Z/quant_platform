@@ -12,12 +12,11 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
 import numpy as np
-
+import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
-from quant_platform.utils.logging import setup_logging, get_logger
+from quant_platform.utils.logging import get_logger, setup_logging
 
 setup_logging()
 logger = get_logger("cost")
@@ -124,7 +123,6 @@ def backtest_with_cost(returns, prices, use_vol_filter=False,
     # 计算收益序列
     df = pd.DataFrame(portfolio_log)
     values = df["value"].values
-    period_rets = np.diff(values) / values[:-1] + 1  # 太粗略了
 
     # 直接用每期收益
     ps = pd.Series([(values[t] / values[t-1] - 1) for t in range(1, len(values))])
@@ -183,11 +181,11 @@ def main():
     print(f"  无成本 Sharpe: {baseline:.4f}")
     print(f"  中成本 Sharpe: {mid:.4f}")
     if mid > 0.3:
-        print(f"  -> Net Sharpe > 0.3: VIABLE (可交易)")
+        print("  -> Net Sharpe > 0.3: VIABLE (可交易)")
     elif mid > 0.2:
-        print(f"  -> Net Sharpe 0.2-0.3: MARGINAL (边际)")
+        print("  -> Net Sharpe 0.2-0.3: MARGINAL (边际)")
     else:
-        print(f"  -> Net Sharpe < 0.2: NOT TRADABLE (不可交易)")
+        print("  -> Net Sharpe < 0.2: NOT TRADABLE (不可交易)")
     print("=" * 90)
 
 

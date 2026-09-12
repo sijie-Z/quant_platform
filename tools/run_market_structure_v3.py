@@ -15,16 +15,15 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
 import numpy as np
-from scipy import stats as scipy_stats
-
+import pandas as pd
+from quant_platform.backtest.cost_model import CostModel
+from quant_platform.backtest.engine import BacktestEngine
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
-from quant_platform.backtest.engine import BacktestEngine
-from quant_platform.backtest.cost_model import CostModel
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger, setup_logging
+from scipy import stats as scipy_stats
 
 setup_logging()
 logger = get_logger("ms3")
@@ -118,7 +117,6 @@ def run():
     prices, returns, benchmark, metadata = load_data()
 
     # Build market cap and sector data
-    mcap = None
     sector_map = None
     if metadata is not None:
         if "sector" in metadata.columns and metadata["sector"].nunique() > 1:
@@ -146,7 +144,7 @@ def run():
         # Build reversal signal: -rank(past_H_return)
         logger.info("  Backtest H=%d...", H)
         past_ret = returns.rolling(H).apply(
-            lambda x: np.prod(1 + x) - 1 if len(x) == H else np.nan, raw=True
+            lambda x, H=H: np.prod(1 + x) - 1 if len(x) == H else np.nan, raw=True
         )
         signal = -past_ret.rank(axis=1, pct=True) + 0.5  # Reversal signal
 
@@ -179,8 +177,6 @@ def run():
     logger.info("[3/3] RQ6: Size Bucket Analysis...")
     # Use proxy: divide stocks by average price (no mcap in data)
     avg_price = prices.mean()
-    n_stocks = len(avg_price)
-    terciles = [avg_price.quantile(q) for q in [1/3, 2/3]]
 
     small_mask = avg_price <= avg_price.quantile(1/3)
     mid_mask = (avg_price > avg_price.quantile(1/3)) & (avg_price <= avg_price.quantile(2/3))

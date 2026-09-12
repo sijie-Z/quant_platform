@@ -1,7 +1,6 @@
 """P4 smoke tests: web server health and paper trading loop."""
 
 from fastapi.testclient import TestClient
-
 from quant_platform.app import create_app
 from quant_platform.trading.live_runner import LiveRunner
 

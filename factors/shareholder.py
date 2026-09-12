@@ -11,6 +11,7 @@ Data source: akshare (stock_gdfx_top_10_em) — free, no API key.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
 import pandas as pd
 
 from quant_platform.utils.logging import get_logger
@@ -96,10 +97,7 @@ class ShareholderStructure:
 
 def _keyword_match(name: str, keywords: list[str]) -> bool:
     """Check if shareholder name matches any keyword."""
-    for kw in keywords:
-        if kw in name:
-            return True
-    return False
+    return any(kw in name for kw in keywords)
 
 
 def _is_etf(name: str) -> bool:

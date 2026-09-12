@@ -38,7 +38,7 @@ class ReconReport:
 
     def print(self):
         print(f"\n{'=' * 60}")
-        print(f"  Reconciliation Report")
+        print("  Reconciliation Report")
         print(f"{'=' * 60}")
         print(f"  Positions: {self.total_positions}")
         print(f"  Matched:   {self.matched}")
@@ -46,7 +46,7 @@ class ReconReport:
         print(f"  Cash diff: {self.cash_diff:>+.2f}")
         print(f"  Status:    {'PASS' if self.passes else 'FAIL'}")
         if self.mismatched > 0:
-            print(f"\n  Mismatched positions:")
+            print("\n  Mismatched positions:")
             for p in self.details:
                 if not p.is_matched:
                     print(f"    {p.asset}: expected={p.expected_shares} actual={p.actual_shares}")

@@ -27,7 +27,12 @@ websocket-client==1.9.0
 httpx==0.28.1
 
 # ML
-xgboost==2.1.4
+# xgboost-cpu, not xgboost: the plain PyPI wheel hard-depends on
+# nvidia-nccl-cu12 (342 MB) on Linux x86_64. This platform is CPU-only, so
+# that dependency can never be used — it just bloats the Docker image and
+# adds ~350 MB of download to every CI install. Same version, same `xgboost`
+# module, same API.
+xgboost-cpu==2.1.4
 lightgbm==4.5.0
 shap==0.46.0
 

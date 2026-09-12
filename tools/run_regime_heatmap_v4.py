@@ -14,13 +14,14 @@ Protocol frozen. Results only.
 
 import sys
 from pathlib import Path
+
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
-import numpy as np
 from collections import defaultdict
 
+import numpy as np
+import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
@@ -229,7 +230,7 @@ def run():
         print()
         k40 = [r for r in all_results if r["signal_h"] == 40 and r["hold_h"] == 80]
         if k40:
-            print(f"  Key Cell S=40 H=80 across regimes:")
+            print("  Key Cell S=40 H=80 across regimes:")
             for k in k40:
                 for rn in sorted(all_regime_names):
                     v = k.get(f"Sharpe_{rn}", np.nan)
@@ -238,7 +239,7 @@ def run():
 
         # State persistence
         print()
-        print(f"  State Persistence:")
+        print("  State Persistence:")
         print()
         transitions = defaultdict(int)
         state_durations = defaultdict(list)
@@ -254,7 +255,7 @@ def run():
                 current_start = date
 
         print(f"  {'State':<12} {'Avg Dur':>8} {'Max Dur':>8} {'N':>5}")
-        for state in sorted([s for s in state_durations.keys() if isinstance(s, str)]):
+        for state in sorted([s for s in state_durations if isinstance(s, str)]):
             durations = state_durations[state]
             print(f"  {state:<12} {np.mean(durations):>8.1f}d {max(durations):>8.0f}d {len(durations):>5d}")
 

@@ -1,16 +1,17 @@
 """Tests for ExecutionEngine and Order state machine."""
 
-import pytest
 from datetime import datetime
+
+import pytest
 
 from quant_platform.execution.engine import (
     ExecutionEngine,
     OrderSide,
     OrderStatus,
-    validate_order_transition,
-    transition_order,
     apply_fill,
+    transition_order,
     update_position,
+    validate_order_transition,
 )
 from quant_platform.execution.models import Fill, Order, Position
 

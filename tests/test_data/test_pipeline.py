@@ -2,7 +2,6 @@
 
 
 import pandas as pd
-
 from quant_platform.data.pipeline import DataPipeline
 
 

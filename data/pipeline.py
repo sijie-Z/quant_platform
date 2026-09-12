@@ -256,7 +256,6 @@ class DataPipeline:
     def _remove_long_suspensions(self, df: pd.DataFrame) -> pd.DataFrame:
         """Drop assets with a consecutive suspension run longer than the limit."""
         close = df["close"].unstack("asset")
-        suspended = close.isna()
         drop_assets = []
         for asset in close.columns:
             is_nan = close[asset].isna()

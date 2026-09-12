@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+
 import pytest
 
 from quant_platform.core.protocols import (
-    AccountState, Position, Order, Fill, Signal,
-    PortfolioSnapshot, Recommendation,
-    OrderSide, OrderStatus, OrderType, RecommendationAction,
-    validate_protocol, validate_weights,
+    AccountState,
+    Fill,
+    Order,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    PortfolioSnapshot,
+    Position,
+    Recommendation,
+    RecommendationAction,
+    Signal,
+    validate_protocol,
+    validate_weights,
 )
 
 

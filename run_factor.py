@@ -12,13 +12,18 @@ Engineering Sanity.
 
 Each factor is a ~10-line compute function. No new scripts needed.
 """
-import sys, os, time, json, sqlite3, math
+import json
+import math
+import os
+import sqlite3
+import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, "D:/Desktop")
 import akshare as ak
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 DB = "data/trading.db"
 C, S, P = 0.0003, 0.001, 0.0005
@@ -200,8 +205,8 @@ def backtest(factor_panel, rets, all_dates, rebals, ny,
     dr = pd.Series(daily_rets, index=all_dates)
     cagr = (capital / INITIAL) ** (1 / ny) - 1
     sharpe = float((dr.mean() / (dr.std() + 1e-12)) * np.sqrt(252))
-    dd = float(((dr.cumsum() + np.log(INITIAL) -
-                 (dr.cumsum() + np.log(INITIAL)).cummax()).min() / INITIAL))
+    dd = float((dr.cumsum() + np.log(INITIAL) -
+                 (dr.cumsum() + np.log(INITIAL)).cummax()).min() / INITIAL)
     avg_to = float(np.mean(turnover_log)) if turnover_log else 0
     return {"cagr": cagr, "sharpe": sharpe, "max_dd": dd,
             "avg_turnover": avg_to, "daily_rets": dr,
@@ -354,7 +359,7 @@ def run_factor_report(factor_key):
     print(f"  {'[4]':<5} Net portfolio:       {base['cagr']:>+8.2%}")
     print(f"  {'[5]':<5} – Benchmark gap:     {-market_excess:>+8.2%}")
     print(f"  {'':<5} = Net Excess:           {market_excess:>+8.2%}")
-    print(f"")
+    print("")
     print(f"  Weight Loss: {abs(weight_loss)/(abs(theo_ann)+1e-8)*100:.0f}%  "
           f"Cost: {abs(annual_cost_drag)/(abs(theo_ann)+1e-8)*100:.0f}%")
     print("")

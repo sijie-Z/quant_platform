@@ -11,14 +11,12 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import pytest
-
 from quant_platform.portfolio.screener import (
-    FactorScreener,
     OPERATORS,
+    FactorScreener,
     ScreenConfig,
     ScreenRule,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

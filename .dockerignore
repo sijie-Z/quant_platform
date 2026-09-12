@@ -1,0 +1,53 @@
+# Build context exclusions.
+# Without this, `COPY . .` drags a Windows .venv (350 MB), the frontend's
+# node_modules (100 MB) and .git into the image.
+
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Python virtualenvs & caches — CRITICAL: a host .venv copied into a Linux
+# image contains foreign binaries and can shadow the container's own packages.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.quant_cache/
+.sentiment_cache/
+.agent_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Frontend — built inside the image by the Dockerfile, never copied in
+frontend/node_modules/
+frontend/dist/
+node_modules/
+
+# Runtime state & generated artifacts
+data/*.db
+data/reports/
+results/
+notebooks/
+_third_slice.log
+*.log
+
+# Local secrets / config
+.env
+.env.local
+
+# Docs & editor noise
+docs/
+*.md
+!README.md
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

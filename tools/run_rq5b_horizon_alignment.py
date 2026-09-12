@@ -20,9 +20,8 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
 import numpy as np
-
+import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
@@ -83,10 +82,8 @@ def backtest_horizon(returns, signal_horizon, holding_horizon):
 
     # Rebalance dates: every `step` days
     rebalance_indices = list(range(step, len(dates) - signal_horizon, step))
-    rebalance_dates = [dates[i] for i in rebalance_indices]
 
     portfolio_returns = []
-    weights_history = []
 
     for i, idx in enumerate(rebalance_indices):
         rdate = dates[idx]
@@ -99,7 +96,6 @@ def backtest_horizon(returns, signal_horizon, holding_horizon):
             continue
 
         selected = valid.head(n_select)
-        w = 1.0 / len(selected)
 
         # Compute holding period return
         next_idx = idx + step
@@ -190,11 +186,8 @@ def run():
     print()
     print("─── Phase 2: 2D Sharpe Matrix ───")
     print()
-    print(f"  Sharpe(Signal_H × Hold_H):")
+    print("  Sharpe(Signal_H × Hold_H):")
     print()
-    sig_labels = [f"S{sig_h}" for sig_h in SIGNAL_HORIZONS]
-    hold_labels = [f"H{hold_h}" for hold_h in HOLDING_HORIZONS]
-
     # Create matrix
     matrix = {}
     for r in matrix_results:
@@ -202,7 +195,8 @@ def run():
         matrix[key] = r["sharpe"]
 
     # Print header
-    print(f"  {'Sig\\Hold':>10}", end="")
+    _sig_hold = "Sig\\Hold"  # hoisted: backslash inside an f-string expression needs Python 3.12+
+    print(f"  {_sig_hold:>10}", end="")
     for hh in HOLDING_HORIZONS:
         print(f"  H={hh:<5d}", end="")
     print()

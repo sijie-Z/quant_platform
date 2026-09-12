@@ -1919,7 +1919,7 @@ async def screen_stocks(req: ScreenRequest):
         ScreenRule,
     )
 
-    config = _load_config(req.config)
+    config = load_config(req.config)
 
     n_stocks = getattr(req, 'n_stocks', None)
     if n_stocks is not None:
@@ -1931,14 +1931,14 @@ async def screen_stocks(req: ScreenRequest):
             config, use_baostock=use_baostock
         )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Data load failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Data load failed: {e}") from e
 
     try:
         processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
             prices, returns, financials, metadata, turnover, config=config,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Factor computation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Factor computation failed: {e}") from e
 
     rules = []
     for r in req.rules:

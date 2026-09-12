@@ -17,13 +17,13 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
-import numpy as np
 from itertools import product
 
+import numpy as np
+import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
-from quant_platform.utils.logging import setup_logging, get_logger
+from quant_platform.utils.logging import get_logger, setup_logging
 
 setup_logging()
 logger = get_logger("ceiling")
@@ -193,7 +193,7 @@ def main():
     if best[1]["sharpe"] > baseline["sharpe"] + 0.05 and best[1]["n"] >= 8:
         print(f"  => +0.45 不是上限。存在稳定提升空间 (delta={best[1]['sharpe']-baseline['sharpe']:+.4f})")
     else:
-        print(f"  => +0.45 接近结构上限。小幅扩展未产生稳定提升。")
+        print("  => +0.45 接近结构上限。小幅扩展未产生稳定提升。")
     print("=" * 90)
 
 

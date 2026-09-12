@@ -14,13 +14,12 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
 import numpy as np
-
+import pandas as pd
+from quant_platform.backtest.metrics import all_metrics
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
-from quant_platform.backtest.metrics import all_metrics
-from quant_platform.utils.logging import setup_logging, get_logger
+from quant_platform.utils.logging import get_logger, setup_logging
 
 setup_logging()
 logger = get_logger("probe")
@@ -170,27 +169,27 @@ def main():
 
     # ── Baseline: fixed-grid ──
     base = baseline_fixed_grid(signal, returns, past_ret, HOLD_H)
-    print(f"\nBaseline (fixed-grid 80d):")
+    print("\nBaseline (fixed-grid 80d):")
     print(f"  Sharpe={base['sharpe']:.4f}  AnnRet={base['ann_ret']*100:.2f}%  "
           f"MDD={base['mdd']*100:.2f}%  n={base['n']}")
 
     # ── Phase-conditioned (MA) ──
     pc_ma = phase_conditioned(signal, returns, past_ret, phase_ma, HOLD_H)
     if not np.isnan(pc_ma["sharpe"]):
-        print(f"\nPhase-conditioned (MA proxy):")
+        print("\nPhase-conditioned (MA proxy):")
         print(f"  Sharpe={pc_ma['sharpe']:.4f}  AnnRet={pc_ma['ann_ret']*100:.2f}%  "
               f"MDD={pc_ma['mdd']*100:.2f}%  trades={pc_ma['n']}  skipped={pc_ma['skipped']}")
     else:
-        print(f"\nPhase-conditioned (MA proxy): insufficient trades (< 3)")
+        print("\nPhase-conditioned (MA proxy): insufficient trades (< 3)")
 
     # ── Phase-conditioned (AC) ──
     pc_ac = phase_conditioned(signal, returns, past_ret, phase_ac, HOLD_H)
     if not np.isnan(pc_ac["sharpe"]):
-        print(f"\nPhase-conditioned (AC proxy):")
+        print("\nPhase-conditioned (AC proxy):")
         print(f"  Sharpe={pc_ac['sharpe']:.4f}  AnnRet={pc_ac['ann_ret']*100:.2f}%  "
               f"MDD={pc_ac['mdd']*100:.2f}%  trades={pc_ac['n']}  skipped={pc_ac['skipped']}")
     else:
-        print(f"\nPhase-conditioned (AC proxy): insufficient trades (< 3)")
+        print("\nPhase-conditioned (AC proxy): insufficient trades (< 3)")
 
     # ── 结论 ──
     print()

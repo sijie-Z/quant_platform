@@ -79,7 +79,6 @@ def _fetch_prices_for_fwd(
 
     frames = {}
     for i, code in enumerate(codes):
-        ok = False
         for _attempt in range(3):
             try:
                 df = ak.stock_zh_a_hist_tx(
@@ -89,7 +88,6 @@ def _fetch_prices_for_fwd(
                 if df is not None and not df.empty:
                     df["date"] = pd.to_datetime(df["date"])
                     frames[code] = df.set_index("date")["close"].astype(float)
-                    ok = True
                     break
             except Exception:
                 time_module.sleep(1)

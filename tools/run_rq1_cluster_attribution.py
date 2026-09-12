@@ -16,21 +16,20 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
 import numpy as np
-
-from quant_platform.factors.evaluation import rank_ic, ic_summary
-from quant_platform.factors.technical import register_all as register_technical
-from quant_platform.factors.fundamental import register_all as register_fundamental
-from quant_platform.factors.registry import get_registry
-from quant_platform.factors.processing import process_factor
+import pandas as pd
+from quant_platform.backtest.cost_model import CostModel
+from quant_platform.backtest.engine import BacktestEngine
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.synthetic import SyntheticDataProvider
-from quant_platform.backtest.engine import BacktestEngine
-from quant_platform.backtest.cost_model import CostModel
+from quant_platform.factors.evaluation import ic_summary, rank_ic
+from quant_platform.factors.fundamental import register_all as register_fundamental
+from quant_platform.factors.processing import process_factor
+from quant_platform.factors.registry import get_registry
+from quant_platform.factors.technical import register_all as register_technical
 from quant_platform.portfolio.constraints import PortfolioConstraints
-from quant_platform.utils.logging import get_logger, setup_logging
 from quant_platform.reporting.dashboard import generate_dashboard
+from quant_platform.utils.logging import get_logger, setup_logging
 
 setup_logging()
 logger = get_logger("rq1")
@@ -269,7 +268,7 @@ def print_results_table(results_list):
     print("  RQ1 — CLUSTER ATTRIBUTION RESULTS")
     print("=" * 90)
     print(f"  Data: {START_DATE} → {END_DATE}, {N_STOCKS} stocks, alpha_strength={ALPHA_STRENGTH}")
-    print(f"  Backtest: monthly rebalance, equal_weight, long-only, 5% max weight")
+    print("  Backtest: monthly rebalance, equal_weight, long-only, 5% max weight")
     print()
     print(f"  {'Experiment':<18} {'IC':>8} {'ICIR':>8} {'Sharpe':>8} {'MDD':>8} {'Turnover':>10}")
     print(f"  {'─'*18} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*10}")

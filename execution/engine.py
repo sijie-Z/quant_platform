@@ -320,9 +320,13 @@ class ExecutionEngine:
             prices: {ticker: current_price}
 
         Returns:
-            Dict with cash, positions_value, unrealized_pnl, etc.
+            Dict with positions_value, n_positions, total_unrealized_pnl,
+            total_realized_pnl and total_pnl.
+
+            Note: there is deliberately no `cash` key. Callers that need cash
+            track their own balance (see PortfolioOrchestrator.cash_available);
+            this engine only owns positions and fills.
         """
-        total_value = 0.0
         total_upnl = 0.0
         total_rpnl = 0.0
         positions_value = 0.0

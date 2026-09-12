@@ -19,11 +19,11 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.operations.reconciliation import reconcile
-from risk.safety import SafetySystem, SafetyLimits
+
+from risk.safety import SafetyLimits, SafetySystem
 from trading.live_engine import LiveEngine
 
 logger = logging.getLogger(__name__)
@@ -58,9 +58,7 @@ class Daemon:
         if now.hour < RUN_HOUR:
             return False
         today = now.strftime("%Y-%m-%d")
-        if today == self.last_run_date:
-            return False
-        return True
+        return today != self.last_run_date
 
     def run_once(self) -> dict[str, Any]:
         """执行一次完整日流程."""

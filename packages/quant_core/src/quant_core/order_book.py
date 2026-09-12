@@ -26,12 +26,11 @@ from __future__ import annotations
 
 import bisect
 import enum
+import logging
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -853,12 +852,17 @@ def benchmark_order_book(
         sym = random.choice(symbols)
         side = random.choice([Side.BUY, Side.SELL])
         # Place orders near the spread to generate trades
-        book = manager.get(sym)
+        sym_book = manager.get(sym)
+        if sym_book is None:
+            # Unreachable: every symbol is pre-populated above. Silently
+            # skipping would shrink the benchmark's sample and quietly change
+            # the throughput numbers, so fail loudly instead.
+            raise RuntimeError(f"order book missing for symbol {sym!r}")
         if side == Side.BUY:
-            ref = book.best_ask or mid_price
+            ref = sym_book.best_ask or mid_price
             price = round(ref * (1 + random.uniform(-0.001, 0.002)), 2)
         else:
-            ref = book.best_bid or mid_price
+            ref = sym_book.best_bid or mid_price
             price = round(ref * (1 + random.uniform(-0.002, 0.001)), 2)
 
         order = BookOrder(

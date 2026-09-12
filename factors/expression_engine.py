@@ -32,7 +32,8 @@ Architecture:
 from __future__ import annotations
 
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -443,7 +444,7 @@ class ScreenFilter:
     def __invert__(self):
         if self._mask is None:
             return ScreenFilter(None)
-        return ScreenFilter((1.0 - self._mask))
+        return ScreenFilter(1.0 - self._mask)
 
     def apply(self, signal):
         """Apply this filter as a screen. Failed assets get zero signal."""

@@ -30,11 +30,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-
-from quant_platform.backtest.cost_model import CostModel
 from quant_core.market_impact import (
     SquareRootModel,
 )
+
+from quant_platform.backtest.cost_model import CostModel
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)

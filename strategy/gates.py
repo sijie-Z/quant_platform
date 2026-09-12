@@ -165,7 +165,7 @@ class GateReport:
             lines.append(f"  [{icon.get(gr.status, '?')}] {gr.gate_name:<30} {gr.status:<10} {gr.message}")
 
         if self.warnings:
-            lines.append(f"\n  Warnings:")
+            lines.append("\n  Warnings:")
             for w in self.warnings:
                 lines.append(f"    WARN: {w}")
 

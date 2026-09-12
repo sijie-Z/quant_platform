@@ -20,11 +20,10 @@ Reference:
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +319,9 @@ class CompositeImpactModel:
         self,
         models: list[tuple[Any, float]] | None = None,
     ):
+        # Pinned explicitly: without it mypy joins the two branches below to
+        # list[tuple[object, float]], and the .estimate() call stops checking.
+        self.models: list[tuple[Any, float]]
         if models is None:
             # Default: equal weight across all three models
             self.models = [

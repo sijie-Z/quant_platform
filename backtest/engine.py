@@ -241,7 +241,7 @@ class BacktestEngine:
         self.portfolio_values = self.initial_capital * (1 + self.daily_returns).cumprod()
         self.portfolio_values.name = "portfolio_value"
         if turnover_records:
-            dates_idx, values = zip(*turnover_records)
+            dates_idx, values = zip(*turnover_records, strict=True)
             self.turnover_history = pd.Series(
                 values, index=pd.DatetimeIndex(dates_idx), name="turnover"
             )

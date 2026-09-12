@@ -309,7 +309,7 @@ def cmd_run(args) -> int:
     # Save factor evaluations to Factor Research Store if requested
     if getattr(args, 'save_factors', False):
         try:
-            from quant_platform.factors.store import FactorResearchStore, FactorEvalRecord
+            from quant_platform.factors.store import FactorEvalRecord, FactorResearchStore
             fs = FactorResearchStore()
             saved = 0
             for name, summary in ic_results.items():
@@ -335,8 +335,7 @@ def cmd_run(args) -> int:
 
     if screener_enabled:
         logger.info("[3/6] Running Factor Screener (boolean rules)...")
-        from quant_platform.portfolio.screener import FactorScreener, ScreenConfig
-        from quant_platform.portfolio.screener import ScreenRule
+        from quant_platform.portfolio.screener import FactorScreener, ScreenConfig, ScreenRule
 
         # Build screener from config rules
         rules = []
@@ -1183,8 +1182,8 @@ def cmd_factor(args) -> int:
 
 def cmd_factor_store(args) -> int:
     """Factor Research Store operations."""
-    from quant_platform.factors.store import FactorResearchStore, FactorDefinition
     from quant_platform.factors.registry import get_registry
+    from quant_platform.factors.store import FactorDefinition, FactorResearchStore
 
     store = FactorResearchStore()
 
@@ -1197,7 +1196,7 @@ def cmd_factor_store(args) -> int:
 
     elif args.subcommand == "rank":
         ranking = store.get_factor_ranking()
-        print(f"\n=== Factor Ranking by Health Score ===")
+        print("\n=== Factor Ranking by Health Score ===")
         print(f"  {'Rank':<4} {'Factor':<25} {'IC':<10} {'ICIR':<8} {'Coverage':<10} {'Health':<8}")
         print(f"  {'-'*4} {'-'*25} {'-'*10} {'-'*8} {'-'*10} {'-'*8}")
         for i, f in enumerate(ranking[:getattr(args, 'limit', 20)]):
@@ -1206,8 +1205,8 @@ def cmd_factor_store(args) -> int:
 
     elif args.subcommand == "register-all":
         # Register all factors into registry first
-        from quant_platform.factors.technical import register_all as register_technical
         from quant_platform.factors.fundamental import register_all as register_fundamental
+        from quant_platform.factors.technical import register_all as register_technical
         register_technical()
         register_fundamental()
         registry = get_registry()
@@ -1278,7 +1277,7 @@ def cmd_gate(args) -> int:
     Integrates IC results, walk-forward, backtest metrics, and data coverage
     into a unified PASS/WARNING/FAIL/REJECTED gate report.
     """
-    from quant_platform.strategy.gates import GateRunner, GateConfig
+    from quant_platform.strategy.gates import GateConfig, GateRunner
 
     config = load_config(_resolve_config_path(args.config))
 
@@ -1298,9 +1297,9 @@ def cmd_gate(args) -> int:
         prices, returns, financials, metadata, turnover, config=config)
 
     # Estimate factor params count
-    from quant_platform.factors.technical import register_all as register_technical
     from quant_platform.factors.fundamental import register_all as register_fundamental
     from quant_platform.factors.registry import get_registry
+    from quant_platform.factors.technical import register_all as register_technical
     register_technical()
     register_fundamental()
     n_params = 0
@@ -1315,8 +1314,8 @@ def cmd_gate(args) -> int:
     # Check for saved walk-forward results
     wf_result = None
     try:
-        from pathlib import Path
         import glob
+        from pathlib import Path
         wf_files = glob.glob(str(Path(config.output.results_dir) / "walkforward*.json"))
         if wf_files:
             import json
@@ -1347,12 +1346,14 @@ def cmd_gate(args) -> int:
 
 def cmd_strategy(args) -> int:
     """Manage Strategy DSL definitions."""
+    from quant_platform.factors.fundamental import register_all as register_fundamental
+    from quant_platform.factors.technical import register_all as register_technical
     from quant_platform.strategy.dsl import (
-        StrategyDefinition, validate_strategy, dsl_to_config_overrides,
+        StrategyDefinition,
+        dsl_to_config_overrides,
+        validate_strategy,
     )
     from quant_platform.strategy.registry import StrategyRegistry
-    from quant_platform.factors.technical import register_all as register_technical
-    from quant_platform.factors.fundamental import register_all as register_fundamental
 
     registry = StrategyRegistry()
 
@@ -1453,8 +1454,9 @@ def cmd_strategy(args) -> int:
                                    sector_map, financials)
 
         # Generate report
-        from quant_platform.reporting.dashboard import DashboardGenerator
         from pathlib import Path
+
+        from quant_platform.reporting.dashboard import DashboardGenerator
 
         report_path = Path(config.output.results_dir)
         report_path.mkdir(parents=True, exist_ok=True)
@@ -1743,13 +1745,13 @@ def main() -> int:
     fs_sub.add_parser("stats", help="Show store statistics")
     fs_rank = fs_sub.add_parser("rank", help="Rank factors by health score")
     fs_rank.add_argument("--limit", type=int, default=20, help="Number of top factors")
-    fs_reg = fs_sub.add_parser("register-all", help="Register all available factors from registry")
+    fs_sub.add_parser("register-all", help="Register all available factors from registry")
     fs_hist = fs_sub.add_parser("history", help="Show evaluation history for a factor")
     fs_hist.add_argument("--factor", type=str, default="", help="Factor name")
     fs_hist.add_argument("--limit", type=int, default=50, help="Number of records")
     fs_wf = fs_sub.add_parser("walkforward-summary", help="Show walk-forward summary for a factor")
     fs_wf.add_argument("--factor", type=str, required=True, help="Factor name")
-    fs_clear = fs_sub.add_parser("clear", help="Clear all factor store data (for testing)")
+    fs_sub.add_parser("clear", help="Clear all factor store data (for testing)")
 
     # walkforward (standalone)
     wf_parser = subparsers.add_parser("walkforward", help="Walk-forward validation")
@@ -1799,7 +1801,7 @@ def main() -> int:
     config_parser = subparsers.add_parser("config", help="Manage configuration versions")
     config_sub = config_parser.add_subparsers(dest="subcommand", help="Config action")
 
-    config_list = config_sub.add_parser("list", help="List all config versions")
+    config_sub.add_parser("list", help="List all config versions")
     config_show = config_sub.add_parser("show", help="Show config for a version")
     config_show.add_argument("version", type=str, help="Version ID (e.g. v3)")
     config_diff = config_sub.add_parser("diff", help="Diff two config versions")

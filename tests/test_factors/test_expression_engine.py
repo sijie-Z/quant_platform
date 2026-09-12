@@ -5,7 +5,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-
 from quant_platform.factors.expression_engine import (
     DataProxy,
     ExpressionFactor,
@@ -16,7 +15,6 @@ from quant_platform.factors.expressions import (
     ALL_FUNCTIONS,
     register_expression_functions,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -13,9 +13,14 @@ Uses daily OHLCV HFQ prices from AkShare TX source.
 
 from __future__ import annotations
 
-import sys, time, traceback
+import sys
+import time
+import traceback
 from pathlib import Path
-import numpy as np, pandas as pd, akshare as ak
+
+import akshare as ak
+import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -68,7 +73,8 @@ def run() -> str:
             if i and i % 50 == 0:
                 print(f"[{SLICE}] fetched {i}/{len(codes)} ok={len(frames)}", flush=True)
 
-        prices = pd.DataFrame(frames); prices.index.name = "date"
+        prices = pd.DataFrame(frames)
+        prices.index.name = "date"
         print(f"[{SLICE}] price panel: {prices.shape}", flush=True)
 
         # Low vol factor: negated 60d rolling std of daily returns
@@ -78,7 +84,8 @@ def run() -> str:
 
         ic_vals = []
         for date in factor_panel.index:
-            f = factor_panel.loc[date].dropna(); r = fwd_ret.loc[date].reindex(f.index).dropna()
+            f = factor_panel.loc[date].dropna()
+            r = fwd_ret.loc[date].reindex(f.index).dropna()
             common = f.index.intersection(r.index)
             if len(common) >= 20:
                 ic_vals.append((date, f.loc[common].rank().corr(r.loc[common].rank(), method="pearson")))
@@ -88,7 +95,8 @@ def run() -> str:
 
         ls_rets = []
         for date in ic_series.index:
-            f = factor_panel.loc[date].dropna(); r = fwd_ret.loc[date].reindex(f.index).dropna()
+            f = factor_panel.loc[date].dropna()
+            r = fwd_ret.loc[date].reindex(f.index).dropna()
             common = f.index.intersection(r.index)
             if len(common) < 30: continue
             ranks = f.loc[common].rank()

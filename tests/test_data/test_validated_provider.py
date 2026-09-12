@@ -2,15 +2,14 @@
 
 import pandas as pd
 import pytest
-
 from quant_platform.data.providers.base import DataProvider
 from quant_platform.data.providers.validated_provider import (
+    HIGH_CONFIDENCE,
+    LOW_CONFIDENCE,
+    MEDIUM_CONFIDENCE,
+    UNUSABLE,
     ValidatedProvider,
     ValidatedResult,
-    HIGH_CONFIDENCE,
-    MEDIUM_CONFIDENCE,
-    LOW_CONFIDENCE,
-    UNUSABLE,
 )
 
 

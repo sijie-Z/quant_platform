@@ -18,10 +18,10 @@ noisy / untradable regimes.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +227,15 @@ def detect_profile(
     transition = features.get("transition")
     breakout = features.get("breakout_ignite", False)
 
+    if tradability is None or transition is None:
+        # Missing inputs are a caller bug, not a profile. Failing loudly beats
+        # silently returning "All_other" and emitting a research result built
+        # on absent data. (The original code raised TypeError here too, from
+        # inside np.isfinite; this just says why.)
+        raise TypeError(
+            "classify_profile() requires 'tradability' and 'transition'; got "
+            f"tradability={tradability!r}, transition={transition!r}"
+        )
     if not np.isfinite(tradability) or not np.isfinite(transition):
         return "All_other"
 

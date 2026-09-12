@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+
 import pytest
 import yaml
 
 from quant_platform.strategy.dsl import (
     StrategyDefinition,
-    validate_strategy,
-    dsl_to_config_overrides,
     ValidationResult,
+    dsl_to_config_overrides,
+    validate_strategy,
 )
 from quant_platform.strategy.registry import StrategyRegistry
 
@@ -189,7 +190,8 @@ class TestDSLToConfig:
 
 class TestStrategyRegistry:
     def setup_method(self):
-        import tempfile, os
+        import os
+        import tempfile
         self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self._db_path = self._tmp.name
         self._tmp.close()
