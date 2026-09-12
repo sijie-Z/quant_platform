@@ -1,0 +1,56 @@
+version: 2
+updates:
+  # ---------------------------------------------------------------------------
+  # Python. Every dependency is pinned with ==, so Dependabot opens one PR per
+  # package by default — grouped here into a single weekly PR per tree to keep
+  # the noise down on a repo where the pins are deliberately conservative.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      python-deps:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: pip
+    directory: "/packages/quant_core"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+
+  - package-ecosystem: npm
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      frontend-deps:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ---------------------------------------------------------------------------
+  # Actions and base images: these are how supply-chain fixes actually reach
+  # the build, so they are worth keeping current.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2

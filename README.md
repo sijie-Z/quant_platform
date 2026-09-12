@@ -1,7 +1,9 @@
 # A-Share Multi-Factor Quantitative Research & Trading Platform
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white" alt="Python">
+  <a href="https://github.com/sijie-Z/quant_platform/actions/workflows/ci.yml"><img src="https://github.com/sijie-Z/quant_platform/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/sijie-Z/quant_platform/actions/workflows/codeql.yml"><img src="https://github.com/sijie-Z/quant_platform/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
+  <img src="https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/API-97%20endpoints-brightgreen" alt="API">
   <img src="https://img.shields.io/badge/CLI-18%20commands-blueviolet" alt="CLI">
   <img src="https://img.shields.io/badge/前端-Vue%203%20%2B%20ECharts-orange" alt="Frontend">

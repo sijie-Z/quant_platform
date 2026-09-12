@@ -9,6 +9,8 @@ build/
 # Virtual environments
 venv/
 .venv/
+# Any versioned variant, e.g. .venv312 (the canonical Python 3.12 env)
+.venv*/
 env/
 
 # IDE

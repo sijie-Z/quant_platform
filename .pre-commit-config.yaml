@@ -14,17 +14,20 @@ repos:
       - id: detect-private-key
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.0
+    # Pinned to the same version CI installs, so pre-commit and CI agree.
+    rev: v0.15.12
     hooks:
       - id: ruff
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.11.0
+    rev: v1.14.1
     hooks:
       - id: mypy
         language: system
-        args: [--config-file=pyproject.toml]
+        # Same scope CI gates on: the annotated quant_core tree. Passing no
+        # target left this hook checking nothing at all.
+        args: [--config-file=pyproject.toml, packages/quant_core/src]
         pass_filenames: false
         additional_dependencies: []
