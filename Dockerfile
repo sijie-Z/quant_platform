@@ -21,7 +21,7 @@ RUN npm run build
 # future pin has no wheel, the build will fail here loudly rather than
 # silently pulling in a 500 MB apt toolchain.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 
