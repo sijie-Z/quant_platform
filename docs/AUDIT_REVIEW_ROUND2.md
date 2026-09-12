@@ -278,38 +278,66 @@ xgboost-cpu 2.1.4: xgboost_cpu-2.1.4-...whl
 
 > 注意：这是**替换同版本的 CPU-only 发行版**，不是升级版本，因此不违反 Q3 的"不要升级"。
 
+**但必须准确描述这次变更的性质**（第三轮裁定特别指出）：这是 **distribution identity
+change**，不是"依赖优化"。工程事实应当这样写：
+
+| 事实 | 状态 |
+|---|---|
+| 上游版本相同 | ✅ `2.1.4`，未升级 |
+| 发行版不同 | `xgboost` → `xgboost-cpu`（同版本的两个发行包） |
+| API / 导入名变更 | ❌ 无 —— 两者都提供 `xgboost` 模块 |
+| 容器内实测 | ✅ `import xgboost → 2.1.4`，且 `nvidia-nccl` 不存在 |
+| 节省 | 561 MB / 次安装（这是**结果**，不是变更的理由） |
+
+不允许只写"优化依赖，省了 561 MB"—— 那是把工程事实降级成了收益数字。
+
 ### 2.6 其他已修项（第一轮文档 §1 已列，此处不重复）
 
 Dockerfile 多阶段化 / `.dockerignore`（构建上下文从 ~450 MB 降到 366.93 kB）/
 docker-compose healthcheck 用 curl 而镜像无 curl / `POST /api/screen` 的 `_load_config`
 NameError / `get_execution_params()` 必然 TypeError / 2 个 tools 脚本的 3.12+ 语法 / ruff 256 → 0。
 
-### 2.7 ⚠️ 新发现：「研究基线」目前**并没有被冻结**——72 个传递依赖完全浮动
+### 2.7 ⚠️ 新发现：「研究基线」目前**并没有被冻结**——大量传递依赖未被固定
+
+> **措辞说明（第三轮裁定后修正）**：本节早先写成"72 个传递依赖完全浮动"，这是一个
+> **过度断言**。精确数量取决于统计口径（`pip freeze` vs `importlib.metadata`、
+> 是否含本地 editable 包、去重与否），并且"installed distributions"与
+> "resolver dependency graph"不是同一个概念。下面改用有据可查的表述。
 
 在为 QD 建立 canonical 环境时核对 `requirements.txt`，发现一个此前所有讨论都默认错误的前提：
 
-| 项 | 数量 |
-|---|---|
-| `requirements.txt` 里的依赖声明 | 30 行 |
-| 其中用 `==` 精确锁定 | **29** |
-| 未锁定的 | 1（`adata>=1.0.0`） |
-| **Docker 构建实际安装的包** | **101** |
-| **因此完全未锁版本的传递依赖** | **约 72 个** |
+| 项 | 数量 | 口径 |
+|---|---|---|
+| `requirements.txt` 里的依赖声明 | 30 行 | 顶层直接声明 |
+| 其中用 `==` 精确锁定 | **29** | |
+| 未锁定的 | 1（`adata>=1.0.0`） | |
+| canonical 3.12 环境实际安装 | **104 个唯一发行包**<br>（`pip freeze` 显示 102 + 2 个本地 editable：`quant-core` / `quant-platform`） | 实测 |
 
-这个文件**不是 `pip freeze` 的产物**，而是一份手写的顶层依赖清单。未被锁定的传递依赖
-（示例，全部来自实测构建日志）：
+**因此存在大量未由顶层文件直接固定的传递依赖** —— 具体数量应以 dependency graph /
+lock resolver 为准，不应从这个差值直接得出。但结论不依赖于精确数字：**除那 30 项之外，
+其余全部由解析当天的可用版本决定**。
+
+这个文件**不是 `pip freeze` 的产物**，而是一份手写的顶层依赖清单。更准确的名字是
+**"pinned direct requirements"**，而不是 **"fully reproducible environment lock"** ——
+这正是 Q3 / QG 的真正根因。
+
+未被固定的传递依赖（示例，全部来自实测构建日志）：
 
 ```
 llvmlite  urllib3  starlette  joblib  threadpoolctl  blosc2  pytz
 tzdata    certifi  charset_normalizer  idna  anyio  jinja2  rich
 markdown-it-py  curl_cffi  akracer  scs  osqp  clarabel  numexpr
-greenlet  cffi  pyparsing  requests  python-dateutil  ...（约 72 个）
+greenlet  cffi  pyparsing  requests  python-dateutil  ...（数量以 resolver 为准）
 ```
+
+> **一个直接印证"pip freeze 不是 lock"的实测**：同一个 commit，Linux 的 Docker 构建
+> 解析出 **101** 个包，Windows 的 canonical venv 解析出 **104** 个。
+> 平台不同 → 解析结果不同 → 任何单机 `pip freeze` 都不能当作跨平台的安装来源。
 
 **为什么这件事重要**：
 
 1. **第一轮和第二轮裁定都建立在"当前 baseline 是冻结的、升级才有风险"这个前提上。**
-   实际上前提不成立 —— 那 72 个传递依赖**任何时候都可能解析出新版本**，
+   实际上前提不成立 —— 除那 30 项之外，其余依赖**任何时候都可能解析出新版本**，
    在没有 diff 的情况下悄悄改变运行时行为。
 2. 这**不是理论风险**：本次审计中 Docker 构建就解析出了
    `llvmlite 0.46.0` / `scs 3.3.1` / `curl_cffi 0.16.3` / `akracer 0.0.14` ——
@@ -460,7 +488,7 @@ GitHub 上（仓库是 public）还是先记录在本地文档里？** 项目所
 
 ### QG.（新，由 §2.7 推出）既然 baseline 从未被冻结，是否该插一个"零风险补锁"步骤？
 
-§2.7 证明：当前 29 个顶层依赖被锁定，但 **72 个传递依赖完全浮动**。这意味着
+§2.7 证明：当前 29 个顶层依赖被精确锁定，但**其余传递依赖未被固定**。这意味着
 **在 uv.lock 迁移完成之前，这个项目的研究结果在严格意义上都不是可复现的** ——
 而"可复现"恰恰是它自己宣称的核心价值（Truth First / Knowledge compounds）。
 
@@ -493,6 +521,25 @@ GitHub 上（仓库是 public）还是先记录在本地文档里？** 项目所
 3. (b) 会不会反而制造出"第三套锁定来源"，正是 QC 想避免的局面？
 
 请你裁定。这个问题的答案会直接改变第 ⑥–⑨ 步的顺序。
+
+#### QG 裁定结果（第三轮）
+
+> **采集 `pip freeze`，但取消"补锁"这个定位。** —— `snapshot/evidence` ✅，`lock` ❌
+
+裁定要点，已按此执行：
+
+| 项 | 裁定 |
+|---|---|
+| `pip freeze` 作为**环境快照** | ✅ 可以，且**建议现在就做** |
+| `pip freeze` 作为**项目正式 lockfile** | ❌ 不推荐 —— 它回答的是"这台机器现在装了什么"，而不是"所有支持平台应该解析出什么" |
+| 命名为 `requirements.lock.txt` 并提交 | ❌ **不要**，会制造第三套权威依赖来源，未来维护者必然要问"到底哪个是真的" |
+| 正确命名 | `2026-09-12-py312-freeze.txt` 之类，语义上直接说明是 snapshot |
+| 是否进 Git | 默认**不进**；若作为审计留痕，需放在 `docs/audit/evidence/` 并在文件头写明 **"NOT A CANONICAL DEPENDENCY SPECIFICATION / DO NOT INSTALL FROM THIS FILE"** |
+| 我倾向的 (b) 方案 | **定位错了** —— 应是"保存已验证环境的解析快照"，不是"补锁" |
+| QG 是否阻塞当前 PR | ❌ **不阻塞**。canonical 环境 + 1313 passed 已经完成，QG 只是把解析结果留证 |
+
+**已执行**：生成 `docs/audit/evidence/2026-09-12-py312-freeze.txt`（102 个发行包 + 本地
+editable 2 个 = 104 个唯一发行包），文件头带完整免责声明。**目前未提交，保持未跟踪。**
 
 ---
 
@@ -590,9 +637,10 @@ FAILED test_screen_passes_request_config_path_through
 | legacy venv 的 **49 个 failure 全部是环境问题** | 同一份代码在 canonical 环境里 0 failed |
 | **本次审计改动未引入任何回归** | 0 failed / 0 errors |
 | 此前的 `1247 collected` 是被 7 个 collection error **藏住了 66 个测试** | canonical 环境实际收集到 1313 个 |
-| §2.7 的"传递依赖未锁"得到二次印证 | `requirements.txt` 声明 30 个，实际安装 **106 个发行包** |
+| §2.7 的"传递依赖未锁"得到二次印证 | `requirements.txt` 声明 30 项，环境实际安装 **104 个唯一发行包** |
 
-> 注意最后一点：**106 − 30 = 76 个传递依赖没有版本约束**。这与 §2.7 的估算一致，
+> 注意最后一点：**差值本身不能直接读作"未锁的传递依赖数量"**（见 §2.7 的口径说明）。
+> 可确证的是：`requirements.txt` 只固定了 30 项，**其余全部由解析当天决定**。
 > 也就意味着"在这个环境里跑出的绿"仍然**不是完全可复现的** —— 换个时间重装可能装到
 > 不同的 `llvmlite` / `starlette` / `blosc2`。这正是 QC 零差异门与 QG 要解决的问题。
 
