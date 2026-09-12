@@ -1,43 +1,36 @@
 version: 2
+
+# ---------------------------------------------------------------------------
+# Scope: GitHub Actions only.
+#
+# Deliberately EXCLUDED for now: pip, npm, docker.
+#
+# The dependency versions in requirements.txt and pyproject.toml are not
+# incidental -- they are the research environment. Changing them changes
+# numerical output, and this project's whole point is that past results stay
+# reproducible. That is not hypothetical: pandas 2.1 -> 3.x removes the 'M'
+# resampling alias, which this codebase still uses in four production call
+# sites (operations/investor.py, reporting/performance.py, api/routes.py x2).
+#
+# requirements.txt pins 30 top-level items; everything beyond that resolves
+# fresh on each install. So the baseline is not currently frozen in a way that
+# would make an automated bump safe to review. See
+# docs/AUDIT_REVIEW_ROUND2.md sections 2.7 and 3-QG.
+#
+# What was happening before this change: Dependabot opened 8 PRs within an
+# hour of being enabled, including `numpy 1.26.2 -> 2.4.6`, a grouped 18-package
+# bump, and `python:3.12-slim -> 3.14-slim` (which contradicts the deliberate
+# `requires-python = ">=3.11,<3.13"` bound).
+#
+# WHEN TO RE-ENABLE pip/npm/docker:
+#   once the explicit lockfile migration lands (the uv.lock work with its
+#   zero-diff gate). At that point every bump arrives as a reviewable diff
+#   against a frozen resolution rather than an unbounded re-resolve.
+#
+# GitHub Actions is kept because an action bump cannot change research output,
+# and these updates are the main channel for supply-chain fixes.
+# ---------------------------------------------------------------------------
 updates:
-  # ---------------------------------------------------------------------------
-  # Python. Every dependency is pinned with ==, so Dependabot opens one PR per
-  # package by default — grouped here into a single weekly PR per tree to keep
-  # the noise down on a repo where the pins are deliberately conservative.
-  # ---------------------------------------------------------------------------
-  - package-ecosystem: pip
-    directory: "/"
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    groups:
-      python-deps:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
-
-  - package-ecosystem: pip
-    directory: "/packages/quant_core"
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
-
-  - package-ecosystem: npm
-    directory: "/frontend"
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    groups:
-      frontend-deps:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
-
-  # ---------------------------------------------------------------------------
-  # Actions and base images: these are how supply-chain fixes actually reach
-  # the build, so they are worth keeping current.
-  # ---------------------------------------------------------------------------
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -47,10 +40,3 @@ updates:
     groups:
       actions:
         patterns: ["*"]
-
-  - package-ecosystem: docker
-    directory: "/"
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
