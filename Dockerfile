@@ -3,7 +3,7 @@
 # Building it in a Node image keeps node/npm out of the runtime image entirely
 # (the previous single-stage build installed and then purged them via apt).
 # ---------------------------------------------------------------------------
-FROM node:22-slim AS frontend
+FROM node:26-slim AS frontend
 
 WORKDIR /frontend
 
