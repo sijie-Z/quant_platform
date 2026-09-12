@@ -37,7 +37,7 @@ dependencies = [
     "httpx==0.28.1",
     # CPU-only build; the plain `xgboost` wheel pulls in 342 MB of
     # nvidia-nccl-cu12 on Linux. Same version, same `xgboost` module.
-    "xgboost-cpu==2.1.4",
+    "xgboost-cpu==3.2.0",
     "lightgbm==4.5.0",
     "shap==0.46.0",
     "pyyaml==6.0.2",

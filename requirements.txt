@@ -32,7 +32,7 @@ httpx==0.28.1
 # that dependency can never be used — it just bloats the Docker image and
 # adds ~350 MB of download to every CI install. Same version, same `xgboost`
 # module, same API.
-xgboost-cpu==2.1.4
+xgboost-cpu==3.2.0
 lightgbm==4.5.0
 shap==0.46.0
 
