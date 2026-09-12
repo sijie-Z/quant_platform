@@ -101,11 +101,7 @@ def _violations() -> list[str]:
                 continue
             if src == target:
                 continue
-            if src == "core" and target in ("live", "lab"):
-                violations.append(f"{py_file.relative_to(REPO_ROOT)} imports {imp}")
-            elif src == "live" and target == "lab":
-                violations.append(f"{py_file.relative_to(REPO_ROOT)} imports {imp}")
-            elif src == "lab" and target == "live":
+            if src == "core" and target in ("live", "lab") or src == "live" and target == "lab" or src == "lab" and target == "live":
                 violations.append(f"{py_file.relative_to(REPO_ROOT)} imports {imp}")
     return sorted(set(violations))
 
@@ -121,4 +117,4 @@ def test_core_never_imports_live_or_lab():
 def test_shared_modules_listed_for_migration():
     """Fail loudly if the shared-module whitelist drifts without review."""
     expected: set[str] = set()
-    assert SHARED_ALLOWED == expected
+    assert expected == SHARED_ALLOWED

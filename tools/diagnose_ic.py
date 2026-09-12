@@ -17,9 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
-
 from quant_platform.data.providers.synthetic import SyntheticDataProvider
+from scipy.stats import spearmanr
 
 
 def rank_ic_manual(factor: pd.DataFrame, forward_returns: pd.DataFrame) -> float:
@@ -122,7 +121,8 @@ print(f"  Momentum(21d) vs same-day return (contemporaneous): IC = {ic_contemp:.
 
 # Test with stronger alpha
 print("\n  Testing with stronger alpha signal...")
-from quant_platform.data.providers.synthetic import SyntheticDataProvider as SDP
+from quant_platform.data.providers.synthetic import SyntheticDataProvider
+
 # Create provider with custom data to test strong alpha
 # We can't easily modify the alpha strength externally, so let's check
 # what the alpha strength actually is

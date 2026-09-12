@@ -13,11 +13,11 @@ sys.path.insert(0, str(_project_root.parent))
 import logging
 from datetime import datetime
 
-import pandas as pd
 import numpy as np
-
+import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
+
 from trading.reversal_paper_trader import ReversalPaperTrader
 
 logging.basicConfig(
@@ -106,7 +106,7 @@ def main():
 
     # ── 输出 ──
     print()
-    print(f"  Performance:")
+    print("  Performance:")
     print(f"    Sharpe:        {sharpe:>+8.4f} (baseline: {BASELINE_SHARPE})")
     print(f"    年化收益:      {ann_ret*100:>+8.2f}% (baseline: {BASELINE_ANN_RET*100:.0f}%)")
     print(f"    总收益:        {total_ret*100:>+8.2f}%")
@@ -118,7 +118,7 @@ def main():
         for a in alerts:
             print(f"    [{a}]")
     else:
-        print(f"\n  [OK] No alerts — system nominal")
+        print("\n  [OK] No alerts — system nominal")
 
     # ── 保存 ──
     df.to_csv('results/monitor_equity.csv', index=False)

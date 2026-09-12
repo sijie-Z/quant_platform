@@ -14,19 +14,18 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 sys.path.insert(0, str(_project_root / "regime_router"))
-from router import RegimeRouterStub
-from adapter import ExecutionAdapter
-
-import pandas as pd
 import numpy as np
+import pandas as pd
+from adapter import ExecutionAdapter
+from router import RegimeRouterStub
 
+from quant_platform.backtest.cost_model import CostModel
+from quant_platform.backtest.engine import BacktestEngine
+from quant_platform.backtest.metrics import all_metrics
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
-from quant_platform.backtest.engine import BacktestEngine
-from quant_platform.backtest.cost_model import CostModel
 from quant_platform.portfolio.constraints import PortfolioConstraints
-from quant_platform.backtest.metrics import all_metrics
-from quant_platform.utils.logging import setup_logging, get_logger
+from quant_platform.utils.logging import get_logger, setup_logging
 
 setup_logging()
 logger = get_logger(__name__)

@@ -14,21 +14,20 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
 import numpy as np
-
-from quant_platform.factors.evaluation import rank_ic, ic_summary
-from quant_platform.factors.technical import register_all as register_technical
-from quant_platform.factors.fundamental import register_all as register_fundamental
-from quant_platform.factors.registry import get_registry
-from quant_platform.factors.processing import process_factor
-from quant_platform.data.pipeline import DataPipeline
-from quant_platform.data.providers.synthetic import SyntheticDataProvider
-from quant_platform.data.providers.baostock_provider import BaostockDataProvider
-from quant_platform.backtest.engine import BacktestEngine
+import pandas as pd
 from quant_platform.backtest.cost_model import CostModel
-from quant_platform.portfolio.constraints import PortfolioConstraints
+from quant_platform.backtest.engine import BacktestEngine
 from quant_platform.backtest.metrics import all_metrics
+from quant_platform.data.pipeline import DataPipeline
+from quant_platform.data.providers.baostock_provider import BaostockDataProvider
+from quant_platform.data.providers.synthetic import SyntheticDataProvider
+from quant_platform.factors.evaluation import ic_summary, rank_ic
+from quant_platform.factors.fundamental import register_all as register_fundamental
+from quant_platform.factors.processing import process_factor
+from quant_platform.factors.registry import get_registry
+from quant_platform.factors.technical import register_all as register_technical
+from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger, setup_logging
 
 setup_logging()
@@ -252,7 +251,7 @@ def run_rq1(cs, prices, returns, benchmark, sector_map, label=""):
             results.append({"Experiment": exp_name, "IC": ic_s.get("mean_ic", 0),
                            "ICIR": ic_s.get("icir", 0), "Sharpe": s.get("sharpe_ratio", 0),
                            "MDD": s.get("max_drawdown", 0)})
-        except Exception as e:
+        except Exception:
             results.append({"Experiment": exp_name, "IC": ic_s.get("mean_ic", 0),
                            "ICIR": ic_s.get("icir", 0), "Sharpe": 0, "MDD": 0})
         logger.info("  %s %-12s IC=%.4f Sharpe=%.2f", label, exp_name, results[-1]["IC"], results[-1]["Sharpe"])
@@ -278,7 +277,7 @@ def run_rq2(cs, prices, returns, benchmark, sector_map, label=""):
             results.append({"Experiment": exp_name, "IC": ic_s.get("mean_ic", 0),
                            "ICIR": ic_s.get("icir", 0), "Sharpe": s.get("sharpe_ratio", 0),
                            "MDD": s.get("max_drawdown", 0)})
-        except Exception as e:
+        except Exception:
             results.append({"Experiment": exp_name, "IC": ic_s.get("mean_ic", 0),
                            "ICIR": ic_s.get("icir", 0), "Sharpe": 0, "MDD": 0})
         logger.info("  %s %-12s IC=%.4f Sharpe=%.2f", label, exp_name, results[-1]["IC"], results[-1]["Sharpe"])

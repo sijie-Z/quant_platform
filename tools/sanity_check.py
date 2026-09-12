@@ -18,11 +18,17 @@ Three experiments against the M4.2 backtest + leakage audit pipeline:
 All three run the IDENTICAL portfolio construction, cost model,
 and metrics as M4.2. Only the factor definition changes.
 """
-import sys, os, time, json, sqlite3, math
+import json
+import math
+import os
+import sqlite3
+import sys
+import time
+
 sys.path.insert(0, "D:/Desktop")
 import akshare as ak
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 DB = "data/trading.db"
 C, S, P = 0.0003, 0.001, 0.0005
@@ -62,7 +68,8 @@ for i, c in enumerate(codes):
     if i and i % 50 == 0:
         print(f"  prices {i}/{n_stocks} ok={len(frames)}", flush=True)
 
-prices = pd.DataFrame(frames); prices.index.name = "date"
+prices = pd.DataFrame(frames)
+prices.index.name = "date"
 rets = prices.pct_change(fill_method=None)
 fwd_ret = rets.shift(-1)
 all_dates = prices.index.sort_values()
@@ -163,7 +170,6 @@ def run_factor(factor_panel: pd.DataFrame) -> dict:
             style_daily_rets.append(0.0)
 
     dr = pd.Series(daily_rets, index=all_dates)
-    style_dr = pd.Series(style_daily_rets, index=all_dates)
 
     # IC
     ic_vals = []
@@ -179,7 +185,7 @@ def run_factor(factor_panel: pd.DataFrame) -> dict:
     # Metrics
     cagr = (capital/INITIAL) ** (1/ny) - 1
     sharpe = float((dr.mean()/(dr.std()+1e-12)) * np.sqrt(252))
-    dd = float(((dr.cumsum() + np.log(INITIAL) - (dr.cumsum() + np.log(INITIAL)).cummax()).min() / INITIAL))
+    dd = float((dr.cumsum() + np.log(INITIAL) - (dr.cumsum() + np.log(INITIAL)).cummax()).min() / INITIAL)
     avg_to = float(np.mean(turnover_log)) if turnover_log else 0
 
     style_cagr = (style_capital/INITIAL) ** (1/ny) - 1
@@ -301,6 +307,7 @@ conn.execute(
      json.dumps({"pit":False,"bias_warning":["survivorship_bias_possible"]}),
      "sanity_check", json.dumps({"tests":["random","oracle","mc_100"]}),
      json.dumps(ev, default=str), "", "", "[]"))
-conn.commit(); conn.close()
+conn.commit()
+conn.close()
 print(f"Registry: {rid}")
 print("DONE" if all_pass else "DONE (with issues — review above)")

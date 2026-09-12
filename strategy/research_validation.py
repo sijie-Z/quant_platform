@@ -20,7 +20,6 @@ from datetime import datetime
 from typing import Any
 
 import pandas as pd
-
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -111,7 +110,7 @@ class ValidationReport:
             lines.append(f"\n  --- Strategy Gates: {self.gate_result.get('overall_status', 'N/A')} ---")
 
         if self.warnings_global:
-            lines.append(f"\n  Warnings:")
+            lines.append("\n  Warnings:")
             for w in self.warnings_global:
                 lines.append(f"    WARN: {w}")
 
@@ -276,9 +275,10 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
+            from types import SimpleNamespace
+
             from quant_platform.data.pipeline import DataPipeline
             from quant_platform.data.providers.synthetic import SyntheticDataProvider
-            from types import SimpleNamespace
 
             config = SimpleNamespace()
             config.data = SimpleNamespace()
@@ -337,9 +337,9 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            from quant_platform.factors.technical import register_all as register_technical
             from quant_platform.factors.fundamental import register_all as register_fundamental
             from quant_platform.factors.registry import get_registry
+            from quant_platform.factors.technical import register_all as register_technical
 
             register_technical()
             register_fundamental()
@@ -366,7 +366,7 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            from quant_platform.factors.evaluation import rank_ic, ic_summary
+            from quant_platform.factors.evaluation import ic_summary, rank_ic
             from quant_platform.factors.processing import process_factor
             from quant_platform.factors.registry import get_registry
 
@@ -510,7 +510,7 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            from quant_platform.factors.store import FactorResearchStore, FactorEvalRecord
+            from quant_platform.factors.store import FactorEvalRecord, FactorResearchStore
 
             store = FactorResearchStore()
             saved = 0
@@ -546,7 +546,7 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            from quant_platform.strategy.gates import GateRunner, GateConfig
+            from quant_platform.strategy.gates import GateConfig, GateRunner
 
             runner = GateRunner()
             report = runner.run(

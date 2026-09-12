@@ -21,14 +21,13 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +242,7 @@ class Store:
         """Get orders with optional filters."""
         with self._conn() as conn:
             query = "SELECT * FROM orders WHERE 1=1"
-            params = []
+            params: list = []
             if tenant_id:
                 query += " AND tenant_id = ?"
                 params.append(tenant_id)

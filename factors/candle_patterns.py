@@ -147,8 +147,8 @@ class CandlePatternRecognizer:
     def _check_two_candles(
         self, c1: pd.Series, c2: pd.Series
     ) -> list[PatternResult]:
-        o1, h1, l1, cl1 = c1["open"], c1["high"], c1["low"], c1["close"]
-        o2, h2, l2, cl2 = c2["open"], c2["high"], c2["low"], c2["close"]
+        o1, cl1 = c1["open"], c1["close"]
+        o2, cl2 = c2["open"], c2["close"]
         bull1 = cl1 > o1
         bull2 = cl2 > o2
         body1 = abs(cl1 - o1)

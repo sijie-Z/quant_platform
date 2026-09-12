@@ -22,7 +22,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-
 from quant_platform.core.events import get_event_bus
 from quant_platform.execution.engine import (
     ExecutionEngine,

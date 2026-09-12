@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +182,6 @@ class LiveEngine:
 
         day_idx = self._returns.index.get_loc(date)
         n_stocks = len(self._returns.columns)
-        cost = COST_BPS / 10000
 
         # ── 平到期仓位 ──
         date_str = str(date)[:10]

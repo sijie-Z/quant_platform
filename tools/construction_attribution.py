@@ -13,11 +13,17 @@ One data fetch. Three outputs:
 
   PART 3: Combined Report
 """
-import sys, os, time, json, sqlite3, math
+import json
+import math
+import os
+import sqlite3
+import sys
+import time
+
 sys.path.insert(0, "D:/Desktop")
 import akshare as ak
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 DB = "data/trading.db"
 C, S, P = 0.0003, 0.001, 0.0005
@@ -56,7 +62,8 @@ for i, c in enumerate(codes):
     if i and i % 50 == 0:
         print(f"  prices {i}/{n_stocks} ok={len(frames)}", flush=True)
 
-prices = pd.DataFrame(frames); prices.index.name = "date"
+prices = pd.DataFrame(frames)
+prices.index.name = "date"
 rets = prices.pct_change(fill_method=None)
 fwd_ret = rets.shift(-1)
 all_dates = prices.index.sort_values()
@@ -153,7 +160,7 @@ def backtest(factor_panel, cost_multiplier=1.0, rebalance_override=None):
     dr = pd.Series(daily_rets, index=all_dates)
     cagr = (capital/INITIAL) ** (1/ny) - 1
     sharpe = float((dr.mean()/(dr.std()+1e-12)) * np.sqrt(252))
-    dd = float(((dr.cumsum() + np.log(INITIAL) - (dr.cumsum() + np.log(INITIAL)).cummax()).min() / INITIAL))
+    dd = float((dr.cumsum() + np.log(INITIAL) - (dr.cumsum() + np.log(INITIAL)).cummax()).min() / INITIAL)
     avg_to = float(np.mean(turnover_log)) if turnover_log else 0
     return {"cagr": cagr, "sharpe": sharpe, "max_dd": dd,
             "avg_turnover": avg_to, "daily_rets": dr, "turnover_log": turnover_log,
@@ -212,8 +219,8 @@ print(f"  {'[4]':<5} {'- Cost Loss (turnover+fees)':<45} {-cost_loss:>+9.2%} {ba
 print(f"  {'':<5} {'= Net Portfolio Return':<45} {base['cagr']:>+9.2%}")
 
 leak_theo = abs(theo_ann) + 1e-8
-print(f"")
-print(f"  Attribution (% of total loss):")
+print("")
+print("  Attribution (% of total loss):")
 print(f"    Universe loss:      {abs(universe_loss)/leak_theo*100:.0f}%")
 wg_pct = abs(weight_loss)/leak_theo*100 if weight_loss > 0 else 0
 print(f"    Weight loss:        {wg_pct:.0f}%  ({-weight_loss:+.2%})")
@@ -221,7 +228,7 @@ cost_pct_attr = abs(cost_loss)/leak_theo*100
 print(f"    Cost loss:          {cost_pct_attr:.0f}%  ({-cost_loss:+.2%})")
 remain = 100 - abs(universe_loss)/leak_theo*100 - wg_pct - cost_pct_attr
 print(f"    Remaining (unexpl): {remain:.0f}%")
-print(f"    TOTAL:              100%")
+print("    TOTAL:              100%")
 
 # ══════════════════════════════════════════════════════════════════════
 # 5. ENGINEERING SANITY TESTS
@@ -237,8 +244,8 @@ cost_free = backtest(vol20, cost_multiplier=0.0)
 test_a = cost_free["cagr"] >= base["cagr"]
 print(f"  Test A (Cost=0):       net={cost_free['cagr']:+.2%}  base={base['cagr']:+.2%}  {'PASS' if test_a else 'FAIL'}")
 if not test_a:
-    print(f"    WARNING: Cost-free run has LOWER return than with-cost run!")
-    print(f"    This indicates the cost deduction logic is broken.")
+    print("    WARNING: Cost-free run has LOWER return than with-cost run!")
+    print("    This indicates the cost deduction logic is broken.")
 
 # Test B: Turnover=0 (rebalance once, hold forever)
 single_rebal = [rebals[0]]  # rebalance only on first month-end
@@ -248,7 +255,7 @@ test_b = n_to <= 1  # at most 1 turnover event (the initial buy)
 print(f"  Test B (Turnover=0):   n_rebals={n_to}  turnover={hold_forever['avg_turnover']*100:.1f}%  {'PASS' if test_b else 'FAIL'}")
 if not test_b:
     print(f"    WARNING: Single-rebalance strategy has {n_to} turnover events!")
-    print(f"    Should be at most 1 (the second rebalance sells the initial positions).")
+    print("    Should be at most 1 (the second rebalance sells the initial positions).")
 
 # Test C: Weight audit — all weights must sum to 1, none negative
 # Run a quick pass to collect all weights on rebalance dates
@@ -283,7 +290,7 @@ test_c = weight_violations == 0
 print(f"  Test C (Weight audit): violations={weight_violations}  near_miss={weight_near_miss}  {'PASS' if test_c else 'FAIL'}")
 if not test_c:
     print(f"    WARNING: {weight_violations} rebalance dates have invalid weights!")
-    print(f"    Check weight calculation and short-leg logic.")
+    print("    Check weight calculation and short-leg logic.")
 
 # Test D: Rebalance count matches expected
 expected_rebals = len(rebals) - 1  # first rebalance is initial buy, no prior positions
@@ -292,7 +299,7 @@ test_d = abs(actual_rebals - expected_rebals) <= 2  # allow ±2 for edge cases
 print(f"  Test D (Rebal count):  expected~{expected_rebals}  actual={actual_rebals}  {'PASS' if test_d else 'FAIL'}")
 
 all_pass = test_a and test_b and test_c and test_d
-print(f"")
+print("")
 print(f"  OVERALL: {'ALL PASS' if all_pass else 'FAILURES DETECTED — review above'}")
 
 # ══════════════════════════════════════════════════════════════════════
@@ -303,13 +310,13 @@ print("")
 print("=" * 72)
 print("  COMBINED VERDICT")
 print("=" * 72)
-print(f"")
-print(f"  Construction attribution:")
+print("")
+print("  Construction attribution:")
 print(f"    Primary alpha loss: Weight Loss ({-weight_loss:+.2%} ann)")
 print(f"    — Top20 equal-weight captures only ~{gross_cagr/theo_ann*100:.0f}% of IC-implied alpha")
 print(f"    — The remaining {(theo_ann-gross_cagr)/theo_ann*100:.0f}% sits in the 268 discarded stocks")
 print(f"    — Cost adds {-cost_loss:+.2%} ann drag ({(cost_loss/(theo_ann-gross_cagr+cost_loss))*100:.0f}% of total loss)")
-print(f"")
+print("")
 print(f"  Engineering sanity: {'ALL PASS' if all_pass else 'FAILURES'}")
 print(f"    Pipeline infrastructure is {'verified' if all_pass else 'suspicious'}.")
 print("=" * 72)
@@ -344,6 +351,7 @@ conn.execute(
      "volatility_20d",
      json.dumps({"n_long":N_LONG,"n_short":N_SHORT}),
      json.dumps(ev, default=str), "", "", "[]"))
-conn.commit(); conn.close()
+conn.commit()
+conn.close()
 print(f"Registry: {rid}")
 print("DONE")

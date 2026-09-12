@@ -282,7 +282,6 @@ class RealTimeRiskEngine:
             inst = self._asset_universe.get(symbol)
             if inst is not None:
                 multiplier = inst.multiplier
-        notional = price * quantity * multiplier
         if side == "sell":
             pos = self._positions.get(symbol)
             sell_qty = min(quantity, pos["quantity"] if pos else 0)

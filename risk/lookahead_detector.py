@@ -283,7 +283,7 @@ class LookaheadDetector:
                 print(f"    ... and {len(result['biased_dates']) - 20} more")
 
         print(f"\n  {'─' * 70}")
-        print(f"  Factor Bias Report:")
+        print("  Factor Bias Report:")
         print(f"  {'Factor':<25} {'Max Diff':>10} {'Mean Diff':>10} {'% Biased':>10}")
         print(f"  {'─' * 55}")
         for name, stats in sorted(

@@ -8,18 +8,18 @@ Tests:
 
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
-
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.synthetic import SyntheticDataProvider
-from quant_platform.factors.evaluation import rank_ic, ic_summary
+from quant_platform.factors.evaluation import ic_summary, rank_ic
 from quant_platform.factors.processing import process_factor
 from quant_platform.factors.technical import Momentum1M
 from quant_platform.utils.logging import get_logger, setup_logging
+from scipy.stats import spearmanr
 
 logger = get_logger(__name__)
 
@@ -44,7 +44,7 @@ print(f"\n[Step 0] Config: {config_data['start_date']} to {config_data['end_date
       f"{config_universe['n_stocks']} stocks, embedded_alpha=True")
 
 # Step 1: Load data through the exact pipeline
-print(f"\n[Step 1] Loading data through DataPipeline...")
+print("\n[Step 1] Loading data through DataPipeline...")
 provider = SyntheticDataProvider(
     n_stocks=config_universe["n_stocks"],
     start_date=config_data["start_date"],
@@ -69,20 +69,20 @@ print(f"  prices: {prices.shape}, returns: {returns.shape}")
 calc_ret = prices.pct_change(fill_method=None)
 
 # Step 3: Compute momentum_1m the exact way the pipeline does
-print(f"\n[Step 2] Computing momentum_1m factor...")
+print("\n[Step 2] Computing momentum_1m factor...")
 mom = Momentum1M()
 raw_factor = mom.compute(prices)
 print(f"  raw factor: {raw_factor.shape}")
 
 # Step 4: IC BEFORE any processing (using pipeline returns)
-print(f"\n[Step 3] IC BEFORE processing (using pipeline.returns):")
+print("\n[Step 3] IC BEFORE processing (using pipeline.returns):")
 common = raw_factor.index.intersection(returns.index)
 ic_before = rank_ic(raw_factor.loc[common], returns.loc[common])
 s_before = ic_summary(ic_before)
 print(f"  momentum_1m IC={s_before['mean_ic']:.6f} ICIR={s_before['icir']:.4f}")
 
 # Step 5: IC AFTER processing
-print(f"\n[Step 4] IC AFTER processing (winsorize+standardize+neutralize):")
+print("\n[Step 4] IC AFTER processing (winsorize+standardize+neutralize):")
 sector_map = provider.get_metadata()["sector"]
 fin = provider.get_financials(config_data["start_date"], config_data["end_date"])
 fin_unstacked = fin.unstack("asset") if fin is not None else None
@@ -95,12 +95,12 @@ s_proc = ic_summary(proc)
 print(f"  momentum_1m IC={s_proc['mean_ic']:.6f} ICIR={s_proc['icir']:.4f}")
 
 # Step 6: Check if data is aligned correctly
-print(f"\n[Step 5] Data alignment check:")
+print("\n[Step 5] Data alignment check:")
 print(f"  raw_factor index[0]: {raw_factor.index[0]}, returns index[0]: {returns.index[0]}")
 print(f"  raw_factor index[-1]: {raw_factor.index[-1]}, returns index[-1]: {returns.index[-1]}")
 
 # Check that returns[t] corresponds to price return t->t+1
-print(f"\n[Step 6] What does pipeline.returns[date] actually represent?")
+print("\n[Step 6] What does pipeline.returns[date] actually represent?")
 t0 = returns.index[0]
 t1 = returns.index[1]
 # returns[t0] should be return from t0 to t1

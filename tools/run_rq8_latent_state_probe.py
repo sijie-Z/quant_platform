@@ -20,14 +20,13 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
 import numpy as np
-from hmmlearn import hmm
+import pandas as pd
 import pywt
-
+from hmmlearn import hmm
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
-from quant_platform.utils.logging import setup_logging, get_logger
+from quant_platform.utils.logging import get_logger, setup_logging
 
 setup_logging()
 logger = get_logger("rq8")
@@ -207,39 +206,39 @@ def main():
 
     # ── Baseline ──
     base = backtest_80d(past_ret, returns)
-    print(f"\nBaseline (no mask, 80d fixed-grid):")
+    print("\nBaseline (no mask, 80d fixed-grid):")
     print(f"  Sharpe={base['sharpe']:.4f}  AnnRet={base['ann_ret']*100:.2f}%  "
           f"MDD={base['mdd']*100:.2f}%  trades={base['n']}")
 
     # ── HMM ──
     mask_a = hmm_trade_mask(returns, n_states=2)
     r_a = backtest_80d(past_ret, returns, mask_a)
-    print(f"\n[A] HMM regime:")
+    print("\n[A] HMM regime:")
     if not np.isnan(r_a["sharpe"]):
         print(f"  Sharpe={r_a['sharpe']:.4f}  AnnRet={r_a['ann_ret']*100:.2f}%  "
               f"MDD={r_a['mdd']*100:.2f}%  trades={r_a['n']}  skipped={r_a['skipped']}")
     else:
-        print(f"  insufficient trades")
+        print("  insufficient trades")
 
     # ── Wavelet ──
     mask_b = wavelet_trade_mask(returns)
     r_b = backtest_80d(past_ret, returns, mask_b)
-    print(f"\n[B] Wavelet phase:")
+    print("\n[B] Wavelet phase:")
     if not np.isnan(r_b["sharpe"]):
         print(f"  Sharpe={r_b['sharpe']:.4f}  AnnRet={r_b['ann_ret']*100:.2f}%  "
               f"MDD={r_b['mdd']*100:.2f}%  trades={r_b['n']}  skipped={r_b['skipped']}")
     else:
-        print(f"  insufficient trades")
+        print("  insufficient trades")
 
     # ── Kalman ──
     mask_c = kalman_trade_mask(returns)
     r_c = backtest_80d(past_ret, returns, mask_c)
-    print(f"\n[C] Kalman filter:")
+    print("\n[C] Kalman filter:")
     if not np.isnan(r_c["sharpe"]):
         print(f"  Sharpe={r_c['sharpe']:.4f}  AnnRet={r_c['ann_ret']*100:.2f}%  "
               f"MDD={r_c['mdd']*100:.2f}%  trades={r_c['n']}  skipped={r_c['skipped']}")
     else:
-        print(f"  insufficient trades")
+        print("  insufficient trades")
 
     # ── 结论 ──
     print()
@@ -250,14 +249,14 @@ def main():
     if improved:
         best = max([(n, r) for n, r in all_results if not np.isnan(r["sharpe"])],
                    key=lambda x: x[1]["sharpe"])
-        print(f"  Latent-state improves signal: YES")
+        print("  Latent-state improves signal: YES")
         print(f"  Best model: {best[0]} (Sharpe {best[1]['sharpe']:.4f})")
         print(f"  vs baseline: {base['sharpe']:.4f}")
-        print(f"  => NO-GO ZONE is model-limited, not fundamental")
+        print("  => NO-GO ZONE is model-limited, not fundamental")
     else:
-        print(f"  Latent-state improves signal: NO")
-        print(f"  All models <= baseline")
-        print(f"  => NO-GO ZONE confirmed within tested model class")
+        print("  Latent-state improves signal: NO")
+        print("  All models <= baseline")
+        print("  => NO-GO ZONE confirmed within tested model class")
     print("=" * 80)
 
     # 保存

@@ -93,7 +93,7 @@ class TestConfigVersion:
 class TestVersionManager:
     def test_init_creates_directory(self, tmp_versions_dir):
         dir_path = tmp_versions_dir / "subdir"
-        vm = VersionManager(str(dir_path))
+        VersionManager(str(dir_path))
         assert dir_path.exists()
         assert dir_path.is_dir()
 
@@ -231,12 +231,12 @@ class TestVersionManager:
             vm.rollback("v999")
 
     def test_hash_changes_with_config(self, vm, sample_config):
-        v1_id = vm.save(sample_config)
+        vm.save(sample_config)
         v1 = vm.list()[0]
 
         modified = dict(sample_config)
         modified["portfolio"]["optimizer"] = "risk_parity"
-        v2_id = vm.save(modified)
+        vm.save(modified)
         v2 = vm.list()[0]  # v2 is newest
 
         assert v1.config_hash != v2.config_hash
@@ -276,7 +276,7 @@ class TestAutoSave:
 
         # Should be usable immediately
         mgr = VersionManager()
-        desc = f"Run: alpha=equal_weight optimizer=mean_variance"
+        desc = "Run: alpha=equal_weight optimizer=mean_variance"
         vid = mgr.save(sample_config, description=desc)
         assert vid == "v1"
 

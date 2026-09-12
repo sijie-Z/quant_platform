@@ -12,10 +12,11 @@ factor weights, stop-loss levels) based on market conditions.
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 import numpy as np
 import pandas as pd
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -224,14 +225,14 @@ class CompositeRegimeDetector:
         vol_result = self.vol_detector.detect(returns)
         trend_result = self.trend_detector.detect(prices)
 
-        corr_result = {"regime": RegimeType.NORMAL, "confidence": 0.0}
+        corr_result: dict[str, Any] = {"regime": RegimeType.NORMAL, "confidence": 0.0}
         if returns_matrix is not None and len(returns_matrix.columns) > 5:
             corr_result = self.corr_detector.detect(returns_matrix)
 
         # Composite risk score (0=calm, 1=extreme)
         vol_score = vol_result.get("percentile", 0.5)
         trend_score = 0.8 if trend_result["regime"] == RegimeType.BEAR else 0.2
-        corr_score = corr_result.get("avg_correlation", 0)
+        corr_score = float(corr_result.get("avg_correlation", 0) or 0)
 
         composite_risk = 0.4 * vol_score + 0.35 * trend_score + 0.25 * corr_score
 
@@ -258,12 +259,23 @@ class CompositeRegimeDetector:
             "correlation": corr_result,
         }
 
-    def get_execution_params(self, returns: pd.Series | None = None) -> dict:
+    def get_execution_params(
+        self,
+        returns: pd.Series,
+        prices: pd.Series,
+        returns_matrix: pd.DataFrame | None = None,
+    ) -> dict:
         """Get regime-adaptive execution parameters.
 
         Inspired by stock-trader-ai's regime-adaptive stop-loss and
         position sizing. Returns different parameters based on the
         current market regime.
+
+        Args:
+            returns: Asset return series, forwarded to `detect`.
+            prices: Price series aligned to `returns`, forwarded to `detect`.
+            returns_matrix: Optional cross-sectional returns for the
+                correlation detector.
 
         Returns:
             Dict with keys:
@@ -275,10 +287,7 @@ class CompositeRegimeDetector:
                 max_leverage: Max leverage.
                 risk_multiplier: Scale factor [0,1] for position sizing.
         """
-        if returns is not None:
-            result = self.detect(returns)
-        else:
-            result = self.detect()
+        result = self.detect(returns, prices, returns_matrix)
 
         overall = result["overall_regime"]
 

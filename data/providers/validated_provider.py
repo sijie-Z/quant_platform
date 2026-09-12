@@ -14,8 +14,8 @@ Confidence scoring:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -36,7 +36,7 @@ PRICE_DEVIATION_THRESHOLD = 2.0   # 2% for prices
 FINANCIAL_DEVIATION_THRESHOLD = 10.0  # 10% for financial metrics
 
 
-class DataDiscrepancy(Exception):
+class DataDiscrepancyError(Exception):
     """Raised when providers return conflicting data."""
 
 

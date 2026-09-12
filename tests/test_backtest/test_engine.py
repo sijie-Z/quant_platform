@@ -2,7 +2,6 @@
 
 import pandas as pd
 import pytest
-
 from quant_platform.backtest.cost_model import CostModel
 from quant_platform.backtest.engine import BacktestEngine
 

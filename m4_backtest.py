@@ -2,11 +2,16 @@
 Monthly rebalance, full A-share cost model (commission + stamp + slippage).
 Output: CAGR, Sharpe, Sortino, MaxDD, Turnover, Yearly Returns.
 """
-import sys, os, time, json, sqlite3
+import json
+import os
+import sqlite3
+import sys
+import time
+
 sys.path.insert(0, "D:/Desktop")
 import akshare as ak
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 print("=== M4 PORTFOLIO BACKTEST: volatility_20d ===", flush=True)
 

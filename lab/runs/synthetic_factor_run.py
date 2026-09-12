@@ -35,8 +35,21 @@ def run_synthetic_factor(
     n_stocks: int = 5,
     n_days: int = 500,
     seed: int = 7,
+    db_path: str | Path = DEFAULT_DB,
+    out_dir: str | Path = "data/reports",
 ) -> str:
-    """Run one technical factor offline and persist the research record."""
+    """Run one technical factor offline and persist the research record.
+
+    Args:
+        factor_name: Registered factor to evaluate.
+        n_stocks: Width of the synthetic panel.
+        n_days: Length of the synthetic panel.
+        seed: RNG seed, for reproducibility.
+        db_path: Research Registry to write into. Defaults to the real one.
+            Tests MUST override this and `out_dir` -- `research_runs` is the
+            project's research knowledge base, not a scratch table.
+        out_dir: Directory for the generated Markdown report.
+    """
     register_technical()
     from quant_platform.factors.registry import get_registry
 
@@ -72,7 +85,7 @@ def run_synthetic_factor(
     )
     stats = ic_summary(ic_series) if len(ic_series) else {}
 
-    store = RunStore(DEFAULT_DB)
+    store = RunStore(str(db_path))
     run_id = store.begin_run(f"synthetic_{factor_name}", {
         "data_source": "synthetic",
         "factor": factor_name,
@@ -86,7 +99,7 @@ def run_synthetic_factor(
         "ic_positive_ratio": round(float(stats.get("ic_positive_ratio", float("nan"))), 4) if stats else None,
     }
     store.finish_run(run_id, status="success", evaluation=evaluation, report_path=None, warnings=[])
-    report_path = generate_report(store.get_run(run_id), out_dir="data/reports")
+    report_path = generate_report(store.get_run(run_id), out_dir=str(out_dir))
     store.finish_run(run_id, status="success", evaluation=evaluation, report_path=report_path, warnings=[])
 
     print(f"[synthetic_factor_run] {factor_name}: IC={evaluation['ic_mean']} "

@@ -16,10 +16,10 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
 
-import pandas as pd
-import numpy as np
 from collections import defaultdict
 
+import numpy as np
+import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
@@ -168,7 +168,8 @@ def run():
     print()
     print("─── 1. 全周期 Sharpe 矩阵 (2018-2025) ───")
     print()
-    print(f"  {'Sig\\Hold':>8}", end="")
+    _sig_hold = "Sig\\Hold"  # hoisted: backslash inside an f-string expression needs Python 3.12+
+    print(f"  {_sig_hold:>8}", end="")
     for hh in HOLDING_HORIZONS:
         print(f"  {hh:>7d}", end="")
     print()
@@ -225,7 +226,7 @@ def run():
         print(f"  Sharpe稳定性(均值/标准差): {df_roll['sharpe'].mean()/df_roll['sharpe'].std() if df_roll['sharpe'].std()>0 else 0:.2f}")
         print()
         # Print some sample rolling windows
-        print(f"  滚动窗口样本:")
+        print("  滚动窗口样本:")
         print(f"  {'Start':<12} {'End':<12} {'Sharpe':>8} {'AnnRet':>8} {'n':>4}")
         for _, r in df_roll.iterrows():
             print(f"  {r['start']:<12} {r['end']:<12} {r['sharpe']:>+8.4f} {r['ann_ret']:>+8.2%} {r['n']:>4d}")
@@ -245,7 +246,7 @@ def run():
     short_long = df_all[(df_all["signal_h"] <= 20) & (df_all["hold_h"] >= 60)]["sharpe"].mean()
     long_short = df_all[(df_all["signal_h"] >= 60) & (df_all["hold_h"] <= 20)]["sharpe"].mean()
     long_long = df_all[(df_all["signal_h"] >= 40) & (df_all["hold_h"] >= 40)]["sharpe"].mean()
-    print(f"  区域平均:")
+    print("  区域平均:")
     print(f"    短信号×短持有 (S≤20,H≤20): {short_short:.4f}")
     print(f"    短信号×长持有 (S≤20,H≥60): {short_long:.4f}")
     print(f"    长信号×短持有 (S≥60,H≤20): {long_short:.4f}")

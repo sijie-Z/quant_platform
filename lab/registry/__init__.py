@@ -22,7 +22,7 @@ import hashlib
 import json
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,7 @@ DEFAULT_DB = "data/trading.db"
 
 
 def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _content_hash(payload: dict[str, Any]) -> str:

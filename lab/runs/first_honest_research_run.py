@@ -41,7 +41,7 @@ import akshare as ak  # noqa: E402
 
 from quant_platform.factors.evaluation import ic_summary  # noqa: E402
 from quant_platform.factors.technical import Momentum12M  # noqa: E402
-from quant_platform.lab.registry import RunStore, DEFAULT_DB  # noqa: E402
+from quant_platform.lab.registry import DEFAULT_DB, RunStore  # noqa: E402
 from quant_platform.lab.reports import generate_report  # noqa: E402
 
 SLICE = "first_honest_research_run"
@@ -95,7 +95,6 @@ def _fetch_prices(codes: list[str], start: str, end) -> pd.DataFrame:
         return ("sh" if code.startswith(("60", "68", "9")) else "sz") + code
 
     for i, code in enumerate(codes):
-        ok = False
         for attempt in range(3):
             try:
                 if fetch_fn_name == "stock_zh_a_hist_tx":
@@ -114,7 +113,6 @@ def _fetch_prices(codes: list[str], start: str, end) -> pd.DataFrame:
                     df = df.rename(columns={"日期": "date", "收盘": "close"})
                 df["date"] = pd.to_datetime(df["date"])
                 frames[code] = df.set_index("date")["close"].astype(float)
-                ok = True
                 break
             except Exception:
                 if fetch_fn_name == "stock_zh_a_hist_tx" and attempt == 0:

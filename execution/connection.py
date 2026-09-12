@@ -26,8 +26,8 @@ Usage:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import StrEnum
-from typing import Callable
 
 
 class ConnectionStatus(StrEnum):

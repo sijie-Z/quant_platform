@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-
 from quant_platform.factors.registry import get_registry
 from quant_platform.utils.logging import get_logger
 
@@ -298,7 +297,6 @@ def dsl_to_config_overrides(strategy: StrategyDefinition) -> dict[str, Any]:
 
     # Factors — set enabled factors and their weights
     factor_names = []
-    factor_overrides = {}
     for item in strategy.factors:
         name = str(item.get("name") or "").strip().lower()
         if name:

@@ -1,16 +1,21 @@
 """Tests for Strategy Evaluation Gates."""
 
 import pytest
+
 from quant_platform.strategy.gates import (
+    FAIL,
+    PASS,
+    REJECTED,
+    SKIPPED,
+    WARNING,
     GateConfig,
-    GateRunner,
-    GateResult,
     GateReport,
-    PASS, WARNING, FAIL, REJECTED, SKIPPED,
-    check_ic_quality,
-    check_drawdown_risk,
+    GateResult,
+    GateRunner,
     check_complexity,
     check_data_coverage,
+    check_drawdown_risk,
+    check_ic_quality,
 )
 
 

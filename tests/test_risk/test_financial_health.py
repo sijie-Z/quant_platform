@@ -2,14 +2,13 @@
 
 import pandas as pd
 import pytest
-
 from quant_platform.risk.financial_health import (
     FraudDetector,
     FraudReport,
     assess_st_risk,
-    owner_earnings,
     estimate_maintenance_capex,
     moat_score,
+    owner_earnings,
 )
 
 

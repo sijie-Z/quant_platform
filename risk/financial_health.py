@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-
 # ---------------------------------------------------------------------------
 # Module 1: 30-rule Fraud Detection (financial-report-minesweeper)
 # ---------------------------------------------------------------------------
@@ -327,7 +326,7 @@ def assess_st_risk(df: pd.DataFrame) -> STRiskReport:
             details.append("连续2年亏损")
     if "revenue" in df.columns and df["revenue"].iloc[-1] < 100_000_000:
         score += 2
-        details.append(f"营收低于1亿元")
+        details.append("营收低于1亿元")
     if "net_assets" in df.columns and df["net_assets"].iloc[-1] < 0:
         score += 3
         details.append("净资产为负")
@@ -511,7 +510,7 @@ def capital_cycle_stage(
     if len(capex) < 3 or len(depreciation) < 3:
         return {"stage": "数据不足", "ratio": None, "trend": ""}
 
-    ratios = [c / max(d, 1) for c, d in zip(capex, depreciation)]
+    ratios = [c / max(d, 1) for c, d in zip(capex, depreciation, strict=False)]
     current = ratios[0]
     prev = ratios[1]
     trend = "rising" if current > prev else "falling"
