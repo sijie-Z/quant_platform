@@ -317,6 +317,91 @@ walk-forward 的 "OOS" 含训练期、ML 交叉验证按行切分、基本面在
 
 ---
 
+## 第四组发现：API / CLI 契约（agent 报告 + 我复核了 CRITICAL）
+
+> agent 在巡检期间注意到有新提交落地，**全部发现都在 `0a93746` 上重新复现过**。
+> 其中一条直接指出**我那次 kill-switch 修复不完整**（见 BUG-31）。
+
+### BUG-31 · `POST /api/run` 永远无法完成 —— schema 拒绝流水线自己构造的数据 【CRITICAL · 我已复核】
+
+```python
+# api/schemas.py:163
+monthly_returns: dict[str, list[float]] | None = None
+```
+```python
+# api/routes.py:751-755 —— 实际构造的形状完全不同
+monthly = {
+    "years":  [str(y) for y in mdf.index.tolist()],   # list[str]
+    "months": list(range(1, 13)),                     # list[int]
+    "data":   mdf.values.tolist(),                    # list[list[float]]
+}
+```
+
+**我亲自复现**：
+```
+ValidationError: 2 validation errors for ChartData
+monthly_returns.data.0  Input should be a valid number [input_type=list]
+```
+
+**后果**：**主产品端点从来无法产出结果**。`_execute_pipeline` 捕获后把运行标记为 `failed`，
+`GET /api/run/{id}/result` 返 404。`/api/demo` 逃过一劫是因为它没有 `response_model`。
+
+### BUG-32 · `_run_store` 存的是 Pydantic 对象，所有消费方都当 dict 用 【HIGH】
+
+生产者 `api/routes.py:377-407` 存 `{"performance": PerformanceMetrics(...), "chart_data": ChartData(...)}`，
+而消费方全部用 `.get(...)`：
+
+```
+_run_walkforward  -> AttributeError: 'ChartData' object has no attribute 'get'
+_run_monte_carlo  -> AttributeError: 'ChartData' object has no attribute 'get'
+_decompose_risk   -> AttributeError: 'FactorICItem' object has no attribute 'get'
+_detect_regime    -> AttributeError: 'ChartData' object has no attribute 'get'
+```
+
+**注**：这一条**修正了我文档里 BUG-24 的描述**——`/api/walkforward` 目前**根本走不到**
+那段伪造折叠结果的代码，它在 `routes.py:1573` 就先崩了；而且 `/api/run` 从不成功，
+`_run_store` 始终是空的。
+
+### BUG-33 · **我上一次的 kill-switch 修复漏了第三个入口** 【HIGH · 已修复】
+
+`api/routes.py:1990` 还有第三个构造点，被 `/api/risk/status`、`/api/risk/kill-switch`、
+`/api/risk/check-order` 使用。前端有**三个** kill switch 调用点，我上次只覆盖了两个：
+
+```
+api/index.js:114  /risk/kill-switch        ← 漏掉的那个（Terminal 风控面板按的就是它）
+api/index.js:270  /core/risk/kill-switch   ← 已修
+api/index.js:295  /monitor/kill-switch     ← 已修
+```
+
+我在 commit message 里写了 "route **every** construction site through it" —— **那句话是错的**。
+已在 `60d9d28` 补齐并验证。**这是本次巡检中由独立检查抓出的、我自己的失误。**
+
+### BUG-34 · `POST /api/monitor/config` 静默忽略 `max_position_pct` 【HIGH · 已修复】
+
+`api/monitor.py:319` 写 `risk.limits.max_position_pct`，而 dataclass 字段名是
+`max_single_position_pct`。`@dataclass` 会默默接受这个野字段，**没有任何代码读它** →
+接口返回 `{"updated": ["max_position_pct"]}` 报告成功，而**实际执行的限额一动没动**。
+
+### 其余（agent 报告，我未逐条复核）
+
+| 编号 | 问题 | 位置 |
+|---|---|---|
+| BUG-35 | `POST /api/report/html` 双重失败：先用错参数调 `_build_chart_data`，再把 Pydantic 对象当 dict 传给 `html_report` → 下载栏永远 500 | `routes.py:2123,2130` |
+| BUG-36 | `POST /api/trading/start {"broker":"qmt"}` 必然 500：传 `qmt_path=`，而 `QMTBroker.__init__` 的参数是 `account=/server=/password=` | `routes.py:2344` |
+| BUG-37 | `python main.py strategy run` 崩溃：`DashboardGenerator` 这个类**根本不存在**（只有函数 `generate_dashboard`） | `main.py:1459` |
+| BUG-38 | `POST /api/data/quality` 必然 500：`numpy.bool_` 不可 JSON 序列化 | `routes.py:2289` |
+| BUG-39 | `/api/fundamentals/stats` 被 `/api/fundamentals/{code}` 遮蔽（注册顺序问题）→ 返回一只叫 "stats" 的假股票 | `routes.py:3061` vs `:3113` |
+| BUG-40 | `POST /api/portfolio/import` 正则写成了 `r"\\d{6}"`（转义过头）→ **静默导入 0 只股票**，还返回 `{"status":"ok"}` | `routes.py:1247` |
+| BUG-41 | `main.py run` **破坏它自己刚存的配置快照**：`load_config` 会 `pop` 调用方的 dict，而它在 `vm.save()` 之前执行 → 快照缺 `constraints`/`covariance`/`var`，`config rollback` 会静默回退这些段 | `utils/config.py:72` + `main.py:266,272` |
+| BUG-42 | 缓存命中时 `turnover_20d` **静默退化成价格 SMA 代理**（缓存只存 5 元组，不含 turnover）→ 同样的输入、不同的因子值 | `main.py:289,296` + `factors/technical.py:132` |
+| BUG-43 | `/api/analysis/ic-decay` 与 `/api/analysis/correlation` 总是取**最旧**的那次运行（`_run_store` 里没有 `started_at`，`max()` 对空串退化为第一个键） | `routes.py:1783,1819` |
+| BUG-44 | `_compute_attribution` 用了上一轮循环残留的 `factor_df` | `routes.py:687` |
+
+**额外印证**：BUG-05（EventBus→WebSocket 桥接）被独立确认——从 ThreadPoolExecutor 工作线程调用
+`_update_status` 时 `_broadcast_status` 调用次数为 **0**。
+
+---
+
 ## 待补
 
-- **API 契约巡检**（agent 运行中）
+- 无。四组巡检已全部完成。
