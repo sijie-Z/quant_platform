@@ -120,8 +120,8 @@ def _get_risk():
     global _core_risk
     if _core_risk is None:
         try:
-            from quant_platform.risk.circuit_breaker import RiskMonitor
-            _core_risk = RiskMonitor()
+            from quant_platform.risk.circuit_breaker import get_risk_monitor
+            _core_risk = get_risk_monitor()
         except Exception:
             pass
     return _core_risk
@@ -317,7 +317,11 @@ async def update_monitor_config(req: ConfigUpdateRequest):
 
     try:
         if req.max_position_pct is not None:
-            risk.limits.max_position_pct = req.max_position_pct
+            # The dataclass field is `max_single_position_pct`. Writing
+            # `max_position_pct` used to succeed silently on the instance and
+            # be read by nothing, so the endpoint reported success while the
+            # enforced limit never moved.
+            risk.limits.max_single_position_pct = req.max_position_pct
             updated.append("max_position_pct")
 
         if req.max_sector_pct is not None:

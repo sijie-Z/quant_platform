@@ -1988,16 +1988,17 @@ _risk_monitor = None
 
 
 def _get_risk_monitor():
+    """Return the process-wide RiskMonitor.
+
+    This previously built its own instance with an explicit RiskLimits(...)
+    whose five values are identical to the dataclass defaults, so routing it
+    through the shared singleton does not change any limit -- it only makes
+    /api/risk/* act on the same object the engine checks.
+    """
     global _risk_monitor
     if _risk_monitor is None:
-        from quant_platform.risk.circuit_breaker import RiskLimits, RiskMonitor
-        _risk_monitor = RiskMonitor(RiskLimits(
-            max_single_position_pct=0.05,
-            max_sector_pct=0.30,
-            max_daily_loss_pct=0.03,
-            max_drawdown_pct=0.15,
-            kill_drawdown_pct=0.25,
-        ))
+        from quant_platform.risk.circuit_breaker import get_risk_monitor
+        _risk_monitor = get_risk_monitor()
     return _risk_monitor
 
 
@@ -2298,13 +2299,13 @@ from quant_platform.core.audit import AuditLog
 from quant_platform.core.events import get_event_bus
 from quant_platform.core.state_machine import PortfolioStateMachine
 from quant_platform.core.store import Store
-from quant_platform.risk.circuit_breaker import RiskMonitor
+from quant_platform.risk.circuit_breaker import RiskMonitor, get_risk_monitor
 
 _core_store = Store()
 _core_bus = get_event_bus()
 _core_sm = PortfolioStateMachine()
 _core_audit = AuditLog(_core_store, _core_bus)
-_core_risk = RiskMonitor()
+_core_risk = get_risk_monitor()
 
 # Subscribe EventBus → WebSocket bridge for real-time push
 for _topic in ["order.filled", "order.rejected", "portfolio.snapshot",
@@ -2346,10 +2347,13 @@ async def trading_start(req: dict):
             account_id=req.get("account_id", ""),
         )
 
-    # Fresh state machine + risk monitor per engine start
+    # Fresh state machine per engine start, but NOT a fresh risk monitor:
+    # risk state must survive an engine restart, and the Monitor dashboard's
+    # kill switch must reach whichever engine is running. See ADR-0003 and
+    # risk.circuit_breaker.get_risk_monitor().
     _core_sm = PortfolioStateMachine()
     _core_audit = AuditLog(_core_store, _core_bus)
-    _core_risk = RiskMonitor()
+    _core_risk = get_risk_monitor()
 
     engine = LiveTradingEngine(
         broker=broker,

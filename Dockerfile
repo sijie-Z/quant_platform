@@ -52,6 +52,29 @@ COPY --from=frontend /frontend/dist ./frontend/dist
 RUN ln -sf /app /quant_platform
 ENV PYTHONPATH=/:/app
 
+# ---------------------------------------------------------------------------
+# Drop privileges. Only the paths the application actually writes to are
+# handed to the runtime user; the code itself stays root-owned and read-only
+# to the process, so a compromised app cannot rewrite itself.
+#
+# The writable set was enumerated from the source, not guessed:
+#   data/               research Registry (SQLite) + generated reports
+#   results/            config: output.results_dir
+#   .quant_cache/       PipelineCache
+#   .cache/             baostock provider cache
+#   .agent_cache/       ResearchAgent JSON cache
+#   .sentiment_cache/   LLMSentimentFactor JSON cache
+#   .quant_versions/    ConfigVersionManager snapshots
+# Each one already exists with content or is created here, so the named volumes
+# in docker-compose inherit the right ownership on first use.
+# ---------------------------------------------------------------------------
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
+    && mkdir -p data/reports results .quant_cache .cache .agent_cache .sentiment_cache .quant_versions \
+    && chown -R appuser:appuser \
+        data results .quant_cache .cache .agent_cache .sentiment_cache .quant_versions
+
+USER appuser
+
 EXPOSE 8000
 
 # python:3.12-slim ships no curl/wget, so probe with the stdlib.
