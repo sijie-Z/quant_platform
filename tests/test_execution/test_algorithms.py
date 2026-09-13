@@ -2,6 +2,11 @@
 
 from datetime import datetime
 
+import pytest
+
+# Fixed timestamp so slice target times are deterministic.
+_START = datetime(2026, 1, 5, 9, 30)
+
 from quant_platform.execution.algorithms import (
     ExecutionPlan,
     IcebergAlgorithm,
@@ -111,3 +116,39 @@ class TestSmartRouter:
         plan_normal = SmartRouter.execute(order, avg_daily_volume=1_000_000, urgency="normal")
         plan_high = SmartRouter.execute(order, avg_daily_volume=1_000_000, urgency="high")
         assert plan_high.num_slices <= plan_normal.num_slices
+
+
+class TestVWAPSliceQuantities:
+    """Regression for BUG-15.
+
+    The lot-size floor (`max(100, ...)`) can exceed what is left on a small
+    order, and the clamp that was meant to catch it compared against
+    `allocated` *after* incrementing it, so it never bit. A 200-share order over
+    10 slices produced [100, 100, 0, -100, -200, ..., -700] -- a plan summing to
+    -2600 for a 200-share parent.
+    """
+
+    @pytest.mark.parametrize("quantity", [100, 200, 500, 1000, 10_000])
+    def test_slices_are_positive_lots_summing_to_the_parent(self, quantity):
+        order = Order(ticker="600519", side=OrderSide.BUY, quantity=quantity)
+        plan = VWAPAlgorithm(num_slices=10).create_plan(order, start_time=_START)
+
+        quantities = [s.quantity for s in plan.slices]
+        assert quantities, "expected at least one slice"
+        assert all(q > 0 for q in quantities), f"non-positive slice in {quantities}"
+        assert all(q % 100 == 0 for q in quantities), f"non-lot slice in {quantities}"
+        assert sum(quantities) == quantity, (
+            f"slices sum to {sum(quantities)}, parent is {quantity}"
+        )
+
+    def test_small_order_is_not_over_split(self):
+        """200 shares is two lots, so it cannot fill ten lot-sized slices."""
+        order = Order(ticker="600519", side=OrderSide.BUY, quantity=200)
+        plan = VWAPAlgorithm(num_slices=10).create_plan(order, start_time=_START)
+        assert len(plan.slices) == 2
+        assert plan.num_slices == 2
+
+    def test_plan_never_exceeds_the_parent_quantity(self):
+        order = Order(ticker="600519", side=OrderSide.BUY, quantity=300)
+        plan = VWAPAlgorithm(num_slices=10).create_plan(order, start_time=_START)
+        assert sum(s.quantity for s in plan.slices) <= order.quantity
