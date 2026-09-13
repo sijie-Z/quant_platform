@@ -1,5 +1,7 @@
 """Tests for transaction cost model."""
 
+import logging
+
 import pandas as pd
 import pytest
 from quant_platform.backtest.cost_model import CostModel
@@ -75,3 +77,57 @@ def test_cost_zero_turnover():
     turnover = pd.Series([0.0], index=["A"])
     costs = model.compute_costs(turnover)
     assert costs.iloc[0] == 0.0
+
+
+class TestSlippageModelFallbackIsNotSilent:
+    """Regression for BUG-19.
+
+    `config/default.yaml` set `slippage_model: "impact"`, but the impact model
+    needs per-asset `daily_volume` and `volatility`, and `BacktestEngine` passes
+    neither. Every rebalance was therefore charged fixed slippage while the
+    config claimed a market-impact model was running -- silently, because the
+    fall-through had no branch of its own.
+    """
+
+    def _model(self, model_name):
+        return CostModel(
+            commission=0.0003, stamp_tax=0.001, slippage=0.0005,
+            slippage_model=model_name,
+        )
+
+    def test_impact_without_inputs_warns_that_it_is_not_running(self, caplog):
+        model = self._model("impact")
+        with caplog.at_level(logging.WARNING):
+            model.compute_costs(0.30)
+
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert messages, "the fallback was silent"
+        assert any("NOT what is running" in m for m in messages), messages
+        assert any("daily_volume" in m for m in messages), messages
+
+    def test_the_warning_is_emitted_once_not_per_rebalance(self, caplog):
+        """It describes a configuration problem, so it must not repeat on every
+        rebalance of a long backtest."""
+        model = self._model("impact")
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                model.compute_costs(0.30)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f"expected 1 warning, got {len(warnings)}"
+
+    def test_fixed_does_not_warn(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            self._model("fixed").compute_costs(0.30)
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_impact_with_inputs_engages_the_model_without_warning(self, caplog):
+        """The contrast that makes the warning meaningful: given the inputs,
+        the impact model produces a very different cost."""
+        model = self._model("impact")
+        with caplog.at_level(logging.WARNING):
+            impact_cost = model.compute_costs(0.30, daily_volume=1_000_000, volatility=0.02)
+        fixed_cost = self._model("fixed").compute_costs(0.30)
+
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert impact_cost != pytest.approx(fixed_cost, rel=0.01)
