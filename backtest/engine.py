@@ -224,7 +224,13 @@ class BacktestEngine:
 
                 turnover = (target_weights - current_weights).abs().sum() / 2
                 if turnover > 0:
-                    rebalance_cost = self.cost_model.compute_costs(turnover)
+                    # `turnover` is one-sided (the convention documented in
+                    # portfolio/constraints.py), but CostModel.compute_costs
+                    # charges commission and slippage on the value it is given
+                    # and halves stamp tax on the assumption that half of it is
+                    # sells -- which only holds for the *two-way* traded value.
+                    # Passing one-sided turnover halved every component.
+                    rebalance_cost = self.cost_model.compute_costs(turnover * 2)
                 turnover_records.append((next_rdate, turnover))
 
                 current_weights = target_weights.copy()
