@@ -70,23 +70,30 @@ def _parse_config(raw: dict[str, Any]) -> Config:
     alpha = AlphaConfig(**alpha_raw)
 
     portfolio_raw = raw.get("portfolio", {})
-    constraints_raw = portfolio_raw.pop("constraints", {})
-    cov_raw = portfolio_raw.pop("covariance", {})
-    constraints = PortfolioConstraintsConfig(**constraints_raw)
-    covariance = CovarianceConfig(**cov_raw)
+    # Non-mutating on purpose: these used to be `portfolio_raw.pop(...)`, which
+    # removed the keys from the caller's dict. `main.py run` passes the same
+    # dict to `load_config()` and then to `VersionManager.save()` a few lines
+    # later, so every auto-saved config snapshot was written *without*
+    # `portfolio.constraints`, `portfolio.covariance` and `risk.var` -- and
+    # `config rollback` then silently reverted those sections to defaults.
+    constraints = PortfolioConstraintsConfig(**portfolio_raw.get("constraints", {}))
+    covariance = CovarianceConfig(**portfolio_raw.get("covariance", {}))
     portfolio = PortfolioConfig(
         constraints=constraints,
         covariance=covariance,
-        **portfolio_raw,
+        **{k: v for k, v in portfolio_raw.items()
+           if k not in ("constraints", "covariance")},
     )
 
     backtest = BacktestConfig(**raw.get("backtest", {}))
     costs = CostsConfig(**raw.get("costs", {}))
 
     risk_raw = raw.get("risk", {})
-    var_raw = risk_raw.pop("var", {})
-    var_config = VarConfig(**var_raw)
-    risk = RiskConfig(var=var_config, **risk_raw)
+    var_config = VarConfig(**risk_raw.get("var", {}))
+    risk = RiskConfig(
+        var=var_config,
+        **{k: v for k, v in risk_raw.items() if k != "var"},
+    )
 
     output = OutputConfig(**raw.get("output", {}))
     factors = _parse_factors(raw.get("factors"))
