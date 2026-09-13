@@ -15,9 +15,16 @@ from quant_platform.alpha.ml_signal import (
 
 @pytest.fixture
 def sample_factors():
-    """Create sample factor data for testing."""
+    """Create sample factor data for testing.
+
+    `n_dates` has to satisfy the configured training window in *days*, not in
+    rows. The default `train_window` is 504 (two years), plus the purge gap and
+    the test window, so a 300-day panel cannot support it -- the previous 300
+    only "worked" because the splitter counted flattened (date, asset) rows and
+    so trained on about ten days of data while believing it had 504.
+    """
     np.random.seed(42)
-    n_dates, n_assets = 300, 50
+    n_dates, n_assets = 800, 50
     dates = pd.bdate_range("2022-01-01", periods=n_dates)
     assets = [f"stock_{i:03d}" for i in range(n_assets)]
 
@@ -96,12 +103,14 @@ class TestMLSignalGenerator:
 
     def test_prepare_dataset(self, sample_factors, sample_forward_returns):
         gen = MLSignalGenerator()
-        X, y, names = gen._prepare_dataset(
-            sample_factors, sample_forward_returns, 0, 300
+        X, y, names, row_dates = gen._prepare_dataset(
+            sample_factors, sample_forward_returns, 0, 200
         )
         assert len(X) > 0
         assert len(y) == len(X)
         assert len(names) == 5
+        # One date per row, so a splitter can divide on the date axis.
+        assert len(row_dates) == len(X)
 
     @pytest.mark.skipif(not HAS_LGB, reason="lightgbm not installed")
     def test_train_lightgbm(self, sample_factors, sample_forward_returns):
@@ -127,8 +136,10 @@ class TestMLSignalGenerator:
         gen.train(sample_factors, sample_forward_returns)
         signal = gen.predict(sample_factors)
         assert isinstance(signal, pd.DataFrame)
-        assert signal.shape[0] == 300
-        assert signal.shape[1] == 50
+        # Derive from the fixture rather than hardcoding, so growing the panel
+        # does not silently invalidate this assertion.
+        assert signal.shape[0] == sample_factors["momentum"].shape[0]
+        assert signal.shape[1] == sample_factors["momentum"].shape[1]
         # Cross-sectional rank should be in [-0.5, 0.5]
         for col in signal.columns:
             valid = signal[col].dropna()
@@ -196,3 +207,78 @@ class TestModelPerformance:
         assert perf.date == "2024-01-01"
         assert perf.test_ic == 0.03
         assert perf.test_icir == 1.5
+
+
+class TestTimeSeriesCVDates:
+    """Regression for BUG-23.
+
+    `split()` counts rows, but `_prepare_dataset` returns one row per
+    (date, asset) pair. Counting rows made `train_size=504` about ten trading
+    days rather than two years, and a ten-row purge gap less than a single
+    cross-section -- so train and test shared dates and the labels of those
+    dates leaked across the split.
+    """
+
+    def test_train_and_test_are_disjoint_on_dates(
+        self, sample_factors, sample_forward_returns
+    ):
+        gen = MLSignalGenerator()
+        n_dates = len(sample_factors["momentum"].index)
+        _, _, _, row_dates = gen._prepare_dataset(
+            sample_factors, sample_forward_returns, 0, n_dates
+        )
+        cv = TimeSeriesCV(n_splits=2, train_size=252, test_size=63, gap=10)
+
+        folds = list(cv.split_by_dates(row_dates))
+        assert folds, "expected at least one fold"
+
+        for train_idx, test_idx in folds:
+            train_dates = set(row_dates[train_idx])
+            test_dates = set(row_dates[test_idx])
+            overlap = train_dates & test_dates
+            assert not overlap, f"train and test share {len(overlap)} dates"
+            assert max(train_dates) < min(test_dates), "train must precede test"
+
+    def test_train_size_is_counted_in_days(self, sample_factors, sample_forward_returns):
+        """504 must mean 504 trading days, not 504 flattened rows."""
+        gen = MLSignalGenerator()
+        n_dates = len(sample_factors["momentum"].index)
+        _, _, _, row_dates = gen._prepare_dataset(
+            sample_factors, sample_forward_returns, 0, n_dates
+        )
+        cv = TimeSeriesCV(n_splits=1, train_size=252, test_size=63, gap=10)
+        train_idx, _ = next(iter(cv.split_by_dates(row_dates)))
+        assert len(set(row_dates[train_idx])) == 252
+
+    @pytest.mark.skipif(not HAS_LGB, reason="lightgbm not installed")
+    def test_train_splits_on_dates_not_rows(
+        self, sample_factors, sample_forward_returns, monkeypatch
+    ):
+        """The guard the two tests above cannot provide.
+
+        They exercise `split_by_dates` directly, so they would still pass if
+        `train()` went back to calling `split(len(X_full))`. This asserts which
+        one the caller actually uses.
+        """
+        import quant_platform.alpha.ml_signal as ml
+
+        calls = {"by_dates": 0, "by_rows": 0}
+        orig_by_dates = ml.TimeSeriesCV.split_by_dates
+        orig_by_rows = ml.TimeSeriesCV.split
+
+        def spy_by_dates(self, row_dates):
+            calls["by_dates"] += 1
+            return orig_by_dates(self, row_dates)
+
+        def spy_by_rows(self, n_samples):
+            calls["by_rows"] += 1
+            return orig_by_rows(self, n_samples)
+
+        monkeypatch.setattr(ml.TimeSeriesCV, "split_by_dates", spy_by_dates)
+        monkeypatch.setattr(ml.TimeSeriesCV, "split", spy_by_rows)
+
+        cfg = MLSignalConfig(model_type="lightgbm", n_splits=2)
+        MLSignalGenerator(config=cfg).train(sample_factors, sample_forward_returns)
+
+        assert calls["by_dates"] > 0, "train() did not split on dates"
+        assert calls["by_rows"] == 0, "train() fell back to counting rows"
