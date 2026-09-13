@@ -87,6 +87,10 @@ _MAX_RUNS = 50  # Keep at most this many completed runs in memory
 # WebSocket connection manager for real-time updates
 _ws_clients: set[WebSocket] = set()
 
+# The server's event loop, captured by the first WebSocket connection. Events
+# are published from worker threads, which cannot look their own loop up.
+_main_loop: asyncio.AbstractEventLoop | None = None
+
 
 async def _broadcast_status(run_id: str, status: dict):
     """Push status update to all connected WebSocket clients."""
@@ -118,15 +122,44 @@ async def _broadcast_event(event_type: str, data: dict):
     _ws_clients -= dead
 
 
-def _on_bus_event(event):
-    """EventBus handler — bridges internal events to WebSocket clients."""
-    loop = None
+def _remember_loop() -> asyncio.AbstractEventLoop | None:
+    """Record the server's event loop, from a context that is on it.
+
+    Called from the WebSocket endpoint, which is guaranteed to run on the loop
+    before any client could receive an event. Worker threads cannot do this:
+    `asyncio.get_running_loop()` raises there, which is the whole problem.
+    """
+    global _main_loop
     try:
-        loop = asyncio.get_event_loop()
+        running = asyncio.get_running_loop()
     except RuntimeError:
+        return _main_loop
+    if _main_loop is None or _main_loop.is_closed():
+        _main_loop = running
+    return _main_loop
+
+
+def _on_bus_event(event):
+    """EventBus handler -- bridges internal events to WebSocket clients.
+
+    The trading engine publishes from a worker thread
+    (`LiveTradingEngine._run_loop`), and `asyncio.get_event_loop()` raises
+    `RuntimeError` there. The old code caught that and returned, so every
+    `order.filled` / `portfolio.snapshot` / `risk.status` was dropped and the
+    dashboard's live stream stayed empty while the engine traded -- silently,
+    since the only trace was the absence of messages.
+
+    Handing the coroutine to the server's loop works from any thread, so the
+    event no longer depends on which thread published it.
+    """
+    if not _ws_clients:
         return
-    if loop and loop.is_running() and _ws_clients:
-        asyncio.ensure_future(_broadcast_event(event.topic, event.data))
+    loop = _main_loop
+    if loop is None or loop.is_closed() or not loop.is_running():
+        return
+    asyncio.run_coroutine_threadsafe(
+        _broadcast_event(event.topic, event.data), loop
+    )
 
 
 def _cleanup_old_runs():
@@ -179,6 +212,9 @@ async def health():
 
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    # Capture the loop here: this is the one place guaranteed to be running on
+    # it before events start flowing. See _on_bus_event.
+    _remember_loop()
     await ws.accept()
     _ws_clients.add(ws)
     try:
