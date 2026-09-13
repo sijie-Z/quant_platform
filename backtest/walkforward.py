@@ -179,8 +179,21 @@ class WalkForwardValidator:
                         financials=financials,
                     )
 
+                # The engine is handed extra history so its first rebalance has
+                # a warm-up, but only the test window is out of sample. Taking
+                # `result["daily_returns"]` whole made every fold's reported
+                # metrics cover train + test -- a 63-day test window was being
+                # reported over 315 days, so the "OOS" numbers were mostly
+                # in-sample performance.
+                test_start_ts = prices.index[test_sl.start]
+
                 oos_ret = result["daily_returns"]
+                if len(oos_ret) > 0:
+                    oos_ret = oos_ret.loc[oos_ret.index >= test_start_ts]
+
                 oos_bench = result.get("benchmark_returns", test_benchmark)
+                if hasattr(oos_bench, "index") and len(oos_bench) > 0:
+                    oos_bench = oos_bench.loc[oos_bench.index >= test_start_ts]
 
                 oos_returns_list.append(oos_ret)
                 oos_benchmark_list.append(oos_bench)
@@ -199,7 +212,7 @@ class WalkForwardValidator:
                     "fold": fi,
                     "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
                     "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
-                    "oos_days": len(fold_signal),
+                    "oos_days": len(oos_ret),
                     "sharpe": fold_metrics[-1].get("sharpe_ratio", 0) if fold_metrics else 0,
                 })
 
