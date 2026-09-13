@@ -1601,90 +1601,51 @@ async def run_walkforward(req: dict):
 
 
 def _run_walkforward(result: dict, params: dict) -> dict:
-    """Execute walk-forward validation."""
-    from quant_platform.backtest.walkforward import WalkForwardValidator
+    """Report that walk-forward cannot be computed from a stored run.
 
+    This used to slice the in-sample equity curve, label the slices "OOS" and
+    manufacture a Sharpe from them -- the comment said as much ("Generate
+    synthetic walk-forward results based on the run data"). No signal was
+    recomputed and no model refit, so the numbers were in-sample performance
+    wearing an out-of-sample label, on the dashboard panel titled
+    "Walk-Forward 验证". That is the most user-visible overstatement the audit
+    found.
+
+    A real walk-forward needs the per-period returns and the factor panel, to
+    recompute the signal inside each fold from train-only data. A stored run
+    keeps neither -- only `chart_data`, holding dates and an equity curve.
+    Rather than fabricate, this says so. The response shape is preserved with
+    empty collections so the panel renders nothing rather than breaking:
+    WalkForward.vue already guards on `fold_details?.length`.
+    """
     train_period = params.get("train_period", 504)
     test_period = params.get("test_period", 126)
-    mode = params.get("mode", "rolling")
-
-    WalkForwardValidator(
-        train_period=train_period,
-        test_period=test_period,
-        step_size=test_period,
-        mode=mode,
-    )
-
-    # Reconstruct data from the stored run
-    # For demo, use the stored chart data to simulate walk-forward
-    chart = result.get("chart_data", {})
-    dates = chart.get("dates", [])
-    equity = chart.get("equity", [])
-
-    if len(dates) < train_period + test_period:
-        return {
-            "error": f"Not enough data: {len(dates)} days < {train_period + test_period} required",
-            "n_folds": 0,
-        }
-
-    # Generate synthetic walk-forward results based on the run data
-    import random
-    random.Random(42)
-
-    n_folds = max(1, (len(dates) - train_period) // test_period)
-    fold_details = []
-    fold_sharpes = []
-    fold_returns = []
-
-    for i in range(min(n_folds, 8)):
-        test_start_idx = train_period + i * test_period
-        test_end_idx = min(test_start_idx + test_period, len(dates) - 1)
-        if test_start_idx >= len(dates):
-            break
-
-        # Compute OOS metrics from equity curve
-        start_val = equity[test_start_idx] if test_start_idx < len(equity) else 1
-        end_val = equity[test_end_idx] if test_end_idx < len(equity) else 1
-        fold_ret = (end_val / start_val - 1) if start_val > 0 else 0
-        fold_sharpe = fold_ret / 0.15 * np.sqrt(252 / test_period) if fold_ret != 0 else 0
-
-        fold_sharpes.append(fold_sharpe)
-        fold_returns.append(fold_ret)
-
-        fold_details.append({
-            "fold": i,
-            "train": f"{dates[0]} → {dates[min(test_start_idx - 1, len(dates)-1)]}",
-            "test": f"{dates[test_start_idx]} → {dates[test_end_idx]}",
-            "oos_days": test_end_idx - test_start_idx,
-            "sharpe": round(fold_sharpe, 2),
-            "return_pct": round(fold_ret * 100, 2),
-        })
-
-    # OOS equity curve
-    oos_equity = equity[train_period:] if len(equity) > train_period else equity
-    oos_dates = dates[train_period:] if len(dates) > train_period else dates
-
-    # Stability metrics
-    mean_sharpe = float(np.mean(fold_sharpes)) if fold_sharpes else 0
-    std_sharpe = float(np.std(fold_sharpes)) if fold_sharpes else 0
 
     return {
-        "n_folds": len(fold_details),
-        "mode": mode,
+        "available": False,
+        "reason": (
+            "Walk-forward cannot be computed from a stored run: it needs the "
+            "per-period returns and the factor panel in order to recompute the "
+            "signal inside each fold from train-only data, and a run keeps only "
+            "its equity curve. Use `python main.py walkforward`, which runs the "
+            "real validator on data it loads itself."
+        ),
+        "n_folds": 0,
+        "mode": params.get("mode", "rolling"),
         "train_period": train_period,
         "test_period": test_period,
-        "fold_details": fold_details,
-        "oos_equity": oos_equity,
-        "oos_dates": oos_dates,
+        "fold_details": [],
+        "oos_equity": [],
+        "oos_dates": [],
         "stability": {
-            "mean_sharpe": round(mean_sharpe, 3),
-            "std_sharpe": round(std_sharpe, 3),
-            "min_sharpe": round(min(fold_sharpes), 3) if fold_sharpes else 0,
-            "max_sharpe": round(max(fold_sharpes), 3) if fold_sharpes else 0,
-            "sharpe_consistency": round(sum(1 for s in fold_sharpes if s > 0) / len(fold_sharpes), 2) if fold_sharpes else 0,
-            "positive_folds": sum(1 for r in fold_returns if r > 0),
-            "total_folds": len(fold_returns),
-            "mean_return_pct": round(float(np.mean(fold_returns)) * 100, 2) if fold_returns else 0,
+            "mean_sharpe": 0,
+            "std_sharpe": 0,
+            "min_sharpe": 0,
+            "max_sharpe": 0,
+            "sharpe_consistency": 0,
+            "positive_folds": 0,
+            "total_folds": 0,
+            "mean_return_pct": 0,
         },
     }
 
