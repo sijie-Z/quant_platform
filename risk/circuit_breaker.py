@@ -111,6 +111,30 @@ class RiskMonitor:
         """
         breaches = []
 
+        # A missing instrument key used to degrade silently: the limit checks
+        # below read `order.get("ticker", "")`, so an order dict keyed on `code`
+        # -- the name `Order` and the positions table use -- resolved to an
+        # empty ticker, found no existing position, and re-checked the limit
+        # from zero. A held position of 49% against a 5% limit passed. Risk
+        # checks fail closed, so an order we cannot identify is blocked rather
+        # than waved through, and the aliases the codebase actually uses are
+        # accepted instead of only the one this function documents.
+        instrument = order.get("ticker") or order.get("symbol") or order.get("code")
+        if not instrument:
+            breaches.append(RiskBreach(
+                breach_type=BreachType.POSITION_LIMIT,
+                severity=RiskLevel.KILL,
+                message=(
+                    "Order has no instrument identifier (ticker/symbol/code) -- "
+                    "blocked, because position and sector limits cannot be "
+                    "evaluated without one"
+                ),
+                auto_action="block",
+            ))
+            return False, breaches
+        if order.get("ticker") != instrument:
+            order = {**order, "ticker": instrument}
+
         if self.kill_switch_active:
             breaches.append(RiskBreach(
                 breach_type=BreachType.POSITION_LIMIT,

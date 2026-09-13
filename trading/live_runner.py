@@ -329,7 +329,7 @@ class LiveRunner:
         # Risk pre-trade check
         side = OrderSide.BUY if sig["side"] == "buy" else OrderSide.SELL
         approved, breaches = self._risk.check_pre_trade({
-            "code": code, "side": sig["side"],
+            "ticker": code, "side": sig["side"],
             "quantity": qty, "price": price,
         })
         if not approved:

@@ -184,17 +184,24 @@ class PortfolioOrchestrator:
                         quantity=self._round_lot(buy_qty),
                         strategy=strategy_id,
                     )
-                    # Pre-trade risk check
+                    # Pre-trade risk check.
+                    #
+                    # This called `check_pre_trade(ticker=..., side=...)` with
+                    # keyword arguments, but the method takes a single dict, and
+                    # it then read `check.get('approved')` from a return value
+                    # that is a (approved, breaches) tuple. Both were wrong, so
+                    # this path raised rather than checking anything.
                     if self.risk_monitor is not None:
-                        check = self.risk_monitor.check_pre_trade(
-                            ticker=ticker,
-                            quantity=order.quantity,
-                            price=price,
-                            side=OrderSide.BUY,
-                        )
-                        if not check.get('approved', True):
-                            logger.warning('Order blocked by risk: %s', check.get('reason', ''))
-                            order.notes = f'Risk blocked: {check.get("reason", "")}'
+                        approved, breaches = self.risk_monitor.check_pre_trade({
+                            "ticker": ticker,
+                            "quantity": order.quantity,
+                            "price": price,
+                            "side": "buy",
+                        })
+                        if not approved:
+                            reason = "; ".join(b.message for b in breaches)
+                            logger.warning("Order blocked by risk: %s", reason)
+                            order.notes = f"Risk blocked: {reason}"
                             self.exec_engine.reject_order(order)
                             continue
                     self.exec_engine.submit_order(order)
