@@ -39,7 +39,13 @@ class TestSimulatePnl:
         engine.weights_history = {dates[1]: target}
         engine._simulate_pnl(returns)
 
-        assert engine.portfolio_values.iloc[-1] == pytest.approx(999_500.0)
+        # One-sided turnover is 0.5 (cash -> fully invested), so the two-way
+        # traded value is 1.0 and the cost is 1.0 * commission = 0.001.
+        # This used to assert 999_500 -- the half-charged figure produced by
+        # passing one-sided turnover to a cost model that expects two-way.
+        assert engine.portfolio_values.iloc[-1] == pytest.approx(999_000.0)
         assert engine.turnover_history is not None
         assert len(engine.turnover_history) == 1
+        # The recorded turnover stays one-sided: it is a metric, not the base
+        # the cost model is fed.
         assert engine.turnover_history.iloc[0] == pytest.approx(0.5)
