@@ -1244,7 +1244,19 @@ async def import_holdings(file_content: dict):
         df["hold_vol"] = pd.to_numeric(df["hold_vol"], errors="coerce")
         df = df[df["hold_vol"] > 0]
         df["code"] = df["code"].astype(str).str.strip().str.zfill(6)
-        df = df[df["code"].str.fullmatch(r"\\d{6}")]
+        # `r"\\d{6}"` is a 6-character pattern -- escaped backslash, then six
+        # literal `d`s -- so it matched nothing and only `\dddddd` would have
+        # passed. Every import came back {"status": "ok", "n_stocks": 0}.
+        before = len(df)
+        df = df[df["code"].str.fullmatch(r"\d{6}")]
+        if df.empty and before > 0:
+            # Not a silent success: the file had rows, none of them usable.
+            raise HTTPException(
+                400,
+                f"None of the {before} rows had a 6-digit code. Note that codes "
+                "are zero-padded -- a numeric column read from a spreadsheet "
+                "may have lost its leading zeros.",
+            )
 
         _holdings_data = {
             "holdings": df.to_dict(orient="records"),
