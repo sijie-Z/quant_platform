@@ -180,11 +180,26 @@ class VWAPAlgorithm:
 
         allocated = 0
         for i in range(n_slices):
+            remaining = order.quantity - allocated
+            if remaining <= 0:
+                break
+
             if i == n_slices - 1:
-                slice_qty = order.quantity - allocated  # Last slice gets remainder
+                slice_qty = remaining  # last slice takes the remainder
             else:
+                # The lot floor can exceed what is left on a small order: a flat
+                # volume profile with a 200-share order over 10 slices wants
+                # max(100, 20) on every slice. The previous clamp compared
+                # against `allocated` *after* incrementing it, so it never bit,
+                # and the plan came out as
+                #     [100, 100, 0, -100, -200, ..., -700]
+                # -- negative child quantities for a 200-share parent.
                 slice_qty = max(100, int(order.quantity * volume_profile[i]))
-                slice_qty = (slice_qty // 100) * 100  # Round to lot size
+                slice_qty = (slice_qty // 100) * 100  # round down to a lot
+                slice_qty = min(slice_qty, remaining)
+
+            if slice_qty <= 0:
+                break
 
             allocated += slice_qty
             target_time = start_time + timedelta(minutes=i * interval)
@@ -193,14 +208,22 @@ class VWAPAlgorithm:
                 parent_order_id=order.order_id,
                 ticker=order.ticker,
                 side=order.side.value,
-                quantity=min(slice_qty, order.quantity - (allocated - slice_qty)),
+                quantity=slice_qty,
                 target_time=target_time.isoformat(),
                 participation_rate=volume_profile[i],
             ))
 
+        plan.num_slices = len(plan.slices)
+        if allocated != order.quantity:
+            logger.warning(
+                "VWAP plan for %s allocated %d of %d shares -- the order is too "
+                "small to spread across %d lot-sized slices",
+                order.ticker, allocated, order.quantity, n_slices,
+            )
+
         logger.info("VWAP plan: %s %s x%d over %d min, %d slices",
                      order.side.value, order.ticker, order.quantity,
-                     duration_minutes, n_slices)
+                     duration_minutes, len(plan.slices))
         return plan
 
 
