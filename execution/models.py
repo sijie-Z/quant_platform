@@ -104,6 +104,11 @@ class Position:
     """Current position for a single stock."""
     ticker: str = ""
     quantity: int = 0
+    #: Shares that may be sold today. A-share T+1: anything bought today is
+    #: excluded until `OrderManager.new_trading_day()` rolls the book. The OMS
+    #: had no such field, so a sell was validated against the full holding and
+    #: a same-day round trip -- which A-share rules forbid -- went through.
+    available: int = 0
     avg_cost: float = 0.0
     current_price: float = 0.0
     sector: str = ""

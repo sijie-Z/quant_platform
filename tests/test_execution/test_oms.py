@@ -50,7 +50,10 @@ class TestOrderManager:
         self.om.submit_order(order.order_id)
         self.om.fill_order(order.order_id, price=1000.0)
 
-        # Then sell
+        # Then sell -- on the *next* session. This test used to sell the same
+        # day, which A-share T+1 forbids; the OMS had no `available` concept so
+        # it went through. See TestT1Settlement below.
+        self.om.new_trading_day()
         sell_order = self.om.create_order("600519", "sell", 100)
         self.om.submit_order(sell_order.order_id)
         self.om.fill_order(sell_order.order_id, price=1100.0)
@@ -109,10 +112,73 @@ class TestOrderManager:
         self.om.fill_order(buy_order.order_id, price=1000.0)
         assert buy_order.fills[0].tax == 0.0
 
+        self.om.new_trading_day()  # T+1: the shares are sellable tomorrow
         sell_order = self.om.create_order("600519", "sell", 100)
         self.om.submit_order(sell_order.order_id)
         self.om.fill_order(sell_order.order_id, price=1000.0)
         assert sell_order.fills[0].tax > 0.0
+
+
+class TestT1Settlement:
+    """A-share T+1: shares bought today cannot be sold today.
+
+    The OMS carried a `_trade_date_offset` field commented "For T+1
+    simulation" that nothing ever read, and validated sells against the full
+    holding, so a same-day round trip -- which the market forbids -- was booked
+    as a profit.
+    """
+
+    def setup_method(self):
+        self.om = OrderManager(initial_cash=10_000_000)
+
+    def _buy(self, qty=100, price=1000.0):
+        order = self.om.create_order("600519", "buy", qty)
+        self.om.submit_order(order.order_id)
+        self.om.fill_order(order.order_id, price=price)
+
+    def test_shares_bought_today_are_not_sellable_today(self):
+        self._buy()
+        assert self.om.positions["600519"].quantity == 100
+        assert self.om.positions["600519"].available == 0
+
+        with pytest.raises(ValueError, match="Insufficient sellable position"):
+            self.om.create_order("600519", "sell", 100)
+
+    def test_a_same_day_round_trip_cannot_be_booked(self):
+        """Before the fix this buy-then-sell pair completed and pocketed the
+        difference as realised P&L."""
+        self._buy(price=1000.0)
+        with pytest.raises(ValueError):
+            self.om.create_order("600519", "sell", 100)
+
+    def test_new_trading_day_releases_overnight_holdings(self):
+        self._buy()
+        self.om.new_trading_day()
+        assert self.om.positions["600519"].available == 100
+
+        order = self.om.create_order("600519", "sell", 100)
+        self.om.submit_order(order.order_id)
+        self.om.fill_order(order.order_id, price=1100.0)
+        assert "600519" not in self.om.positions
+
+    def test_only_the_old_cohort_is_released(self):
+        """A buy after the roll stays locked until the next roll."""
+        self._buy(qty=100)
+        self.om.new_trading_day()
+        self._buy(qty=100)
+
+        pos = self.om.positions["600519"]
+        assert pos.quantity == 200
+        assert pos.available == 100, "yesterday's 100 only"
+
+        with pytest.raises(ValueError, match="Insufficient sellable position"):
+            self.om.create_order("600519", "sell", 200)
+
+        # Selling what is actually available works.
+        order = self.om.create_order("600519", "sell", 100)
+        self.om.submit_order(order.order_id)
+        self.om.fill_order(order.order_id, price=1100.0)
+        assert self.om.positions["600519"].quantity == 100
 
 
 class TestSimulatedExchange:
