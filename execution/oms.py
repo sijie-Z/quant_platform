@@ -54,7 +54,6 @@ class OrderManager:
         self.positions: dict[str, Position] = {}
         self.blotter: list[Order] = []
         self.snapshots: list[PortfolioSnapshot] = []
-        self._trade_date_offset = 0  # For T+1 simulation
 
     # ── Order Lifecycle ──
 
@@ -74,13 +73,20 @@ class OrderManager:
         if quantity <= 0:
             raise ValueError(f"Invalid quantity: {quantity} (min {MIN_LOT})")
 
-        # A-share T+1: cannot sell shares bought today
+        # A-share T+1: cannot sell shares bought today.
+        #
+        # This checked `pos.quantity`, the full holding, so a buy and a sell in
+        # the same session went through. `available` excludes today's purchases
+        # and is released by `new_trading_day()`.
         if side == "sell":
             pos = self.positions.get(ticker)
-            if not pos or pos.quantity < quantity:
-                avail = pos.quantity if pos else 0
+            available = pos.available if pos else 0
+            if available < quantity:
+                held = pos.quantity if pos else 0
                 raise ValueError(
-                    f"Insufficient position: {ticker} has {avail}, "
+                    f"Insufficient sellable position: {ticker} has {available} "
+                    f"available today (holding {held}, of which "
+                    f"{held - available} was bought today and is T+1 locked), "
                     f"trying to sell {quantity}"
                 )
 
@@ -207,6 +213,8 @@ class OrderManager:
             if total_qty > 0:
                 pos.avg_cost = (pos.avg_cost * pos.quantity + cost) / total_qty
             pos.quantity = total_qty
+            # Today's purchase is T+1 locked: quantity grows, `available` does
+            # not. `new_trading_day()` releases it.
 
         elif order.side == OrderSide.SELL:
             # Add cash (minus costs)
@@ -217,9 +225,21 @@ class OrderManager:
             realized = (fill.price - pos.avg_cost) * fill.quantity
             pos.realized_pnl += realized
             pos.quantity -= fill.quantity
+            pos.available -= fill.quantity
             # Remove position if fully sold
             if pos.quantity <= 0:
                 del self.positions[ticker]
+
+    def new_trading_day(self) -> None:
+        """Roll the book: everything held overnight becomes sellable.
+
+        A-share T+1 settlement. Call once per session, before the day's orders.
+        Without this, `available` would never leave zero -- the class carried a
+        `_trade_date_offset` field commented "For T+1 simulation" that nothing
+        ever read, and no day-boundary method existed at all.
+        """
+        for pos in self.positions.values():
+            pos.available = pos.quantity
 
     def update_prices(self, prices: dict[str, float]):
         """Update all positions with current market prices."""
