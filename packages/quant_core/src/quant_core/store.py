@@ -521,6 +521,20 @@ class Store:
                 (cutoff,)).fetchall()
             return [dict(r) for r in rows]
 
+    def get_latest_nav(self) -> dict | None:
+        """Return the most recent NAV record, or None if there is none.
+
+        Distinct from get_nav_history(): that one takes a *window ending now*,
+        so it cannot answer "what was the last state we recorded" when the
+        process has not run for a while. State restoration needs the latest
+        row, which is what this returns.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM nav_history ORDER BY date DESC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
+
     # ── Stats ──
 
     def get_stats(self) -> dict:

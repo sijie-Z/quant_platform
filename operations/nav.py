@@ -87,11 +87,22 @@ class NAVCalculator:
         self._restore_state()
 
     def _restore_state(self) -> None:
-        """Restore HWM and units from the latest NAV record."""
+        """Restore HWM and units from the most recent NAV record.
+
+        This asked for `days=1` and then relied on `date > cutoff`, where
+        cutoff is *yesterday's date string*. A record written yesterday does
+        not satisfy `>`, so the lookup only ever found a record written today.
+        Any restart on a new calendar day silently reset the high-water mark to
+        1.0 and the unit count to the initial value -- which books a
+        performance fee against investors who are still below high water.
+
+        Restoring state means "read the latest record we have", not "read
+        yesterday's" -- so this asks the store for the latest row directly
+        rather than for a window ending today.
+        """
         try:
-            history = self._store.get_nav_history(days=1)
-            if history:
-                latest = history[-1]
+            latest = self._store.get_latest_nav()
+            if latest:
                 self._high_water_mark = latest.get(
                     "high_water_mark", self._initial_nav_per_unit
                 )

@@ -340,3 +340,27 @@ class RiskMonitor:
                 "kill_drawdown": self.limits.kill_drawdown_pct,
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# Process-wide instance.
+#
+# docs/ARCHITECTURE_V2.md ADR-0003 already makes this a design rule ("OMS、
+# 风控、实盘引擎各只有一条主实现"), but it also has to be literally one object:
+# the Monitor dashboard's kill switch and the trading engine must act on the
+# same state. They previously did not — api/monitor.py and api/routes.py each
+# built their own RiskMonitor, so pressing Kill Switch in the UI flipped a
+# flag on an instance no engine ever read, and the engine kept trading.
+# ---------------------------------------------------------------------------
+_default_monitor: RiskMonitor | None = None
+
+
+def get_risk_monitor() -> RiskMonitor:
+    """Return the process-wide RiskMonitor, creating it on first use.
+
+    Use this everywhere instead of constructing RiskMonitor() directly.
+    """
+    global _default_monitor
+    if _default_monitor is None:
+        _default_monitor = RiskMonitor()
+    return _default_monitor

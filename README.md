@@ -22,7 +22,7 @@
 一个覆盖 **研究 → 验证 → 实盘** 全链路的 A 股量化平台：
 
 - **研究层**：20+ 因子引擎、IC/ICIR 评估、因子合成、Walk-Forward 验证、组合优化
-- **验证层**：Oracle IC / Known Alpha / MVO Audit 六项系统性验证，No-Lookahead 零前视契约
+- **验证层**：Oracle IC / Known Alpha / MVO Audit 六项系统性验证；No-Lookahead 契约 8 条中 4 条已验证成立、3 条未接线（见「研究验证」一节）
 - **实盘层**：实时行情、Paper Trading 模拟盘、QMT 实盘接口、实时风控熔断、执行算法
 - **展示层**：FastAPI 97 个 REST 端点 + WebSocket 实时推送 + Vue 3 Bloomberg 风格仪表盘
 
@@ -169,8 +169,25 @@ quant_platform/
 | Known Alpha Recovery | 生成含已知 Alpha 的数据 → 因子引擎恢复 | **IC 与理论值一致** |
 | Rank IC 对比 | 手动 vs 官方计算 | **差异 < 0.001%** |
 | MVO Audit | 60 次调仓全日志 | **60/60 Success, 0 Fallback** |
-| WalkForward | 多 fold 滚动 OOS | **全部通过（无前视偏差）** |
-| No-Lookahead | 8 条不可协商契约 | **全部实现** |
+| WalkForward | 多 fold 滚动 OOS | ⚠️ **信号生成成立，指标窗口不成立** —— 每折信号确实只用 train-only 数据重算（已验证），但**报告的 OOS 指标覆盖 train+test**。见 BUG-21 |
+| No-Lookahead | 8 条不可协商契约 | ⚠️ **4 条已验证成立，3 条未接线，1 条未核** —— 见下方 |
+
+**逐条核对结果**（2026-09-13 巡检实测，详见 `docs/AUDIT_BUG_PATROL_2026-09-13.md`）：
+
+| 契约 | 状态 |
+|------|------|
+| 第一条 价格因子只用 signal_date 及之前 | ✅ 成立（截断测试 max\|diff\| = 0） |
+| 第二条 Alpha 权重只用历史 IC | ✅ 成立（`ic_s[ic_s.index < date]`） |
+| 第三条 基本面用 `publish_date` 而非期末 | ⚠️ **只实现了一半** —— 生成并保留了 `publish_date`，但**从未按它过滤**。实测 2021-06-30 的财报在 2021-07-01 即可见（`publish_date` 为 2021-08-17）。做 PIT 的 `get_financials_as_of()` 存在但只被测试调用 |
+| 第四条 Walk-Forward 每折用 train-only 重算信号 | ✅ 成立 |
+| 第五条 合成数据嵌入式 Alpha 仅用于演示 | 未核 |
+| 第六条 IC 计算 shift 链条正确 | ✅ 成立（与手算逐点对照 max\|diff\| = 0.00e+00） |
+| 第七条 行业分类用生效日期 | ❌ 未实现（`processing.py` 只接受静态 map） |
+| 第八条 ST 状态用公告日期 | ❌ 未实现（`pipeline.py:95` 用全样本 `is_st` 过滤） |
+
+> **另有两项验证能力当前不达标**（见 `docs/AUDIT_BUG_PATROL_2026-09-13.md`）：
+> ML 交叉验证按 `(日期, 股票)` 拍平行切分，训练与测试**共享真实日期**（BUG-23）；
+> 交易成本模型系统性减半（BUG-03）。**受影响的既有回测结果需要重新解释。**
 
 **诚实研究记录**（`lab/`）：每次因子运行都会在 SQLite Registry 中记录数据源、复权方式、PIT 状态、偏差警告，失败运行同样记录——系统从不隐藏自身的不确定性。
 
