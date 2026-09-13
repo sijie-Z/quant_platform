@@ -272,7 +272,10 @@ class CapacityEstimator:
                 # Standard turnover cost
                 turnover = abs(trade_weights).sum() / 2
                 total_turnover += turnover
-                cost_rate = self.cost_model.compute_costs(turnover)
+                # Two-way traded value: compute_costs halves stamp tax on the
+                # assumption that half of its input is sells, so it needs
+                # buys + sells, not the one-sided turnover kept above.
+                cost_rate = self.cost_model.compute_costs(turnover * 2)
                 capital -= cost_rate * capital
 
                 # Extra impact cost
