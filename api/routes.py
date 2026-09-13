@@ -2333,6 +2333,24 @@ async def trading_start(req: dict):
 
     global _live_engine, _core_sm, _core_risk
 
+    # Refuse to start a second engine.
+    #
+    # `_live_engine` is only ever overwritten, so a second start orphaned the
+    # first: its scheduler thread and broker kept running with no handle left
+    # to stop them, both engines wrote positions/P&L/orders into the same
+    # store, and the orphan's kill switch became unreachable because
+    # `_core_risk` was rebound too. LiveTradingEngine.start()'s own
+    # `if self._running: return` guard is per-instance and cannot help.
+    existing = _get_live_engine()
+    if existing is not None and getattr(existing, "_running", False):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A trading engine is already running. Call POST /api/trading/stop "
+                "before starting another."
+            ),
+        )
+
     broker_type = req.get("broker", "simulated")
     initial_cash = req.get("initial_cash", 1_000_000)
     n_stocks = req.get("n_stocks", 30)
