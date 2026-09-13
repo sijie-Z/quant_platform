@@ -283,18 +283,23 @@ def cmd_run(args) -> int:
     # ------------------------------------------------------------------
     logger.info("[1/6] Loading data...")
     data_tuple = None
+    # Stage name carries a version. This entry used to be a 5-tuple without
+    # `turnover`, and on a cache hit the code set `turnover = None` -- which
+    # made TurnoverFactor fall back to a price SMA. Identical inputs therefore
+    # produced a different `turnover_20d` depending on whether the cache was
+    # warm. Reading old entries back is what caused that, so a new stage name
+    # retires them rather than trying to detect the shape.
     if use_cache:
-        data_tuple = cache.load_stage("data", cache_key)
+        data_tuple = cache.load_stage("data_v2", cache_key)
 
     if data_tuple is not None:
-        prices, returns, benchmark, metadata, financials = data_tuple
-        turnover = None
+        prices, returns, benchmark, metadata, financials, turnover = data_tuple
         logger.info("Data loaded from cache")
     else:
         prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_baostock=args.use_baostock)
         if use_cache:
-            cache.save_stage("data", cache_key,
-                             (prices, returns, benchmark, metadata, financials))
+            cache.save_stage("data_v2", cache_key,
+                             (prices, returns, benchmark, metadata, financials, turnover))
 
     # ------------------------------------------------------------------
     # 2. Factors
