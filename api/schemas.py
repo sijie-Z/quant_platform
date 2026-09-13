@@ -153,6 +153,25 @@ class AttributionItem(BaseModel):
     avg_ic: float
 
 
+class MonthlyReturns(BaseModel):
+    """Year x month grid for the dashboard's monthly-returns heatmap.
+
+    The producer (`_build_chart_data`) and the consumer (`TerminalDashboard`'s
+    heatmap) both already used this shape -- `years[i]` labels row i,
+    `months[j]` labels column j, `data[i][j]` is that cell's return -- but the
+    field was annotated `dict[str, list[float]]`, which no value of this shape
+    can satisfy. `POST /api/run` therefore failed validation at its final stage
+    on every request, so the run was marked failed and `/api/run/{id}/result`
+    always returned 404.
+
+    Cells with no observation are NaN; the chart skips them.
+    """
+
+    years: list[str] = Field(default_factory=list)
+    months: list[int] = Field(default_factory=list)
+    data: list[list[float]] = Field(default_factory=list)
+
+
 class ChartData(BaseModel):
     dates: list[str]
     equity: list[float]
@@ -160,7 +179,7 @@ class ChartData(BaseModel):
     drawdown: list[float] | None = None
     rolling_sharpe: list[float] | None = None
     rolling_sharpe_dates: list[str] | None = None
-    monthly_returns: dict[str, list[float]] | None = None
+    monthly_returns: MonthlyReturns | None = None
     return_distribution: dict[str, Any] | None = None
     excess_cumulative: list[float] | None = None
     turnover: list[TurnoverItem] | None = None
