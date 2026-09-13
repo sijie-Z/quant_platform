@@ -73,6 +73,34 @@ class TestNAVCalculatorInit:
         calc = NAVCalculator(store)
         assert calc._high_water_mark == 1.02
 
+    def test_restore_state_after_a_date_gap(self, store):
+        """Regression: restore asked for a window ending *today*.
+
+        `_restore_state` used `get_nav_history(days=1)`, whose filter is
+        `date > (now - 1 day)`. A record written on an earlier calendar day
+        does not satisfy a strict `>`, so the lookup only ever found a record
+        written today; any restart on a new day reset the high-water mark to
+        1.0 and booked a performance fee against investors still below high
+        water.
+
+        The existing test above passes today's date, which is exactly the one
+        case the old code handled -- so it could never catch this.
+        """
+        older = (_TODAY - timedelta(days=5)).strftime("%Y-%m-%d")
+        store.save_nav({
+            "date": older, "nav_total": 10_800_000,
+            "nav_per_unit": 1.08, "total_units": 12_000_000,
+            "high_water_mark": 1.20,
+        })
+        calc = NAVCalculator(store)
+        assert calc._high_water_mark == 1.20
+        assert calc._total_units == 12_000_000
+
+    def test_restore_state_on_empty_store(self, store):
+        """No history must leave the defaults alone, not raise."""
+        calc = NAVCalculator(store)
+        assert calc._high_water_mark == 1.0
+
 
 # ── Daily NAV Calculation ──
 
