@@ -131,10 +131,19 @@ class TurnoverFactor(BaseFactor):
 
     def compute(self, prices: pd.DataFrame, **kwargs) -> pd.DataFrame:
         turnover = kwargs.get("turnover")
-        if turnover is not None:
-            return turnover.rolling(self._period).mean()
-        logger.warning("turnover data not provided, using price SMA as proxy")
-        return prices.rolling(self._period).mean()
+        if turnover is None:
+            # Returning a price SMA here used to make a cached run disagree
+            # with an uncached one under the same config -- same inputs, a
+            # different `turnover_20d`, because the cached path dropped the
+            # real turnover. A price-level moving average is not turnover, and
+            # naming it `turnover_20d` mislabels whatever the alpha pipeline
+            # does with it. Refusing is the honest option.
+            raise ValueError(
+                "turnover_20d requires turnover data; the caller passed None. "
+                "Substituting a price SMA would produce a value that is not "
+                "turnover while keeping the factor's name."
+            )
+        return turnover.rolling(self._period).mean()
 
 
 # ---------------------------------------------------------------------------
