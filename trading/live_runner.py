@@ -285,17 +285,47 @@ class LiveRunner:
         current_equity = self._get_equity()
         target_value_per_stock = current_equity * 0.04  # 4% per position
 
+        # Rebalance against what is actually held.
+        #
+        # This used to emit `buy` for the whole top-N on every cycle without
+        # ever looking at the book, so a 4%-per-name target drained ~4% x N of
+        # cash per cycle and no position could ever be exited. Cash went
+        # 1M -> 927k -> 873k -> 839k over three cycles with three positions
+        # held throughout.
+        held = {p.code: p for p in self._broker.get_positions()}
+        wanted = {code for code, score in sorted_scores[:top_n] if score > 0.005}
+
+        # Exit anything that has dropped out of the target set.
+        for ticker, pos in held.items():
+            if ticker in wanted or pos.quantity <= 0:
+                continue
+            signals.append({
+                "code": ticker,
+                "side": "sell",
+                "quantity": pos.quantity,
+                "strength": 0.0,
+                "reason": "dropped out of target set",
+            })
+
+        # Buy only the shortfall on names we want, not the whole target again.
         for code, score in sorted_scores[:top_n]:
-            if score > 0.005:  # threshold
-                price = self._current_prices.get(code, 0)
-                if price > 0:
-                    signals.append({
-                        "code": code,
-                        "side": "buy",
-                        "target_value": target_value_per_stock,
-                        "strength": round(score, 4),
-                        "reason": f"composite={score:.3f}",
-                    })
+            if score <= 0.005:  # threshold
+                continue
+            price = self._current_prices.get(code, 0)
+            if price <= 0:
+                continue
+            existing = held.get(code)
+            held_value = existing.market_value if existing is not None else 0.0
+            shortfall = target_value_per_stock - held_value
+            if shortfall <= 0:
+                continue
+            signals.append({
+                "code": code,
+                "side": "buy",
+                "target_value": shortfall,
+                "strength": round(score, 4),
+                "reason": f"composite={score:.3f}",
+            })
 
         return signals
 
@@ -321,8 +351,14 @@ class LiveRunner:
         lot_size = 100
         if isinstance(self._broker, SimulatedBroker):
             lot_size = self._broker._get_lot_size(code)
-        target_value = sig["target_value"]
-        qty = int(target_value / price / lot_size) * lot_size
+
+        if sig.get("quantity") is not None:
+            # Exit signal: an explicit share count, already held, so it is
+            # whole lots by construction.
+            qty = int(sig["quantity"])
+        else:
+            target_value = sig["target_value"]
+            qty = int(target_value / price / lot_size) * lot_size
         if qty <= 0:
             return None
 
@@ -352,8 +388,12 @@ class LiveRunner:
         price = self._current_prices.get(code, 0)
         if price <= 0:
             return None
-        target_value = sig["target_value"]
-        qty = int(target_value / price / 100) * 100
+        if sig.get("quantity") is not None:
+            # Exit signal: explicit share count, already held.
+            qty = int(sig["quantity"])
+        else:
+            target_value = sig["target_value"]
+            qty = int(target_value / price / 100) * 100
         if qty <= 0:
             return None
 
@@ -378,6 +418,9 @@ class LiveRunner:
 
         if prices:
             self.set_prices(prices)
+
+        # Mark to market before anything reads equity.
+        self._mark_to_market()
 
         # Generate and execute signals
         signals = self._generate_signals()
@@ -406,7 +449,9 @@ class LiveRunner:
         risk_status = self._risk.get_status()
         risk_status.get("risk_level", "GREEN")
 
-        # Calculate P&L
+        # Calculate P&L. Mark to market again first: a position opened during
+        # this cycle is still valued at zero until its price is refreshed.
+        self._mark_to_market()
         equity = self._get_equity()
         prev_equity = self._peak_equity
         if self._daily_reports:
@@ -517,6 +562,27 @@ class LiveRunner:
     def _get_equity(self) -> float:
         acct = self._broker.get_account()
         return acct.get("total_equity", self._initial_cash)
+
+    def _mark_to_market(self) -> None:
+        """Refresh broker position valuations from the latest prices.
+
+        `Position.market_value` is written by exactly one method --
+        `SimulatedBroker.update_price()`, reached through
+        `update_market_prices()` -- and this runner never called it. Every
+        position therefore kept `market_value == 0` and `get_account()`'s
+        `total_equity` was just cash: a cycle that spent 160k on stock reported
+        a 160k *loss*, and that wrong figure fed back into sizing
+        (`target_value_per_stock = equity * 0.04`), so the book shrank every
+        cycle. `LiveTradingEngine` does this at its own step 1.
+
+        Called twice per cycle on purpose. Once before sizing, so the equity
+        behind the target values includes the book; and once after execution,
+        because a position opened this cycle is still valued at zero until the
+        next price update -- the same trap as the P&L snapshot in
+        `LiveTradingEngine._execute_cycle`.
+        """
+        if isinstance(self._broker, SimulatedBroker) and self._current_prices:
+            self._broker.update_market_prices(self._current_prices)
 
     def _get_cash(self) -> float:
         acct = self._broker.get_account()
