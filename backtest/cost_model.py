@@ -61,6 +61,9 @@ class CostModel:
         # Lazy-load impact model (only when needed)
         self._impact_calculator = None
         self._impact_model_name = impact_model
+        # Set once, the first time a configured model cannot be used, so the
+        # warning names the problem without repeating on every rebalance.
+        self._slippage_fallback_warned = False
 
     def compute_costs(
         self,
@@ -115,6 +118,31 @@ class CostModel:
             slippage_cost = abs_turnover * self.slippage * np.sqrt(participation)
         else:
             # Fixed slippage (default, fast)
+            #
+            # Reached whenever a non-fixed model was configured but the inputs
+            # it needs were not supplied. That used to be completely silent:
+            # `config/default.yaml` asked for "impact", `BacktestEngine` passed
+            # neither `daily_volume` nor `volatility`, and every rebalance was
+            # charged fixed slippage while the config claimed otherwise. The
+            # numbers were not wrong, but the description of them was.
+            if self.slippage_model != "fixed":
+                missing = [
+                    name for name, value in (
+                        ("daily_volume", daily_volume),
+                        ("volatility", volatility),
+                    )
+                    if value is None
+                ]
+                if not self._slippage_fallback_warned:
+                    self._slippage_fallback_warned = True
+                    logger.warning(
+                        "slippage_model=%r is not in use: compute_costs() was "
+                        "given no %s. Falling back to fixed slippage of %.1f "
+                        "bps -- the configured model is NOT what is running.",
+                        self.slippage_model,
+                        " or ".join(missing) or "supporting inputs",
+                        self.slippage * 10000,
+                    )
             slippage_cost = abs_turnover * self.slippage
 
         return commission_cost + stamp_cost + slippage_cost
