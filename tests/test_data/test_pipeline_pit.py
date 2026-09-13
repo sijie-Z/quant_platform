@@ -150,12 +150,13 @@ class TestSyntheticProviderPIT:
         assert "publish_date" in fin.columns
 
     def test_publish_date_after_report_date(self):
-        """publish_date should be after the original quarter-end report date.
+        """publish_date must not precede the fiscal period it describes.
 
-        After forward-fill to daily frequency, the index 'date' is a daily
-        timestamp that may exceed the publish_date. We verify the relationship
-        on the original quarterly rows by checking unique publish_date values
-        against the quarter-end dates they were generated from.
+        After the PIT fix, the index 'date' is the *visibility* date -- the day
+        a value became usable -- not the fiscal period end. Reports are
+        re-indexed to their publish_date before forward-filling, so the period
+        the figures describe now lives in the `fiscal_period_end` column and
+        that is what this compares against.
         """
         provider = SyntheticDataProvider(n_stocks=10, seed=42)
         provider._generate_all()
@@ -164,24 +165,61 @@ class TestSyntheticProviderPIT:
 
         if "publish_date" not in fin.columns:
             pytest.skip("No publish_date column")
+        if "fiscal_period_end" not in fin.columns:
+            pytest.skip("No fiscal_period_end column")
 
-        # Get unique publish_dates and their associated quarter-end dates
-        valid = fin.dropna(subset=["publish_date"])[["publish_date"]]
-        unique = valid.reset_index().drop_duplicates(subset=["date", "publish_date"])
+        rows = fin.dropna(subset=["publish_date", "fiscal_period_end"]).reset_index()
+        rows = rows.drop_duplicates(subset=["fiscal_period_end", "publish_date"])
+        assert not rows.empty
 
-        # After forward-fill, the original quarter-end dates are preserved in
-        # the 'date' index. But forward-fill means later daily dates share the
-        # same publish_date. We only check rows where date is a quarter-end
-        # (the original report dates).
-        quarter_ends = unique[unique["date"].dt.is_quarter_end]
-        if quarter_ends.empty:
-            # If no quarter-end rows in range, just verify publish_dates are
-            # reasonable (within 60 days of any date in the row)
-            for _, row in unique.head(5).iterrows():
-                delta = (row["publish_date"] - row["date"]).days
-                assert delta < 60, f"publish_date too far from date: {delta} days"
-        else:
-            for _, row in quarter_ends.iterrows():
-                assert row["publish_date"] >= row["date"], (
-                    f"publish_date {row['publish_date']} < report_date {row['date']}"
-                )
+        for _, row in rows.iterrows():
+            assert row["publish_date"] >= row["fiscal_period_end"], (
+                f"publish_date {row['publish_date']} < fiscal_period_end "
+                f"{row['fiscal_period_end']}"
+            )
+
+    def test_no_value_is_visible_before_its_publish_date(self):
+        """Regression for BUG-22.
+
+        The daily panel used to be forward-filled from the fiscal period end
+        and then bfilled, so a Q2 report was visible ~33 trading days before
+        publication and the first report was pushed back to the start of the
+        sample. A report's figures must first appear on their publish_date.
+        """
+        provider = SyntheticDataProvider(n_stocks=5, seed=7)
+        provider._generate_all()
+        fin = provider.get_financials("2020-01-01", "2023-12-31").reset_index()
+
+        rows = fin.dropna(subset=["publish_date"])
+        assert not rows.empty
+
+        checked = 0
+        for (_, pub), sub in rows.groupby(["asset", "publish_date"]):
+            first_visible = pd.Timestamp(sub["date"].min())
+            assert first_visible >= pd.Timestamp(pub), (
+                f"a value published {pd.Timestamp(pub).date()} is already "
+                f"visible on {first_visible.date()}"
+            )
+            checked += 1
+        assert checked > 0, "no (asset, publish_date) groups were checked"
+
+    def test_nothing_is_backfilled_before_the_first_report(self):
+        """Regression for BUG-22, second half.
+
+        `bfill()` used to push the first report back to the first date of the
+        sample, so fundamentals were "known" months before anything was
+        published. Before a company's first report there is genuinely nothing
+        to know.
+        """
+        provider = SyntheticDataProvider(n_stocks=5, seed=7)
+        provider._generate_all()
+        fin = provider.get_financials("2020-01-01", "2023-12-31")
+
+        earliest_publish = fin["publish_date"].min()
+        assert pd.notna(earliest_publish)
+
+        before = fin.loc[fin.index.get_level_values("date") < earliest_publish]
+        assert before["market_cap"].isna().all(), (
+            "fundamental values exist before the first publish_date, which can "
+            "only come from a backward fill"
+        )
