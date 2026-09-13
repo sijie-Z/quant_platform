@@ -1505,12 +1505,14 @@ def cmd_strategy(args) -> int:
         # Generate report
         from pathlib import Path
 
-        from quant_platform.reporting.dashboard import DashboardGenerator
+        # `reporting.dashboard` exposes `generate_dashboard(results, ...)`, not
+        # a `DashboardGenerator` class -- that name existed here and nowhere
+        # else, so `main.py strategy run` raised ImportError every time.
+        from quant_platform.reporting.dashboard import generate_dashboard
 
         report_path = Path(config.output.results_dir)
         report_path.mkdir(parents=True, exist_ok=True)
-        dg = DashboardGenerator(strategy.name, output_dir=str(report_path))
-        report = dg.generate(bt_result)
+        report = generate_dashboard(bt_result, output_dir=str(report_path))
         print(report)
         logger.info("Strategy run complete: %s v%s", strategy.name, strategy.version)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -159,6 +160,24 @@ def _on_bus_event(event):
         return
     asyncio.run_coroutine_threadsafe(
         _broadcast_event(event.topic, event.data), loop
+    )
+
+
+def _latest_run_id() -> str:
+    """The most recently started run.
+
+    `_run_store` holds only result payloads -- performance, chart_data,
+    factors -- and no timestamps at all. The endpoints below compared
+    `_run_store[k].get("started_at", "")` for every key, i.e. empty string
+    against empty string, so `max` returned the first-inserted run and IC decay
+    and factor correlation always served the *oldest* run. `started_at` lives
+    in `_run_status`.
+    """
+    if not _run_status:
+        raise HTTPException(400, "No completed run found. Run pipeline first.")
+    return max(
+        _run_status.keys(),
+        key=lambda k: _run_status[k].get("started_at", "") or "",
     )
 
 
@@ -721,6 +740,12 @@ def _compute_attribution(
         # Compute average IC
         try:
             fwd_ret = returns.shift(-1)
+            # `factor_df` here was left over from the loop above, so it held
+            # whichever factor that loop happened to end on -- the IC reported
+            # for each name was computed from some other factor's dates. Line
+            # 729 already used processed_factors[name]; this line did not. If
+            # the earlier loop never ran, the name was simply undefined.
+            factor_df = processed_factors[name]
             common_dates = factor_df.index.intersection(fwd_ret.dropna().index)
             ics = []
             for d in common_dates[:60]:
@@ -1828,7 +1853,7 @@ async def get_ic_decay():
         return {"factors": []}
 
     # Get the latest run
-    latest_id = max(_run_store.keys(), key=lambda k: _run_store[k].get("started_at", ""))
+    latest_id = _latest_run_id()
     result = _run_store[latest_id]
     factors = result.get("factors", [])
 
@@ -1864,7 +1889,7 @@ async def get_factor_correlation():
     if not _run_store:
         return {"names": [], "matrix": []}
 
-    latest_id = max(_run_store.keys(), key=lambda k: _run_store[k].get("started_at", ""))
+    latest_id = _latest_run_id()
     result = _run_store[latest_id]
     factors = result.get("factors", [])
 
@@ -2408,9 +2433,16 @@ async def trading_start(req: dict):
         broker = SimulatedBroker(initial_cash=initial_cash)
     else:
         from quant_platform.trading.broker import QMTBroker
+        # `QMTBroker.__init__` takes account/server/password/mode/data_server.
+        # This passed `qmt_path` and `account_id`, neither of which exists, so
+        # selecting the QMT broker raised TypeError and the endpoint returned
+        # 500 on every attempt -- the live-trading path could not be started
+        # through the API at all.
         broker = QMTBroker(
-            qmt_path=req.get("qmt_path", ""),
-            account_id=req.get("account_id", ""),
+            account=req.get("account_id", ""),
+            server=req.get("server", "localhost:58610"),
+            password=req.get("password", "") or os.environ.get("QMT_PASSWORD", ""),
+            mode=req.get("mode", "sim"),
         )
 
     # Fresh state machine per engine start, but NOT a fresh risk monitor:
@@ -3125,6 +3157,12 @@ def _get_fundamental_provider():
     return _fundamental_provider
 
 
+@router.get("/fundamentals/stats")
+async def fundamental_stats():
+    """Get fundamental provider statistics."""
+    provider = _get_fundamental_provider()
+    return provider.stats
+
 @router.get("/fundamentals/{code}", response_model=FundamentalMetricsResponse)
 async def get_fundamentals(code: str):
     """Get real-time fundamental metrics for a stock."""
@@ -3177,8 +3215,3 @@ async def rank_fundamentals(req: FundamentalRankRequest):
     )
 
 
-@router.get("/fundamentals/stats")
-async def fundamental_stats():
-    """Get fundamental provider statistics."""
-    provider = _get_fundamental_provider()
-    return provider.stats
