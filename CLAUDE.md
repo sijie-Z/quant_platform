@@ -1029,7 +1029,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 6. **LLM Agent 集成** — 财经新闻情感因子，Strategy 模式可插拔 OpenAI，JSON 缓存
 7. **向量化回测** — 热路径无 for 循环，月频调仓+日频漂移，完整成本模型
 8. **未来函数防范** — Point-in-time IC加权(严格因果) + IC计算无shift链条 + Walk-Forward折内重算信号 + 合成数据真实IC水平，5项显式防护
-9. **数据时间点快照** — 财务数据publish_date过滤 + ST公告滞后 + 行业分类effective_date，回测零前视偏差
+9. **数据时间点快照** — ⚠️ **当前不成立**：publish_date 的生成与保留已实现，但**从未按它过滤**；ST 过滤用全样本状态；行业分类用静态 map。三条 PIT accessor 存在但只被测试调用。实测财报可提前 33 个交易日可见。详见 `docs/AUDIT_BUG_PATROL_2026-09-13.md` BUG-22/26/30
 10. **IC自动降权** — FactorICAutoDecay: 滚动IC监控 → 连续低IC自动禁用 → IC回升自动恢复 → 权重归零+重归一化
 11. **开盘前系统自检** — HealthCheck 5项检查(数据连接/资金余额/持仓核对/订单路由/风控限额) → 任一失败阻断发单
 12. **跨资产接口** — InstrumentType/Instrument/AssetUniverse统一抽象，消除lot_size=100/multiplier=1硬编码，支持股票/ETF/期货/期权，per-instrument成本/保证金/T+1规则，向后兼容
