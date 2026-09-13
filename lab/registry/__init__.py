@@ -76,12 +76,26 @@ class RunStore:
                     evaluation        TEXT,                    -- JSON: ic/icir/dsr/bh_fdr/...
                     input_hash        TEXT,                    -- reproducibility fingerprint
                     report_path       TEXT,
-                    warnings          TEXT                     -- JSON list
+                    warnings          TEXT,                    -- JSON list
+                    validity          TEXT DEFAULT 'valid',    -- valid|affected|invalidated|superseded
+                    affected_by       TEXT DEFAULT '[]'        -- JSON list of reasons, e.g. ["BUG-03"]
                 );
                 CREATE INDEX IF NOT EXISTS idx_runs_status ON research_runs(status);
                 CREATE INDEX IF NOT EXISTS idx_runs_factor ON research_runs(factor);
                 """
             )
+
+            # Databases created before the validity columns exist need them
+            # added: CREATE TABLE IF NOT EXISTS leaves an existing table alone.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(research_runs)")}
+            if "validity" not in cols:
+                conn.execute(
+                    "ALTER TABLE research_runs ADD COLUMN validity TEXT DEFAULT 'valid'"
+                )
+            if "affected_by" not in cols:
+                conn.execute(
+                    "ALTER TABLE research_runs ADD COLUMN affected_by TEXT DEFAULT '[]'"
+                )
             conn.commit()
 
     def begin_run(self, slice_name: str, inputs: dict[str, Any]) -> str:
@@ -157,3 +171,86 @@ class RunStore:
                 "SELECT * FROM research_runs ORDER BY timestamp DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Result validity ─────────────────────────────────────────────────
+    #
+    # A bug fix that changes numerical output invalidates earlier results
+    # without making them disappear. NO_LOOKAHEAD_CONTRACT's own remediation
+    # procedure asks for the affected versions to be *marked*, not deleted:
+    #
+    #     1. 这是一个 bug，提交 issue 或 PR
+    #     2. 修复后在该文件中更新"已在代码中实现的位置"
+    #     3. 如果该 bug 影响了之前的回测结果，标注 affected 版本
+    #
+    # These methods are what makes step 3 answerable by machine instead of by
+    # reading commit messages.
+
+    VALIDITY_STATES = ("valid", "affected", "invalidated", "superseded")
+
+    def mark_validity(self, run_id: str, validity: str, reason: str = "") -> bool:
+        """Record whether a run's result can still be trusted.
+
+        Args:
+            run_id: The run to mark.
+            validity: One of VALIDITY_STATES.
+            reason: What affected it, e.g. "BUG-03". Appended to the run's
+                affected_by list if not already present, so a run can be
+                affected by several things and the history is additive.
+
+        Returns:
+            True if the run existed and was updated.
+        """
+        if validity not in self.VALIDITY_STATES:
+            raise ValueError(
+                f"validity must be one of {self.VALIDITY_STATES}, got {validity!r}"
+            )
+
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT affected_by FROM research_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return False
+
+            try:
+                existing = json.loads(row["affected_by"] or "[]")
+            except json.JSONDecodeError:
+                existing = []
+            if reason and reason not in existing:
+                existing.append(reason)
+
+            conn.execute(
+                "UPDATE research_runs SET validity=?, affected_by=? WHERE run_id=?",
+                (validity, json.dumps(existing), run_id),
+            )
+        return True
+
+    def list_affected(self, reason: str | None = None) -> list[dict]:
+        """Runs whose results are no longer plain 'valid'.
+
+        Args:
+            reason: Optional filter, e.g. "BUG-03" -- returns only runs marked
+                as affected by that specific cause.
+
+        Returns:
+            Matching runs, newest first.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM research_runs "
+                "WHERE COALESCE(validity, 'valid') != 'valid' "
+                "ORDER BY timestamp DESC"
+            ).fetchall()
+
+        out = [dict(r) for r in rows]
+        if reason:
+            filtered = []
+            for r in out:
+                try:
+                    causes = json.loads(r.get("affected_by") or "[]")
+                except json.JSONDecodeError:
+                    causes = []
+                if reason in causes:
+                    filtered.append(r)
+            out = filtered
+        return out

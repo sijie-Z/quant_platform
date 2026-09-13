@@ -626,6 +626,50 @@ def cmd_cache(args) -> int:
     return 0
 
 
+def cmd_runs(args) -> int:
+    """Research run registry: list results and their validity.
+
+    Exists so that "which results does this bug fix invalidate?" is a query
+    rather than an exercise in reading commit messages. A fix that changes
+    numerical output marks the earlier runs affected; it does not delete them.
+    """
+    from quant_platform.lab.registry import DEFAULT_DB, RunStore
+
+    store = RunStore(getattr(args, "db", None) or DEFAULT_DB)
+    sub = getattr(args, "subcommand", None) or "list"
+
+    if sub == "mark":
+        ok = store.mark_validity(args.run_id, args.state, args.reason or "")
+        if not ok:
+            print(f"Unknown run: {args.run_id}")
+            return 1
+        print(
+            f"{args.run_id}: validity={args.state}"
+            + (f"  affected_by={args.reason}" if args.reason else "")
+        )
+        return 0
+
+    if sub == "affected":
+        rows = store.list_affected(args.reason)
+        title = "Runs affected" + (f" by {args.reason}" if args.reason else "")
+    else:
+        rows = store.list_runs(getattr(args, "limit", 50))
+        title = "Recent runs"
+
+    if not rows:
+        print(f"{title}: none")
+        return 0
+
+    print(f"{title} ({len(rows)}):")
+    print(f"  {'run_id':36s} {'validity':12s} {'factor':18s} affected_by")
+    for r in rows:
+        print(
+            f"  {r['run_id']:36s} {r.get('validity') or 'valid':12s} "
+            f"{(r.get('factor') or '-'):18s} {r.get('affected_by') or '[]'}"
+        )
+    return 0
+
+
 def cmd_web(args) -> int:
     """Start the web server (FastAPI + Vue frontend)."""
     import uvicorn
@@ -1698,6 +1742,29 @@ def main() -> int:
     cache_parser.add_argument("--cache-dir", type=str, default=".quant_cache",
                               help="Cache directory path")
 
+    # runs — research run registry and result validity
+    runs_parser = subparsers.add_parser(
+        "runs", help="Research runs: list results and mark their validity"
+    )
+    runs_sub = runs_parser.add_subparsers(dest="subcommand", help="Runs action")
+    runs_list = runs_sub.add_parser("list", help="List recent runs with validity")
+    runs_list.add_argument("--limit", type=int, default=50, help="How many runs")
+    runs_list.add_argument("--db", type=str, default=None, help="Registry path")
+    runs_aff = runs_sub.add_parser(
+        "affected", help="Runs marked affected/invalidated rather than valid"
+    )
+    runs_aff.add_argument("--reason", type=str, default=None,
+                          help="Filter by cause, e.g. BUG-03")
+    runs_aff.add_argument("--db", type=str, default=None, help="Registry path")
+    runs_mark = runs_sub.add_parser("mark", help="Mark a run's result validity")
+    runs_mark.add_argument("run_id", type=str, help="Run id to mark")
+    runs_mark.add_argument("state", type=str,
+                           choices=["valid", "affected", "invalidated", "superseded"],
+                           help="New validity state")
+    runs_mark.add_argument("--reason", type=str, default="",
+                           help="Cause, e.g. BUG-03")
+    runs_mark.add_argument("--db", type=str, default=None, help="Registry path")
+
     # ml
     ml_parser = subparsers.add_parser("ml", help="ML alpha signal operations")
     ml_sub = ml_parser.add_subparsers(dest="subcommand", help="ML action")
@@ -1874,6 +1941,8 @@ def main() -> int:
         return cmd_sweep(args)
     elif args.command == "cache":
         return cmd_cache(args)
+    elif args.command == "runs":
+        return cmd_runs(args)
     elif args.command == "web":
         return cmd_web(args)
     elif args.command == "ml":
