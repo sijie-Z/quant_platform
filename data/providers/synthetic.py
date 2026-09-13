@@ -509,15 +509,30 @@ class SyntheticDataProvider(DataProvider):
         ])
         df = df.set_index(["date", "asset"]).sort_index()
 
+        # Point-in-time: a quarter's figures become visible on their
+        # *publish_date*, not on the fiscal period end. A-share reports land
+        # 40-50 days after the period closes, so re-indexing each report to its
+        # publication date before forward-filling is what stops the daily panel
+        # from showing a figure before it was public.
+        #
+        # The previous version forward-filled from the fiscal period end
+        # (`df` was still keyed on `qdate`) and then bfilled, which made a
+        # Q2 report visible 33 trading days early and pushed the first report
+        # back to the start of the sample.
+        pit = df.reset_index()
+        pit["fiscal_period_end"] = pit["date"]
+        pit["date"] = pit["publish_date"]
+        pit = pit.set_index(["date", "asset"]).sort_index()
+
         # Forward-fill to daily frequency by joining with all dates
-        # Create empty frame with all date-asset combos
         full_idx = pd.MultiIndex.from_product(
             [all_dates, self._assets], names=["date", "asset"]
         )
-        df_full = df.reindex(full_idx)
-        # Forward-fill financial values but keep publish_date from the original quarter
+        df_full = pit.reindex(full_idx)
         df_full = df_full.groupby("asset").ffill()
-        df_full = df_full.groupby("asset").bfill()  # Fill initial NaN
+        # Deliberately no bfill: before a company's first report is published
+        # there is genuinely nothing to know, and filling it backwards is
+        # itself a look-ahead.
 
         return df_full
 
