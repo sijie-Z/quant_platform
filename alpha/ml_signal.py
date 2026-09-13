@@ -149,21 +149,18 @@ class TimeSeriesCV:
         self.embargo = embargo
         self.mode = mode
 
-    def split(self, n_samples: int):
-        """Generate train/test index pairs with purge and embargo.
+    def _folds(self, n_units: int):
+        """Yield (train_start, train_end, test_start, test_end) in unit terms.
 
-        Args:
-            n_samples: Total number of samples.
-
-        Yields:
-            (train_indices, test_indices) tuples.
+        Split out from `split()` so the same arithmetic can be applied to a
+        date axis or to a row axis.
         """
         min_size = self.train_size + self.gap + self.test_size
-        if n_samples < min_size:
-            raise ValueError(f"Need at least {min_size} samples, got {n_samples}")
+        if n_units < min_size:
+            raise ValueError(f"Need at least {min_size} units, got {n_units}")
 
         # Step size accounts for test_size + embargo (next fold's train starts after embargo)
-        available = n_samples - self.train_size - self.gap
+        available = n_units - self.train_size - self.gap
         step = max(1, (available - self.test_size) // max(self.n_splits - 1, 1))
 
         for i in range(self.n_splits):
@@ -174,15 +171,57 @@ class TimeSeriesCV:
 
             train_end = self.train_size + i * step
             test_start = train_end + self.gap  # purge gap
-            test_end = min(test_start + self.test_size, n_samples)
+            test_end = min(test_start + self.test_size, n_units)
 
-            if train_end >= n_samples or test_start >= n_samples:
+            if train_end >= n_units or test_start >= n_units:
                 break
 
-            train_idx = list(range(train_start, min(train_end, n_samples)))
-            test_idx = list(range(test_start, test_end))
+            yield train_start, min(train_end, n_units), test_start, test_end
 
-            if len(train_idx) > 0 and len(test_idx) > 0:
+    def split(self, n_samples: int):
+        """Generate train/test index pairs with purge and embargo.
+
+        Args:
+            n_samples: Total number of samples.
+
+        Yields:
+            (train_indices, test_indices) tuples.
+        """
+        for train_start, train_end, test_start, test_end in self._folds(n_samples):
+            train_idx = list(range(train_start, train_end))
+            test_idx = list(range(test_start, test_end))
+            if train_idx and test_idx:
+                yield train_idx, test_idx
+
+    def split_by_dates(self, row_dates):
+        """Split on the date axis when each row is a (date, asset) pair.
+
+        `split()` counts in rows. On a cross-sectional panel that makes
+        `train_size=504` about twelve trading days rather than two years, and a
+        ten-row purge gap removes less than a single cross-section -- so train
+        and test end up sharing dates, and the labels of those dates leak
+        across the split.
+
+        This applies the identical fold arithmetic to the unique date axis and
+        returns row indices, so callers do not change.
+
+        Args:
+            row_dates: sequence of dates, one per row, in row order.
+
+        Yields:
+            (train_row_indices, test_row_indices) tuples.
+        """
+        dates = pd.Index(pd.unique(pd.Index(row_dates)))
+        rows_by_date: dict = {}
+        for i, d in enumerate(row_dates):
+            rows_by_date.setdefault(d, []).append(i)
+
+        for train_start, train_end, test_start, test_end in self._folds(len(dates)):
+            train_dates = dates[train_start:train_end]
+            test_dates = dates[test_start:test_end]
+            train_idx = [i for d in train_dates for i in rows_by_date.get(d, ())]
+            test_idx = [i for d in test_dates for i in rows_by_date.get(d, ())]
+            if train_idx and test_idx:
                 yield train_idx, test_idx
 
 
@@ -298,6 +337,12 @@ class MLSignalGenerator:
 
         Flattens all dates and assets into a single feature matrix.
         Each row = (date, asset) pair.
+
+        Returns:
+            (X, y, feature_names, row_dates) -- `row_dates` carries the date of
+            each row, so a splitter can divide on the date axis instead of
+            counting rows. Row counts per date vary (NaN assets are dropped),
+            so this cannot be reconstructed by the caller.
         """
         feature_names = sorted(factors.keys())[:self.config.top_n_features]
         first_factor = factors[feature_names[0]]
@@ -306,6 +351,7 @@ class MLSignalGenerator:
 
         X_list = []
         y_list = []
+        dates_list = []
 
         for i, date in enumerate(dates):
             actual_idx = start_idx + i
@@ -332,11 +378,17 @@ class MLSignalGenerator:
             if len(X_valid) > 0:
                 X_list.append(X_valid)
                 y_list.append(y_valid)
+                dates_list.extend([date] * len(X_valid))
 
         if not X_list:
-            return np.array([]), np.array([]), feature_names
+            return np.array([]), np.array([]), feature_names, pd.Index([])
 
-        return np.vstack(X_list), np.concatenate(y_list), feature_names
+        return (
+            np.vstack(X_list),
+            np.concatenate(y_list),
+            feature_names,
+            pd.Index(dates_list),
+        )
 
     def train(
         self,
@@ -356,7 +408,7 @@ class MLSignalGenerator:
         n_dates = len(first_factor.index)
 
         # Prepare full dataset for CV
-        X_full, y_full, feature_names = self._prepare_dataset(
+        X_full, y_full, feature_names, row_dates = self._prepare_dataset(
             factors, forward_returns, 0, n_dates
         )
 
@@ -374,7 +426,9 @@ class MLSignalGenerator:
         )
 
         cv_results = []
-        for fold, (train_idx, test_idx) in enumerate(cv.split(len(X_full))):
+        # Split on dates, not rows: X_full has one row per (date, asset), so a
+        # row-based split would put the same trading day in both train and test.
+        for fold, (train_idx, test_idx) in enumerate(cv.split_by_dates(row_dates)):
             X_train, y_train = X_full[train_idx], y_full[train_idx]
             X_test, y_test = X_full[test_idx], y_full[test_idx]
 
@@ -498,7 +552,7 @@ class MLSignalGenerator:
 
         first_factor = list(factors.values())[0]
         n_dates = len(first_factor.index)
-        X, _, feature_names = self._prepare_dataset(factors, pd.DataFrame(), 0, n_dates)
+        X, _, feature_names, _ = self._prepare_dataset(factors, pd.DataFrame(), 0, n_dates)
 
         if len(X) == 0:
             return {"error": "no data"}
@@ -550,7 +604,7 @@ class MLSignalGenerator:
             if i - last_train_idx >= self.config.retrain_frequency or model is None:
                 # Prepare training data: all dates before i
                 train_start = max(0, i - self.config.train_window)
-                X_train, y_train, feat_names = self._prepare_dataset(
+                X_train, y_train, feat_names, _ = self._prepare_dataset(
                     factors, forward_returns, train_start, i
                 )
 
