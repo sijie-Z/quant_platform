@@ -368,6 +368,15 @@ class SimulatedBroker(BrokerInterface):
             else:
                 pos = Position(code=order.code, quantity=total_filled, avg_cost=avg_fill_price)
                 self._positions[order.code] = pos
+            # Mark to market at the fill price.
+            #
+            # A new position otherwise keeps market_value = 0 until the next
+            # update_market_prices() call, which the live engine makes *before*
+            # it executes orders (engine.py, step 1 vs step 3). For the rest of
+            # the cycle the position contributed nothing to equity while its
+            # cost had already left cash, so the step-4 P&L snapshot reported
+            # the whole purchase as a loss.
+            pos.update_price(avg_fill_price)
             self._today_bought.add(order.code)
         else:  # SELL
             self._cash += total_value - commission - tax
@@ -375,6 +384,7 @@ class SimulatedBroker(BrokerInterface):
             pos.quantity -= total_filled
             pos.available -= total_filled
             pos.realized_pnl += (avg_fill_price - pos.avg_cost) * total_filled
+            pos.update_price(avg_fill_price)
             if pos.quantity <= 0:
                 del self._positions[order.code]
 
