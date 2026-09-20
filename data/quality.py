@@ -26,7 +26,12 @@ class DataQualityCheck:
     def __init__(self, name: str, passed: bool, severity: str, message: str,
                  details: dict | None = None):
         self.name = name
-        self.passed = passed
+        # Coerced here rather than at each construction site: `passed` is
+        # usually derived from a numpy comparison (`missing_pct <= limit`), so
+        # it arrives as `numpy.bool_`, which `json.dumps` and FastAPI both
+        # refuse. That made POST /api/data/quality return 500 on every call,
+        # deterministically, because _check_missing_data always runs.
+        self.passed = bool(passed)
         self.severity = severity    # info/warn/error/critical
         self.message = message
         self.details = details or {}
