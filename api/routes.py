@@ -376,7 +376,12 @@ def _execute_pipeline(run_id: str, req: RunRequest):
             latest_date = max(weights_history.keys())
             latest_weights = weights_history[latest_date]
             from quant_platform.risk.exposure import exposure_report
-            sector_map_meta = metadata.get("sector", {}) if metadata else {}
+            # `metadata` is a DataFrame, and `if metadata` on a DataFrame
+            # raises "The truth value of a DataFrame is ambiguous". That made
+            # `POST /api/run` fail at this line on every request, before it
+            # could store a result. `_compute_factors` (main.py) guards the
+            # same expression with `is not None`.
+            sector_map_meta = metadata.get("sector", {}) if metadata is not None else {}
             exp = exposure_report(latest_weights, sector_map_meta)
             sectors_dict = exp.get("sector_exposure", {})
             if hasattr(sectors_dict, "to_dict"):
@@ -388,7 +393,14 @@ def _execute_pipeline(run_id: str, req: RunRequest):
                 sorted_w = latest_weights.sort_values(ascending=False)
                 for ticker, w in sorted_w.head(20).items():
                     if w > 0.001:
-                        sec = sector_map_meta.get(str(ticker), "") if sector_map_meta else ""
+                        # `sector_map_meta` is a Series (the metadata frame's
+                        # `sector` column), so it cannot be used as a truth
+                        # value either.
+                        sec = (
+                            sector_map_meta.get(str(ticker), "")
+                            if sector_map_meta is not None
+                            else ""
+                        )
                         # Estimate P&L from price changes over holding period
                         pnl = None
                         if str(ticker) in prices.columns:
@@ -429,6 +441,14 @@ def _execute_pipeline(run_id: str, req: RunRequest):
             ))
         factor_items.sort(key=lambda x: abs(x.icir), reverse=True)
 
+        # Store plain dicts, not the Pydantic models.
+        #
+        # Every consumer of `_run_store` treats it as a dict of dicts:
+        # `result.get("chart_data", {}).get("equity", [])` in the Monte Carlo,
+        # risk-decomposition and regime endpoints, `f.get("name")` over the
+        # factor list in the HTML report. Storing models made each of those an
+        # `AttributeError: 'ChartData' object has no attribute 'get'`, so the
+        # endpoints returned 500 whenever a run had actually succeeded.
         _run_store[run_id] = {
             "performance": PerformanceMetrics(
                 total_return=summary.get("total_return", 0),
@@ -449,16 +469,16 @@ def _execute_pipeline(run_id: str, req: RunRequest):
                 n_rebalances=summary.get("n_rebalances", 0),
                 optimizer=summary.get("optimizer", ""),
                 initial_capital=summary.get("initial_capital", 0),
-            ),
+            ).model_dump(),
             "risk": RiskMetrics(
                 historical_var=risk.get("historical_var", 0),
                 parametric_var=risk.get("parametric_var", 0),
                 historical_cvar=risk.get("historical_cvar", 0),
-            ),
-            "stress_tests": stress_tests,
-            "factors": factor_items,
-            "exposure": exposure_info,
-            "chart_data": chart_data,
+            ).model_dump(),
+            "stress_tests": [s.model_dump() for s in stress_tests],
+            "factors": [f.model_dump() for f in factor_items],
+            "exposure": exposure_info.model_dump(),
+            "chart_data": chart_data.model_dump(),
         }
 
         _update_status(run_id, 100, "done")
@@ -1749,57 +1769,41 @@ async def decompose_risk(req: dict):
 
 
 def _decompose_risk(result: dict) -> dict:
-    """Factor risk decomposition using stored run data."""
-    chart = result.get("chart_data", {})
-    factors = result.get("factors", [])
+    """Risk decomposition cannot be computed from a stored run.
 
-    if not factors:
-        return {"error": "No factor data available"}
+    This used to invent one, and the shape of the invention gave it away:
 
-    # Generate synthetic factor risk decomposition for demo
-    # In production, this uses the actual factor returns and betas
-    total_risk = 15.2  # annualized vol %
-    factor_summaries = []
-    remaining_risk = total_risk
+        total_risk = 15.2                       # annualized vol %, hardcoded
+        risk_share = min(icir * 15, ...)        # a factor's risk share = ICIR x 15
+        beta = 0.5 + icir * 0.3                 # beta is a function of ICIR
+        t_stat = icir * sqrt(252)               # so is the t-statistic
 
-    for f in factors[:8]:
-        name = f.get("name", "unknown")
-        icir = abs(f.get("icir", 0))
+    None of those are measurements. A factor's risk contribution is its
+    exposure times the factor covariance, and the t-statistic comes from
+    regressing realized factor returns -- neither of which a stored run keeps.
+    The run holds per-factor IC summaries (`name`, `mean_ic`, `std_ic`,
+    `icir`, `ic_positive_ratio`) and a portfolio equity curve.
 
-        # Risk share proportional to ICIR
-        risk_share = min(icir * 15, remaining_risk * 0.4)
-        annual_ret_bps = f.get("mean_ic", 0) * 252 * 10000
+    `risk/factor_risk.py` and `risk/barra.py` compute the real thing given the
+    factor panel and returns.
 
-        factor_summaries.append({
-            "factor": name,
-            "risk_share_pct": round(risk_share, 2),
-            "annual_return_bps": round(annual_ret_bps, 1),
-            "beta": round(0.5 + icir * 0.3, 3),
-            "t_stat": round(icir * np.sqrt(252), 2),
-            "contribution": "systematic",
-        })
-        remaining_risk -= risk_share
-
-    # Alpha / idiosyncratic
-    factor_summaries.append({
-        "factor": "Alpha (idiosyncratic)",
-        "risk_share_pct": round(max(remaining_risk, 0), 2),
-        "annual_return_bps": round(float(chart.get("equity", [1])[-1]) ** (252 / max(len(chart.get("dates", [])), 1)) * 10000 - 10000, 1) if chart.get("equity") else 0,
-        "beta": 0,
-        "t_stat": 0,
-        "contribution": "alpha",
-    })
-
-    factor_summaries.sort(key=lambda x: x["risk_share_pct"], reverse=True)
-
-    r_squared = 1 - max(remaining_risk, 0) / total_risk
-
+    The empty list is deliberate: the front-end panel renders nothing rather
+    than a decomposition that looks computed and is not. Before this, the
+    endpoint also raised `AttributeError` on every call, because the stored
+    factor entries were Pydantic objects being read with `.get()`.
+    """
     return {
-        "total_risk_pct": total_risk,
-        "factor_risk_pct": round(total_risk - max(remaining_risk, 0), 2),
-        "idiosyncratic_risk_pct": round(max(remaining_risk, 0), 2),
-        "r_squared": round(r_squared, 4),
-        "factors": factor_summaries,
+        "available": False,
+        "reason": (
+            "Risk decomposition needs factor exposures and realized factor "
+            "returns; a stored run keeps only per-factor IC summaries. "
+            "POST /api/barra/decompose computes it from the factor panel."
+        ),
+        "factors": [],
+        "total_risk_pct": None,
+        "factor_risk_pct": None,
+        "idiosyncratic_risk_pct": None,
+        "r_squared": None,
     }
 
 
@@ -2155,7 +2159,11 @@ async def generate_report(req: dict):
     if not result:
         raise HTTPException(404, f"Run {run_id} not found. Run a pipeline first.")
 
-    chart = _build_chart_data(result)
+    # `_build_chart_data` takes a returns Series, not the run record; passing
+    # the record made this an AttributeError on `dict.dropna()` and the
+    # download bar always returned 500. The chart was already built when the
+    # run completed.
+    chart = result.get("chart_data", {})
     perf = result.get("performance", {})
     risk_data = result.get("risk", {})
     factors = result.get("factors", [])
