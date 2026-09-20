@@ -1813,79 +1813,60 @@ def _decompose_risk(result: dict) -> dict:
 
 @router.get("/analysis/ic-decay")
 async def get_ic_decay():
-    """Get IC decay curves for all factors."""
-    if not _run_store:
-        return {"factors": []}
+    """IC decay cannot be computed from a stored run.
 
-    # Get the latest run
-    latest_id = _latest_run_id()
-    result = _run_store[latest_id]
-    factors = result.get("factors", [])
+    This used to manufacture it:
 
-    # Generate synthetic IC decay data
-    decay_data = []
-    for f in factors:
-        name = f.get("name", "unknown")
-        base_ic = abs(f.get("mean_ic", 0.03))
+        decay = np.exp(-lag * 0.15) * base_ic
+        ics.append(round(decay + noise, 5))
 
-        lags = list(range(1, 21))
-        ics = []
-        import random
-        rng = random.Random(hash(name) % 10000)
-        for lag in lags:
-            decay = np.exp(-lag * 0.15) * base_ic
-            noise = (rng.random() - 0.5) * 0.005
-            ics.append(round(decay + noise, 5))
+    a synthetic exponential curve scaled by each factor's *mean* IC, with the
+    reported half-life derived from the same 0.15 constant. It was shaped like
+    a measurement and contained none -- the shape could not have come out any
+    other way.
 
-        decay_data.append({
-            "factor": name,
-            "lags": lags,
-            "ics": ics,
-            "base_ic": round(base_ic, 5),
-            "half_life": round(-np.log(2) / np.log(max(np.exp(-0.15), 0.01)), 1),
-        })
+    Real IC decay needs the factor panel and forward returns at several
+    horizons. `factors/evaluation.py` computes it correctly given those, and
+    `python main.py run` produces them; a stored run keeps only per-factor
+    summary statistics.
 
-    return {"factors": decay_data}
+    The empty list is deliberate: `ICDecay.vue` renders nothing for an empty
+    factor list, so a panel that says nothing beats one that says something
+    false.
+    """
+    return {
+        "available": False,
+        "reason": (
+            "IC decay needs the factor panel and forward returns at multiple "
+            "horizons; a stored run keeps only per-factor summary statistics. "
+            "Run `python main.py run` to compute it."
+        ),
+        "factors": [],
+    }
 
 
 @router.get("/analysis/correlation")
 async def get_factor_correlation():
-    """Get factor correlation matrix."""
-    if not _run_store:
-        return {"names": [], "matrix": []}
+    """Factor correlation cannot be computed from a stored run.
 
-    latest_id = _latest_run_id()
-    result = _run_store[latest_id]
-    factors = result.get("factors", [])
+    This used to build a random matrix, including a rule that made factors
+    whose names contain "momentum" correlate with each other by construction
+    (`0.3 + rng.random() * 0.4`) and likewise for "volatility". The values were
+    generated to look plausible; none of them came from the data.
 
-    names = [f.get("name", "") for f in factors]
-    n = len(names)
-
-    # Generate realistic correlation matrix
-    import random
-    rng = random.Random(42)
-    matrix = []
-
-    for i in range(n):
-        row = []
-        for j in range(n):
-            if i == j:
-                row.append(1.0)
-            elif j > i:
-                # Low correlations between different factors
-                val = (rng.random() - 0.5) * 0.4
-                # Momentum factors correlate with each other
-                if "momentum" in names[i] and "momentum" in names[j]:
-                    val = 0.3 + rng.random() * 0.4
-                # Volatility factors correlate
-                if "volatility" in names[i] and "volatility" in names[j]:
-                    val = 0.4 + rng.random() * 0.3
-                row.append(round(val, 3))
-            else:
-                row.append(matrix[j][i])  # Symmetric
-        matrix.append(row)
-
-    return {"names": names, "matrix": matrix}
+    `factors/evaluation.py` computes the real matrix from the factor panel. A
+    stored run keeps per-factor summary statistics, not the panel.
+    """
+    return {
+        "available": False,
+        "reason": (
+            "Factor correlation needs the factor panel; a stored run keeps only "
+            "per-factor summary statistics. Run `python main.py run` to compute "
+            "it."
+        ),
+        "names": [],
+        "matrix": [],
+    }
 
 
 # ---------------------------------------------------------------------------
