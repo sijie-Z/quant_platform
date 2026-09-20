@@ -112,11 +112,11 @@
     <div class="tg-row-corr">
       <Panel :title="$t('terminal.factorCorrelation')" dotColor="#a78bfa" class="tg-corr">
         <div v-if="loading" class="tg-skeleton-chart-sm"></div>
-        <FactorCorrelation v-else :factors="factors" />
+        <FactorCorrelation v-else />
       </Panel>
       <Panel :title="$t('terminal.icDecay')" dotColor="#34d399" class="tg-decay">
         <div v-if="loading" class="tg-skeleton-chart-sm"></div>
-        <ICDecay v-else :factors="factors" />
+        <ICDecay v-else />
       </Panel>
     </div>
 

@@ -12,7 +12,11 @@
       </div>
     </div>
 
-    <template v-if="result">
+    <!-- The API reports `available: false` when a stored run cannot support a
+         decomposition. Rendering the summary anyway would print "%" for a
+         null risk and "0.0%" for an unknown R-squared -- a number where none
+         was measured. -->
+    <template v-if="result && result.available !== false">
       <!-- Summary -->
       <div class="rd-summary">
         <div class="rd-card">
@@ -80,10 +84,11 @@
     </template>
 
     <!-- Empty State -->
-    <div v-if="!result && !loading" class="rd-empty">
+    <div v-if="(!result || result.available === false) && !loading" class="rd-empty">
       <div class="rd-empty-icon">&#9670;</div>
       <h3>{{ locale === 'zh-CN' ? '因子风险分解' : 'Factor Risk Decomposition' }}</h3>
-      <p>{{ locale === 'zh-CN' ? '请先运行流水线，然后将组合风险分解为系统性因子暴露和特质性Alpha。' : 'Run a pipeline first, then decompose portfolio risk into systematic factor exposure and idiosyncratic alpha.' }}</p>
+      <p v-if="result?.reason" class="rd-empty-reason">{{ result.reason }}</p>
+      <p v-else>{{ locale === 'zh-CN' ? '请先运行流水线，然后将组合风险分解为系统性因子暴露和特质性Alpha。' : 'Run a pipeline first, then decompose portfolio risk into systematic factor exposure and idiosyncratic alpha.' }}</p>
     </div>
   </div>
 </template>
