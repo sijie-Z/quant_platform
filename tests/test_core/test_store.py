@@ -123,6 +123,83 @@ class TestStoreSessions:
         assert sessions[0]["session_id"] == "sess-1"
 
 
+class TestStoppingASessionKeepsTheStartRecord:
+    """A session is written twice under one id: by `start()` and by `stop()`.
+
+    `stop()` supplies only `{session_id, status, stopped_at}` (see
+    core/scheduler.py:106 and trading/engine.py:241). `INSERT OR REPLACE`
+    deleted the row and reinserted it from that dict, so the defaults for every
+    absent key overwrote what `start()` had written.
+    """
+
+    def _start(self, store, **overrides):
+        session = {
+            "session_id": "sess-1",
+            "broker": "SimulatedBroker",
+            "status": "active",
+            "started_at": "2026-01-05T09:30:00",
+            "total_trades": 7,
+            "total_pnl": 1234.5,
+            "config": {"n_stocks": 300},
+        }
+        session.update(overrides)
+        store.save_session(session)
+
+    def _only(self, store) -> dict:
+        sessions = store.get_sessions()
+        assert len(sessions) == 1, "stopping must not create a second session"
+        return sessions[0]
+
+    def test_started_at_is_not_rewritten_to_the_stop_time(self, store):
+        self._start(store)
+        store.save_session({
+            "session_id": "sess-1",
+            "status": "stopped",
+            "stopped_at": "2026-01-05T15:00:00",
+        })
+
+        row = self._only(store)
+        assert row["started_at"] == "2026-01-05T09:30:00"
+        assert row["stopped_at"] == "2026-01-05T15:00:00"
+        assert row["status"] == "stopped"
+
+    def test_the_other_start_fields_survive(self, store):
+        self._start(store)
+        store.save_session({
+            "session_id": "sess-1",
+            "status": "stopped",
+            "stopped_at": "2026-01-05T15:00:00",
+        })
+
+        row = self._only(store)
+        assert row["broker"] == "SimulatedBroker"
+        assert row["total_trades"] == 7
+        assert row["total_pnl"] == 1234.5
+        assert json.loads(row["config"]) == {"n_stocks": 300}
+
+    def test_a_supplied_field_still_overwrites(self, store):
+        """The engine's stop() passes a final trade count; that must land."""
+        self._start(store)
+        store.save_session({
+            "session_id": "sess-1",
+            "status": "stopped",
+            "stopped_at": "2026-01-05T15:00:00",
+            "total_trades": 19,
+        })
+
+        row = self._only(store)
+        assert row["total_trades"] == 19
+        assert row["started_at"] == "2026-01-05T09:30:00", "and nothing else moved"
+
+    def test_saving_twice_without_a_stop_time_keeps_the_row(self, store):
+        self._start(store)
+        store.save_session({"session_id": "sess-1", "status": "active"})
+
+        row = self._only(store)
+        assert row["started_at"] == "2026-01-05T09:30:00"
+        assert row["broker"] == "SimulatedBroker"
+
+
 class TestStoreEvents:
     def test_log_and_get_event(self, store):
         store.log_event({"event_id": "e1", "topic": "order.filled", "data": {"code": "600519"}})

@@ -414,22 +414,61 @@ class Store:
 
     # ── Sessions ──
 
+    #: Session columns written from a caller's dict, in INSERT order.
+    _SESSION_FIELDS = (
+        "strategy_id", "broker", "status", "started_at",
+        "stopped_at", "total_trades", "total_pnl", "config",
+    )
+
     def save_session(self, session: dict):
-        """Save a trading session record."""
+        """Insert or update a trading session record.
+
+        A session is written twice under the same id -- once by `start()`, once
+        by `stop()` -- and the second call carries only the fields it knows
+        about. `INSERT OR REPLACE` deleted the row and reinserted it from that
+        second dict, so the defaults for the absent keys silently discarded the
+        start record: `started_at` became the stop time, `broker` fell back to
+        'simulated', `total_trades` to 0 and `config` to '{}'. A stopped
+        session then read as one that began when it ended.
+
+        Fields the caller supplies still overwrite; fields it omits are kept.
+        """
+        values = {
+            "strategy_id": session.get("strategy_id", ""),
+            "broker": session.get("broker", "simulated"),
+            "status": session.get("status", "active"),
+            "started_at": session.get("started_at", datetime.now().isoformat()),
+            "stopped_at": session.get("stopped_at", ""),
+            "total_trades": session.get("total_trades", 0),
+            "total_pnl": session.get("total_pnl", 0),
+            "config": json.dumps(session.get("config", {})),
+        }
+        session_id = session["session_id"]
+
         with self._lock, self._conn() as conn:
-            conn.execute("""
-                    INSERT OR REPLACE INTO sessions
-                    (session_id, strategy_id, broker, status, started_at,
-                     stopped_at, total_trades, total_pnl, config)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                session['session_id'], session.get('strategy_id', ''),
-                session.get('broker', 'simulated'), session.get('status', 'active'),
-                session.get('started_at', datetime.now().isoformat()),
-                session.get('stopped_at', ''),
-                session.get('total_trades', 0), session.get('total_pnl', 0),
-                json.dumps(session.get('config', {})),
-            ))
+            existing = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO sessions (session_id, strategy_id, broker, status, "
+                    "started_at, stopped_at, total_trades, total_pnl, config) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (session_id, *(values[f] for f in self._SESSION_FIELDS)),
+                )
+                return
+
+            merged = {
+                f: (values[f] if f in session else existing[f])
+                for f in self._SESSION_FIELDS
+            }
+            conn.execute(
+                "UPDATE sessions SET strategy_id = ?, broker = ?, status = ?, "
+                "started_at = ?, stopped_at = ?, total_trades = ?, total_pnl = ?, "
+                "config = ? WHERE session_id = ?",
+                (*(merged[f] for f in self._SESSION_FIELDS), session_id),
+            )
 
     def get_sessions(self, limit: int = 20) -> list[dict]:
         """Get trading session history."""
