@@ -175,15 +175,24 @@ class LiveSignalGenerator:
             return {}
 
         # Step 3: Combine via AlphaPipeline
-        # Generate a dummy forward_returns for IC estimation (equal_weight
-        # method ignores it, ic_weighted/icir_weighted need it)
-        dummy_forward = pd.DataFrame(
-            np.random.default_rng().normal(0, 0.01, (len(dates), len(assets))),
-            index=dates, columns=assets,
-        )
+        #
+        # IC/ICIR weighting needs a forward-return panel. This used to be
+        # `np.random.default_rng().normal(...)` -- a fresh, unseeded draw on
+        # every call. Under `alpha.method: ic_weighted` or `icir_weighted`
+        # that made the live factor weights a function of noise, redrawn each
+        # cycle, which also breaks the module's own promise that live and
+        # backtest share one signal definition.
+        #
+        # The real panel is available. Following data/pipeline.py:279,
+        # `returns.loc[s]` is close(s) -> close(s+1), which is realized as
+        # soon as s+1 has closed. AlphaPipeline consumes IC history only
+        # strictly before the date being scored (alpha/combination.py:80),
+        # so the one genuinely unobservable row -- the last -- never enters
+        # a weight.
+        forward_returns = prices.pct_change(fill_method=None).shift(-1)
 
         try:
-            signal = self._alpha_pipeline.run(processed, dummy_forward)
+            signal = self._alpha_pipeline.run(processed, forward_returns)
         except Exception as e:
             logger.warning("AlphaPipeline failed: %s", e)
             # Fallback to equal-weight of processed factors
