@@ -2,70 +2,66 @@
   <div class="ic-decay">
     <div class="decay-header">
       <span class="decay-title">IC DECAY CURVE</span>
-      <div class="decay-tabs">
+      <div v-if="curves.length" class="decay-tabs">
         <button
-          v-for="f in factorNames"
-          :key="f"
-          :class="['decay-tab', { active: selectedFactor === f }]"
-          @click="selectedFactor = f"
-        >{{ f }}</button>
+          v-for="c in curves"
+          :key="c.factor"
+          :class="['decay-tab', { active: selectedFactor === c.factor }]"
+          @click="selectedFactor = c.factor"
+        >{{ c.factor }}</button>
       </div>
     </div>
     <div ref="chartRef" class="decay-chart"></div>
+    <div v-if="!curves.length" class="decay-empty">{{ message }}</div>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount, watch, computed, nextTick } from 'vue'
 import * as echarts from 'echarts'
+import { getICDecay } from '../api/index.js'
 
-const props = defineProps({
-  factors: { type: Array, default: () => [] },
-})
-
+/**
+ * The curve comes from `/api/analysis/ic-decay`. It used to be generated here,
+ * in the browser: `Math.exp(-lag * 0.15) * baseIC` with a baseIC picked by
+ * substring-matching the factor name and noise from a seeded LCG. That was the
+ * same invention the endpoint itself was removed for (BUG-45), one layer up --
+ * the panel never called the API at all.
+ */
 const chartRef = ref(null)
 const selectedFactor = ref('')
+const curves = ref([])
+const message = ref('Loading IC decay...')
 let chart = null
 let resizeObs = null
 
-const factorNames = computed(() => props.factors.map(f => f.name || f))
+const selectedCurve = computed(
+  () => curves.value.find(c => c.factor === selectedFactor.value) || curves.value[0],
+)
 
-function generateDecayCurve(factorName) {
-  // Generate realistic IC decay: decays from peak toward zero as lag increases
-  // In production, this comes from the backend factor evaluation
-  const lags = []
-  const ics = []
-  const seed = factorName.split('').reduce((a, c) => a + c.charCodeAt(0), 0)
-  let s = seed
-  function rand() { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff }
-
-  // Base IC depends on factor type
-  let baseIC = 0.03
-  if (factorName.includes('momentum')) baseIC = 0.04
-  if (factorName.includes('value') || factorName.includes('pb') || factorName.includes('pe')) baseIC = 0.025
-  if (factorName.includes('volatility')) baseIC = 0.02
-  if (factorName.includes('size') || factorName.includes('market_cap')) baseIC = 0.035
-  if (factorName.includes('roe')) baseIC = 0.03
-
-  for (let lag = 1; lag <= 20; lag++) {
-    lags.push(lag)
-    // Exponential decay with noise
-    const decay = Math.exp(-lag * 0.15) * baseIC
-    const noise = (rand() - 0.5) * 0.008
-    ics.push(Math.round((decay + noise) * 10000) / 10000)
+async function load() {
+  try {
+    const data = await getICDecay()
+    if (data?.available === false) {
+      curves.value = []
+      message.value = data.reason || 'IC decay is not available for this run.'
+      return
+    }
+    curves.value = data?.factors ?? []
+    if (!curves.value.length) {
+      message.value = 'No IC decay data for this run.'
+    } else if (!selectedFactor.value) {
+      selectedFactor.value = curves.value[0].factor
+    }
+  } catch (e) {
+    curves.value = []
+    message.value = `IC decay request failed: ${e?.message || e}`
   }
-
-  return { lags, ics }
 }
 
 function render() {
-  if (!chartRef.value || !factorNames.value.length) return
-
-  if (!selectedFactor.value) {
-    selectedFactor.value = factorNames.value[0]
-  }
-
-  const { lags, ics } = generateDecayCurve(selectedFactor.value)
+  const curve = selectedCurve.value
+  if (!chartRef.value || !curve?.lags?.length) return
 
   if (!chart) {
     chart = echarts.init(chartRef.value, null, { renderer: 'canvas' })
@@ -82,7 +78,7 @@ function render() {
     grid: { top: 16, right: 20, bottom: 28, left: 50 },
     xAxis: {
       type: 'category',
-      data: lags,
+      data: curve.lags,
       name: 'Lag (days)',
       nameLocation: 'center',
       nameGap: 18,
@@ -101,7 +97,7 @@ function render() {
     series: [
       {
         type: 'line',
-        data: ics,
+        data: curve.ics,
         smooth: 0.3,
         symbol: 'circle',
         symbolSize: 5,
@@ -124,14 +120,10 @@ function render() {
 }
 
 watch(selectedFactor, () => nextTick(render))
-watch(() => props.factors, () => {
-  if (!selectedFactor.value && factorNames.value.length) {
-    selectedFactor.value = factorNames.value[0]
-  }
-  nextTick(render)
-}, { deep: true })
 
-onMounted(() => {
+onMounted(async () => {
+  await load()
+  await nextTick()
   render()
   resizeObs = new ResizeObserver(() => chart?.resize())
   if (chartRef.value) resizeObs.observe(chartRef.value)
@@ -149,6 +141,7 @@ onBeforeUnmount(() => {
   flex-direction: column;
   height: 100%;
   gap: 6px;
+  position: relative;
 }
 
 .decay-header {
@@ -198,5 +191,19 @@ onBeforeUnmount(() => {
 .decay-chart {
   flex: 1;
   min-height: 0;
+}
+
+.decay-empty {
+  position: absolute;
+  inset: 24px 0 0 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 16px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  pointer-events: none;
 }
 </style>

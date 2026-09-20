@@ -9,6 +9,8 @@ in-sample or invented numbers presented as measurements -- on two more panels.
 """
 
 import inspect
+import re
+from pathlib import Path
 
 import pytest
 
@@ -57,3 +59,47 @@ class TestTheFabricationIsGone:
         corr = asyncio.run(get_factor_correlation())
         assert set(decay) >= {"available", "reason", "factors"}
         assert set(corr) >= {"available", "reason", "names", "matrix"}
+
+
+class TestThePanelsDoNotFabricate:
+    """Fixing the endpoints was not enough to stop these two numbers.
+
+    Both were *also* generated in the browser, and the panels never called the
+    API at all. `ICDecay.vue` rebuilt `Math.exp(-lag * 0.15) * baseIC` with the
+    base IC chosen by substring-matching the factor name, and
+    `FactorCorrelation.vue` rebuilt the seeded random matrix including the
+    "momentum factors correlate" rule. Removing the generators server-side
+    would have left the panels drawing the same fiction from the client.
+    """
+
+    COMPONENTS = Path(__file__).resolve().parents[2] / "frontend" / "src" / "components"
+
+    def _code(self, name: str) -> str:
+        """Component source with comments removed.
+
+        The explanatory comments quote the expressions that were deleted, so a
+        naive `in` check matches the prose explaining their removal.
+        """
+        src = (self.COMPONENTS / name).read_text(encoding="utf-8")
+        src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+        src = re.sub(r"<!--.*?-->", "", src, flags=re.DOTALL)
+        return src
+
+    def test_ic_decay_panel_has_no_generator_and_calls_the_api(self):
+        src = self._code("ICDecay.vue")
+        assert "Math.exp(-lag" not in src, "the decay curve is generated client-side again"
+        assert "1103515245" not in src, "the noise LCG is back"
+        assert "getICDecay" in src, "the panel does not fetch its own data"
+
+    def test_correlation_panel_has_no_generator_and_calls_the_api(self):
+        src = self._code("FactorCorrelation.vue")
+        assert "buildCorrelationMatrix" not in src, "the random matrix is back"
+        assert "1103515245" not in src, "the noise LCG is back"
+        assert "getFactorCorrelation" in src, "the panel does not fetch its own data"
+
+    def test_both_panels_render_an_unavailable_state(self):
+        for name in ("ICDecay.vue", "FactorCorrelation.vue"):
+            src = (self.COMPONENTS / name).read_text(encoding="utf-8")
+            assert "available === false" in src, (
+                f"{name} would render an empty chart instead of saying why"
+            )
