@@ -1,5 +1,6 @@
 """Regression tests for the vectorized backtest engine."""
 
+import numpy as np
 import pandas as pd
 import pytest
 from quant_platform.backtest.cost_model import CostModel
@@ -49,3 +50,82 @@ class TestSimulatePnl:
         # The recorded turnover stays one-sided: it is a metric, not the base
         # the cost model is fed.
         assert engine.turnover_history.iloc[0] == pytest.approx(0.5)
+
+
+class TestCovarianceWindowSeesNoFuture:
+    """`returns` carries the forward return close(t) -> close(t+1).
+
+    data/pipeline.py:279 builds it as `close.pct_change().shift(-1)`, so the
+    row dated t is only observable once t+1 has closed. At rdate's close --
+    the moment the weights are chosen -- the row dated rdate has not happened.
+    The covariance window used to end `lookback_end + 1`, which is inclusive
+    of exactly that row.
+    """
+
+    N_ASSETS = 12
+    N_DAYS = 400
+
+    def _run(self, monkeypatch):
+        import quant_platform.backtest.engine as engine_mod
+
+        rng = np.random.default_rng(7)
+        dates = pd.bdate_range("2022-01-03", periods=self.N_DAYS)
+        assets = [f"S{i:02d}" for i in range(self.N_ASSETS)]
+
+        closes = pd.DataFrame(
+            100 * np.exp(np.cumsum(rng.normal(0, 0.01, (self.N_DAYS, self.N_ASSETS)), axis=0)),
+            index=dates, columns=assets,
+        )
+        # The pipeline's convention, including the unobservable last row.
+        returns = closes.pct_change(fill_method=None).shift(-1)
+        signal = pd.DataFrame(
+            rng.normal(size=(self.N_DAYS, self.N_ASSETS)), index=dates, columns=assets,
+        )
+        sector_map = pd.Series("Tech", index=assets)
+
+        windows = []
+
+        def capture(ret_window, method, lookback):
+            windows.append(ret_window)
+            return None
+
+        monkeypatch.setattr(engine_mod, "estimate_covariance", capture)
+
+        engine = BacktestEngine(
+            rebalance_frequency="monthly",
+            optimizer="equal_weight",
+            covariance_method="sample",
+            covariance_lookback=252,
+        )
+        engine.run(
+            signal=signal, prices=closes, returns=returns,
+            benchmark_returns=None, sector_map=sector_map,
+        )
+        # The engine's own record of which dates produced weights, in order.
+        return sorted(engine.weights_history), windows, returns
+
+    def test_window_never_contains_the_rebalance_day(self, monkeypatch):
+        rdates, windows, _ = self._run(monkeypatch)
+
+        assert windows, "the engine never estimated a covariance"
+        assert len(windows) == len(rdates), "one covariance per rebalance"
+
+        for rdate, window in zip(rdates, windows, strict=True):
+            assert rdate not in window.index, (
+                f"covariance at {rdate.date()} used the bar dated {rdate.date()}, "
+                "which is the return from that close to the next one"
+            )
+            assert window.index[-1] < rdate, (
+                f"covariance at {rdate.date()} ends on {window.index[-1].date()}"
+            )
+
+    def test_window_is_the_configured_length(self, monkeypatch):
+        rdates, windows, _ = self._run(monkeypatch)
+
+        # The lookback is `covariance_lookback` rows, not one more. Windows
+        # fill up as the sample grows and then stay pinned there; they used
+        # to reach 253.
+        lengths = [len(w) for w in windows]
+        assert all(n <= 252 for n in lengths), f"a window exceeded the lookback: {max(lengths)}"
+        assert lengths == sorted(lengths), "the window grows then stops growing"
+        assert lengths[-1] == 252, "the last window is pinned at the lookback"

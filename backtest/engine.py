@@ -116,9 +116,20 @@ class BacktestEngine:
                 if len(sig) < 10:
                     continue
 
-            # Estimate covariance matrix
-            lookback_end = returns.index.get_indexer([rdate], method="ffill")[0]
-            lookback_start = max(0, lookback_end - self.covariance_lookback)
+            # Estimate covariance matrix.
+            #
+            # Only bars strictly before rdate may enter. `returns` is built as
+            # `close.pct_change().shift(-1)` (data/pipeline.py), so the row
+            # dated t is the return from close(t) to close(t+1) -- at rdate's
+            # close the row dated rdate has not happened yet. The window used
+            # to end at `lookback_end + 1`, which is inclusive of that row:
+            # the optimizer was estimating risk from one day of its own
+            # future. It was also one row too long (253 for a 252 lookback).
+            prior_dates = returns.index[returns.index < rdate]
+            if len(prior_dates) == 0:
+                continue
+            lookback_end = returns.index.get_loc(prior_dates[-1])
+            lookback_start = max(0, lookback_end + 1 - self.covariance_lookback)
             ret_window = returns.iloc[lookback_start:lookback_end + 1]
 
             # Filter to assets with sufficient history
