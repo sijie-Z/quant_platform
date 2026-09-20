@@ -8,6 +8,7 @@ from quant_platform.trading.broker import (
     Order,
     OrderSide,
     OrderStatus,
+    OrderType,
     Position,
     QMTBroker,
     SimulatedBroker,
@@ -291,3 +292,49 @@ class TestPositionModel:
         assert p.market_value == 190000.0
         assert p.unrealized_pnl == 10000.0
         assert abs(p.unrealized_pnl_pct - 0.0556) < 0.001
+
+
+class TestPositionsAreMarkedOnFill:
+    """A position opened during a cycle used to be worth zero in that cycle.
+
+    `Position(...)` is created with the dataclass defaults current_price=0 and
+    market_value=0, and only `update_market_prices()` sets them -- which the
+    live engine calls in step 1, before it executes orders in step 3. For the
+    rest of the cycle the shares contributed nothing to equity while their cost
+    had already left cash.
+    """
+
+    def _buy(self, broker, quantity=1000, price=10.0):
+        return broker.place_order(Order(
+            code="600000", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+            quantity=quantity, price=price,
+        ))
+
+    def test_a_same_cycle_buy_is_not_reported_as_a_loss(self):
+        broker = SimulatedBroker(initial_cash=1_000_000)
+        assert broker.connect()
+        before = broker.get_account()["total_equity"]
+
+        order = self._buy(broker)
+        assert order.filled_quantity > 0, order.error_msg
+
+        after = broker.get_account()["total_equity"]
+        # The account may lose the fees, but not the purchase price as well:
+        # the shares it now holds are worth roughly what was paid for them.
+        assert before - after < 200, (
+            f"equity fell by {before - after:.2f} on a "
+            f"{order.filled_quantity * order.filled_price:.2f} purchase"
+        )
+
+    def test_the_new_position_carries_a_market_value(self):
+        broker = SimulatedBroker(initial_cash=1_000_000)
+        assert broker.connect()
+
+        order = self._buy(broker)
+
+        held = broker.get_positions()
+        assert len(held) == 1
+        assert held[0].current_price == pytest.approx(order.filled_price)
+        assert held[0].market_value == pytest.approx(
+            held[0].quantity * order.filled_price
+        )
