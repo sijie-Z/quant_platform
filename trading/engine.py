@@ -347,10 +347,28 @@ class LiveTradingEngine:
 
             self._stop_event.wait(timeout=self._rebalance_interval)
 
+    def _halt(self, reason: str) -> None:
+        """Move the state machine to HALTED.
+
+        HALTED was unreachable from production code -- the only transitions to
+        it lived in tests. The cycle moves the machine to REBALANCING on entry,
+        and the kill-switch early return then skipped the transition back at
+        the end of the cycle, so the state the engine reported stayed at
+        REBALANCING for the life of the process while the kill switch was on.
+        """
+        if self._sm.state != PortfolioState.HALTED:
+            self._sm.transition(PortfolioState.HALTED, reason)
+
     def _execute_cycle(self) -> CycleResult:
         self._cycle_count += 1
         now = datetime.now().isoformat()
         self._last_update = now
+
+        # Recover once the kill switch has been cleared. HALTED only reaches
+        # READY and INIT (core/state_machine.py:48), so resuming is two hops.
+        if self._sm.state == PortfolioState.HALTED and not self._risk.kill_switch_active:
+            self._sm.transition(PortfolioState.READY, "kill switch cleared")
+            self._sm.transition(PortfolioState.TRADING, "resumed after halt")
 
         if self._sm.state == PortfolioState.TRADING:
             self._sm.transition(PortfolioState.REBALANCING, f"cycle {self._cycle_count}")
@@ -361,6 +379,7 @@ class LiveTradingEngine:
             logger.critical("Kill switch active, skipping cycle %d", self._cycle_count)
             self._bus.publish("risk.kill_switch", {"active": True}, source="risk")
             self._audit.log_risk_breach("kill_switch", {"active": True}, severity="critical")
+            self._halt("kill switch active")
             return cycle
 
         # Step 1: Fetch prices → publish market.tick events
@@ -473,9 +492,14 @@ class LiveTradingEngine:
             "positions": cycle.n_positions,
         }, source="engine")
 
-        # Transition back to trading
+        # Transition back to trading -- unless the kill switch fired during
+        # this cycle, in which case the machine goes to HALTED instead of
+        # reporting a normal cycle completion.
         if self._sm.state == PortfolioState.REBALANCING:
-            self._sm.transition(PortfolioState.TRADING, f"cycle {self._cycle_count} complete")
+            if self._risk.kill_switch_active:
+                self._halt("kill switch active")
+            else:
+                self._sm.transition(PortfolioState.TRADING, f"cycle {self._cycle_count} complete")
 
         logger.info("Cycle %d: signals=%d, orders=%d, equity=%.2f",
                      self._cycle_count, len(signals), len(cycle.orders), cycle.portfolio_value)
