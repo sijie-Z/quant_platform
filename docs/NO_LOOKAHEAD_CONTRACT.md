@@ -3,6 +3,13 @@
 > 这是本平台所有量化研究代码必须遵守的铁律。任何违反此契约的代码都是 bug。
 > 回测的高收益只有在零前视偏差的前提下才有意义。
 
+> ⚠️ **当前有两条未满足**（2026-09-21 复核）：**第八条**（ST 用公告日期）是真实的未来函数，
+> 且方向上是抬高回测的；**第七条**（行业用生效日期）未满足，但方向上只是陈旧、不构成未来函数。
+> 两条的现状、证据与修复方向都在各自小节里。
+>
+> 本次只逐条追踪了第二、第六条（alpha 权重与 IC shift 链条，未发现违反）。
+> 第一、三、四、五条**本次没有重新复核**，不要按"未列出即无问题"理解。
+
 ---
 
 ## 第一条：价格因子 — 只能用 signal_date 及之前的数据
@@ -153,12 +160,24 @@ for train_idx, test_idx in folds:
 
 **规则**：行业分类用 effective_date，不是静态标签。当股票在回测期间发生行业变更时，使用变更生效后的分类。
 
-**已在代码中实现的位置**：
+**状态**：⚠️ **当前不成立**（2026-09-21 复核）。
+
+`neutralize` 接受的是 `sector_map: Series`（asset → sector）并在每个日期上复用同一份映射
+（`factors/processing.py:99`、`:126-129`），而 `main.py` 传进去的是 `metadata["sector"]`——
+provider 的**样本起始分类**。实测（synthetic，120 只，2023-01-01 ~ 2025-12-31，seed 17）：
+38 只（32%）在样本内发生行业变更，它们**全部日期的中性化都用的是起始行业**。
+
+**方向上不是未来函数**：用变更生效**之前**的分类是**陈旧**，不是偷看未来——它永远不会读到 t
+之后的分类。所以这一条既不会抬高回测业绩，也不违反"无未来函数"；它只是让中性化对那 32% 的
+股票在变更后的区间内失效。
+
+**已在代码中实现的位置（部分）**：
 
 | 位置 | 实现 |
 |------|------|
-| `data/providers/synthetic.py:583-601` | 行业分类附带 effective_date，~5%/半年变更率 |
-| `factors/processing.py:119-148` | neutralization 支持 point-in-time sector map |
+| `data/providers/synthetic.py:605-641` | 行业分类附带 effective_date，~5%/半年变更率 |
+| `data/pipeline.py:188-215` | `get_industry_map(as_of_date)` 按 effective_date 返回当期分类 |
+| ⚠️ 缺口 | `get_industry_map` **没有任何生产调用方**（grep 仅命中自身定义与测试）；`neutralize` 也不接受按日期的映射。要真正做到这一条，需要把按日期的行业映射从 provider 一路传到 `process_factor` |
 
 ---
 
@@ -166,12 +185,19 @@ for train_idx, test_idx in folds:
 
 **规则**：ST 标记用 announce_date，不是 trigger_date。交易所发布 ST 公告之前，市场不知道。
 
-**已在代码中实现的位置**：
+**状态**：⚠️ **当前不成立，且这一条是真实的未来函数**（2026-09-21 复核）。
 
-| 位置 | 实现 |
-|------|------|
-| `data/providers/synthetic.py:504-548` | ST 有 trigger_date / announce_date 两个字段，中间差 1-3 个交易日 |
-| `data/pipeline.py` | 使用 announce_date 做 ST 过滤 |
+`_filter_universe`（`data/pipeline.py:97`）用的是 `metadata["is_st"]`，而 provider 对该字段的定义是
+"这只股票是否**在样本内某时点**变成 ST"（`data/providers/synthetic.py:555`，`trigger_idx` 随机落在
+`[60, len-60]`）。于是样本一开始就排除了约 3% 的股票——而这 3% 恰好是后来出事的股票，属于
+**逆向选择**，方向上会抬高所有基于该股票池的回测。
+
+`get_st_status(as_of_date)` 按 announce_date 判断，但**没有任何生产调用方**。而且
+`_load_point_in_time_data()` 在 `_filter_universe()` **之后**才执行（`data/pipeline.py:61` 与 `:74`），
+所以即使去调用它，过滤时 `_st_timeseries` 也还是 `None`。
+
+**修复方向**（未实施，会改变研究数字）：`valid_assets` 是"整个回测共用一个集合"，无法表达
+"某只股票从某个日期起不可交易"。要做到第八条，需要把它改成按日期的可交易掩码，并让回测消费它。
 
 ---
 
@@ -183,4 +209,4 @@ for train_idx, test_idx in folds:
 
 ---
 
-*最后更新：2026-06-18*
+*最后更新：2026-09-21*
