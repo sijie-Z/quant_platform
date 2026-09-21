@@ -312,3 +312,55 @@ class TestTopicMatching:
     def test_different_lengths(self):
         assert not AsyncEventBus._topic_matches("a.b.c", "a.*")
         assert not AsyncEventBus._topic_matches("a", "a.*")
+
+
+class TestTheBusCanBeRestarted:
+    """`stop()` left its consumer tasks in `_consumer_tasks`, and `start()`
+    skips any key already present (`if key not in self._consumer_tasks`), so a
+    stop/start pair produced a bus with zero consumers: every published event
+    was queued and never delivered, silently."""
+
+    @pytest.fixture
+    def bus(self):
+        return AsyncEventBus(default_queue_size=1000)
+
+    @pytest.mark.asyncio
+    async def test_stop_clears_the_consumer_registry(self, bus):
+        async def handler(event: Event):
+            pass
+
+        bus.subscribe("test.topic", handler)
+        await bus.start()
+
+        assert bus._consumer_tasks, "start() registered no consumers"
+
+        await bus.stop()
+
+        assert bus._consumer_tasks == {}, (
+            "the cancelled tasks survived stop(), so start() will skip them"
+        )
+        assert bus._dlq_task is None
+        assert bus._loop is None
+
+    @pytest.mark.asyncio
+    async def test_a_restarted_bus_still_delivers(self, bus):
+        received = []
+
+        async def handler(event: Event):
+            received.append(event)
+
+        bus.subscribe("test.topic", handler)
+
+        await bus.start()
+        await bus.publish_async("test.topic", {"n": 1})
+        await asyncio.sleep(0.1)
+        await bus.stop()
+        assert len(received) == 1
+
+        await bus.start()
+        await bus.publish_async("test.topic", {"n": 2})
+        await asyncio.sleep(0.1)
+        await bus.stop()
+
+        assert len(received) == 2, "the restarted bus never delivered the event"
+        assert received[1].data["n"] == 2

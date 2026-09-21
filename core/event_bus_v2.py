@@ -742,6 +742,18 @@ class AsyncEventBus:
         if self._consumer_tasks:
             await asyncio.gather(*self._consumer_tasks.values(), return_exceptions=True)
 
+        # Clear the registry so `start()` can rebuild the consumers.
+        #
+        # These used to survive `stop()`, and `start()` skips any key already
+        # present (`if key not in self._consumer_tasks`), so a stop/start pair
+        # produced a bus with zero consumers: every published event was queued
+        # and never delivered. `_loop` is cleared too -- it pointed at the loop
+        # that was just torn down, and `publish` reads it to decide between
+        # async delivery and the sync fallback.
+        self._consumer_tasks.clear()
+        self._dlq_task = None
+        self._loop = None
+
         # Close event store
         self._event_store.close()
 
