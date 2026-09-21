@@ -231,3 +231,113 @@ class TestStoreStats:
         stats = store.get_stats()
         assert stats["orders"] == 1
         assert stats["positions"] == 1
+
+
+class TestTwoTenantsCanHoldTheSameTicker:
+    """`positions` was keyed by `code` alone.
+
+    A `tenant_id` column existed and was indexed, but was not part of the
+    primary key, and `INSERT OR REPLACE` matches on the key. So the second
+    tenant to save a ticker replaced the first tenant's row outright --
+    `get_positions(tenant_id=...)` could not recover it, because the row was
+    gone.
+    """
+
+    @staticmethod
+    def _save(store, tenant_id, quantity, code="600519"):
+        store.save_position({
+            "tenant_id": tenant_id,
+            "code": code,
+            "quantity": quantity,
+            "available": quantity,
+            "avg_cost": 10.0,
+        })
+
+    def test_both_tenants_rows_survive(self, store):
+        self._save(store, "fund_a", 100)
+        self._save(store, "fund_b", 200)
+
+        assert len(store.get_positions()) == 2
+
+    def test_each_tenant_reads_only_its_own(self, store):
+        self._save(store, "fund_a", 100)
+        self._save(store, "fund_b", 200)
+
+        assert [p["quantity"] for p in store.get_positions("fund_a")] == [100]
+        assert [p["quantity"] for p in store.get_positions("fund_b")] == [200]
+
+    def test_a_tenant_can_update_its_own_row(self, store):
+        self._save(store, "fund_a", 100)
+        self._save(store, "fund_b", 200)
+
+        self._save(store, "fund_a", 150)
+
+        assert [p["quantity"] for p in store.get_positions("fund_a")] == [150]
+        assert [p["quantity"] for p in store.get_positions("fund_b")] == [200]
+
+    def test_deleting_one_tenant_position_leaves_the_other(self, store):
+        self._save(store, "fund_a", 100)
+        self._save(store, "fund_b", 200)
+
+        store.delete_position("600519", tenant_id="fund_a")
+
+        assert store.get_positions("fund_a") == []
+        assert [p["quantity"] for p in store.get_positions("fund_b")] == [200]
+
+
+class TestThePrimaryKeyMigration:
+    """An existing database must be rebuilt, since SQLite cannot alter a
+    primary key."""
+
+    @staticmethod
+    def _legacy_db(path):
+        """A database with the old `code TEXT PRIMARY KEY` schema."""
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE positions (
+                code TEXT PRIMARY KEY,
+                tenant_id TEXT DEFAULT 'default',
+                name TEXT DEFAULT '',
+                quantity INTEGER NOT NULL,
+                available INTEGER NOT NULL,
+                avg_cost REAL NOT NULL,
+                current_price REAL DEFAULT 0,
+                market_value REAL DEFAULT 0,
+                unrealized_pnl REAL DEFAULT 0,
+                realized_pnl REAL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+        """)
+        conn.execute(
+            "INSERT INTO positions (code, tenant_id, quantity, available, avg_cost, updated_at)"
+            " VALUES ('600519', 'default', 100, 100, 10.0, '2026-01-01')"
+        )
+        conn.commit()
+        conn.close()
+
+    def test_existing_rows_are_kept_and_the_key_becomes_composite(self, tmp_path):
+        db = str(tmp_path / "legacy.db")
+        self._legacy_db(db)
+
+        store = Store(db)  # opening runs the migration
+
+        kept = store.get_positions()
+        assert len(kept) == 1
+        assert kept[0]["code"] == "600519"
+        assert kept[0]["quantity"] == 100
+
+        # The new key admits a second tenant on the same ticker.
+        store.save_position({"tenant_id": "fund_b", "code": "600519",
+                             "quantity": 200, "available": 200, "avg_cost": 11.0})
+        assert len(store.get_positions()) == 2
+
+    def test_reopening_does_not_migrate_twice(self, tmp_path):
+        db = str(tmp_path / "legacy.db")
+        self._legacy_db(db)
+
+        Store(db).save_position({"tenant_id": "fund_b", "code": "600519",
+                                 "quantity": 200, "available": 200, "avg_cost": 11.0})
+        reopened = Store(db)
+
+        assert len(reopened.get_positions()) == 2
