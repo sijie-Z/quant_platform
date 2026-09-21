@@ -300,18 +300,31 @@ class PortfolioOrchestrator:
         self._update_strategy_pnl()
 
     def _update_strategy_pnl(self) -> None:
-        """Push current P&L to MultiStrategyManager."""
-        for sid in self._targets:
-            if sid not in self.multi_strategy.states:
-                continue
-            state = self.multi_strategy.states[sid]
-            total_pnl = sum(
-                p.unrealized_pnl + p.realized_pnl
-                for p in self.exec_engine.positions
-            )
-            if state.current_value > 0:
-                daily_return = total_pnl / state.current_value
-                self.multi_strategy.update_strategy_pnl(sid, daily_return)
+        """Per-strategy P&L is not reported, because it cannot be attributed.
+
+        This used to compute
+
+            total_pnl = sum(p.unrealized_pnl + p.realized_pnl
+                            for p in self.exec_engine.positions)
+            daily_return = total_pnl / state.current_value
+            self.multi_strategy.update_strategy_pnl(sid, daily_return)
+
+        -- the *whole shared book's* P&L, divided by one strategy's capital and
+        handed back as that strategy's own daily return. With N strategies the
+        same book P&L is credited N times, and `get_aggregate_metrics()` sums
+        it. `ExecutionEngine.positions` carries no strategy attribution
+        (`execution/models.py:Position` has no such field; orders are tagged
+        with a strategy at `create_order` but the resulting position is not),
+        so there is no per-strategy number to report.
+
+        The `if state.current_value > 0` guard used to make this a no-op in
+        practice. Fixing BUG-06 -- a funded strategy now starts at its
+        allocation -- made it pass, which is what brought this into reach.
+        Reporting a figure that belongs to every strategy as if it belonged to
+        one is worse than reporting none, so the push is skipped until
+        positions are attributed. See BUG-08.
+        """
+        return
 
     # ------------------------------------------------------------------
     # Position inquiry
