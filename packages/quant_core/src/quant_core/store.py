@@ -88,8 +88,8 @@ class Store:
                 );
 
                 CREATE TABLE IF NOT EXISTS positions (
-                    code TEXT PRIMARY KEY,
-                    tenant_id TEXT DEFAULT 'default',
+                    code TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
                     name TEXT DEFAULT '',
                     quantity INTEGER NOT NULL,
                     available INTEGER NOT NULL,
@@ -98,7 +98,12 @@ class Store:
                     market_value REAL DEFAULT 0,
                     unrealized_pnl REAL DEFAULT 0,
                     realized_pnl REAL DEFAULT 0,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    -- Two tenants may hold the same ticker. The key used to be
+                    -- `code` alone (with the tenant_id column present and
+                    -- indexed but not part of the key), so the second tenant's
+                    -- write replaced the first one's row.
+                    PRIMARY KEY (tenant_id, code)
                 );
 
                 CREATE TABLE IF NOT EXISTS trades (
@@ -195,6 +200,8 @@ class Store:
 
             # Migrate existing tables: add tenant_id if missing
             self._migrate_tenant_id(conn)
+            # ... and give positions a tenant-scoped key
+            self._migrate_positions_primary_key(conn)
 
             # Create tenant_id indexes after migration
             conn.executescript("""
@@ -211,6 +218,50 @@ class Store:
             if "tenant_id" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT DEFAULT 'default'")
                 logger.info("Migrated %s: added tenant_id", table)
+
+    def _migrate_positions_primary_key(self, conn: sqlite3.Connection) -> None:
+        """Rebuild `positions` so its key is (tenant_id, code).
+
+        SQLite cannot alter a primary key, so the table is recreated and the
+        rows copied. Databases written before this have `code` alone as the
+        key, which means a ticker could exist for only one tenant: the second
+        tenant's `INSERT OR REPLACE` matched on `code` and replaced the first
+        tenant's row outright.
+        """
+        info = conn.execute("PRAGMA table_info(positions)").fetchall()
+        if not info:
+            return
+        if [row[1] for row in info if row[5]] == ["tenant_id", "code"]:
+            return
+
+        # Rebuild the column list from what is actually there, so this keeps
+        # working if columns are added later.
+        defs = []
+        for row in info:
+            name, ctype, notnull, dflt = row[1], row[2], row[3], row[4]
+            if name in ("tenant_id", "code"):
+                continue
+            col = f'"{name}" {ctype}'
+            if notnull:
+                col += " NOT NULL"
+            if dflt is not None:
+                col += f" DEFAULT {dflt}"
+            defs.append(col)
+
+        cols = ", ".join(f'"{row[1]}"' for row in info)
+        conn.executescript(f"""
+            CREATE TABLE positions_new (
+                "tenant_id" TEXT NOT NULL DEFAULT 'default',
+                "code" TEXT NOT NULL,
+                {", ".join(defs)},
+                PRIMARY KEY (tenant_id, code)
+            );
+            INSERT OR REPLACE INTO positions_new ({cols}) SELECT {cols} FROM positions;
+            DROP TABLE positions;
+            ALTER TABLE positions_new RENAME TO positions;
+        """)
+        n = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+        logger.info("Migrated positions: primary key is now (tenant_id, code), %d rows kept", n)
 
     # ── Orders ──
 
@@ -288,7 +339,16 @@ class Store:
                 conn.execute("DELETE FROM positions WHERE code = ?", (code,))
 
     def get_positions(self, tenant_id: str = "") -> list[dict]:
-        """Get all current positions."""
+        """Get current positions.
+
+        With `tenant_id`, only that tenant's rows. With the default empty
+        string, **every tenant's rows**, which is the behaviour callers
+        currently get: `core/scheduler.py:208`, `operations/nav.py:207` and
+        `api/monitor.py` read positions without naming a tenant, and neither
+        `TradingScheduler` nor `NAVCalculator` carries one. Those callers
+        therefore see a merged book once more than one tenant is trading;
+        giving them a tenant is a separate change from the key fix above.
+        """
         with self._conn() as conn:
             if tenant_id:
                 rows = conn.execute(

@@ -481,9 +481,13 @@ class LiveTradingEngine:
             "n_positions": cycle.n_positions,
         })
 
-        # Save positions to store
+        # Save positions to store. The tenant has to travel with the row:
+        # `Position.to_dict()` from the broker has no tenant_id, so the store
+        # fell back to 'default' for every engine and the rows of two tenants
+        # collided on `code` (data/pipeline.py's sibling problem -- see
+        # `Store._migrate_positions_primary_key`).
         for pos in self._broker.get_positions():
-            self._store.save_position(pos.to_dict())
+            self._store.save_position({**pos.to_dict(), "tenant_id": self._tenant_id})
 
         # Publish portfolio event
         self._bus.publish("portfolio.snapshot", {
