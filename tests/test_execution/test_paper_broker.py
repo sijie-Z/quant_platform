@@ -1,10 +1,12 @@
 """Tests for enhanced paper trading broker."""
 
-
+import numpy as np
+import pytest
 
 from quant_platform.execution.order_book import (
     BookOrder,
     OrderBook,
+    Trade,
 )
 from quant_platform.execution.order_book import (
     OrderType as BookOrderType,
@@ -368,3 +370,67 @@ class TestFillRecord:
                         cancel_attempted=True, cancel_succeeded=False)
         assert fr.cancel_attempted
         assert not fr.cancel_succeeded
+
+
+class TestPartialFillsScaleEveryTrade:
+    """`_simulate_partial_fill` is meant to fill 30-80% of what the book
+    would have matched. It scaled the first trade and left the rest.
+
+    The loop decremented its own scale factor as it went:
+
+        scale -= new_qty / trade.quantity
+
+    and since `new_qty` is `trade.quantity * scale`, that subtraction leaves
+    `scale` at ~0 after the first iteration, so every later trade collapsed to
+    the `max(1, ...)` floor.
+    """
+
+    SIZES = [1000, 1000, 1000, 500]
+
+    @staticmethod
+    def _trades(sizes):
+        return [
+            Trade(trade_id=f"t{i}", symbol="600519", price=10.0, quantity=qty,
+                  aggressor_side=BookSide.BUY, maker_order_id=f"m{i}",
+                  taker_order_id="o1")
+            for i, qty in enumerate(sizes)
+        ]
+
+    def _run(self, seed: int):
+        broker = PaperBroker(initial_cash=10_000_000, partial_fill_rate=1.0)
+        broker._rng = np.random.default_rng(seed)
+        order = BookOrder(order_id="o1", symbol="600519", side=BookSide.BUY,
+                          order_type=BookOrderType.LIMIT, price=10.0,
+                          quantity=sum(self.SIZES))
+        return broker, order, broker._simulate_partial_fill(order, self._trades(self.SIZES))
+
+    @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+    def test_the_fill_lands_in_the_intended_range(self, seed):
+        _, _, result = self._run(seed)
+
+        filled = sum(t.quantity for t in result)
+        total = sum(self.SIZES)
+        assert 0.30 * total <= filled <= 0.80 * total, (
+            f"filled {filled} of {total}, outside the 30-80% the method targets"
+        )
+
+    @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+    def test_later_trades_are_not_collapsed_to_one_share(self, seed):
+        _, _, result = self._run(seed)
+
+        quantities = [t.quantity for t in result]
+        assert all(q > 1 for q in quantities), (
+            f"a trade was scaled to the floor: {quantities}"
+        )
+
+    def test_no_trade_is_scaled_above_its_book_quantity(self):
+        _, _, result = self._run(0)
+
+        for original, scaled in zip(self._trades(self.SIZES), result, strict=True):
+            assert scaled.quantity <= original.quantity
+
+    def test_the_order_records_what_was_actually_filled(self):
+        broker, order, result = self._run(0)
+
+        assert order.filled_quantity == sum(t.quantity for t in result)
+        assert broker.get_metrics().partial_fills == 1
