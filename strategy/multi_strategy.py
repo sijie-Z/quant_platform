@@ -75,9 +75,17 @@ class MultiStrategyManager:
     def add_strategy(self, config: StrategyConfig) -> str:
         """Register a new strategy."""
         self.strategies[config.strategy_id] = config
+        allocated = self.total_capital * config.allocation_pct
         self.states[config.strategy_id] = StrategyState(
             strategy_id=config.strategy_id,
-            capital_allocated=self.total_capital * config.allocation_pct,
+            capital_allocated=allocated,
+            # A freshly funded strategy is worth what was allocated to it.
+            # `current_value` defaulted to 0 and `update_strategy_pnl` only
+            # ever adds to it, so the first P&L update computed
+            # `total_pnl = 0 + daily_pnl - capital_allocated`: a 100M strategy
+            # that earned 1M on its first day reported a -99% return and
+            # tripped the `total_return < -0.10` loss alert.
+            current_value=allocated,
         )
         self.daily_returns[config.strategy_id] = []
         logger.info("Added strategy: %s (%s), allocation=%.1f%%",
