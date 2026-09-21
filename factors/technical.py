@@ -584,10 +584,14 @@ class PureVolatilityFactor(BaseFactor):
     """
     category = FactorCategory.TECHNICAL
 
-    def __init__(self, window: int = 20, ar_lags: int = 30, name: str = "pure_volatility"):
-        super().__init__({'window': window, 'ar_lags': ar_lags})
+    def __init__(self, window: int = 20, ar_lags: int = 30, ar_refit: int = 21,
+                 ar_fit_window: int = 504, name: str = "pure_volatility"):
+        super().__init__({'window': window, 'ar_lags': ar_lags, 'ar_refit': ar_refit,
+                          'ar_fit_window': ar_fit_window})
         self._window = window
         self._ar_lags = ar_lags
+        self._ar_refit = max(1, ar_refit)
+        self._ar_fit_window = max(ar_lags + 5, ar_fit_window)
         self._name = name
 
     @property
@@ -604,18 +608,41 @@ class PureVolatilityFactor(BaseFactor):
         market_ret = ret.mean(axis=1)
 
         # Rolling regression: ret_i = alpha + beta * market_ret + epsilon
-        # Then IVOL = std(epsilon) over the window
-        def _rolling_ivol(x):
-            y = x.values
-            m = market_ret.reindex(x.index).values
-            if len(y) < self._window or np.std(m) < 1e-10:
-                return np.nan
-            # Simple OLS: beta = cov(y,m) / var(m)
-            beta = np.cov(y, m)[0, 1] / np.var(m)
-            resid = y - beta * m
-            return float(np.std(resid, ddof=2))
+        # Then IVOL = std(epsilon) over the window.
+        #
+        # This was a python callback handed to `rolling().apply`, invoked once
+        # per asset per date: 300 assets x 1250 days spent 173 s here, and the
+        # factor is enabled in config/default.yaml, so the default 500-stock
+        # five-year universe paid roughly five minutes for it. The window
+        # statistics below are the same arithmetic done with rolling sums.
+        #
+        # For a window of n points, beta = cov_ddof1(y, m) / var_ddof0(m), and
+        # the residual spread expands over the same sums:
+        #     sum(r)   = A1 - beta * B1
+        #     sum(r^2) = A2 - 2*beta*AB + beta^2 * B2
+        n = float(self._window)
+        m = market_ret
+        a1 = ret.rolling(self._window).sum()
+        a2 = (ret ** 2).rolling(self._window).sum()
+        b1 = m.rolling(self._window).sum()
+        b2 = (m ** 2).rolling(self._window).sum()
+        ab = ret.mul(m, axis=0).rolling(self._window).sum()
 
-        ivol = ret.rolling(self._window).apply(_rolling_ivol, raw=False)
+        cov1 = (ab - a1.mul(b1, axis=0) / n) / (n - 1)
+        var0 = b2 / n - (b1 / n) ** 2
+        beta = cov1.div(var0.where(var0 > 1e-20), axis=0)
+
+        sum_r = a1.sub(beta.mul(b1, axis=0))
+        sum_r2 = a2.sub(beta.mul(ab, axis=0) * 2.0).add(beta.pow(2).mul(b2, axis=0))
+        var_r = (sum_r2 - sum_r.pow(2) / n) / (n - 2)
+
+        ivol = np.sqrt(var_r.clip(lower=0.0))
+        # `beta` is already NaN wherever the window was incomplete (any of the
+        # running sums is NaN) or the market leg had no variance, which is
+        # exactly the set the callback returned NaN for. Building the mask by
+        # hand from `a1.notna() & (var0 > 1e-20)` would mix DataFrames with a
+        # Series and align the Series on columns instead of rows.
+        ivol = ivol.where(beta.notna())
 
         # Orthogonalize against turnover (if available)
         turnover = kwargs.get('turnover')
@@ -643,30 +670,63 @@ class PureVolatilityFactor(BaseFactor):
 
             ivol = result
 
-        # AR(lags) filter to remove serial correlation
-        # Fit AR model per asset and return residuals
+        # AR(lags) filter to remove serial correlation.
+        #
+        # Two defects lived in the six lines this replaces.
+        #
+        # 1. `phi` was fitted on the *whole* series and then used to
+        #    residualise every date, so the coefficient applied at date t knew
+        #    every date after t -- in a class whose docstring claims to remove
+        #    "cross-period information leakage". The fit is now expanding: a
+        #    block of dates is residualised with coefficients estimated only
+        #    from observations strictly before it, refitted every `ar_refit`
+        #    days.
+        #
+        # 2. The residuals were written back to
+        #    `ivol.index[ivol.notna().any(axis=1)][lags:]` -- the dates on
+        #    which *any* asset has data -- while `series` came from
+        #    `ivol[asset].dropna()`, *this* asset's dates. The two differ as
+        #    soon as one stock is suspended anywhere in the panel, and the
+        #    insert then raised
+        #        ValueError: shape mismatch: value array of shape (471,)
+        #        could not be broadcast to indexing result of shape (472,)
+        #    ValueError is not LinAlgError, so `except LinAlgError` did not
+        #    catch it; it propagated to main.py, which logs any factor failure
+        #    as a warning. `pure_volatility` is enabled in config/default.yaml
+        #    and the synthetic provider suspends ~2% of stock-days, so the
+        #    factor was silently absent from every run.
         result = ivol.copy()
         for asset in ivol.columns:
-            series = ivol[asset].dropna().values
+            observed = ivol.index[ivol[asset].notna()]
+            series = ivol.loc[observed, asset].to_numpy()
             if len(series) < self._ar_lags + 10:
                 continue
-            # Simple AR fit: X_t = sum(phi_i * X_{t-i}) + epsilon
-            # Using least squares
-            T = len(series)
-            X = np.column_stack([
-                series[self._ar_lags - 1 - i: T - 1 - i]
-                for i in range(self._ar_lags)
-            ])
-            y = series[self._ar_lags:]
-            if X.shape[0] < self._ar_lags + 5:
-                continue
-            try:
-                phi = np.linalg.lstsq(X, y, rcond=None)[0]
-                pred = X @ phi
-                resid_ar = y - pred
-                result.loc[ivol.index[ivol.notna().any(axis=1)][self._ar_lags:], asset] = resid_ar
-            except np.linalg.LinAlgError:
-                continue
+
+            def _design(rows, _s=series):
+                return np.column_stack([
+                    _s[rows - 1 - i] for i in range(self._ar_lags)
+                ])
+
+            start = self._ar_lags
+            while start < len(series):
+                # The fit sees a bounded window of recent history. It stays
+                # causal -- everything here predates `start` -- and it keeps
+                # the least-squares problem a fixed size, where an expanding
+                # window made the later fits grow to the full sample.
+                fit_start = max(self._ar_lags, start - self._ar_fit_window)
+                fit_rows = np.arange(fit_start, start)
+                block = np.arange(start, min(start + self._ar_refit, len(series)))
+                start += self._ar_refit
+                if len(fit_rows) < self._ar_lags + 5:
+                    continue  # not enough history to estimate the AR model
+                try:
+                    phi = np.linalg.lstsq(_design(fit_rows), series[fit_rows], rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    continue
+                resid = series[block] - _design(block) @ phi
+                if not np.all(np.isfinite(resid)):
+                    continue
+                result.loc[observed[block], asset] = resid
 
         return result
 
