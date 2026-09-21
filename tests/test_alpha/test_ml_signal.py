@@ -282,3 +282,72 @@ class TestTimeSeriesCVDates:
 
         assert calls["by_dates"] > 0, "train() did not split on dates"
         assert calls["by_rows"] == 0, "train() fell back to counting rows"
+
+
+class TestPredictReturnsOnlyOutOfSampleSignals:
+    """`train` fits the final model on the whole dataset, labels included.
+
+    `predict` then emitted a signal for *every* date in `factors` -- so each
+    one was an in-sample prediction whose realized forward return the model
+    had been fitted on. The walk-forward metrics `train` reports are honest
+    out-of-sample numbers; the signal a backtest consumed was not.
+    """
+
+    def test_the_model_records_where_training_ended(self, sample_factors, sample_forward_returns):
+        gen = MLSignalGenerator()
+        gen.train(sample_factors, sample_forward_returns)
+
+        assert gen._train_end_date is not None
+
+    def test_no_signal_is_emitted_inside_the_training_window(
+        self, sample_factors, sample_forward_returns,
+    ):
+        gen = MLSignalGenerator()
+        gen.train(sample_factors, sample_forward_returns)
+
+        signal = gen.predict(sample_factors)
+
+        train_end = gen._train_end_date
+        in_sample = signal.loc[signal.index <= train_end]
+        assert in_sample.isna().to_numpy().all(), (
+            "an in-sample date came back with a signal"
+        )
+
+    def test_dates_after_training_still_get_signals(self, sample_factors):
+        """The real pipeline's last row is unobservable (`shift(-1)`), so the
+        final fit stops one day short and that day is a genuine out-of-sample
+        signal -- which is what a live signal is."""
+        factors = sample_factors
+        first = factors[list(factors)[0]]
+        forward_returns = pd.DataFrame(
+            np.random.randn(*first.shape) * 0.01,
+            index=first.index, columns=first.columns,
+        )
+        forward_returns.iloc[-1] = np.nan  # the pipeline's shift(-1) tail
+
+        gen = MLSignalGenerator()
+        gen.train(factors, forward_returns)
+        signal = gen.predict(factors)
+
+        after = signal.loc[signal.index > gen._train_end_date]
+        assert len(after) == 1, "expected exactly the final, unobservable day"
+        assert after.notna().to_numpy().any(), "no out-of-sample signal was produced"
+
+    def test_training_through_the_last_date_yields_no_signal_at_all(
+        self, sample_factors, sample_forward_returns,
+    ):
+        """The honest answer when there is nothing left to predict."""
+        gen = MLSignalGenerator()
+        gen.train(sample_factors, sample_forward_returns)
+        # Pretend the fit consumed every date.
+        gen._train_end_date = sample_factors[list(sample_factors)[0]].index.max()
+
+        signal = gen.predict(sample_factors)
+
+        assert signal.isna().to_numpy().all()
+
+    def test_predicting_before_training_still_raises(self, sample_factors):
+        gen = MLSignalGenerator()
+
+        with pytest.raises(RuntimeError):
+            gen.predict(sample_factors)

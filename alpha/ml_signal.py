@@ -460,6 +460,10 @@ class MLSignalGenerator:
             warnings.simplefilter("ignore")
             self.model.fit(X_full, y_full)
 
+        # Remember which dates the fitted model has seen, so that `predict`
+        # does not hand back in-sample predictions as if they were signals.
+        self._train_end_date = max(row_dates) if len(row_dates) else None
+
         # Feature importance
         if hasattr(self.model, 'feature_importances_'):
             importances = self.model.feature_importances_
@@ -489,7 +493,18 @@ class MLSignalGenerator:
         return perf
 
     def predict(self, factors: dict[str, pd.DataFrame]) -> pd.DataFrame:
-        """Generate ML-based signals for all dates.
+        """Generate ML signals for dates the fitted model has not seen.
+
+        `train` fits the final model on the whole dataset, labels included, and
+        this used to predict for *every* date in `factors` -- so each signal
+        was an in-sample prediction whose realized forward return the model had
+        been fitted on. The walk-forward metrics `train` reports are honest
+        out-of-sample numbers; the signal a backtest consumed was not.
+
+        Dates at or before the last training date now come back NaN, which is
+        the honest answer: a model trained through T has nothing out-of-sample
+        to say about T. In practice that leaves the most recent date, whose
+        forward return is not yet observable -- which is what a live signal is.
 
         Args:
             factors: dict of factor_name -> (date x asset) processed factor values
@@ -507,7 +522,25 @@ class MLSignalGenerator:
 
         signal_data = np.full((len(dates), len(assets)), np.nan)
 
+        train_end = getattr(self, "_train_end_date", None)
+        if train_end is not None and len(dates):
+            in_sample = dates <= train_end
+            if in_sample.any():
+                logger.warning(
+                    "predict: %d of %d dates are inside the training window "
+                    "(<= %s) and are returned as NaN rather than as in-sample "
+                    "predictions.",
+                    int(in_sample.sum()), len(dates), str(train_end)[:10],
+                )
+            if in_sample.all():
+                logger.warning(
+                    "predict: the model was fitted through the last available "
+                    "date, so no out-of-sample signal exists for any date."
+                )
+
         for i, date in enumerate(dates):
+            if train_end is not None and date <= train_end:
+                continue
             features = []
             valid_mask = np.ones(len(assets), dtype=bool)
             for name in feature_names:
