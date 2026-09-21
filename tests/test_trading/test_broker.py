@@ -338,3 +338,63 @@ class TestPositionsAreMarkedOnFill:
         assert held[0].market_value == pytest.approx(
             held[0].quantity * order.filled_price
         )
+
+
+class TestCashCannotGoNegative:
+    """The buy pre-check used a 0.1% buffer where the fee schedule applies.
+
+    `worst_cost = price * quantity * multiplier * 1.001` ignores the ¥5
+    commission floor, so 100 shares at ¥10 -- which costs ¥1005 -- passed the
+    check on any balance of ¥1001 or more and left `self._cash` negative.
+    """
+
+    PRICE = 10.0
+
+    def _broker(self, cash: float) -> SimulatedBroker:
+        broker = SimulatedBroker(initial_cash=cash)
+        assert broker.connect()
+        return broker
+
+    def _buy(self, broker, quantity=100):
+        return broker.place_order(Order(
+            code="600000", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+            quantity=quantity, price=self.PRICE,
+        ))
+
+    @pytest.mark.parametrize("cash", [1000.50, 1001.00, 1002.00, 1004.90, 1004.99, 1005.00])
+    def test_the_balance_is_never_left_negative(self, cash):
+        broker = self._broker(cash)
+
+        self._buy(broker)
+
+        assert broker.get_account()["cash"] >= 0, (
+            f"cash went negative from a starting balance of {cash}"
+        )
+
+    def test_a_balance_short_of_the_commission_is_rejected(self):
+        broker = self._broker(1004.99)  # the shares cost 1000, the fee 5
+
+        order = self._buy(broker)
+
+        assert order.status == OrderStatus.REJECTED
+        assert broker.get_account()["cash"] == pytest.approx(1004.99), "cash moved on a rejection"
+        assert broker.get_positions() == []
+
+    def test_a_balance_that_exactly_covers_cost_and_fee_fills(self):
+        broker = self._broker(1005.00)
+
+        order = self._buy(broker)
+
+        assert order.status == OrderStatus.FILLED, order.error_msg
+        assert order.filled_quantity == 100
+        assert broker.get_account()["cash"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_the_boundary_is_the_fee_schedule_not_a_percentage(self):
+        """¥1001 is above `value * 1.001` (¥1001) and below `value + fee`
+        (¥1005): the old check admitted it, a correct one does not."""
+        broker = self._broker(1001.00)
+
+        order = self._buy(broker)
+
+        assert order.status == OrderStatus.REJECTED
+        assert broker.get_account()["cash"] == pytest.approx(1001.00)

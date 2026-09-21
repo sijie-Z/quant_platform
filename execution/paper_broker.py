@@ -268,11 +268,21 @@ class PaperBroker:
         fill_pct = self._rng.uniform(0.3, 0.8)
         target_fill = max(1, int(total_filled * fill_pct))
 
-        # Scale down trades proportionally
+        # Scale down trades proportionally.
+        #
+        # This loop used to decrement `scale` by each trade's own share:
+        #
+        #     scale -= new_qty / trade.quantity
+        #
+        # Since `new_qty` is `trade.quantity * scale`, the subtraction leaves
+        # `scale` at ~0 after the first iteration, so every later trade fell to
+        # the `max(1, ...)` floor. Trades of [1000, 1000, 1000, 500] with a 50%
+        # target came out as [500, 1, 1, 1] -- roughly one trade's worth, far
+        # below the 30-80% of available volume the method is supposed to fill.
         scale = target_fill / total_filled
         result = []
         for trade in trades:
-            new_qty = max(1, int(trade.quantity * scale))
+            new_qty = min(trade.quantity, max(1, int(trade.quantity * scale)))
             result.append(Trade(
                 trade_id=trade.trade_id,
                 symbol=trade.symbol,
@@ -283,7 +293,6 @@ class PaperBroker:
                 taker_order_id=trade.taker_order_id,
                 timestamp_ns=trade.timestamp_ns,
             ))
-            scale -= new_qty / trade.quantity
 
         # Mark order as partial
         order.filled_quantity = sum(t.quantity for t in result)

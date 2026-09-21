@@ -262,6 +262,31 @@ class SimulatedBroker(BrokerInterface):
         inst = self._get_instrument(symbol)
         return inst.t_plus if inst else 1
 
+    def _max_affordable(self, symbol: str, price: float, cash: float) -> int:
+        """Largest lot-multiple quantity whose value *plus fees* fits in `cash`.
+
+        A percentage buffer cannot stand in for the fee schedule: commission
+        has a ¥5 floor, so 100 shares at ¥10 costs ¥1005 while a 0.1% buffer
+        allows only ¥1001. Any order in `[1.001 * value, value + fees)` passed
+        the old pre-check and then drove `self._cash` negative.
+        """
+        lot = self._get_lot_size(symbol)
+        multiplier = self._get_multiplier(symbol)
+        if price <= 0 or lot <= 0 or multiplier <= 0:
+            return 0
+
+        qty = int(cash / (price * multiplier) / lot) * lot
+        while qty > 0:
+            value = price * qty * multiplier
+            fees = (
+                self._get_commission(symbol, price, qty)
+                + self._get_stamp_tax(symbol, price, qty, OrderSide.BUY)
+            )
+            if value + fees <= cash:
+                return qty
+            qty -= lot
+        return 0
+
     def place_order(self, order: Order) -> Order:
         """Submit order to the real order book for price-time priority matching."""
         if not self._connected:
@@ -287,11 +312,15 @@ class SimulatedBroker(BrokerInterface):
                 self._orders.append(order)
                 return order
 
-        # Check cash for buy (pre-check with worst-case price, use multiplier)
+        # Check cash for buy (worst-case cost, including the fee schedule)
         if order.side == OrderSide.BUY:
-            multiplier = self._get_multiplier(order.code)
-            worst_cost = order.price * order.quantity * multiplier * 1.001  # 0.1% buffer
-            if worst_cost > self._cash:
+            if self._max_affordable(order.code, order.price, self._cash) < order.quantity:
+                worst_value = order.price * order.quantity * self._get_multiplier(order.code)
+                worst_cost = (
+                    worst_value
+                    + self._get_commission(order.code, order.price, order.quantity)
+                    + self._get_stamp_tax(order.code, order.price, order.quantity, order.side)
+                )
                 order.status = OrderStatus.REJECTED
                 order.error_msg = f"Insufficient cash. Need ~{worst_cost:.2f}, have {self._cash:.2f}"
                 self._orders.append(order)
@@ -346,9 +375,11 @@ class SimulatedBroker(BrokerInterface):
         if order.side == OrderSide.BUY:
             total_cost = total_value + commission + tax
             if total_cost > self._cash:
-                # Partial fill at what we can afford (use lot_size, not hardcoded 100)
-                lot_size = self._get_lot_size(order.code)
-                affordable_qty = int(self._cash / (avg_fill_price * 1.001) / lot_size) * lot_size
+                # Partial fill at what we can afford, fees included. The old
+                # bound divided by 1.001 and ignored the commission floor, so
+                # the recomputed `total_cost` was still larger than cash and
+                # the subtraction below drove the balance negative.
+                affordable_qty = self._max_affordable(order.code, avg_fill_price, self._cash)
                 if affordable_qty <= 0:
                     order.status = OrderStatus.REJECTED
                     order.error_msg = f"Insufficient cash after fill. Need {total_cost:.2f}, have {self._cash:.2f}"
@@ -357,6 +388,7 @@ class SimulatedBroker(BrokerInterface):
                 total_filled = min(total_filled, affordable_qty)
                 total_value = avg_fill_price * total_filled
                 commission = self._get_commission(order.code, avg_fill_price, total_filled)
+                tax = self._get_stamp_tax(order.code, avg_fill_price, total_filled, order.side)
                 total_cost = total_value + commission + tax
 
             self._cash -= total_cost
