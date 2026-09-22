@@ -310,7 +310,9 @@ walk-forward 的 "OOS" 含训练期、ML 交叉验证按行切分、基本面在
 ## 附带发现的非未来函数缺陷
 
 - `factors/technical.py:492-520` `MAConvergenceFactor.compute` 返回 **Series 而非 DataFrame**
-  → 在流水线里退化成单列，IC 为空
+  → 在流水线里退化成单列；而 `rank_ic_numba` 按位置取 `.values`，把这一列和 418 只股票逐行
+  相关，得到 1304 个「有值但无意义」的 IC（不是空 IC，纯 pandas 回退路径下才是空）。
+  **【已修复 2026-09-22】**
 - `api/routes.py:2659` 向 `generate()` 传它不接受的 `force_retrain=` → **`/api/ml/predict` 必然 500**
 - `research/validation.py` Deflated Sharpe 里 `observed_sr` 年化后代入按日计算的公式
   → z 统计量被放大约 √252，该检验几乎恒显著

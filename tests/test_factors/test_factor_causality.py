@@ -59,10 +59,21 @@ def _compute(name: str, panel: pd.DataFrame) -> pd.DataFrame | None:
 
 FACTORS = _registered_factors()
 
-#: Factors whose `compute` needs data this module does not supply (turnover,
-#: volume, financials). Named rather than silently skipped, so that a factor
-#: which starts failing to compute is noticed.
-NEEDS_EXTRA_INPUT = {"turnover_20d", "ma_convergence"}
+#: Factors whose `compute` needs data this module does not supply:
+#: `turnover_20d` wants a turnover panel, the fundamental factors want
+#: financials. Named rather than silently skipped, so that a factor which
+#: starts failing to compute is noticed. The set names every factor that can
+#: be in FACTORS, so the check does not depend on which test module happened
+#: to register what first. `ma_convergence` sat here only because its
+#: `compute` returned a Series; with that fixed it is exercised like the rest.
+NEEDS_EXTRA_INPUT = {
+    "turnover_20d",
+    "log_market_cap",
+    "pb_ratio",
+    "pe_ratio",
+    "roe",
+    "asset_growth",
+}
 
 
 @pytest.mark.parametrize("name", FACTORS)

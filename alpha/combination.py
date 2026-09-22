@@ -64,7 +64,9 @@ def combine_ic_weighted(
 
     aligned = _align_factors(factors)
     dates = sorted(next(iter(aligned.values())).index)
-    factor_names = list(factors.keys())
+    # Weights are normalized over the factors that survived alignment: giving
+    # a share to a factor that was dropped would scale the row down by it.
+    factor_names = list(aligned)
 
     # Precompute Rank IC series for each factor (one pass)
     ic_series_dict = {}
@@ -138,7 +140,9 @@ def combine_icir_weighted(
 
     aligned = _align_factors(factors)
     dates = sorted(next(iter(aligned.values())).index)
-    factor_names = list(factors.keys())
+    # Weights are normalized over the factors that survived alignment: giving
+    # a share to a factor that was dropped would scale the row down by it.
+    factor_names = list(aligned)
 
     # Precompute Rank IC series for each factor (one pass)
     ic_series_dict = {}
@@ -208,6 +212,14 @@ def _build_row(
         if date not in factor.index:
             continue
         vals = factor.loc[date]
+        if not vals.notna().any():
+            # A factor with nothing to say about this cross-section used to
+            # seed the sum with an all-NaN row, and NaN + x is NaN, so every
+            # other factor's values for the date were lost with it. Skipping
+            # it keeps the row's meaning: the weighted sum of what the factors
+            # actually have. Which factors were summed no longer depends on
+            # the order they happen to sit in the dict.
+            continue
         if row is None:
             row = vals * w
         else:
@@ -215,8 +227,45 @@ def _build_row(
     return row
 
 
+def _asset_universe(factors: dict[str, pd.DataFrame]) -> pd.Index:
+    """The asset universe the factors agree on, by majority.
+
+    Every factor is supposed to span the same assets. One that does not is a
+    defect in that factor: taking the union of columns would let its stray
+    labels into the signal, and taking the intersection would hand it the
+    whole cross-section. The modal column set ignores the odd one out.
+    """
+    groups: dict[tuple, list[str]] = {}
+    for name, df in factors.items():
+        groups.setdefault(tuple(df.columns), []).append(name)
+
+    if not groups:
+        raise ValueError("No factors provided")
+    # Most members wins; ties go to the widest panel, so a one-column factor
+    # can never outvote a full asset panel.
+    columns = max(groups, key=lambda cols: (len(groups[cols]), len(cols)))
+    return pd.Index(columns)
+
+
 def _align_factors(factors: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    """Align factor dates and assets."""
+    """Align factors to a common date index and asset universe.
+
+    This used to intersect dates only. pandas aligns on labels and fills the
+    misses with NaN, so a factor carrying one non-asset column -- or a Series
+    wrapped by `process_factor` as a column named 'factor' -- unioned its
+    label into every cross-section and emptied the entire signal. A factor
+    whose columns are not the universe is now aligned to it, and dropped if
+    that leaves nothing, so the damage stops at that factor.
+    """
+    for name, df in factors.items():
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError(
+                f"Factor '{name}' is a {type(df).__name__}, not a (date x asset) "
+                "DataFrame. A per-date series has no asset axis to combine on."
+            )
+
+    universe = _asset_universe(factors)
+
     common_dates = None
     for df in factors.values():
         if common_dates is None:
@@ -229,7 +278,27 @@ def _align_factors(factors: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
 
     result = {}
     for name, df in factors.items():
-        result[name] = df.reindex(common_dates)
+        if df.columns.equals(universe):
+            result[name] = df.reindex(common_dates)
+            continue
+
+        stray = [c for c in df.columns if c not in universe]
+        logger.warning(
+            "Factor '%s' has %d column(s) outside the %d-asset universe (%s) -- "
+            "aligning it to the universe",
+            name, len(stray), len(universe), stray[:3],
+        )
+        aligned = df.reindex(index=common_dates, columns=universe)
+        if not aligned.notna().any().any():
+            logger.warning(
+                "Factor '%s' shares no asset with the universe -- dropping it",
+                name,
+            )
+            continue
+        result[name] = aligned
+
+    if not result:
+        raise ValueError("No factor spans the asset universe; nothing to combine")
     return result
 
 

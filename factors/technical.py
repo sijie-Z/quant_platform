@@ -522,7 +522,14 @@ class MAConvergenceFactor(BaseFactor):
 
         gap1 = (ma5 - ma10).abs() / ma10 * 100
         gap2 = (ma10 - ma20).abs() / ma20 * 100
-        max_gap = pd.concat([gap1, gap2], axis=1).max(axis=1)
+        # Per asset, the wider of the two gaps. Concatenating the panels and
+        # taking max(axis=1) collapses the asset axis -- it returned one value
+        # per date, and the single column that then reached the alpha
+        # combination ('factor', from processing.process_factor) turned every
+        # cross-section of the signal into NaN. np.fmax is the element-wise
+        # maximum and, like the old skipna max, ignores a gap that is still
+        # NaN (gap2 needs 20 days of history before it exists).
+        max_gap = np.fmax(gap1, gap2)
 
         # Convert gap % to score: 0% gap = 1.0, >=5% gap = 0.0
         score = 1.0 - (max_gap.clip(0, 5) / 5.0)
