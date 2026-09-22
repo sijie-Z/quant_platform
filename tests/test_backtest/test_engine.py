@@ -129,3 +129,113 @@ class TestCovarianceWindowSeesNoFuture:
         assert all(n <= 252 for n in lengths), f"a window exceeded the lookback: {max(lengths)}"
         assert lengths == sorted(lengths), "the window grows then stops growing"
         assert lengths[-1] == 252, "the last window is pinned at the lookback"
+
+
+class TestExecutionTiming:
+    """The signal is computed *from* rdate's close, so it cannot also be
+    traded at that same close.
+
+    The engine used to apply the new weights at `date >= rdate` and therefore
+    earn `returns.loc[rdate]` -- the move from the previous close to the very
+    close the signal was read off. The module docstring, ASHARE_PITFALLS.md
+    and the T+1 notes all say execution is at the next trading day's close;
+    the code never did that.
+    """
+
+    SIGNAL_DAY = 3
+
+    @staticmethod
+    def _returns(signal_day_return: float = 0.10):
+        """Ten flat days, with one big move on the signal day itself."""
+        dates = pd.bdate_range("2024-01-01", periods=10)
+        r = pd.DataFrame(0.0, index=dates, columns=["A", "B"])
+        r.loc[dates[TestExecutionTiming.SIGNAL_DAY], "A"] = signal_day_return
+        return r
+
+    @staticmethod
+    def _engine(timing: str, returns: pd.DataFrame, cost_model=None) -> BacktestEngine:
+        # Zero cost by default: these tests are about *when* a weight takes
+        # effect, and a fee would blur the timing signal they assert on. The
+        # cost's own date is checked separately below.
+        engine = BacktestEngine(
+            rebalance_frequency="monthly",
+            optimizer="equal_weight",
+            execution_timing=timing,
+            cost_model=cost_model or CostModel(commission=0, stamp_tax=0, slippage=0),
+        )
+        engine.weights_history = {
+            returns.index[TestExecutionTiming.SIGNAL_DAY]: pd.Series({"A": 1.0, "B": 0.0})
+        }
+        return engine
+
+    def test_the_signal_days_own_return_is_not_captured(self):
+        returns = self._returns()
+        engine = self._engine("next_close", returns)
+
+        engine._simulate_pnl(returns)
+
+        assert engine.daily_returns.loc[returns.index[self.SIGNAL_DAY]] == pytest.approx(0.0), (
+            "the portfolio earned a move that happened before the decision"
+        )
+        # Nothing else moved, so the whole run is flat.
+        assert engine.daily_returns.abs().sum() == pytest.approx(0.0)
+
+    def test_the_old_timing_did_capture_it(self):
+        """Pins `signal_close` to the behaviour being migrated away from, so
+        the comparison harness measures the real old semantics."""
+        returns = self._returns()
+        engine = self._engine("signal_close", returns)
+
+        engine._simulate_pnl(returns)
+
+        assert engine.daily_returns.loc[returns.index[self.SIGNAL_DAY]] == pytest.approx(0.10)
+
+    def test_turnover_is_recorded_on_the_execution_date(self):
+        returns = self._returns()
+        engine = self._engine("next_close", returns)
+
+        engine._simulate_pnl(returns)
+
+        exec_date = returns.index[self.SIGNAL_DAY + 1]
+        assert list(engine.turnover_history.index) == [exec_date]
+        assert engine.turnover_history.iloc[0] == pytest.approx(0.5)
+
+    def test_the_old_timing_recorded_it_on_the_signal_date(self):
+        returns = self._returns()
+        engine = self._engine("signal_close", returns)
+
+        engine._simulate_pnl(returns)
+
+        assert list(engine.turnover_history.index) == [returns.index[self.SIGNAL_DAY]]
+
+    def test_a_signal_with_no_following_day_is_dropped(self):
+        """Nothing can be executed on the last bar, and trading it at that bar's
+        own close is the assumption being removed."""
+        returns = self._returns()
+        last = returns.index[-1]
+        engine = self._engine("next_close", returns)
+        engine.weights_history = {last: pd.Series({"A": 1.0, "B": 0.0})}
+
+        engine._simulate_pnl(returns)
+
+        assert len(engine.turnover_history) == 0
+        assert engine.daily_returns.abs().sum() == pytest.approx(0.0)
+
+    def test_an_unknown_timing_is_rejected(self):
+        with pytest.raises(ValueError, match="execution_timing"):
+            BacktestEngine(execution_timing="same_bar")
+
+    def test_the_transaction_cost_is_charged_on_the_execution_date(self):
+        returns = self._returns()
+        engine = self._engine(
+            "next_close", returns,
+            cost_model=CostModel(commission=0.001, stamp_tax=0, slippage=0),
+        )
+
+        engine._simulate_pnl(returns)
+
+        signal_date = returns.index[self.SIGNAL_DAY]
+        exec_date = returns.index[self.SIGNAL_DAY + 1]
+        assert engine.daily_returns.loc[signal_date] == pytest.approx(0.0)
+        # One-sided turnover 0.5 -> two-way 1.0 -> 0.001 of capital.
+        assert engine.daily_returns.loc[exec_date] == pytest.approx(-0.001)
