@@ -1,0 +1,97 @@
+{
+  "baseline_commit": "21049a7",
+  "timings": {
+    "old": "signal_close",
+    "new": "next_close"
+  },
+  "data": {
+    "provider": "synthetic",
+    "embedded_alpha": true,
+    "start_date": "2021-01-01",
+    "end_date": "2025-12-31",
+    "n_assets": 418,
+    "n_days": 1304
+  },
+  "config": {
+    "optimizer": "mean_variance",
+    "alpha_method": "icir_weighted",
+    "rebalance_frequency": "monthly",
+    "covariance_method": "ledoit_wolf",
+    "slippage_model": "fixed"
+  },
+  "metrics": {
+    "annual_return": {
+      "old": 0.21482781936759432,
+      "new": 0.2007162878394364,
+      "delta": -0.014111531528157917
+    },
+    "annual_volatility": {
+      "old": 0.20210958500311466,
+      "new": 0.20266404180940462,
+      "delta": 0.0005544568062899602
+    },
+    "sharpe_ratio": {
+      "old": 0.9144930922734119,
+      "new": 0.8423610143924126,
+      "delta": -0.07213207788099929
+    },
+    "sortino_ratio": {
+      "old": 1.5292997999071134,
+      "new": 1.4021665514001627,
+      "delta": -0.12713324850695074
+    },
+    "calmar_ratio": {
+      "old": 0.44031363036076016,
+      "new": 0.4159523194117333,
+      "delta": -0.024361310949026882
+    },
+    "max_drawdown": {
+      "old": -0.4878972726589918,
+      "new": -0.4825463844589264,
+      "delta": 0.005350888200065407
+    },
+    "total_return": {
+      "old": 1.7373490725941214,
+      "new": 1.5767516094579954,
+      "delta": -0.160597463136126
+    },
+    "win_rate": {
+      "old": 0.5184049079754601,
+      "new": 0.5176380368098159,
+      "delta": -0.0007668711656442229
+    },
+    "information_ratio": {
+      "old": 2.6494599095781943,
+      "new": 2.504271754647029,
+      "delta": -0.14518815493116533
+    },
+    "excess_return": {
+      "old": 1.8610407959163378,
+      "new": 1.7004433327802118,
+      "delta": -0.160597463136126
+    },
+    "n_rebalances": {
+      "old": 60.0,
+      "new": 60.0,
+      "delta": 0.0
+    }
+  },
+  "daily_delta": {
+    "n_common_days": 1304,
+    "mean": -4.594988542886049e-05,
+    "median": 0.0,
+    "max_abs": 0.015449287957846596,
+    "std": 0.0010784846751020944,
+    "n_nonzero": 119
+  },
+  "cumulative": {
+    "old": 1.7373490725941214,
+    "new": 1.5767516094579954
+  },
+  "turnover": {
+    "old_sum": 26.3828814772932,
+    "new_sum": 25.920856035428567,
+    "old_first_date": "2021-01-29",
+    "new_first_date": "2021-02-01"
+  }
+}

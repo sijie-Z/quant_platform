@@ -28,7 +28,9 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_HERE = Path(__file__).resolve()
+sys.path.insert(0, str(_HERE.parent.parent))        # repo root, for `import main`
+sys.path.insert(0, str(_HERE.parent.parent.parent))  # its parent, so `quant_platform` resolves to the repo
 
 from quant_platform.backtest.cost_model import CostModel  # noqa: E402
 from quant_platform.backtest.engine import BacktestEngine  # noqa: E402
