@@ -261,10 +261,23 @@ def rank_ic_numba(
     factor: pd.DataFrame,
     forward_returns: pd.DataFrame,
 ) -> pd.Series:
-    """Numba-accelerated Rank IC computation."""
+    """Numba-accelerated Rank IC computation.
+
+    `.values` is indexed positionally, so the panels are first intersected on
+    dates *and* columns and reindexed to that intersection. Without it a
+    factor whose columns were not the return panel's columns -- the one-column
+    frame `MAConvergenceFactor` used to produce, say -- had each date's single
+    value correlated against hundreds of returns, yielding a plausible-looking
+    IC for every date and nothing of the sort in fact.
+    """
     if not HAS_NUMBA:
         from quant_platform.factors.evaluation import rank_ic
         return rank_ic(factor, forward_returns)
+
+    dates = factor.index.intersection(forward_returns.index)
+    assets = factor.columns.intersection(forward_returns.columns)
+    factor = factor.reindex(index=dates, columns=assets)
+    forward_returns = forward_returns.reindex(index=dates, columns=assets)
 
     f_arr = factor.values.astype(np.float64)
     r_arr = forward_returns.values.astype(np.float64)

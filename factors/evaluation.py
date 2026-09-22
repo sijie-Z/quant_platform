@@ -48,10 +48,9 @@ def rank_ic(
         ).shift(-(period - 1))
 
     if HAS_NUMBA:
-        common_dates = factor.index.intersection(target.index)
-        f_aligned = factor.loc[common_dates]
-        r_aligned = target.loc[common_dates]
-        return rank_ic_numba(f_aligned, r_aligned)
+        # rank_ic_numba intersects dates and columns itself; passing the raw
+        # panels is what keeps the two axes from being correlated positionally.
+        return rank_ic_numba(factor, target)
 
     # Pure Pandas fallback
     ic_series = []

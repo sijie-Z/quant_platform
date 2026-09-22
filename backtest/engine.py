@@ -42,6 +42,7 @@ class BacktestEngine:
         benchmark: str = "equal_weight",
         covariance_method: str = "ledoit_wolf",
         covariance_lookback: int = 252,
+        execution_timing: str = "next_close",
     ):
         self.initial_capital = initial_capital
         self.rebalance_frequency = rebalance_frequency
@@ -51,6 +52,17 @@ class BacktestEngine:
         self.benchmark_type = benchmark
         self.covariance_method = covariance_method
         self.covariance_lookback = covariance_lookback
+
+        # `next_close` (default): the signal is computed from rdate's close and
+        # executed at the *next* trading day's close, which is what the module
+        # docstring, data/ASHARE_PITFALLS.md and the T+1 notes have always said.
+        # `signal_close` reproduces the previous behaviour, where the portfolio
+        # was traded at the very close the signal was computed from, and exists
+        # so the migration can be measured against it (see
+        # `tools/execution_timing_migration.py`). Do not use it for research.
+        if execution_timing not in ("next_close", "signal_close"):
+            raise ValueError(f"Unknown execution_timing: {execution_timing}")
+        self.execution_timing = execution_timing
 
         # Results
         self.daily_returns: pd.Series | None = None
@@ -210,27 +222,64 @@ class BacktestEngine:
         else:
             raise ValueError(f"Unknown optimizer: {self.optimizer_name}")
 
+    def _execution_schedule(
+        self, returns: pd.DataFrame
+    ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+        """Map each signal date to the trading day whose close it executes at.
+
+        The signal is computed *from* rdate's close, so it cannot also be
+        traded at that same close -- the earliest fill the strategy could have
+        got is the next trading day's close. Until the weights are applied the
+        portfolio still holds yesterday's positions, and the traded value, its
+        cost and the resulting turnover all belong to the execution day, not to
+        the day the decision was made.
+
+        `signal_close` returns (rdate, rdate), reproducing the previous
+        behaviour exactly so the migration can be measured against it.
+        """
+        index = returns.index
+        schedule: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        for rdate in sorted(self.weights_history.keys()):
+            if self.execution_timing == "signal_close":
+                schedule.append((rdate, rdate))
+                continue
+            pos = index.get_indexer([rdate], method="ffill")[0]
+            if pos < 0 or pos + 1 >= len(index):
+                # No trading day follows the signal, so it cannot be executed.
+                # Dropping it is the honest outcome; trading it at rdate's own
+                # close is exactly the assumption being removed.
+                logger.warning(
+                    "Rebalance %s has no following trading day -- signal dropped "
+                    "rather than executed at its own close",
+                    str(rdate)[:10],
+                )
+                continue
+            schedule.append((index[pos + 1], rdate))
+        return schedule
+
     def _simulate_pnl(self, returns: pd.DataFrame) -> None:
         """Simulate daily P&L with costs.
 
-        Between rebalance dates, weights drift with price movements.
-        At rebalance dates, we compute turnover and deduct transaction costs.
+        Between executions, weights drift with price movements. On an
+        execution date, the new weights take effect at that close, turnover is
+        computed against the held weights, and the cost is charged for that
+        day -- so `turnover_history` is indexed by execution date too.
         """
         all_dates = returns.index.sort_values()
-        rebalance_dates = sorted(self.weights_history.keys())
+        schedule = self._execution_schedule(returns)
 
         capital = self.initial_capital
         current_weights = pd.Series(0.0, index=returns.columns)
         daily_ret_list = []
         turnover_records = []
 
-        rebalance_iter = iter(rebalance_dates)
-        next_rdate = next(rebalance_iter, None)
+        next_idx = 0
 
         for date in all_dates:
             rebalance_cost = 0.0
-            if next_rdate is not None and date >= next_rdate:
-                target_weights = self.weights_history.get(next_rdate, current_weights)
+            if next_idx < len(schedule) and date >= schedule[next_idx][0]:
+                exec_date, rdate = schedule[next_idx]
+                target_weights = self.weights_history.get(rdate, current_weights)
                 target_weights = target_weights.reindex(returns.columns, fill_value=0.0)
 
                 turnover = (target_weights - current_weights).abs().sum() / 2
@@ -242,10 +291,10 @@ class BacktestEngine:
                     # sells -- which only holds for the *two-way* traded value.
                     # Passing one-sided turnover halved every component.
                     rebalance_cost = self.cost_model.compute_costs(turnover * 2)
-                turnover_records.append((next_rdate, turnover))
+                turnover_records.append((exec_date, turnover))
 
                 current_weights = target_weights.copy()
-                next_rdate = next(rebalance_iter, None)
+                next_idx += 1
 
             daily_ret_assets = returns.loc[date].reindex(current_weights.index, fill_value=0.0)
             portfolio_return = (current_weights * daily_ret_assets).sum()
