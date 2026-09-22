@@ -10,6 +10,7 @@ Transforms raw data provider output into analysis-ready DataFrames with:
 from __future__ import annotations
 
 import pandas as pd
+
 from quant_platform.data.providers.base import DataProvider
 from quant_platform.utils.logging import get_logger
 
