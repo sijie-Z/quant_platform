@@ -16,7 +16,8 @@
 | 问题 | 事实 | 处置 |
 |---|---|---|
 | **alpha 信号是空的** | `ma_convergence` 是 21 个默认因子里唯一返回 `Series` 的，它的字面量列名 `'factor'` 通过 pandas 的标签并集把**整个截面**变成 NaN。信号只有 0.69% 有值，60 个调仓日里 59 个走等权回退 —— **每一次回测实际都是等权买入持有** | 已修（#54） |
-| **`embedded_alpha: false` 从来没生效过** | `load_config()` 不把嵌套 dict 转成声明的 dataclass，`getattr` 全部拿回退值，`embedded_alpha or (alpha_strength > 0)` 恒为真。三种配置产出的收益矩阵 **SHA1 完全相同** | 修复中（分支 `fix/nested-config-coercion`） |
+| **`embedded_alpha: false` 从来没生效过** | `load_config()` 不把嵌套 dict 转成声明的 dataclass，`getattr` 全部拿回退值，`embedded_alpha or (alpha_strength > 0)` 恒为真。三种配置产出的收益矩阵 **SHA1 完全相同** | 已修（#65） |
+| **四个嵌套配置段全是坏的** | 修上面那个时按 schema 枚举 18 个嵌套字段，发现 **4 个**没被读取：`data.synthetic`（dict 而非 dataclass）、**`screener`**、**`execution`（含 QMT）**、**`instruments`**。后三个 YAML **从没被读过**，而类型检查看不出来（`default_factory` 让类型正确、YAML 被丢掉）——**跨资产 `instruments` 那个卖点配置从来没生效过** | 已修（#65） |
 | **成交时点与四处文档矛盾** | 引擎按信号当日收盘成交，而 docstring、`ASHARE_PITFALLS.md`、`CLAUDE.md` 全写的是次日成交。那个判据来自初始提交，从没兑现过 | 已修（#53/#56） |
 | **股票池用未来信息** | `is_st` 的语义是"**整个样本内会不会**变 ST"，触发日随机落在样本内 —— 第一天就按几年后的事件剔除股票 | 已修（#55） |
 | **契约第 7、8 条是假的** | 文档写着"已实现的位置"，实际那两个 PIT 访问器**没有任何生产调用方** | 已修文档（#48），第 8 条代码已修（#55） |
