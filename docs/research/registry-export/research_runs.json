@@ -1,0 +1,2190 @@
+[
+  {
+    "run_id": "run_1783677409_21c397c93f42ed13",
+    "timestamp": "2026-07-10T09:56:49+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "first_honest_research_run",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx / stock_zh_a_hist",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "momentum_12m",
+    "factor_params": {
+      "name": "momentum_12m",
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 2246,
+      "ic_mean": 0.0114,
+      "icir": 0.0515,
+      "ic_positive_ratio": 0.5356,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run; DSR corrects for multiple testing, N=1 has nothing to correct",
+        "observed_sharpe_proxy": 0.7405,
+        "note": "Do not read this as formal validation. Run more factors first, then re-evaluate with proper num_trials."
+      },
+      "bh_fdr": "n/a (single factor; BH-FDR requires multiple factors)"
+    },
+    "input_hash": "21c397c93f42ed13",
+    "report_path": "data/reports/momentum_honest_run.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783693738_ec87364db449c6ce",
+    "timestamp": "2026-07-10T14:28:58+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "second_honest_research_run",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "none",
+      "basis": "fiscal_year_end",
+      "cross_sectional_use": true,
+      "interface": "stock_financial_analysis_indicator",
+      "trust_warning": [
+        "quarterly_point_in_time",
+        "no_pe_ttm_precision"
+      ],
+      "description": "AkShare quarterly financial indicators; ROE from latest fiscal year"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "roe",
+    "factor_params": {
+      "name": "roe",
+      "source": "stock_financial_analysis_indicator"
+    },
+    "evaluation": {
+      "n_ic_obs": 1244,
+      "ic_mean": 0.0017,
+      "icir": 0.0116,
+      "ic_positive_ratio": 0.5,
+      "long_short_sharpe_proxy": 0.5374,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run; DSR corrects for multiple testing, N=1 has nothing to correct",
+        "observed_sharpe_proxy": 0.5374,
+        "note": "Do not read this as formal validation. Run more factors first."
+      },
+      "bh_fdr": "n/a (single factor; BH-FDR requires multiple factors)"
+    },
+    "input_hash": "ec87364db449c6ce",
+    "report_path": "data/reports/roe_honest_run.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783758177_d71696de7376187d",
+    "timestamp": "2026-07-11T08:22:57+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "third_honest_research_run",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "volatility_60d",
+    "factor_params": {
+      "name": "volatility_60d",
+      "period": 60
+    },
+    "evaluation": {
+      "n_ic_obs": 1241,
+      "ic_mean": 0.0349,
+      "icir": 0.1144,
+      "ic_positive_ratio": 0.5326,
+      "long_short_sharpe_proxy": -0.8561,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run",
+        "observed_sharpe_proxy": -0.8561,
+        "note": "Do not read this as formal validation."
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "d71696de7376187d",
+    "report_path": "data/reports/volatility_60d_honest_run.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "diag_1783761708",
+    "timestamp": "2026-07-11T09:21:48",
+    "status": "diagnostic",
+    "reason": "",
+    "slice": "m2_factor_diagnostic",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_60d",
+    "factor_params": {
+      "period": 60
+    },
+    "evaluation": {
+      "ic_mean": 0.034879585340061435,
+      "icir": 0.11435642466198799,
+      "yearly_ic": {
+        "2021": {
+          "n": 183,
+          "ic_mean": 0.005673777332474068,
+          "ic_std": 0.23340564146295284
+        },
+        "2022": {
+          "n": 242,
+          "ic_mean": 0.04559387186951971,
+          "ic_std": 0.2708437966136175
+        },
+        "2023": {
+          "n": 242,
+          "ic_mean": 0.0532741151613978,
+          "ic_std": 0.26806594641510223
+        },
+        "2024": {
+          "n": 242,
+          "ic_mean": 0.058333800481198295,
+          "ic_std": 0.3597507288491937
+        },
+        "2025": {
+          "n": 243,
+          "ic_mean": 0.011264158710655559,
+          "ic_std": 0.35218661351613445
+        },
+        "2026": {
+          "n": 89,
+          "ic_mean": 0.016485854051147966,
+          "ic_std": 0.3139436028691026
+        }
+      },
+      "rolling_60d_min": -0.05875680551081626,
+      "rolling_60d_max": 0.14449667630794585,
+      "rolling_60d_latest": 0.018374840844151127,
+      "monthly_pct_positive": 0.5967741935483871,
+      "coverage_mean": 0.9149198882061784,
+      "coverage_min": 0.0,
+      "stable_days_pct": 0.9539170506912442,
+      "fetch_duration_s": 1,
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "diag_vol60d_1783761881",
+    "timestamp": "2026-07-11T09:24:41",
+    "status": "diagnostic",
+    "reason": "",
+    "slice": "m2_factor_diagnostic",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_60d",
+    "factor_params": {
+      "period": 60
+    },
+    "evaluation": {
+      "diagnostic_type": "m2_factor_diagnostic",
+      "ic_mean": 0.034879585340061435,
+      "icir": 0.11435642466198799,
+      "yearly_ic": {
+        "2021": {
+          "n": 183,
+          "ic_mean": 0.005673777332474068,
+          "ic_std": 0.23340564146295284
+        },
+        "2022": {
+          "n": 242,
+          "ic_mean": 0.04559387186951971,
+          "ic_std": 0.2708437966136175
+        },
+        "2023": {
+          "n": 242,
+          "ic_mean": 0.0532741151613978,
+          "ic_std": 0.26806594641510223
+        },
+        "2024": {
+          "n": 242,
+          "ic_mean": 0.058333800481198295,
+          "ic_std": 0.3597507288491937
+        },
+        "2025": {
+          "n": 243,
+          "ic_mean": 0.011264158710655559,
+          "ic_std": 0.35218661351613445
+        },
+        "2026": {
+          "n": 89,
+          "ic_mean": 0.016485854051147966,
+          "ic_std": 0.3139436028691026
+        }
+      },
+      "rolling_60d_min": -0.05875680551081626,
+      "rolling_60d_max": 0.14449667630794585,
+      "rolling_60d_latest": 0.018374840844151127,
+      "monthly_pct_positive": 0.5967741935483871,
+      "coverage_mean": 0.9149198882061784,
+      "coverage_min": 0.0,
+      "stable_days_pct": 0.9539170506912442,
+      "fetch_duration_s": 1,
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "diag_mom12m_5stock_1783764365",
+    "timestamp": "2026-07-11T10:06:05",
+    "status": "diagnostic",
+    "reason": "",
+    "slice": "m2_factor_diagnostic",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21,
+      "n_stocks": 5
+    },
+    "evaluation": {
+      "diagnostic_type": "m2_factor_diagnostic",
+      "ic_mean": 0.0424,
+      "icir": 0.0789,
+      "yearly_ic": {
+        "2021": {
+          "n": 12,
+          "ic_mean": 0.0167,
+          "ic_std": 0.5374
+        },
+        "2022": {
+          "n": 242,
+          "ic_mean": 0.0341,
+          "ic_std": 0.5402
+        },
+        "2023": {
+          "n": 242,
+          "ic_mean": 0.0858,
+          "ic_std": 0.5354
+        },
+        "2024": {
+          "n": 242,
+          "ic_mean": 0.0351,
+          "ic_std": 0.5249
+        },
+        "2025": {
+          "n": 243,
+          "ic_mean": 0.0321,
+          "ic_std": 0.5281
+        },
+        "2026": {
+          "n": 69,
+          "ic_mean": -0.0145,
+          "ic_std": 0.6177
+        }
+      },
+      "rolling_60d_min": 0,
+      "rolling_60d_max": 0,
+      "rolling_60d_latest": 0,
+      "monthly_pct_positive": 0,
+      "coverage_mean": 0,
+      "coverage_min": 0,
+      "stable_days_pct": 0,
+      "fetch_duration_s": 0,
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a",
+      "note": "5-stock lightweight diagnostic. Per-year IC pattern confirmed. Use 300-stock aggregate IC=0.0114 from honest run for absolute level.",
+      "n_stocks": 5
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "diag_mom12m_1783764461",
+    "timestamp": "2026-07-11T10:07:41",
+    "status": "diagnostic",
+    "reason": "",
+    "slice": "m2_factor_diagnostic",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "diagnostic_type": "m2_factor_diagnostic",
+      "ic_mean": 0.0569,
+      "icir": 0.2553,
+      "yearly_ic": {
+        "2021": {
+          "n": 12,
+          "ic_mean": -0.04205836044548892,
+          "ic_std": 0.1476089933855993
+        },
+        "2022": {
+          "n": 242,
+          "ic_mean": 0.05771792329071651,
+          "ic_std": 0.18559671711881576
+        },
+        "2023": {
+          "n": 242,
+          "ic_mean": 0.05056057810760767,
+          "ic_std": 0.2064742304281391
+        },
+        "2024": {
+          "n": 242,
+          "ic_mean": 0.07112889417953178,
+          "ic_std": 0.2589878967423738
+        },
+        "2025": {
+          "n": 243,
+          "ic_mean": 0.052358254285153435,
+          "ic_std": 0.23199631808708607
+        },
+        "2026": {
+          "n": 69,
+          "ic_mean": 0.0600841445955959,
+          "ic_std": 0.24231559258233867
+        }
+      },
+      "rolling_60d_min": -0.0107,
+      "rolling_60d_max": 0.1213,
+      "rolling_60d_latest": 0.0552,
+      "monthly_pct_positive": 0.85,
+      "coverage_mean": 0.7487,
+      "coverage_min": 0.0,
+      "stable_days_pct": 0.8065,
+      "fetch_duration_s": 1,
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "diag_mom12m_1783764564",
+    "timestamp": "2026-07-11T10:09:24",
+    "status": "diagnostic",
+    "reason": "",
+    "slice": "m2_factor_diagnostic",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "diagnostic_type": "m2_factor_diagnostic",
+      "ic_mean": 0.0569,
+      "icir": 0.2553,
+      "yearly_ic": {
+        "2021": {
+          "n": 12,
+          "ic_mean": -0.04205836044548892,
+          "ic_std": 0.1476089933855993
+        },
+        "2022": {
+          "n": 242,
+          "ic_mean": 0.05771792329071651,
+          "ic_std": 0.18559671711881576
+        },
+        "2023": {
+          "n": 242,
+          "ic_mean": 0.05056057810760767,
+          "ic_std": 0.2064742304281391
+        },
+        "2024": {
+          "n": 242,
+          "ic_mean": 0.07112889417953178,
+          "ic_std": 0.2589878967423738
+        },
+        "2025": {
+          "n": 243,
+          "ic_mean": 0.052358254285153435,
+          "ic_std": 0.23199631808708607
+        },
+        "2026": {
+          "n": 69,
+          "ic_mean": 0.0600841445955959,
+          "ic_std": 0.24231559258233867
+        }
+      },
+      "rolling_60d_min": -0.0107,
+      "rolling_60d_max": 0.1213,
+      "rolling_60d_latest": 0.0552,
+      "monthly_pct_positive": 0.85,
+      "coverage_mean": 0.7487,
+      "coverage_min": 0.0,
+      "stable_days_pct": 0.8065,
+      "fetch_duration_s": 1,
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "diag_mom12m_1783764721",
+    "timestamp": "2026-07-11T10:12:01",
+    "status": "diagnostic",
+    "reason": "",
+    "slice": "m2_factor_diagnostic",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "diagnostic_type": "m2_factor_diagnostic",
+      "ic_mean": 0.0569,
+      "icir": 0.2553,
+      "yearly_ic": {
+        "2021": {
+          "n": 12,
+          "ic_mean": -0.0421,
+          "ic_std": 0.1476
+        },
+        "2022": {
+          "n": 242,
+          "ic_mean": 0.0577,
+          "ic_std": 0.1856
+        },
+        "2023": {
+          "n": 242,
+          "ic_mean": 0.0506,
+          "ic_std": 0.2065
+        },
+        "2024": {
+          "n": 242,
+          "ic_mean": 0.0711,
+          "ic_std": 0.259
+        },
+        "2025": {
+          "n": 243,
+          "ic_mean": 0.0524,
+          "ic_std": 0.232
+        },
+        "2026": {
+          "n": 69,
+          "ic_mean": 0.0601,
+          "ic_std": 0.2423
+        }
+      },
+      "rolling_60d_min": -0.0107,
+      "rolling_60d_max": 0.1213,
+      "rolling_60d_latest": 0.0552,
+      "monthly_pct_positive": 0.85,
+      "coverage_mean": 0.7487,
+      "coverage_min": 0.0,
+      "stable_days_pct": 0.8065,
+      "fetch_duration_s": 1,
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "diag_mom12m_1783764826",
+    "timestamp": "2026-07-11T10:13:46",
+    "status": "diagnostic",
+    "reason": "",
+    "slice": "m2_factor_diagnostic",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "diagnostic_type": "m2_factor_diagnostic",
+      "ic_mean": 0.0569,
+      "icir": 0.2553,
+      "yearly_ic": {
+        "2021": {
+          "n": 12,
+          "ic_mean": -0.0421,
+          "ic_std": 0.1476
+        },
+        "2022": {
+          "n": 242,
+          "ic_mean": 0.0577,
+          "ic_std": 0.1856
+        },
+        "2023": {
+          "n": 242,
+          "ic_mean": 0.0506,
+          "ic_std": 0.2065
+        },
+        "2024": {
+          "n": 242,
+          "ic_mean": 0.0711,
+          "ic_std": 0.259
+        },
+        "2025": {
+          "n": 243,
+          "ic_mean": 0.0524,
+          "ic_std": 0.232
+        },
+        "2026": {
+          "n": 69,
+          "ic_mean": 0.0601,
+          "ic_std": 0.2423
+        }
+      },
+      "rolling_60d_min": -0.0107,
+      "rolling_60d_max": 0.1213,
+      "rolling_60d_latest": 0.0552,
+      "monthly_pct_positive": 0.85,
+      "coverage_mean": 0.7487,
+      "coverage_min": 0.0,
+      "stable_days_pct": 0.8065,
+      "fetch_duration_s": 643,
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783764865_e02c4222e2c4013a",
+    "timestamp": "2026-07-11T10:14:26+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_momentum_1m",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "momentum_1m",
+    "factor_params": {
+      "period": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 1280,
+      "ic_mean": -0.0128,
+      "icir": -0.0538,
+      "ic_positive_ratio": 0.4898,
+      "long_short_sharpe_proxy": 0.5208,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run",
+        "observed_sharpe_proxy": 0.5208,
+        "note": "Do not read this as formal validation."
+      },
+      "bh_fdr": "n/a (single factor)",
+      "fetch_duration_s": 624
+    },
+    "input_hash": "e02c4222e2c4013a",
+    "report_path": "data\\reports\\run_1783764865_e02c4222e2c4013a.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765550_e02c4222e2c4013a",
+    "timestamp": "2026-07-11T10:25:50+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_momentum_1m",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "momentum_1m",
+    "factor_params": {
+      "period": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 1280,
+      "ic_mean": -0.0128,
+      "icir": -0.0538,
+      "ic_positive_ratio": 0.4898,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "e02c4222e2c4013a",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765561_d3441cbe3deecbda",
+    "timestamp": "2026-07-11T10:26:01+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_momentum_3m",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "momentum_3m",
+    "factor_params": {
+      "period": 63
+    },
+    "evaluation": {
+      "n_ic_obs": 1238,
+      "ic_mean": -0.0109,
+      "icir": -0.0444,
+      "ic_positive_ratio": 0.4774,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "d3441cbe3deecbda",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765573_943333093f1fc1f6",
+    "timestamp": "2026-07-11T10:26:13+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_momentum_6m",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "momentum_6m",
+    "factor_params": {
+      "period": 126
+    },
+    "evaluation": {
+      "n_ic_obs": 1175,
+      "ic_mean": -0.0048,
+      "icir": -0.0194,
+      "ic_positive_ratio": 0.5021,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "943333093f1fc1f6",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765584_2ca027268984e833",
+    "timestamp": "2026-07-11T10:26:24+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_momentum_12m",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 1050,
+      "ic_mean": 0.0569,
+      "icir": 0.2553,
+      "ic_positive_ratio": 0.6019,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "2ca027268984e833",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765595_cca4161805a8394e",
+    "timestamp": "2026-07-11T10:26:35+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_volatility_20d",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "volatility_20d",
+    "factor_params": {
+      "period": 20
+    },
+    "evaluation": {
+      "n_ic_obs": 1281,
+      "ic_mean": 0.0334,
+      "icir": 0.1181,
+      "ic_positive_ratio": 0.5441,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "cca4161805a8394e",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765596_01de7c26bcb11bac",
+    "timestamp": "2026-07-11T10:26:36+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_volatility_60d",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "volatility_60d",
+    "factor_params": {
+      "period": 60
+    },
+    "evaluation": {
+      "n_ic_obs": 1241,
+      "ic_mean": 0.0349,
+      "icir": 0.1144,
+      "ic_positive_ratio": 0.5326,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "01de7c26bcb11bac",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765597_4620c31b3ce62d75",
+    "timestamp": "2026-07-11T10:26:37+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_reversal",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "reversal",
+    "factor_params": {
+      "period": 5
+    },
+    "evaluation": {
+      "n_ic_obs": 1296,
+      "ic_mean": 0.0208,
+      "icir": 0.0979,
+      "ic_positive_ratio": 0.5324,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "4620c31b3ce62d75",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765620_1e7ee6641e6ccf72",
+    "timestamp": "2026-07-11T10:27:00+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_rsi_14d",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "rsi_14d",
+    "factor_params": {
+      "period": 14
+    },
+    "evaluation": {
+      "n_ic_obs": 1287,
+      "ic_mean": -0.0089,
+      "icir": -0.0426,
+      "ic_positive_ratio": 0.4911,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "1e7ee6641e6ccf72",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765621_e43cb4f608fa3ecd",
+    "timestamp": "2026-07-11T10:27:01+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_amplitude_20d",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": [],
+      "description": "AkShare daily OHLCV, back-adjusted (hfq)"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ],
+      "description": "CSI300 current constituents applied to full history (NOT PIT)"
+    },
+    "factor": "amplitude_20d",
+    "factor_params": {
+      "period": 20
+    },
+    "evaluation": {
+      "n_ic_obs": 1281,
+      "ic_mean": -0.0346,
+      "icir": -0.1197,
+      "ic_positive_ratio": 0.4614,
+      "dsr": {
+        "status": "insufficient_trials",
+        "reason": "single_research_run"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "e43cb4f608fa3ecd",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765664_c9796a4c8a9b48ec",
+    "timestamp": "2026-07-11T10:27:44+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_momentum_1m",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": []
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "momentum_1m",
+    "factor_params": {},
+    "evaluation": {
+      "n_ic_obs": 1280,
+      "ic_mean": -0.0128,
+      "icir": -0.0538,
+      "ic_positive_ratio": 0.4898,
+      "dsr": {
+        "status": "insufficient_trials"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "c9796a4c8a9b48ec",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765666_f71acc9d3c8289a1",
+    "timestamp": "2026-07-11T10:27:46+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_momentum_6m",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": []
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "momentum_6m",
+    "factor_params": {},
+    "evaluation": {
+      "n_ic_obs": 1175,
+      "ic_mean": -0.0048,
+      "icir": -0.0194,
+      "ic_positive_ratio": 0.5021,
+      "dsr": {
+        "status": "insufficient_trials"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "f71acc9d3c8289a1",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765667_610cc57ed74ad332",
+    "timestamp": "2026-07-11T10:27:47+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_volatility_20d",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": []
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_20d",
+    "factor_params": {},
+    "evaluation": {
+      "n_ic_obs": 1281,
+      "ic_mean": 0.0334,
+      "icir": 0.1181,
+      "ic_positive_ratio": 0.5441,
+      "dsr": {
+        "status": "insufficient_trials"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "610cc57ed74ad332",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765668_bf9d7a4d5d9251df",
+    "timestamp": "2026-07-11T10:27:48+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_reversal",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": []
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "reversal",
+    "factor_params": {},
+    "evaluation": {
+      "n_ic_obs": 1296,
+      "ic_mean": 0.0208,
+      "icir": 0.0979,
+      "ic_positive_ratio": 0.5324,
+      "dsr": {
+        "status": "insufficient_trials"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "bf9d7a4d5d9251df",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783765669_3efce53911e15ea5",
+    "timestamp": "2026-07-11T10:27:49+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "honest_rsi_14d",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": []
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "rsi_14d",
+    "factor_params": {},
+    "evaluation": {
+      "n_ic_obs": 1287,
+      "ic_mean": -0.0089,
+      "icir": -0.0426,
+      "ic_positive_ratio": 0.4911,
+      "dsr": {
+        "status": "insufficient_trials"
+      },
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "3efce53911e15ea5",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783790959_2ffdb2dd9f792c37",
+    "timestamp": "2026-07-11T17:29:19+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "m35_volatility_20d",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": []
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_20d",
+    "factor_params": {},
+    "evaluation": {
+      "validation_type": "candidate_validation",
+      "ic_mean": 0.0334,
+      "icir": 0.1181,
+      "rolling_60d_min": -0.0511,
+      "rolling_60d_max": 0.1372,
+      "rolling_60d_latest": 0.0103,
+      "monthly_positive": 0.64,
+      "bull_ic": 0.0342,
+      "bear_ic": 0.0468,
+      "coverage": 0.9522,
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "2ffdb2dd9f792c37",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1783790959_e0644beb859306cc",
+    "timestamp": "2026-07-11T17:29:19+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "m35_reversal",
+    "data_source": "akshare",
+    "data_meta": {
+      "provider": "akshare",
+      "adjust": "hfq",
+      "adjust_basis": "ipo_date_per_stock",
+      "cross_sectional_use": true,
+      "interface": "stock_zh_a_hist_tx",
+      "trust_warning": []
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "provider": "CurrentConstituentUniverseProvider",
+      "kind": "current_constituent",
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "reversal",
+    "factor_params": {},
+    "evaluation": {
+      "validation_type": "candidate_validation",
+      "ic_mean": 0.0208,
+      "icir": 0.0979,
+      "rolling_60d_min": -0.0589,
+      "rolling_60d_max": 0.0963,
+      "rolling_60d_latest": -0.0291,
+      "monthly_positive": 0.66,
+      "bull_ic": 0.0244,
+      "bear_ic": 0.0052,
+      "coverage": 0.9664,
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "e0644beb859306cc",
+    "report_path": null,
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "m4_pf_1783836170",
+    "timestamp": "2026-07-12T06:02:50",
+    "status": "success",
+    "reason": "",
+    "slice": "m4_portfolio_backtest",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_20d",
+    "factor_params": {
+      "n_long": 20,
+      "n_short": 20
+    },
+    "evaluation": {
+      "validation_type": "m4_portfolio_backtest",
+      "factor": "volatility_20d",
+      "cagr": -0.18046909145023915,
+      "sharpe": -0.9574473453112546,
+      "sortino": -1.299140623985349,
+      "max_dd": -0.6900697467092222,
+      "ann_vol": 0.18724214065515432,
+      "win_rate": 0.47465437788018433,
+      "monthly_win": 0.38461538461538464,
+      "avg_turnover": 0.4623015873015874,
+      "n_rebals": 63,
+      "benchmark_cagr": 0.12149992351793082,
+      "excess": -0.30196901496816997,
+      "yearly": {
+        "2021": -0.13006618294661698,
+        "2022": -0.010318715274448054,
+        "2023": -0.16460260202610721,
+        "2024": -0.16094678301984322,
+        "2025": -0.328913705113818,
+        "2026": -0.1075909097384663
+      },
+      "cost_model": {
+        "commission": 0.0003,
+        "stamp": 0.001,
+        "slippage": 0.0005
+      },
+      "setup": {
+        "n_long": 20,
+        "n_short": 20
+      },
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a"
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "m4.2_lo_1783840198",
+    "timestamp": "2026-07-12T07:20:47",
+    "status": "success",
+    "reason": "",
+    "slice": "m4.2_long_only_backtest",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_20d",
+    "factor_params": {
+      "n_long": 20,
+      "n_short": 0,
+      "experiment": "m4.2_long_only"
+    },
+    "evaluation": {
+      "experiment": "m4.2_long_only",
+      "hypothesis": "Short leg is the primary drag on M4.1 long-short performance. Long-only should improve risk-adjusted returns if factor has directional value.",
+      "variable_changed": "N_SHORT: 20 → 0",
+      "variables_controlled": [
+        "factor=volatility_20d",
+        "universe=CSI300_current_constituents",
+        "data=akshare_hfq",
+        "rebalance=monthly",
+        "weighting=equal_weight",
+        "cost_model=C3bp+S10bp+Slip5bp",
+        "N_LONG=20",
+        "period=2021-01_to_2026-05",
+        "initial_capital=1_000_000"
+      ],
+      "factor": "volatility_20d",
+      "validation_type": "m4.2_portfolio_backtest_long_only",
+      "cagr": 0.06310681881390012,
+      "sharpe": 0.8659605684863573,
+      "sortino": 1.2434739480046169,
+      "max_dd": -0.09241842848170712,
+      "ann_vol": 0.08731150993457136,
+      "win_rate_daily": 0.49001536098310294,
+      "win_rate_monthly": 0.47692307692307695,
+      "avg_turnover": 0.36904761904761907,
+      "n_rebalances": 63,
+      "benchmark_cagr": 0.12149992351793082,
+      "excess_vs_benchmark": -0.058393104704030696,
+      "yearly_returns": {
+        "2021": 0.038555094772839915,
+        "2022": -0.029914980413570547,
+        "2023": 0.1135143698475185,
+        "2024": 0.28104887670651557,
+        "2025": 0.026484868328878086,
+        "2026": -0.017716682715861132
+      },
+      "rolling_12m_sharpe": {
+        "min": -0.7788780531047693,
+        "max": 2.2506704378456455,
+        "latest": 0.15852273869502623
+      },
+      "cost_model": {
+        "commission": 0.0003,
+        "stamp_tax": 0.001,
+        "slippage": 0.0005
+      },
+      "setup": {
+        "n_long": 20,
+        "n_short": 0
+      },
+      "dsr": "insufficient_trials",
+      "bh_fdr": "n/a",
+      "baseline_m4_1_sharpe": -0.96
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "m4.2_lo_1783844556",
+    "timestamp": "2026-07-12T08:22:36",
+    "status": "success",
+    "reason": "",
+    "slice": "m4.2_long_only_backtest",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_20d",
+    "factor_params": {
+      "n_long": 20,
+      "n_short": 0,
+      "experiment": "m4.2_long_only"
+    },
+    "evaluation": {
+      "experiment": "m4.2_long_only",
+      "hypothesis": "Short leg is primary drag on M4.1; long-only should improve risk-adjusted returns.",
+      "variable_changed": "N_SHORT: 20 → 0",
+      "variables_controlled": [
+        "factor=volatility_20d",
+        "universe=CSI300_current",
+        "data=akshare_hfq",
+        "rebalance=monthly",
+        "weighting=equal_weight",
+        "cost_model=C3bp+S10bp+slip5bp",
+        "N_LONG=20"
+      ],
+      "cagr": -0.007755823785353333,
+      "sharpe": 0.8844427443598528,
+      "sortino": 1.2862413242742023,
+      "max_dd": -9.157491260933704e-08,
+      "ann_vol": 0.08849524977352108,
+      "win_rate_daily": 0.5035516969218626,
+      "win_rate_monthly": 0.484375,
+      "avg_turnover": 0.36904761904761907,
+      "n_rebalances": 63,
+      "benchmark_cagr": 0.12097962997823264,
+      "excess": -0.12873545376358597,
+      "ic_mean": 0.033438547913636894,
+      "ic_implied_ann": 0.06907156929086351,
+      "construction_gap": -0.0029190082669340728,
+      "cost_drag_ann": -0.07974640134315092,
+      "primary_leak": "cost",
+      "cost_model": {
+        "commission": 0.0003,
+        "stamp_tax": 0.001,
+        "slippage": 0.0005
+      },
+      "setup": {
+        "n_long": 20,
+        "n_short": 0
+      },
+      "baseline_m4_1_sharpe": -0.96
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "m4.2_lo_1783845285",
+    "timestamp": "2026-07-12T08:34:45",
+    "status": "success",
+    "reason": "",
+    "slice": "m4.2_long_only_backtest",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_20d",
+    "factor_params": {
+      "n_long": 20,
+      "n_short": 0
+    },
+    "evaluation": {
+      "experiment": "m4.2_long_only_complete",
+      "hypothesis": "Short leg is primary drag; long-only improves risk-return.",
+      "variable_changed": "N_SHORT: 20 → 0",
+      "cagr": 0.06310681881390012,
+      "sharpe": 0.8659605684863573,
+      "sortino": 1.2434739480046169,
+      "max_dd": -0.09241842848170712,
+      "ann_vol": 0.08731150993457136,
+      "win_daily": 0.49001536098310294,
+      "win_monthly": 0.47692307692307695,
+      "avg_turnover": 0.36904761904761907,
+      "n_rebalances": 63,
+      "benchmark_cagr": 0.12149992351793082,
+      "excess": -0.058393104704030696,
+      "yearly": {
+        "2021": 0.038555094772839915,
+        "2022": -0.029914980413570547,
+        "2023": 0.1135143698475185,
+        "2024": 0.28104887670651557,
+        "2025": 0.026484868328878086,
+        "2026": -0.017716682715861132
+      },
+      "ic_mean": 0.033438547913636894,
+      "ic_implied_ann": 0.06999388295967933,
+      "construction_gap": -0.0008958851923063366,
+      "cost_drag_ann": -0.007782949338085543,
+      "gross_cagr": 0.07088976815198567,
+      "leakage": {
+        "construction_pct": 0.0,
+        "cost_pct": 11.11946915507184,
+        "bench_mismatch_pct": 71.02658256524926,
+        "primary": "benchmark"
+      },
+      "temporal": {
+        "early_cagr": 0.04047978685418108,
+        "late_cagr": 0.11742263776784956
+      },
+      "cost_model": {
+        "commission": 0.0003,
+        "stamp_tax": 0.001,
+        "slippage": 0.0005
+      },
+      "setup": {
+        "n_long": 20,
+        "n_short": 0
+      },
+      "baseline_m4_1_sharpe": -0.96
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "m4.2_lo_1783913066",
+    "timestamp": "2026-07-13T03:24:26",
+    "status": "success",
+    "reason": "",
+    "slice": "m4.2_long_only_backtest",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_20d",
+    "factor_params": {
+      "n_long": 20,
+      "n_short": 0
+    },
+    "evaluation": {
+      "experiment": "m4.2_long_only_complete",
+      "hypothesis": "Short leg is primary drag; long-only improves risk-return.",
+      "variable_changed": "N_SHORT: 20 → 0",
+      "cagr": 0.06310681881390012,
+      "sharpe": 0.8659605684863573,
+      "sortino": 1.2434739480046169,
+      "max_dd": -0.09241842848170712,
+      "ann_vol": 0.08731150993457136,
+      "win_daily": 0.49001536098310294,
+      "win_monthly": 0.47692307692307695,
+      "avg_turnover": 0.36904761904761907,
+      "n_rebalances": 63,
+      "benchmark_cagr": 0.12149992351793082,
+      "excess": -0.058393104704030696,
+      "yearly": {
+        "2021": 0.038555094772839915,
+        "2022": -0.029914980413570547,
+        "2023": 0.1135143698475185,
+        "2024": 0.28104887670651557,
+        "2025": 0.026484868328878086,
+        "2026": -0.017716682715861132
+      },
+      "ic_mean": 0.033438547913636894,
+      "ic_implied_ann": 0.06999388295967933,
+      "construction_gap": -0.0008958851923063366,
+      "cost_drag_ann": -0.007782949338085543,
+      "gross_cagr": 0.07088976815198567,
+      "leakage": {
+        "construction_pct": 0.0,
+        "cost_pct": 11.11946915507184,
+        "bench_mismatch_pct": 71.02658256524926,
+        "primary": "benchmark"
+      },
+      "temporal": {
+        "early_cagr": 0.04047978685418108,
+        "late_cagr": 0.11742263776784956
+      },
+      "cost_model": {
+        "commission": 0.0003,
+        "stamp_tax": 0.001,
+        "slippage": 0.0005
+      },
+      "setup": {
+        "n_long": 20,
+        "n_short": 0
+      },
+      "baseline_m4_1_sharpe": -0.96
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "constr_attr_1783922137",
+    "timestamp": "2026-07-13T05:55:37",
+    "status": "success",
+    "reason": "",
+    "slice": "construction_attribution",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_20d",
+    "factor_params": {
+      "n_long": 20,
+      "n_short": 0
+    },
+    "evaluation": {
+      "experiment": "construction_attribution",
+      "theoretical_ann": 0.06907156929086351,
+      "gross_cagr": 0.07088976815198567,
+      "net_cagr": 0.06310681881390012,
+      "universe_loss": 0.0,
+      "ranking_loss": 0.0,
+      "weight_loss": -0.0018181988611221528,
+      "cost_loss": 0.0077829493380855395,
+      "weight_loss_pct": 0.0,
+      "cost_loss_pct": 11.267947566843944,
+      "engineering_sanity": {
+        "cost_free_cagr": 0.07141653667304992,
+        "test_a": "True",
+        "turnover_zero_rebals": 0,
+        "test_b": true,
+        "weight_violations": 0,
+        "test_c": true,
+        "rebal_count_expected": 64,
+        "rebal_count_actual": 63,
+        "test_d": true
+      },
+      "overall_pipeline": "VERIFIED"
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "factor_volatility_20d_1783930805",
+    "timestamp": "2026-07-13T08:20:05",
+    "status": "success",
+    "reason": "",
+    "slice": "factor_report",
+    "data_source": "akshare",
+    "data_meta": {
+      "adjust": "hfq",
+      "provider": "akshare"
+    },
+    "universe_provider": "CurrentConstituentUniverseProvider",
+    "universe_meta": {
+      "pit": false,
+      "bias_warning": [
+        "survivorship_bias_possible"
+      ]
+    },
+    "factor": "volatility_20d",
+    "factor_params": {
+      "period": 20
+    },
+    "evaluation": {
+      "factor": "volatility_20d",
+      "category": "low_volatility",
+      "ic_mean": 0.033438547913636894,
+      "icir": 0.11812047830063065,
+      "cagr": 0.06310681881390012,
+      "sharpe": 0.8659605684863573,
+      "max_dd": -9.157491260933704e-08,
+      "avg_turnover": 0.36904761904761907,
+      "benchmark_cagr": 0.12455519337623411,
+      "style_cagr": 0.07141653667304992,
+      "market_excess": -0.061448374562333985,
+      "style_excess": -0.008309717859149801,
+      "theoretical_ann": 0.06907156929086351,
+      "weight_loss": -0.0018181988611221528,
+      "cost_drag": 0.0077829493380855395,
+      "gross_cagr": 0.07088976815198567,
+      "sanity": {
+        "cost_ok": "True",
+        "to_ok": true,
+        "rebals_ok": true,
+        "all_pass": true
+      },
+      "n_stocks": 288,
+      "period_years": 5.4
+    },
+    "input_hash": "",
+    "report_path": "",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1785833805_858f9d5881830a45",
+    "timestamp": "2026-08-04T08:56:45+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "synthetic_offline_validation",
+    "data_source": "synthetic",
+    "data_meta": {},
+    "universe_provider": null,
+    "universe_meta": {},
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 226,
+      "ic_mean": -0.0119,
+      "icir": -0.0231,
+      "ic_positive_ratio": 0.4867
+    },
+    "input_hash": "858f9d5881830a45",
+    "report_path": "data\\reports\\run_1785833805_858f9d5881830a45.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1785836477_858f9d5881830a45",
+    "timestamp": "2026-08-04T09:41:17+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "synthetic_momentum_12m",
+    "data_source": "synthetic",
+    "data_meta": {},
+    "universe_provider": null,
+    "universe_meta": {},
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 226,
+      "ic_mean": -0.0119,
+      "icir": -0.0231,
+      "ic_positive_ratio": 0.4867
+    },
+    "input_hash": "858f9d5881830a45",
+    "report_path": "data\\reports\\run_1785836477_858f9d5881830a45.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1785836619_858f9d5881830a45",
+    "timestamp": "2026-08-04T09:43:39+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "synthetic_momentum_12m",
+    "data_source": "synthetic",
+    "data_meta": {},
+    "universe_provider": null,
+    "universe_meta": {},
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 226,
+      "ic_mean": -0.0119,
+      "icir": -0.0231,
+      "ic_positive_ratio": 0.4867
+    },
+    "input_hash": "858f9d5881830a45",
+    "report_path": "data\\reports\\run_1785836619_858f9d5881830a45.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1785836654_858f9d5881830a45",
+    "timestamp": "2026-08-04T09:44:14+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "synthetic_momentum_12m",
+    "data_source": "synthetic",
+    "data_meta": {},
+    "universe_provider": null,
+    "universe_meta": {},
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 0,
+      "ic_mean": null,
+      "icir": null,
+      "ic_positive_ratio": null
+    },
+    "input_hash": "858f9d5881830a45",
+    "report_path": "data\\reports\\run_1785836654_858f9d5881830a45.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1789198812_858f9d5881830a45",
+    "timestamp": "2026-09-12T07:40:12+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "synthetic_momentum_12m",
+    "data_source": "synthetic",
+    "data_meta": {},
+    "universe_provider": null,
+    "universe_meta": {},
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 0,
+      "ic_mean": null,
+      "icir": null,
+      "ic_positive_ratio": null
+    },
+    "input_hash": "858f9d5881830a45",
+    "report_path": "data\\reports\\run_1789198812_858f9d5881830a45.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1789198894_858f9d5881830a45",
+    "timestamp": "2026-09-12T07:41:34+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "synthetic_momentum_12m",
+    "data_source": "synthetic",
+    "data_meta": {},
+    "universe_provider": null,
+    "universe_meta": {},
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 0,
+      "ic_mean": null,
+      "icir": null,
+      "ic_positive_ratio": null
+    },
+    "input_hash": "858f9d5881830a45",
+    "report_path": "data\\reports\\run_1789198894_858f9d5881830a45.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1789199922_858f9d5881830a45",
+    "timestamp": "2026-09-12T07:58:42+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "synthetic_momentum_12m",
+    "data_source": "synthetic",
+    "data_meta": {},
+    "universe_provider": null,
+    "universe_meta": {},
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 0,
+      "ic_mean": null,
+      "icir": null,
+      "ic_positive_ratio": null
+    },
+    "input_hash": "858f9d5881830a45",
+    "report_path": "data\\reports\\run_1789199922_858f9d5881830a45.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1789200166_858f9d5881830a45",
+    "timestamp": "2026-09-12T08:02:46+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "synthetic_momentum_12m",
+    "data_source": "synthetic",
+    "data_meta": {},
+    "universe_provider": null,
+    "universe_meta": {},
+    "factor": "momentum_12m",
+    "factor_params": {
+      "period": 252,
+      "skip": 21
+    },
+    "evaluation": {
+      "n_ic_obs": 0,
+      "ic_mean": null,
+      "icir": null,
+      "ic_positive_ratio": null
+    },
+    "input_hash": "858f9d5881830a45",
+    "report_path": "data\\reports\\run_1789200166_858f9d5881830a45.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  },
+  {
+    "run_id": "run_1790145888_91bd43cb82120133",
+    "timestamp": "2026-09-23T06:44:48+00:00",
+    "status": "success",
+    "reason": null,
+    "slice": "synthetic_momentum_1m",
+    "data_source": "synthetic",
+    "data_meta": {},
+    "universe_provider": null,
+    "universe_meta": {},
+    "factor": "momentum_1m",
+    "factor_params": {
+      "period": 21,
+      "skip": 0
+    },
+    "evaluation": {
+      "n_ic_obs": 277,
+      "ic_mean": -0.0011,
+      "icir": -0.0075,
+      "ic_positive_ratio": 0.4946
+    },
+    "input_hash": "91bd43cb82120133",
+    "report_path": "data\\reports\\run_1790145888_91bd43cb82120133.md",
+    "warnings": [],
+    "validity": "valid",
+    "affected_by": []
+  }
+]
