@@ -6,7 +6,9 @@ Supports environment variable overrides for sensitive or deployment-specific val
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import typing
 from pathlib import Path
 from typing import Any
 
@@ -21,21 +23,7 @@ try:
 except ImportError:
     pass  # python-dotenv is optional
 
-from quant_platform.config.schema import (
-    AlphaConfig,
-    BacktestConfig,
-    Config,
-    CostsConfig,
-    CovarianceConfig,
-    DataConfig,
-    FactorsConfig,
-    OutputConfig,
-    PortfolioConfig,
-    PortfolioConstraintsConfig,
-    RiskConfig,
-    UniverseConfig,
-    VarConfig,
-)
+from quant_platform.config.schema import Config, FactorsConfig
 
 
 def _parse_factors(raw_factors: dict | None) -> FactorsConfig:
@@ -61,54 +49,90 @@ def _parse_factors(raw_factors: dict | None) -> FactorsConfig:
     )
 
 
+def _coerce_value(field_type: Any, value: Any, path: str) -> Any:
+    """Coerce one raw value to its declared type.
+
+    Recurses into nested dataclasses and into ``list``/``tuple`` fields whose
+    element type is a dataclass.
+    """
+    if dataclasses.is_dataclass(field_type):
+        return _coerce(field_type, value, path)
+
+    origin = typing.get_origin(field_type)
+    if origin in (list, tuple):
+        args = [a for a in typing.get_args(field_type) if a is not Ellipsis]
+        element = args[0] if args else None
+        if element is not None and dataclasses.is_dataclass(element):
+            items = [
+                _coerce(element, item, f"{path}[{i}]")
+                for i, item in enumerate(value or [])
+            ]
+        else:
+            items = list(value or [])
+        return tuple(items) if origin is tuple else items
+
+    return value
+
+
+def _coerce(cls: type, raw: Any, path: str = "") -> Any:
+    """Build dataclass ``cls`` from raw YAML, recursing into nested dataclasses.
+
+    Driven by the schema's own field declarations (``dataclasses.fields`` +
+    ``typing.get_type_hints``) rather than a hand-written list of sections, so a
+    nested section added to ``config/schema.py`` is wired up automatically.
+    A hand-written list is how ``data.synthetic`` came back as a raw dict while
+    ``screener``/``execution``/``instruments`` were dropped entirely.
+
+    Unknown keys are passed through to the constructor so they raise the same
+    "unexpected keyword argument" TypeError as before -- a typo'd key must fail
+    loudly rather than be silently ignored.
+    """
+    if raw is None:
+        return cls()
+    if not isinstance(raw, dict):
+        raise TypeError(
+            f"config section '{path or cls.__name__}' must be a mapping, "
+            f"got {type(raw).__name__}"
+        )
+
+    hints = typing.get_type_hints(cls)
+    kwargs: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key in hints:
+            kwargs[key] = _coerce_value(hints[key], value, f"{path}.{key}" if path else key)
+        else:
+            kwargs[key] = value
+    return cls(**kwargs)
+
+
 def _parse_config(raw: dict[str, Any]) -> Config:
-    """Parse raw dict into Config dataclass with validation."""
-    universe = UniverseConfig(**raw.get("universe", {}))
-    data = DataConfig(**raw.get("data", {}))
+    """Parse raw dict into Config dataclass with validation.
 
-    alpha_raw = raw.get("alpha", {})
-    alpha = AlphaConfig(**alpha_raw)
+    Every top-level section is built through :func:`_coerce`, which walks
+    ``Config``'s declared field types. Adding a nested dataclass to
+    ``config/schema.py`` therefore wires itself in; there is no list of sections
+    here to forget to update.
 
-    portfolio_raw = raw.get("portfolio", {})
-    # Non-mutating on purpose: these used to be `portfolio_raw.pop(...)`, which
-    # removed the keys from the caller's dict. `main.py run` passes the same
-    # dict to `load_config()` and then to `VersionManager.save()` a few lines
-    # later, so every auto-saved config snapshot was written *without*
-    # `portfolio.constraints`, `portfolio.covariance` and `risk.var` -- and
-    # `config rollback` then silently reverted those sections to defaults.
-    constraints = PortfolioConstraintsConfig(**portfolio_raw.get("constraints", {}))
-    covariance = CovarianceConfig(**portfolio_raw.get("covariance", {}))
-    portfolio = PortfolioConfig(
-        constraints=constraints,
-        covariance=covariance,
-        **{k: v for k, v in portfolio_raw.items()
-           if k not in ("constraints", "covariance")},
-    )
+    Non-mutating on purpose: this used to be ``portfolio_raw.pop(...)``, which
+    removed the keys from the caller's dict. `main.py run` passes the same
+    dict to `load_config()` and then to `VersionManager.save()` a few lines
+    later, so every auto-saved config snapshot was written *without*
+    `portfolio.constraints`, `portfolio.covariance` and `risk.var` -- and
+    `config rollback` then silently reverted those sections to defaults.
+    """
+    hints = typing.get_type_hints(Config)
+    sections: dict[str, Any] = {}
 
-    backtest = BacktestConfig(**raw.get("backtest", {}))
-    costs = CostsConfig(**raw.get("costs", {}))
+    for f in dataclasses.fields(Config):
+        if f.name == "factors":
+            # Not a plain mirror of the YAML: the `technical`/`fundamental`
+            # sub-mappings are flattened to enabled-name tuples.
+            sections["factors"] = _parse_factors(raw.get("factors"))
+        elif f.name in raw:
+            sections[f.name] = _coerce_value(hints[f.name], raw[f.name], f.name)
+        # else: absent from YAML -> the dataclass default_factory applies.
 
-    risk_raw = raw.get("risk", {})
-    var_config = VarConfig(**risk_raw.get("var", {}))
-    risk = RiskConfig(
-        var=var_config,
-        **{k: v for k, v in risk_raw.items() if k != "var"},
-    )
-
-    output = OutputConfig(**raw.get("output", {}))
-    factors = _parse_factors(raw.get("factors"))
-
-    return Config(
-        universe=universe,
-        data=data,
-        factors=factors,
-        alpha=alpha,
-        portfolio=portfolio,
-        backtest=backtest,
-        costs=costs,
-        risk=risk,
-        output=output,
-    )
+    return Config(**sections)
 
 
 def load_config(
