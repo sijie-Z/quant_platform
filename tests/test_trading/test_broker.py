@@ -70,6 +70,82 @@ class TestSimulatedBroker:
         assert len(orders) >= 1
 
 
+class TestSeededBook:
+    """The synthetic market maker quotes both sides at the reference price.
+
+    Seeding used to run its quotes through the matching engine, so the two
+    sides crossed with each other as the ladder was built. At ¥10 only the
+    last level of each side survived (best_bid=9.99, best_ask=10.00), and a
+    sell could only be filled by undercutting the market.
+    """
+
+    # The seed ladder is `max(100, int(5000 / (i + 1)))` for i in 0..5.
+    SEEDED_QTY_PER_SIDE = 5000 + 2500 + 1666 + 1250 + 1000 + 833
+
+    @pytest.fixture
+    def broker(self):
+        b = SimulatedBroker(initial_cash=1_000_000)
+        b.connect()
+        b._get_or_create_book("600519", 10.00)
+        return b
+
+    def test_both_sides_survive_seeding_with_their_full_quantity(self, broker):
+        book = broker._order_books["600519"]
+        assert book._total_trades == 0
+        assert book._total_volume == 0
+
+        snapshot = book.get_full_book_snapshot()
+        assert len(snapshot["bids"]) == 6
+        assert len(snapshot["asks"]) == 6
+        assert sum(o["quantity"] for o in snapshot["bids"]) == self.SEEDED_QTY_PER_SIDE
+        assert sum(o["quantity"] for o in snapshot["asks"]) == self.SEEDED_QTY_PER_SIDE
+
+    def test_both_sides_quote_the_same_best_price(self, broker):
+        book = broker._order_books["600519"]
+        assert book.best_bid == 10.00
+        assert book.best_ask == 10.00
+
+    def test_the_seeded_levels_step_away_from_the_reference(self, broker):
+        """Six distinct levels a side, each at least a tick apart.
+
+        1 bp of ¥10 is ¥0.001 -- finer than the ¥0.01 tick -- so a raw
+        percentage step would collapse the whole ladder onto one price.
+        """
+        book = broker._order_books["600519"]
+        bids, asks = book._bid_prices, book._ask_prices
+
+        assert bids[0] == 10.00 == asks[0]
+        assert len(bids) == len(asks) == 6
+        assert all(bids[i] > bids[i + 1] for i in range(len(bids) - 1))
+        assert all(asks[i] < asks[i + 1] for i in range(len(asks) - 1))
+        assert min(bids[0] - p for p in bids[1:]) >= book.tick_size - 1e-9
+        assert min(p - asks[0] for p in asks[1:]) >= book.tick_size - 1e-9
+
+    def test_a_limit_order_at_the_reference_crosses_on_either_side(self, broker):
+        broker._positions["600519"] = Position(code="600519", quantity=100, available=100)
+
+        buy = broker.place_order(
+            Order(code="600519", side=OrderSide.BUY, quantity=100, price=10.00))
+        sell = broker.place_order(
+            Order(code="600519", side=OrderSide.SELL, quantity=100, price=10.00))
+
+        assert buy.status == OrderStatus.FILLED
+        assert buy.filled_price == 10.00
+        assert sell.status == OrderStatus.FILLED
+        assert sell.filled_price == 10.00
+
+    def test_a_sell_is_not_forced_to_undercut_the_market(self, broker):
+        broker._positions["600519"] = Position(code="600519", quantity=100, available=100)
+
+        sell = broker.place_order(
+            Order(code="600519", side=OrderSide.SELL, quantity=100, price=9.95))
+
+        assert sell.status == OrderStatus.FILLED
+        # Crossing down is allowed, but it fills at the bid -- the worse
+        # price the seller named is a limit, not an execution price.
+        assert sell.filled_price == 10.00
+
+
 # ── Cross-Asset SimulatedBroker ──
 
 

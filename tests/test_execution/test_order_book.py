@@ -226,6 +226,95 @@ class TestOrderBook:
         assert len(book._orders) == 0
 
 
+# ── Passive Liquidity Tests ──
+
+
+class TestPassiveLiquidity:
+    """Seeded liquidity rests; it never aggresses.
+
+    A market maker quoting both sides at the touch would cross with itself
+    if its quotes were matched on arrival: the bid would eat the ask, and
+    with both sides of the ladder consumed nothing would be left to fill
+    against. Passive orders are therefore never matched when they arrive --
+    but an incoming order still fills against them.
+    """
+
+    @pytest.fixture
+    def book(self):
+        return OrderBook("TEST", tick_size=0.01)
+
+    def test_passive_orders_do_not_match_each_other(self, book):
+        bid = BookOrder("p_bid", "TEST", Side.BUY, OrderType.LIMIT, 100.0, 500,
+                        passive=True)
+        ask = BookOrder("p_ask", "TEST", Side.SELL, OrderType.LIMIT, 100.0, 300,
+                        passive=True)
+        assert book.add_order(bid) == []
+        assert book.add_order(ask) == []
+
+        # Both quotes sit at 100.0, so an aggressing engine would have
+        # crossed them. Both sides must survive with their full quantity.
+        assert book.best_bid == 100.0
+        assert book.best_ask == 100.0
+        assert book._bid_levels[100.0].total_quantity == 500
+        assert book._ask_levels[100.0].total_quantity == 300
+        assert bid.remaining_quantity == 500
+        assert ask.remaining_quantity == 300
+        assert book._total_trades == 0
+        assert book._total_volume == 0
+
+    def test_a_passive_order_never_aggresses(self, book):
+        # A resting bid at 101 crosses an ask at 100. Seeding that ask must
+        # still not trade -- passive means "placed", not "crossed".
+        book.add_order(BookOrder("b1", "TEST", Side.BUY, OrderType.LIMIT, 101.0, 100))
+        trades = book.add_order(BookOrder("p_ask", "TEST", Side.SELL,
+                                          OrderType.LIMIT, 100.0, 300, passive=True))
+        assert trades == []
+        assert book._total_trades == 0
+        assert book.best_ask == 100.0
+        assert book._ask_levels[100.0].total_quantity == 300
+
+    def test_a_buy_fills_against_passive_asks(self, book):
+        book.add_order(BookOrder("p_ask", "TEST", Side.SELL, OrderType.LIMIT,
+                                 100.0, 300, passive=True))
+        trades = book.add_order(BookOrder("b1", "TEST", Side.BUY, OrderType.LIMIT,
+                                          100.0, 200))
+        assert len(trades) == 1
+        assert trades[0].price == 100.0
+        assert trades[0].quantity == 200
+        assert trades[0].maker_order_id == "p_ask"
+        assert book._ask_levels[100.0].total_quantity == 100
+
+    def test_a_sell_fills_against_passive_bids(self, book):
+        book.add_order(BookOrder("p_bid", "TEST", Side.BUY, OrderType.LIMIT,
+                                 100.0, 300, passive=True))
+        trades = book.add_order(BookOrder("s1", "TEST", Side.SELL, OrderType.LIMIT,
+                                          100.0, 200))
+        assert len(trades) == 1
+        assert trades[0].price == 100.0
+        assert trades[0].quantity == 200
+        assert trades[0].maker_order_id == "p_bid"
+        assert book._bid_levels[100.0].total_quantity == 100
+
+    def test_passive_liquidity_counts_toward_fok(self, book):
+        book.add_order(BookOrder("p_ask", "TEST", Side.SELL, OrderType.LIMIT,
+                                 100.0, 300, passive=True))
+        order = BookOrder("b1", "TEST", Side.BUY, OrderType.FOK, 100.0, 300)
+        assert len(book.add_order(order)) == 1
+        assert order.status == "filled"
+
+    def test_modify_keeps_the_order_passive(self, book):
+        book.add_order(BookOrder("p_ask", "TEST", Side.SELL, OrderType.LIMIT,
+                                 100.0, 300, passive=True))
+        book.add_order(BookOrder("p_bid", "TEST", Side.BUY, OrderType.LIMIT,
+                                 100.0, 300, passive=True))
+        # Re-pricing the passive bid through the ask must not cross the book.
+        _, trades = book.modify_order("p_bid", new_price=100.5)
+        assert trades == []
+        assert book._total_trades == 0
+        assert book.best_bid == 100.5
+        assert book._ask_levels[100.0].total_quantity == 300
+
+
 # ── OrderBookManager Tests ──
 
 
