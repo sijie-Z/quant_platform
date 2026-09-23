@@ -78,6 +78,11 @@ class BookOrder:
     status: BookOrderStatus = BookOrderStatus.OPEN
     timestamp_ns: int = 0   # Nanosecond timestamp for FIFO ordering
     source: str = ""        # Strategy/source identifier
+    # Passive liquidity (seeded market-maker quotes). A passive order rests
+    # and is fillable by an incoming aggressive order, but is never itself an
+    # aggressor: it does not match on arrival, so two passive orders that
+    # quote the same price cannot trade with each other.
+    passive: bool = False
 
     def __post_init__(self):
         if self.timestamp_ns == 0:
@@ -252,8 +257,22 @@ class OrderBook:
         3. IOC: cancel remainder after matching
         4. FOK: cancel entire order if cannot fill completely
         5. Market order: match at any price
+        6. Passive order: skip matching entirely, just rest
+
+        Passive orders are seeded liquidity. They are fillable by any
+        incoming order on the opposite side, but they never aggress -- so
+        two passive orders quoting the same price cannot cross with each
+        other. That is what lets a market maker quote both sides at the
+        touch without trading with itself.
         """
         self._invalidate_cache()
+
+        if order.passive:
+            if order.order_type == OrderType.LIMIT and order.remaining_quantity > 0:
+                self._insert(order)
+                self._orders[order.order_id] = order
+                self._order_prices[order.order_id] = order.price
+            return []
 
         if order.order_type == OrderType.FOK:
             # Check if full fill is possible before matching
@@ -328,6 +347,7 @@ class OrderBook:
             price=new_price if new_price is not None else old_order.price,
             quantity=new_quantity if new_quantity is not None else old_order.remaining_quantity,
             source=old_order.source,
+            passive=old_order.passive,
         )
         trades = self.add_order(new_order)
         return new_order, trades

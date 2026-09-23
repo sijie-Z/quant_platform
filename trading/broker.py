@@ -193,37 +193,48 @@ class SimulatedBroker(BrokerInterface):
     def _seed_book(self, book: OrderBook, symbol: str, price: float):
         """Seed order book with synthetic market-maker liquidity.
 
-        Creates price levels on each side centered on the reference price,
-        with the best bid/ask touching the price (1 bp spread).
-        This ensures limit orders at the reference price can match.
+        Both sides quote outward from the reference price, so the best bid
+        and the best ask both sit AT `price`: a limit order at the reference
+        crosses on either side, and a seller is not forced to undercut the
+        market to get a fill.
+
+        The quotes are submitted as *passive* orders. They rest without
+        matching, which is what makes quoting the same price on both sides
+        safe -- an aggressive bid at the ask would otherwise trade against
+        the ladder as it is built, emptying the book. A user order still
+        fills against them.
+
+        The step is at least one tick, so the levels stay distinct when the
+        spread is finer than the tick (1 bp of ¥10 is ¥0.001).
         """
-        spread_bps = 1  # 1 bp between levels
+        spread_bps = 1
+        step = max(book.tick_size, price * spread_bps / 10000)
         for i in range(6):
-            # Ask side (offers): start AT price, go up
-            ask_price = round(price * (1 + spread_bps * i / 10000), 2)
-            ask_qty = max(100, int(5000 / (i + 1)))
+            level_qty = max(100, int(5000 / (i + 1)))
+
+            ask_price = round(price + step * i, 2)
             ask_order = BookOrder(
                 order_id=f"mm_ask_{symbol}_{i}",
                 symbol=symbol,
                 side=BookSide.SELL,
                 order_type=BookOrderType.LIMIT,
                 price=ask_price,
-                quantity=ask_qty,
+                quantity=level_qty,
                 source="market_maker",
+                passive=True,
             )
             book.add_order(ask_order)
 
-            # Bid side: start AT price, go down
-            bid_price = round(price * (1 - spread_bps * (i + 1) / 10000), 2)
-            bid_qty = max(100, int(5000 / (i + 1)))
+            bid_price = round(price - step * i, 2)
             bid_order = BookOrder(
                 order_id=f"mm_bid_{symbol}_{i}",
                 symbol=symbol,
                 side=BookSide.BUY,
                 order_type=BookOrderType.LIMIT,
                 price=bid_price,
-                quantity=bid_qty,
+                quantity=level_qty,
                 source="market_maker",
+                passive=True,
             )
             book.add_order(bid_order)
 
