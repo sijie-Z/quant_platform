@@ -9,9 +9,17 @@ Generates realistic synthetic data for ~500 stocks over 5 years, including:
 All randomness is seeded for reproducibility.
 
 CRITICAL: embedded_alpha defaults to False.
-- False: Pure noise returns. No predictable patterns. Safe for research.
-- True: Embeds momentum/value/size alpha. For DEMO/INTERVIEW only.
-  Never use embedded_alpha=True to validate strategy performance.
+
+- embedded_alpha=False: Pure noise returns. No predictable patterns. Safe for
+  research. This is the default and it is a HARD gate -- `alpha_strength` is
+  ignored unless the gate is open. Setting `embedded_alpha: false` in a config
+  is therefore a real off-switch.
+- embedded_alpha=True: Embeds momentum/value/size alpha, scaled by
+  `alpha_strength`. For DEMO/INTERVIEW only. Never use embedded_alpha=True to
+  validate strategy performance.
+
+Both knobs can only turn the alpha OFF, never on by accident:
+    alpha_on = embedded_alpha AND alpha_strength > 0
 """
 
 from __future__ import annotations
@@ -52,7 +60,7 @@ class SyntheticDataProvider(DataProvider):
         sector_vol_scale: float = 0.3,
         idio_vol_scale: float = 0.7,
         embedded_alpha: bool = False,
-        alpha_strength: float = 0.03,    # predictive alpha (0=off, 0.03=realistic)
+        alpha_strength: float = 0.03,    # magnitude; only used when embedded_alpha=True
     ):
         self.n_stocks = n_stocks
         self.start_date = pd.Timestamp(start_date)
@@ -64,7 +72,7 @@ class SyntheticDataProvider(DataProvider):
         self.market_vol = market_vol
         self.sector_vol_scale = sector_vol_scale
         self.idio_vol_scale = idio_vol_scale
-        self.embedded_alpha = embedded_alpha or (alpha_strength > 0)
+        self.embedded_alpha = embedded_alpha and alpha_strength > 0
         self.alpha_strength = alpha_strength
 
         # Internal caches

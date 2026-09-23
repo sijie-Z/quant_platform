@@ -13,6 +13,7 @@ class UniverseConfig:
 @dataclass
 class SyntheticConfig:
     embedded_alpha: bool = False
+    alpha_strength: float = 0.03
 
 
 @dataclass
