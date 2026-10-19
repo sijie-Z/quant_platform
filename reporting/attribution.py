@@ -75,14 +75,20 @@ def turnover_analysis(
     for i in range(1, len(dates)):
         prev = weights_history[dates[i - 1]]
         curr = weights_history[dates[i]]
-        common = prev.index.intersection(curr.index)
-        if len(common) < 2:
-            continue
-        turnover = (curr[common] - prev[common]).abs().sum() / 2
+        # Turnover must count names entering and leaving the portfolio. The
+        # old intersection-only diff reported 0.0 for a complete rotation.
+        union = prev.index.union(curr.index)
+        previous = prev.reindex(union, fill_value=0.0)
+        current = curr.reindex(union, fill_value=0.0)
+        turnover = (current - previous).abs().sum() / 2
         results.append({
             "date": dates[i],
             "turnover": turnover,
             "n_assets": int((curr > 1e-6).sum()),
         })
 
+    if not results:
+        return pd.DataFrame(
+            columns=["turnover", "n_assets"], index=pd.Index([], name="date"),
+        )
     return pd.DataFrame(results).set_index("date")

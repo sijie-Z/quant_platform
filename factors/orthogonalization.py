@@ -220,16 +220,19 @@ class FactorOrthogonalizer:
 
         for date in dates:
             # Build matrix: rows = assets, cols = factors (in priority order)
-            vals = []
+            # Rows must be the SAME assets for every factor: independent
+            # dropna() calls line up different assets positionally.
+            common = None
             for name in priority_order:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            # Find common length
-            min_len = min(len(v) for v in vals)
+                index = factors[name].loc[date].dropna().index
+                common = index if common is None else common.intersection(index)
+            min_len = len(common) if common is not None else 0
             if min_len < n_factors + 1:
                 continue
 
-            mat = np.column_stack([v[:min_len] for v in vals])
+            mat = np.column_stack([
+                factors[name].loc[date, common].values for name in priority_order
+            ])
 
             # Standardize each column
             means = mat.mean(axis=0)
@@ -252,7 +255,7 @@ class FactorOrthogonalizer:
                 col_std = orth[:, i].std()
                 if col_std > 1e-10:
                     orth[:, i] = orth[:, i] / col_std
-                assets = factors[name].loc[date].dropna().index[:min_len]
+                assets = common
                 result[name].loc[date, assets] = orth[:, i]
 
         return result, transform
@@ -289,15 +292,19 @@ class FactorOrthogonalizer:
         count = 0
 
         for date in dates:
-            vals = []
+            # Rows must be the SAME assets for every factor: independent
+            # dropna() calls line up different assets positionally.
+            common = None
             for name in names:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            min_len = min(len(v) for v in vals)
+                index = factors[name].loc[date].dropna().index
+                common = index if common is None else common.intersection(index)
+            min_len = len(common) if common is not None else 0
             if min_len < n_factors + 1:
                 continue
 
-            mat = np.column_stack([v[:min_len] for v in vals])
+            mat = np.column_stack([
+                factors[name].loc[date, common].values for name in names
+            ])
 
             # Standardize
             means = mat.mean(axis=0)
@@ -361,15 +368,19 @@ class FactorOrthogonalizer:
         result = {name: factors[names[0]].copy() for name in out_names}
 
         for date in dates:
-            vals = []
+            # Rows must be the SAME assets for every factor: independent
+            # dropna() calls line up different assets positionally.
+            common = None
             for name in names:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            min_len = min(len(v) for v in vals)
+                index = factors[name].loc[date].dropna().index
+                common = index if common is None else common.intersection(index)
+            min_len = len(common) if common is not None else 0
             if min_len < n_factors + 1:
                 continue
 
-            mat = np.column_stack([v[:min_len] for v in vals])
+            mat = np.column_stack([
+                factors[name].loc[date, common].values for name in names
+            ])
             means = mat.mean(axis=0)
             stds = mat.std(axis=0)
             stds[stds < 1e-10] = 1.0
@@ -379,7 +390,7 @@ class FactorOrthogonalizer:
             scores = mat_std @ top_components  # (assets × n_comp)
 
             # Re-standardize each component for consistent scale
-            assets = factors[names[0]].loc[date].dropna().index[:min_len]
+            assets = common
             for i, name in enumerate(out_names):
                 col = scores[:, i]
                 col_std = col.std()
@@ -420,15 +431,19 @@ class FactorOrthogonalizer:
         count = 0
 
         for date in dates:
-            vals = []
+            # Rows must be the SAME assets for every factor: independent
+            # dropna() calls line up different assets positionally.
+            common = None
             for name in names:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            min_len = min(len(v) for v in vals)
+                index = factors[name].loc[date].dropna().index
+                common = index if common is None else common.intersection(index)
+            min_len = len(common) if common is not None else 0
             if min_len < n_factors + 1:
                 continue
 
-            mat = np.column_stack([v[:min_len] for v in vals])
+            mat = np.column_stack([
+                factors[name].loc[date, common].values for name in names
+            ])
             corr = np.corrcoef(mat, rowvar=False)
             corr_sum += corr
             count += 1
@@ -453,17 +468,20 @@ class FactorOrthogonalizer:
         # Apply transformation
         result = {}
         for date in dates:
-            vals = []
+            # Rows must be the SAME assets for every factor.
+            common = None
             for name in names:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            min_len = min(len(v) for v in vals)
+                index = factors[name].loc[date].dropna().index
+                common = index if common is None else common.intersection(index)
+            min_len = len(common) if common is not None else 0
             if min_len < n_factors + 1:
                 for name in names:
                     result.setdefault(name, factors[name].copy())
                 continue
 
-            mat = np.column_stack([v[:min_len] for v in vals])
+            mat = np.column_stack([
+                factors[name].loc[date, common].values for name in names
+            ])
 
             # Standardize
             means = mat.mean(axis=0)
@@ -476,7 +494,7 @@ class FactorOrthogonalizer:
 
             # Re-standardize for consistent scale
             for i, name in enumerate(names):
-                assets = factors[name].loc[date].dropna().index[:min_len]
+                assets = common
                 result.setdefault(name, factors[name].copy())
                 col = orth[:, i]
                 col_std = col.std()

@@ -78,11 +78,24 @@ class BaseFactor(ABC):
         financials: pd.DataFrame | None = None,
         **kwargs,
     ) -> FactorResult:
-        """Compute and return a FactorResult."""
+        """Compute and return a FactorResult.
+
+        The research price panel blanks suspension days so that *returns*
+        never difference across a forward-fill. Level-based factors still
+        need a continuous price path: with blanks, one suspension NaN'd every
+        momentum value for the next 252 days (momentum_12m coverage fell to
+        0/85 on real-shaped data). Factor levels therefore use the stale
+        forward-filled close; the IC target remains the masked return panel.
+        Set ``fill_suspensions = False`` on a factor that genuinely needs the
+        blanks.
+        """
+        price_panel = (
+            prices.ffill() if getattr(self, "fill_suspensions", True) else prices
+        )
         if financials is not None:
-            values = self.compute(prices, financials=financials, **kwargs)
+            values = self.compute(price_panel, financials=financials, **kwargs)
         else:
-            values = self.compute(prices, **kwargs)
+            values = self.compute(price_panel, **kwargs)
         return FactorResult(
             name=self.name,
             category=self.category,

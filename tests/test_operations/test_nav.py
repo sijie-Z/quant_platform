@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 
+import pandas as pd
 import pytest
 
 from quant_platform.core.store import Store
@@ -259,3 +260,42 @@ class TestNAVCases:
 
         history = store.get_nav_history(days=30)
         assert len(history) == 5
+
+
+class TestFeeAccrualAcrossDays:
+    def test_management_fee_is_deducted_and_compounds(self, store):
+        calc = NAVCalculator(store, annual_mgmt_fee=0.02, perf_fee_rate=0.0)
+        dates = pd.bdate_range(end=_TODAY.strftime("%Y-%m-%d"), periods=5)
+
+        navs = []
+        for day in dates:
+            nav = calc.calculate_daily_nav(
+                date=str(day.date()), cash=5_000_000, market_value=5_000_000,
+            )
+            calc.save_nav(nav)
+            navs.append(nav)
+
+        # The fee is a liability: NAV must decline every day.
+        assert navs[-1].nav_total < navs[0].nav_total
+        expected = 10_000_000 * (1 - 0.02 / 252) ** 5
+        assert navs[-1].nav_total == pytest.approx(expected, rel=1e-6)
+
+    def test_performance_fee_is_charged_once_per_new_high(self, store):
+        calc = NAVCalculator(store, annual_mgmt_fee=0.0, perf_fee_rate=0.20)
+        dates = pd.bdate_range(end=_TODAY.strftime("%Y-%m-%d"), periods=3)
+
+        nav1 = calc.calculate_daily_nav(
+            date=str(dates[0].date()), cash=5_000_000, market_value=5_000_000,
+        )
+        calc.save_nav(nav1)
+        nav2 = calc.calculate_daily_nav(
+            date=str(dates[1].date()), cash=5_000_000, market_value=6_000_000,
+        )
+        calc.save_nav(nav2)
+        nav3 = calc.calculate_daily_nav(
+            date=str(dates[2].date()), cash=5_000_000, market_value=6_880_000,
+        )
+
+        total_perf = nav2.perf_fee + nav3.perf_fee
+        gross_gain = (nav3.cash + nav3.market_value) - 10_000_000
+        assert total_perf == pytest.approx(0.20 * gross_gain, rel=1e-6)

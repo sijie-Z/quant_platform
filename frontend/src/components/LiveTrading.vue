@@ -165,8 +165,8 @@
       <div class="lt-risk-grid">
         <div class="lt-risk-item">
           <span class="lt-risk-label">{{ locale === 'zh-CN' ? '紧急熔断' : 'Kill Switch' }}</span>
-          <span :class="riskStatus.kill_switch_active ? 'neg' : 'pos'">
-            {{ riskStatus.kill_switch_active ? (locale === 'zh-CN' ? '已激活' : 'ACTIVE') : (locale === 'zh-CN' ? '关闭' : 'OFF') }}
+          <span :class="riskStatus.kill_switch ? 'neg' : 'pos'">
+            {{ riskStatus.kill_switch ? (locale === 'zh-CN' ? '已激活' : 'ACTIVE') : (locale === 'zh-CN' ? '关闭' : 'OFF') }}
           </span>
         </div>
         <div class="lt-risk-item">
@@ -185,17 +185,17 @@
         </div>
         <div class="lt-risk-item">
           <span class="lt-risk-label">{{ locale === 'zh-CN' ? '最大回撤限额' : 'Max Drawdown Limit' }}</span>
-          <span class="mono">{{ ((riskStatus.limits?.max_drawdown_pct || 0.15) * 100).toFixed(0) }}%</span>
+          <span class="mono">{{ ((riskStatus.limits?.max_drawdown || 0.15) * 100).toFixed(0) }}%</span>
         </div>
         <div class="lt-risk-item">
           <span class="lt-risk-label">{{ locale === 'zh-CN' ? '仓位上限' : 'Max Position Limit' }}</span>
-          <span class="mono">{{ ((riskStatus.limits?.max_single_position_pct || 0.05) * 100).toFixed(0) }}%</span>
+          <span class="mono">{{ ((riskStatus.limits?.max_single_position || 0.05) * 100).toFixed(0) }}%</span>
         </div>
       </div>
-      <div v-if="riskStatus.breaches?.length" class="lt-breaches">
-        <div v-for="(b, i) in riskStatus.breaches.slice(-5)" :key="i" class="lt-breach"
+      <div v-if="riskStatus.recent_breaches?.length" class="lt-breaches">
+        <div v-for="(b, i) in riskStatus.recent_breaches.slice(-5)" :key="i" class="lt-breach"
           :class="'breach-' + (b.severity || 'yellow')">
-          <span class="lt-breach-type">{{ b.breach_type }}</span>
+          <span class="lt-breach-type">{{ b.type }}</span>
           <span class="lt-breach-msg">{{ b.message }}</span>
           <span class="lt-breach-time">{{ fmtTime(b.timestamp) }}</span>
         </div>

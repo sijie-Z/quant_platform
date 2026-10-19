@@ -177,10 +177,14 @@ class RSIFactor(BaseFactor):
         avg_loss = loss.rolling(self._period).mean()
 
         # Avoid division by zero
-        avg_loss = avg_loss.replace(0, np.nan)
-
-        rs = avg_gain / avg_loss
+        rs = avg_gain / avg_loss.replace(0, np.nan)
         rsi = 100 - 100 / (1 + rs)
+        # A window with no losses is RSI 100, not undefined. Turning the
+        # denominator into NaN silently removed strongly trending stocks from
+        # the cross-section; flat windows are neutral (50).
+        rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+        rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
+        rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
         return rsi
 
 
@@ -640,8 +644,10 @@ class PureVolatilityFactor(BaseFactor):
         ab = ret.mul(m, axis=0).rolling(self._window).sum()
 
         cov1 = (ab - a1.mul(b1, axis=0) / n) / (n - 1)
-        var0 = b2 / n - (b1 / n) ** 2
-        beta = cov1.div(var0.where(var0 > 1e-20), axis=0)
+        # Match the sample covariance's ddof; the old population variance
+        # overstated the OLS beta by n/(n-1).
+        var1 = (b2 - b1.pow(2) / n) / (n - 1)
+        beta = cov1.div(var1.where(var1 > 1e-20), axis=0)
 
         sum_r = a1.sub(beta.mul(b1, axis=0))
         sum_r2 = a2.sub(beta.mul(ab, axis=0) * 2.0).add(beta.pow(2).mul(b2, axis=0))

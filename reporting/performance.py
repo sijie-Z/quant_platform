@@ -88,7 +88,9 @@ def plot_rolling_sharpe(
 
     rolling_ann_ret = strategy_returns.rolling(window).mean() * TRADING_DAYS_PER_YEAR
     rolling_ann_vol = strategy_returns.rolling(window).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-    rolling_sharpe = rolling_ann_ret / rolling_ann_vol
+    # Constant returns give zero vol; the raw division produced inf and the
+    # legend read "Mean: inf".
+    rolling_sharpe = rolling_ann_ret / rolling_ann_vol.replace(0, np.nan)
 
     ax.plot(rolling_sharpe.index, rolling_sharpe.values, color="#2ca02c", linewidth=1.0)
     ax.axhline(y=0, color="red", linestyle="--", alpha=0.5)
@@ -109,7 +111,11 @@ def plot_monthly_returns_heatmap(
 ) -> plt.Figure:
     """Plot monthly returns heatmap."""
     # `"M"` was removed in pandas 3; MonthEnd works on 2.x and 3.x.
-    monthly = strategy_returns.resample(pd.offsets.MonthEnd()).apply(lambda x: (1 + x).prod() - 1)
+    # A month with no observations is missing, not a 0.0% return: the empty
+    # product `(1+x).prod()` is 1, which plotted as a real zero month.
+    monthly = strategy_returns.resample(pd.offsets.MonthEnd()).apply(
+        lambda x: (1 + x).prod() - 1 if len(x) else np.nan
+    )
 
     # Build pivot: year x month
     df = monthly.to_frame(name="return")
@@ -118,11 +124,15 @@ def plot_monthly_returns_heatmap(
     pivot = df.pivot_table(values="return", index="year", columns="month", aggfunc="sum") * 100
 
     fig, ax = plt.subplots(figsize=(10, len(pivot) * 0.8 + 1))
+    month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    # Label the columns the pivot actually has. A March-August backtest used
+    # to show its six cells under Jan-Jun.
+    xticklabels = [month_labels[int(month) - 1] for month in pivot.columns]
     sns.heatmap(
         pivot, annot=True, fmt=".1f", cmap="RdYlGn", center=0,
         cbar_kws={"label": "Return (%)"}, ax=ax,
-        xticklabels=["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+        xticklabels=xticklabels,
     )
     ax.set_title("Monthly Returns (%)", fontsize=13, fontweight="bold")
     ax.set_ylabel("Year")

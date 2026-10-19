@@ -202,7 +202,9 @@ class Store:
                     perf_fee REAL DEFAULT 0,
                     high_water_mark REAL DEFAULT 1.0,
                     daily_return REAL DEFAULT 0,
-                    cumulative_return REAL DEFAULT 0
+                    cumulative_return REAL DEFAULT 0,
+                    accrued_mgmt_fee REAL DEFAULT 0,
+                    accrued_perf_fee REAL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS engine_state (
@@ -225,6 +227,16 @@ class Store:
             self._migrate_tenant_id(conn)
             # ... and give positions a tenant-scoped key
             self._migrate_positions_primary_key(conn)
+            # ... and carry cumulative fee accruals on existing NAV databases
+            nav_cols = {r["name"] for r in conn.execute("PRAGMA table_info(nav_history)")}
+            if "accrued_mgmt_fee" not in nav_cols:
+                conn.execute(
+                    "ALTER TABLE nav_history ADD COLUMN accrued_mgmt_fee REAL DEFAULT 0"
+                )
+            if "accrued_perf_fee" not in nav_cols:
+                conn.execute(
+                    "ALTER TABLE nav_history ADD COLUMN accrued_perf_fee REAL DEFAULT 0"
+                )
 
             # Create tenant_id indexes after migration
             conn.executescript("""
@@ -624,14 +636,16 @@ class Store:
             conn.execute("""
                     INSERT OR REPLACE INTO nav_history
                     (date, nav_total, nav_per_unit, total_units, cash, market_value,
-                     mgmt_fee, perf_fee, high_water_mark, daily_return, cumulative_return)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     mgmt_fee, perf_fee, high_water_mark, daily_return, cumulative_return,
+                     accrued_mgmt_fee, accrued_perf_fee)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                 nav['date'], nav['nav_total'], nav['nav_per_unit'],
                 nav['total_units'], nav.get('cash', 0),
                 nav.get('market_value', 0), nav.get('mgmt_fee', 0),
                 nav.get('perf_fee', 0), nav.get('high_water_mark', 1.0),
                 nav.get('daily_return', 0), nav.get('cumulative_return', 0),
+                nav.get('accrued_mgmt_fee', 0), nav.get('accrued_perf_fee', 0),
             ))
 
     def get_nav_history(self, days: int = 365 * 3) -> list[dict]:

@@ -258,4 +258,15 @@
 
 验证：全量测试 **1732 passed / 3 skipped / 0 failed**（1m57s），ruff 全绿。
 
-仍未处理的交接项：#63 已在 `feature/first-real-research` 分支完成（PIT HS300 + 预注册 80 日反转，结论为不复现）；以及 #70/#77 中每个未接线目录的最终"接入 / 删除"决定。
+### 2026-10-19 第三轮审计（alpha / 报告 / 运营 / 前端）
+
+| 领域 | 修复 |
+|---|---|
+| Alpha/因子 | 组合层改为逐资产 NaN 感知加权（一个因子缺一格不再清空该资产；默认因子集不再产出空信号）；水平类因子用前向填充价格计算（停牌不再让 momentum_12m 覆盖率归零）；PE/PB 非正分母剔除（亏损股/负净资产不再排成"最便宜"）；numba 动量窗口与 pandas 对齐（此前滞后一天）；numba Rank IC 平均并列名次（离散因子 IC 不再依赖列序）；正交化按共同资产对齐（NaN 模式不同也能正交）；RSI 无亏损窗口返回 100；NetworkFactor 正确初始化基类；纯波动 beta 统一 ddof |
+| 运营/报告 | NAV 管理费累计计提并逐日扣减（不再永久高估净值）；业绩报酬只在创新高时收一次、HWM 用费前净值；跨周末/节假日日收益不再归零；投资者年化按实际经过时间；归因换手用并集（完整换仓不再报 0）；HTML 月度热图按 `{years,data}` 结构渲染；matplotlib 月份标签/空月/无限 Sharpe 修复 |
+| 前端/契约 | 订单簿与持仓正确解包响应 envelope；实盘风控面板字段对齐（kill_switch/recent_breaches/limits）；市价成交使用真实报价（后端拒绝无价成交，删除 `Math.random()` 价格）；数据质量不再用无关合成数据冒充某次运行；前端 bundle 过期时启动告警；监控端点显式返回 `available/reason`；行情缓存改为共享实例；OMS 快照与 PaperBroker 记录有上限 |
+| 数据 | Baostock 后复权 + Tushare adj_factor 应用 + 合成数据公司行为落到原始价格；基本面 f116/f117 市值映射修正 |
+
+验证：全量测试 **1753 passed / 3 skipped / 0 failed**（3m08s），ruff 全绿。
+
+已知仍未处理：`strategy/gates.py` 中若干配置阈值未接线、多策略 orchestrator 的共享持仓归属、多租户隔离（#75 产品定位未定）。

@@ -68,9 +68,10 @@ def _rolling_cumret_numba(returns: np.ndarray, period: int) -> np.ndarray:
     result = np.full((n_dates, n_assets), np.nan)
 
     for j in prange(n_assets):
-        for t in range(period, n_dates):
-            # Check if any NaN in window
-            window = returns[t - period:t, j]
+        # rolling(period) at row t includes row t; the old window ended at
+        # t-1, so the accelerated path was one day staler than pandas.
+        for t in range(period - 1, n_dates):
+            window = returns[t - period + 1:t + 1, j]
             valid = True
             cumret = 1.0
             for k in range(period):
@@ -226,6 +227,29 @@ def winsorize_numba(factor: pd.DataFrame, lower: float, upper: float) -> pd.Data
 # ======================================================================
 
 @jit(nopython=True, cache=True)
+def _average_rank(values: np.ndarray) -> np.ndarray:
+    """Ranks with ties averaged, matching pandas' default ``rank``."""
+    n = len(values)
+    order = np.argsort(values)
+    sorted_values = values[order]
+    ranks_sorted = np.empty(n)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sorted_values[j + 1] == sorted_values[i]:
+            j += 1
+        average = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks_sorted[k] = average
+        i = j + 1
+
+    ranks = np.empty(n)
+    for idx in range(n):
+        ranks[order[idx]] = ranks_sorted[idx]
+    return ranks
+
+
+@jit(nopython=True, cache=True)
 def _spearman_rank_ic(factor_row: np.ndarray, ret_row: np.ndarray) -> float:
     """Numba JIT: Spearman rank correlation for one cross-section."""
     # Find valid pairs
@@ -237,16 +261,12 @@ def _spearman_rank_ic(factor_row: np.ndarray, ret_row: np.ndarray) -> float:
     f = factor_row[mask]
     r = ret_row[mask]
 
-    # Rank (use argsort twice for ranking)
-    f_rank = np.zeros(n_valid)
-    r_rank = np.zeros(n_valid)
-
-    f_order = np.argsort(f)
-    r_order = np.argsort(r)
-
-    for i in range(n_valid):
-        f_rank[f_order[i]] = i + 1
-        r_rank[r_order[i]] = i + 1
+    # Average ranks for ties. Assigning 1..N via argsort gave tied values
+    # arbitrary distinct ranks, so this path disagreed with pandas and its
+    # result depended on column order (discrete factors such as
+    # breakout_ignition are affected in production).
+    f_rank = _average_rank(f)
+    r_rank = _average_rank(r)
 
     # Pearson correlation of ranks
     f_mean = f_rank.mean()

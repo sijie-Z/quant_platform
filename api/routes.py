@@ -1542,10 +1542,19 @@ async def create_order(order_req: dict):
 async def fill_order(fill_req: dict):
     """Process a fill for an order."""
     try:
+        price = float(fill_req.get("price", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "price must be a number") from exc
+    if price <= 0:
+        # A missing price used to default to 0; the UI papered over it with a
+        # random 100-150 quote. Refuse rather than invent a fill price.
+        raise HTTPException(422, "price is required for a fill")
+
+    try:
         oms = _get_oms()
         order = oms.fill_order(
             order_id=fill_req.get("order_id", ""),
-            price=float(fill_req.get("price", 0)),
+            price=price,
             quantity=fill_req.get("quantity"),
         )
         return {
@@ -2403,6 +2412,15 @@ def data_quality_check(req: dict):
             monitor.check_prices(prices)
             returns = prices.replace(0, np.nan).pct_change(fill_method=None).dropna()
             monitor.check_returns(returns)
+    elif run_id:
+        # The run record does not retain its price panel. Checking an unrelated
+        # synthetic sample and presenting it as this run's quality was worse
+        # than saying no.
+        raise HTTPException(
+            422,
+            "This run does not retain its price panel, so its quality cannot "
+            "be checked. Run the check without run_id for the synthetic demo.",
+        )
     else:
         # Generate synthetic data for demo
         from quant_platform.data.providers.synthetic import SyntheticDataProvider

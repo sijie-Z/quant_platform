@@ -114,11 +114,26 @@ class InvestorPortal:
         # Performance metrics
         latest_nav = float(df["nav_per_unit"].iloc[-1])
         inception_nav = float(df["nav_per_unit"].iloc[0])
+        inception_date = str(df.index[0].date())
+        # The lookback window is not inception. Read the earliest record we
+        # have so cumulative return and the inception date describe the fund,
+        # not the chart range.
+        try:
+            all_records = self._store.get_nav_history(days=365 * 30)
+            if all_records:
+                inception_date = str(all_records[0]["date"])
+                inception_nav = float(all_records[0]["nav_per_unit"])
+        except Exception:
+            pass
         cumulative_return = latest_nav / inception_nav - 1
 
-        n_days = len(df)
-        n_years = n_days / self.TRADING_DAYS_PER_YEAR
-        annualized_return = (1 + cumulative_return) ** (1 / n_years) - 1 if n_years > 0 else 0
+        # Annualize over elapsed time, not record count. Twelve monthly NAVs
+        # were treated as 12/252 years and reported 640% for a 10% year.
+        elapsed_years = (df.index[-1] - df.index[0]).days / 365.25
+        annualized_return = (
+            (1 + cumulative_return) ** (1 / elapsed_years) - 1
+            if elapsed_years > 0 else 0.0
+        )
 
         # Drawdown
         peak = df["nav_per_unit"].expanding().max()
@@ -138,8 +153,6 @@ class InvestorPortal:
         aum = 0.0
         if "nav_total" in df.columns:
             aum = float(df["nav_total"].iloc[-1])
-
-        inception_date = str(df.index[0].date()) if len(df) > 0 else ""
 
         return InvestorView(
             nav_curve=nav_curve.reset_index(),
@@ -162,6 +175,10 @@ class InvestorPortal:
 
         # `"M"` was removed in pandas 3; MonthEnd works on 2.x and 3.x.
         monthly = df["nav_per_unit"].resample(pd.offsets.MonthEnd()).last()
+        # A month with no observation is missing, not a loss of 100%. Dropping
+        # it lets the next available month own the multi-month return instead
+        # of becoming NaN because its predecessor was NaN.
+        monthly = monthly.dropna()
         monthly_ret = monthly.pct_change().dropna()
 
         if len(monthly_ret) == 0:

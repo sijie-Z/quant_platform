@@ -95,6 +95,37 @@ class TestAMisalignedFactorIsDropped:
         assert "broken" not in aligned
         assert set(aligned) == {"f1", "f2", "f3"}
 
+
+class TestPartialNaNCoverage:
+    """A missing cell in one factor must not blank the asset."""
+
+    def test_one_missing_cell_does_not_blank_the_asset(self):
+        factors = _make_factors(n_dates=10, n_assets=5)
+        factors["f1"].iloc[0, 0] = np.nan
+
+        result = combine_equal_weight(factors)
+
+        expected = (factors["f2"].iloc[0, 0] + factors["f3"].iloc[0, 0]) / 2
+        assert result.iloc[0, 0] == pytest.approx(expected)
+
+    def test_an_all_nan_factor_does_not_empty_the_signal(self):
+        factors = _make_factors(n_dates=10, n_assets=5)
+        factors["f1"][:] = np.nan
+
+        result = combine_equal_weight(factors)
+
+        assert result.shape == factors["f2"].shape
+        assert result.notna().all().all()
+
+    def test_disjoint_nan_masks_cover_the_union(self):
+        factors = _make_factors(n_dates=10, n_assets=6)
+        factors["f1"].iloc[:, :3] = np.nan
+        factors["f2"].iloc[:, 3:] = np.nan
+
+        result = combine_equal_weight(factors)
+
+        assert result.notna().all().all()
+
     def test_a_factor_with_a_stray_column_is_aligned_to_the_universe(self):
         factors = _make_factors()
         widened = factors["f3"].copy()

@@ -240,7 +240,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useI18n } from '../i18n/index.js'
-import { createOrder, fillOrder, getBlotter, getPositions, getTCA } from '../api/index.js'
+import { createOrder, fillOrder, getBaostockStock, getBlotter, getPositions, getTCA } from '../api/index.js'
 
 const { $t, locale } = useI18n()
 
@@ -289,12 +289,19 @@ async function submitOrder() {
       strategy: newOrder.value.strategy,
     })
 
-    // Auto-fill market orders (simulate immediate execution)
+    // Auto-fill market orders (simulate immediate execution). The fill price
+    // must come from a real quote: the old fallback was Math.random()*50+100,
+    // so every stock filled at CNY 100-150 regardless of its price.
     if (newOrder.value.order_type === 'market') {
-      await fillOrder({
-        order_id: order.order_id,
-        price: newOrder.value.limit_price || 100 + Math.random() * 50,
-      })
+      let price = newOrder.value.limit_price
+      if (!price) {
+        const quote = await getBaostockStock(newOrder.value.ticker)
+        price = quote.close
+      }
+      if (!price || price <= 0) {
+        throw new Error('No market price available for ' + newOrder.value.ticker)
+      }
+      await fillOrder({ order_id: order.order_id, price })
       emit('toast', { message: locale.value === 'zh-CN' ? `订单 ${order.order_id} 已成交` : `Order ${order.order_id} filled`, type: 'success' })
     } else {
       emit('toast', { message: locale.value === 'zh-CN' ? `订单 ${order.order_id} 已创建 (${order.status})` : `Order ${order.order_id} created (${order.status})`, type: 'success' })
@@ -313,8 +320,8 @@ async function refreshAll() {
   loading.value = true
   try {
     const [b, p, t] = await Promise.all([getBlotter(), getPositions(), getTCA()])
-    blotter.value = b
-    positions.value = p
+    blotter.value = b.orders || []
+    positions.value = p.positions || []
     tca.value = t
   } catch {
     // endpoints may not have data yet

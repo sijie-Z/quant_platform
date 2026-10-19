@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -115,8 +116,22 @@ def create_app(serve_frontend: bool = True) -> FastAPI:
     app.include_router(api_router)
     app.include_router(monitor_router)
 
-    # Serve frontend static files in production
+    # Serve frontend static files in production. Warn loudly when the bundle
+    # is older than the source: serving a stale dist silently shipped removed
+    # client-side fabrications back to users.
     if serve_frontend and _DIST_DIR.exists():
+        index = _DIST_DIR / "index.html"
+        source_dir = _FRONTEND_DIR / "src"
+        if index.exists() and source_dir.exists():
+            newest_source = max(
+                (path.stat().st_mtime for path in source_dir.rglob("*") if path.is_file()),
+                default=0.0,
+            )
+            if newest_source > index.stat().st_mtime:
+                logging.getLogger(__name__).warning(
+                    "frontend/dist is older than frontend/src -- serving a "
+                    "stale bundle. Run `npm run build` in frontend/.",
+                )
         app.mount("/", StaticFiles(directory=str(_DIST_DIR), html=True), name="frontend")
 
     return app

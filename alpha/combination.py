@@ -13,6 +13,7 @@ Walk-Forward validation meaningful.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from quant_platform.factors.evaluation import ic_summary, rank_ic
@@ -203,8 +204,14 @@ def _build_row(
     weights: dict[str, float],
     date: pd.Timestamp,
 ) -> pd.Series | None:
-    """Build a single row of weighted factor values for one date."""
-    row = None
+    """Build a single row of weighted factor values for one date.
+
+    The sum is mask-aware per asset: a missing value in one factor no longer
+    blanks every other factor's view of that asset. Plain addition propagated
+    NaN, so one factor with partial coverage emptied most of the signal.
+    """
+    numerator = None
+    denominator = None
     for name, factor in aligned.items():
         w = weights.get(name, 0.0)
         if abs(w) < 1e-10:
@@ -213,18 +220,19 @@ def _build_row(
             continue
         vals = factor.loc[date]
         if not vals.notna().any():
-            # A factor with nothing to say about this cross-section used to
-            # seed the sum with an all-NaN row, and NaN + x is NaN, so every
-            # other factor's values for the date were lost with it. Skipping
-            # it keeps the row's meaning: the weighted sum of what the factors
-            # actually have. Which factors were summed no longer depends on
-            # the order they happen to sit in the dict.
             continue
-        if row is None:
-            row = vals * w
+
+        contribution = (vals * w).fillna(0.0)
+        coverage = vals.notna().astype(float) * abs(w)
+        if numerator is None:
+            numerator, denominator = contribution, coverage
         else:
-            row = row + vals * w
-    return row
+            numerator = numerator.add(contribution, fill_value=0.0)
+            denominator = denominator.add(coverage, fill_value=0.0)
+
+    if numerator is None or denominator is None:
+        return None
+    return numerator / denominator.replace(0.0, np.nan)
 
 
 def _asset_universe(factors: dict[str, pd.DataFrame]) -> pd.Index:
@@ -306,21 +314,30 @@ def _weighted_sum(
     factors: dict[str, pd.DataFrame],
     weights: dict[str, float],
 ) -> pd.DataFrame:
-    """Compute weighted sum of factor values (static weights, all dates)."""
-    result = None
+    """Weighted factor average, mask-aware per (date, asset).
+
+    Plain `result + df * w` propagated NaN across factors. A single factor
+    with partial coverage therefore blanked the asset for every date, and the
+    default factor set produced an almost entirely empty signal.
+    """
+    numerator = None
+    denominator = None
     for name, df in factors.items():
         w = weights.get(name, 0.0)
         if abs(w) < 1e-10:
             continue
-        if result is None:
-            result = df * w
+        contribution = (df * w).fillna(0.0)
+        coverage = df.notna().astype(float) * abs(w)
+        if numerator is None:
+            numerator, denominator = contribution, coverage
         else:
-            result = result + df * w
+            numerator = numerator.add(contribution, fill_value=0.0)
+            denominator = denominator.add(coverage, fill_value=0.0)
 
-    if result is None:
+    if numerator is None or denominator is None:
         raise ValueError("No valid factors to combine")
 
-    return result
+    return numerator / denominator.replace(0.0, np.nan)
 
 
 def combine_vote(

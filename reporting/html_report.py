@@ -284,10 +284,15 @@ shChart.setOption({{
 
 // Monthly Heatmap
 const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-const years = Object.keys(monthlyData).sort();
+// `monthly_returns` is {{years: [...], months: [...], data: [[...]]}}.
+// The old code treated it as {{year: [12 values]}}, so Object.keys returned
+// ["data","months","years"] and the heatmap plotted row arrays and labels.
+const monthly = monthlyData || {{}};
+const years = Array.isArray(monthly.years) ? monthly.years.map(String) : [];
 const heatData = [];
 years.forEach((y, yi) => {{
-  (monthlyData[y] || []).forEach((v, mi) => {{
+  const row = (monthly.data && monthly.data[yi]) || [];
+  row.forEach((v, mi) => {{
     if (v !== null && v !== undefined) heatData.push([mi, yi, v]);
   }});
 }});

@@ -312,12 +312,14 @@ def to_alphalens(
 
     # Add group info
     if group_map is not None:
-        # group_map is Series(asset -> group)
-        result["group"] = result.index.get_level_values("asset").map(group_map)
+        # group_map is Series(asset -> group). The stacked index levels are
+        # positional (date, asset); `get_level_values("asset")` raised for the
+        # normal case where the input frames have unnamed columns.
+        result["group"] = result.index.get_level_values(-1).map(group_map)
 
     result = result.dropna(subset=["factor", "1D"])
 
     # Alphalens also expects an asset_name column
-    result["asset_name"] = result.index.get_level_values("asset")
+    result["asset_name"] = result.index.get_level_values(-1)
 
     return result
