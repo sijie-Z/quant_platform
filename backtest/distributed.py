@@ -82,20 +82,27 @@ def _run_single_backtest(args: tuple) -> BacktestResult:
         from quant_platform.main import _compute_factors, _generate_signal, _load_data, _run_backtest
         from quant_platform.utils.config import load_config
 
-        # Merge config overrides
+        # Merge config overrides. `load_config()` returns dataclasses, not
+        # dicts, so the old `setdefault` path raised AttributeError and every
+        # parallel cell failed after paying for process startup.
         config = load_config()
         for key, value in config_overrides.items():
-            keys = key.split(".")
-            cfg_section = config
-            for k in keys[:-1]:
-                cfg_section = cfg_section.setdefault(k, {})
-            cfg_section[keys[-1]] = value
+            target = config
+            parts = key.split(".")
+            for part in parts[:-1]:
+                target = getattr(target, part)
+            setattr(target, parts[-1], value)
 
-        # Run pipeline
-        data_result = _load_data(config)
-        factors_result = _compute_factors(data_result, config)
-        signal = _generate_signal(factors_result, config)
-        backtest_result = _run_backtest(signal, data_result, config)
+        # Run pipeline with the real helper signatures.
+        prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
+        processed_factors, _ic_results, sector_map, fin_unstacked = _compute_factors(
+            prices, returns, financials, metadata, turnover, config=config,
+        )
+        signal = _generate_signal(config, processed_factors, returns)
+        backtest_result = _run_backtest(
+            config, signal, prices, returns, benchmark, sector_map,
+            fin_unstacked if fin_unstacked is not None else financials,
+        )
 
         # Extract key metrics
         daily_returns = backtest_result.get("daily_returns")

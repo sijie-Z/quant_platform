@@ -225,11 +225,19 @@ class CapacityEstimator:
         total_impact_bps = 0.0
         total_turnover = 0.0
 
-        rebalance_iter = iter(rebalance_dates)
-        next_rdate = next(rebalance_iter, None)
+        # Execute at the NEXT trading day's close, matching
+        # BacktestEngine._execution_schedule. Applying the target on the signal
+        # date itself captured the move the engine deliberately excludes.
+        schedule = []
+        for rdate in rebalance_dates:
+            later = all_dates[all_dates > rdate]
+            if len(later):
+                schedule.append((later[0], rdate))
+        schedule_idx = 0
 
         for date in all_dates:
-            if next_rdate is not None and date >= next_rdate:
+            if schedule_idx < len(schedule) and date >= schedule[schedule_idx][0]:
+                _exec_date, next_rdate = schedule[schedule_idx]
                 target_weights = weights_history.get(next_rdate, current_weights)
                 target_weights = target_weights.reindex(returns.columns, fill_value=0.0)
 
@@ -289,23 +297,34 @@ class CapacityEstimator:
                     capital -= capped_impact
 
                 current_weights = target_weights.copy()
-                next_rdate = next(rebalance_iter, None)
+                schedule_idx += 1
 
-            # Daily P&L
+            # Daily P&L, with weights drifting between rebalances.
             daily_ret_assets = returns.loc[date].reindex(current_weights.index, fill_value=0.0)
             portfolio_return = (current_weights * daily_ret_assets).sum()
             daily_returns_list.append(portfolio_return)
             capital = capital * (1 + portfolio_return)
 
+            if current_weights.sum() > 1e-12:
+                growth = current_weights * (1.0 + daily_ret_assets.fillna(0.0))
+                cash_weight = max(0.0, 1.0 - float(current_weights.sum()))
+                total_value = float(growth.sum()) + cash_weight
+                if total_value > 1e-12:
+                    current_weights = growth / total_value
+
         # Compute metrics
         daily_returns = pd.Series(daily_returns_list, index=all_dates)
 
         if len(daily_returns) > 0 and daily_returns.std() > 0:
-            ann_return = float(daily_returns.mean() * 252)
+            total_ret = float((1 + daily_returns).prod() - 1)
+            n = len(daily_returns)
+            ann_return = float((1 + total_ret) ** (252 / n) - 1) if n else 0.0
             ann_vol = float(daily_returns.std() * math.sqrt(252))
             sharpe = ann_return / ann_vol if ann_vol > 0 else 0
-            total_ret = float((1 + daily_returns).prod() - 1)
-            max_dd = float((daily_returns.cumsum() - daily_returns.cumsum().cummax()).min())
+            wealth = np.concatenate(
+                ([1.0], (1 + daily_returns).cumprod().to_numpy())
+            )
+            max_dd = float((wealth / np.maximum.accumulate(wealth) - 1).min())
         else:
             ann_return = 0.0
             sharpe = 0.0

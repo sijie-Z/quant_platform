@@ -384,3 +384,69 @@ class TestBrokerRegistry:
     def test_create_unknown_broker_raises(self):
         with pytest.raises(ValueError, match="Unknown broker"):
             create_broker("nonexistent")
+
+
+class TestCallbackLifecycle:
+    """QMT callbacks must update the tracked order from real fill reports."""
+
+    def _broker_with_order(self):
+        broker = QMTBroker.__new__(QMTBroker)
+        broker._orders = []
+        order = Order(
+            code="600519", side=OrderSide.BUY,
+            order_type=OrderType.LIMIT, quantity=100, price=10.0,
+        )
+        order.broker_order_id = "12345"
+        order.status = OrderStatus.SUBMITTED
+        broker._orders.append(order)
+        return broker, order
+
+    def test_trade_report_fills_the_order(self):
+        broker, order = self._broker_with_order()
+
+        class XtTrade:
+            order_id = 12345
+            traded_volume = 100
+            traded_price = 10.5
+
+        broker._on_trade(XtTrade())
+
+        assert order.status == OrderStatus.FILLED
+        assert order.filled_quantity == 100
+        assert order.filled_price == 10.5
+
+    def test_order_update_applies_status_and_partial_fill(self):
+        broker, order = self._broker_with_order()
+
+        class XtOrder:
+            order_id = 12345
+            order_status = 22
+            traded_volume = 40
+            traded_price = 10.2
+
+        broker._on_order_update(XtOrder())
+
+        assert order.status == OrderStatus.PARTIAL
+        assert order.filled_quantity == 40
+
+    def test_error_callback_matches_an_integer_id(self):
+        broker, order = self._broker_with_order()
+
+        broker._update_order_status(12345, OrderStatus.REJECTED, "boom")
+
+        assert order.status == OrderStatus.REJECTED
+        assert order.error_msg == "boom"
+
+    def test_placement_ack_does_not_downgrade_submitted(self):
+        broker, order = self._broker_with_order()
+
+        broker._on_async_ack({"order_id": 12345})
+
+        assert order.status == OrderStatus.SUBMITTED
+
+    def test_async_response_without_status_is_ignored(self):
+        broker, order = self._broker_with_order()
+
+        broker._on_async_response({"order_id": 12345})
+
+        assert order.status == OrderStatus.SUBMITTED

@@ -736,7 +736,14 @@ class QMTBroker(BrokerInterface):
                     })
 
                 def on_order_stock_async_response(self_cb, response):
-                    broker_ref._on_async_response(response)
+                    # Placement ACK only; it carries no lifecycle status.
+                    broker_ref._on_async_ack(response)
+
+                def on_stock_order(self_cb, xt_order):
+                    broker_ref._on_order_update(xt_order)
+
+                def on_stock_trade(self_cb, xt_trade):
+                    broker_ref._on_trade(xt_trade)
 
             self._trader.register_callback(_QMTCallback())
             self._trader.start()
@@ -955,25 +962,91 @@ class QMTBroker(BrokerInterface):
 
     # ── Internals ──
 
-    def _on_async_response(self, response: Any) -> None:
-        """Handle async order response from QMT (fill / status update).
+    def _on_async_ack(self, response: Any) -> None:
+        """Handle the placement ACK.
 
-        Called by the QMT callback thread. Updates the tracked Order
-        and publishes events to EventBus.
+        `on_order_stock_async_response` reports the broker id, not a fill.
+        The old handler parsed it as a status update, mapped the missing
+        status to 0/PENDING and downgraded a fresh SUBMITTED order.
         """
+        d = response if isinstance(response, dict) else {}
+        order_id = d.get("order_id", getattr(response, "order_id", ""))
+        if order_id:
+            logger.debug("QMT placement ACK: %s", order_id)
+            self._publish_event("qmt.order_ack", {"order_id": str(order_id)})
+
+    def _on_order_update(self, xt_order: Any) -> None:
+        """Apply an XtOrder status update to the tracked order."""
+        from quant_platform.trading.qmt_utils import qmt_status_to_internal
+
+        broker_order_id = str(getattr(xt_order, "order_id", ""))
+        status_code = getattr(xt_order, "order_status", None)
+        if status_code is None:
+            return
+        status = qmt_status_to_internal(int(status_code))
+        traded = int(getattr(xt_order, "traded_volume", 0) or 0)
+        traded_price = float(getattr(xt_order, "traded_price", 0) or 0)
+
+        for order in self._orders:
+            if str(order.broker_order_id) == broker_order_id:
+                order.status = status
+                if traded > 0:
+                    order.filled_quantity = traded
+                    if traded_price > 0:
+                        order.filled_price = traded_price
+                order.updated_at = datetime.now().isoformat()
+                self._publish_event("qmt.order_update", order.to_dict())
+                break
+
+    def _on_trade(self, xt_trade: Any) -> None:
+        """Apply an XtTrade fill report to the tracked order."""
+        broker_order_id = str(getattr(xt_trade, "order_id", ""))
+        volume = int(
+            getattr(xt_trade, "traded_volume", 0)
+            or getattr(xt_trade, "volume", 0)
+            or 0
+        )
+        price = float(
+            getattr(xt_trade, "traded_price", 0)
+            or getattr(xt_trade, "price", 0)
+            or 0
+        )
+        if volume <= 0:
+            return
+
+        for order in self._orders:
+            if str(order.broker_order_id) == broker_order_id:
+                order.filled_quantity = min(
+                    order.quantity, int(order.filled_quantity or 0) + volume,
+                )
+                if price > 0:
+                    order.filled_price = price
+                order.status = (
+                    OrderStatus.FILLED
+                    if order.filled_quantity >= order.quantity
+                    else OrderStatus.PARTIAL
+                )
+                order.updated_at = datetime.now().isoformat()
+                self._publish_event("qmt.trade", order.to_dict())
+                break
+
+    def _on_async_response(self, response: Any) -> None:
+        """Handle an async order response carrying a status (legacy hook)."""
         try:
             from quant_platform.trading.qmt_utils import (
-                from_qmt_code,
                 qmt_status_to_internal,
                 qmt_trade_to_dict,
             )
 
             d = qmt_trade_to_dict(response)
+            if "status" not in d and "order_status" not in d:
+                # Placement ACK without lifecycle information: do not touch
+                # the order's status.
+                return
             qmt_order_id = str(d.get("order_id", ""))
             qmt_status = d.get("status", d.get("order_status", 0))
             filled_qty = d.get("filled_quantity", d.get("volume", 0))
             filled_price = d.get("filled_price", d.get("price", 0.0))
-            from_qmt_code(d.get("code", ""))
 
             new_status = qmt_status_to_internal(int(qmt_status) if qmt_status else 0)
 
@@ -998,8 +1071,11 @@ class QMTBroker(BrokerInterface):
 
     def _update_order_status(self, broker_order_id: str, status: OrderStatus, error_msg: str = "") -> None:
         """Update an order's status (e.g. on error callback)."""
+        target = str(broker_order_id)
         for o in self._orders:
-            if o.broker_order_id == broker_order_id:
+            # xtquant reports integer ids while broker_order_id is stored as
+            # a string; comparing raw values never matched.
+            if str(o.broker_order_id) == target or str(o.order_id) == target:
                 o.status = status
                 o.error_msg = error_msg
                 o.updated_at = datetime.now().isoformat()

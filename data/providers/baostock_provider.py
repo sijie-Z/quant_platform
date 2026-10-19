@@ -120,7 +120,7 @@ class BaostockDataProvider(DataProvider):
                     start_date=start_date,
                     end_date=end_date,
                     frequency="d",
-                    adjustflag="3",  # Unadjusted
+                    adjustflag="1",  # 后复权: dividends/splits are already in the path
                 )
                 while rs.error_code == "0" and rs.next():
                     all_rows.append(rs.get_row_data())
@@ -223,9 +223,11 @@ class BaostockDataProvider(DataProvider):
         if df.empty:
             return df
 
-        # Add adj_factor (computed from close/preclose chain)
+        # Add adj_factor. The prices above are already 后复权 (adjustflag="1"),
+        # so the pipeline's divisor is 1; requesting unadjusted prices while
+        # hardcoding this to 1 made ex-dividend dates look like crashes.
         if "adj_factor" not in df.columns:
-            df["adj_factor"] = 1.0  # Unadjusted = 1.0
+            df["adj_factor"] = 1.0
 
         return df
 

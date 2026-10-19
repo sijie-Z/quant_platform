@@ -318,7 +318,15 @@ class HealthCheck:
         try:
             # Try to query account (proves broker connection is alive)
             account = self._broker.get_account()
-            return account is not None
+            if account is None:
+                return False
+            # QMT/XTP return a fallback account dict with connected=False when
+            # the terminal is down; treating that as healthy let the engine
+            # start and reject every order.
+            if account.get("connected") is False:
+                logger.error("Order routing check failed: broker reports disconnected")
+                return False
+            return True
         except Exception as e:
             logger.error("Order routing check failed: %s", e)
             return False

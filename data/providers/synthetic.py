@@ -388,6 +388,16 @@ class SyntheticDataProvider(DataProvider):
                         factor *= self.rng.uniform(0.8, 1.2)
                     adj_factor[d, i] = factor
 
+        # A corporate action must move the RAW price path by the adjustment
+        # factor: P_adj = P_raw / adj_factor. Previously only adj_factor moved,
+        # so the pipeline's close/adj_factor series jumped by up to ±20% on a
+        # random date -- fake returns and fake limit-up/down flags.
+        open_prices = open_prices * adj_factor
+        high_prices = high_prices * adj_factor
+        low_prices = low_prices * adj_factor
+        close_prices = close_prices * adj_factor
+        vwap = vwap * adj_factor
+
         # Build MultiIndex DataFrame
         arrays = []
         for i, asset in enumerate(self._assets):

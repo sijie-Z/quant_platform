@@ -182,7 +182,13 @@ class LiveTradingEngine:
             return
 
         self._session_id = uuid.uuid4().hex[:12]
-        self._broker.connect()
+        # A failed QMT/XTP connection used to be ignored: the engine reported
+        # "started" and every order was silently rejected.
+        if not self._broker.connect():
+            message = f"Broker connection failed: {type(self._broker).__name__}"
+            logger.critical(message)
+            self._bus.publish("engine.start_blocked", {"error": message}, source="engine")
+            raise RuntimeError(message)
         self._stop_event.clear()
 
         # Pre-flight health check

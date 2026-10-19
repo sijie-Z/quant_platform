@@ -338,6 +338,7 @@ class TushareProvider(DataProvider):
         This is the standard for backtesting.
         """
         all_frames = []
+        adj_frames = []
         batch_size = 50  # Tushare API limit
 
         for i in range(0, len(codes), batch_size):
@@ -354,7 +355,9 @@ class TushareProvider(DataProvider):
                 if df is not None and len(df) > 0:
                     all_frames.append(df)
 
-                # Also try to get adj_factor
+                # Also fetch the cumulative adjustment factor. It used to be
+                # fetched, renamed and then discarded, so dividends/splits
+                # appeared as fake one-day returns.
                 try:
                     adj_df = api.adj_factor(
                         ts_code=ts_codes,
@@ -362,9 +365,9 @@ class TushareProvider(DataProvider):
                         end_date=self.end_date.replace("-", ""),
                     )
                     if adj_df is not None and len(adj_df) > 0:
-                        # Merge adj_factor into main df
-                        adj_df = adj_df.rename(columns={"adj_factor": "qfq_factor"})
-                        # Will merge after collection
+                        adj_frames.append(
+                            adj_df[["ts_code", "trade_date", "adj_factor"]]
+                        )
                 except Exception:
                     pass
 
@@ -386,13 +389,33 @@ class TushareProvider(DataProvider):
             "turnover_rate": "turnover",
         })
 
+        # Apply the cumulative adjustment factor to the RAW prices. With the
+        # factor applied, `adj_factor` (the pipeline's divisor) is 1 and
+        # `close_adj` no longer jumps on ex-dividend/ex-split dates.
+        if adj_frames:
+            adj = pd.concat(adj_frames, ignore_index=True)
+            adj["trade_date"] = pd.to_datetime(adj["trade_date"], format="%Y%m%d")
+            adj = adj.rename(columns={
+                "ts_code": "asset", "trade_date": "date", "adj_factor": "cum_factor",
+            })
+            df = df.merge(adj, on=["date", "asset"], how="left")
+            df["cum_factor"] = df["cum_factor"].fillna(1.0)
+            for column in ("open", "high", "low", "close"):
+                df[column] = df[column] * df["cum_factor"]
+            df = df.drop(columns=["cum_factor"])
+        else:
+            logger.warning(
+                "Tushare adj_factor unavailable — prices are UNADJUSTED; "
+                "dividends and splits will appear as price jumps"
+            )
+
         # Set MultiIndex
         df = df.set_index(["date", "asset"]).sort_index()
 
         # Add derived columns
         df["vwap"] = df["amount"] / (df["volume"] * 100)  # VWAP approximation
         df["vwap"] = df["vwap"].replace([np.inf, -np.inf], df["close"])
-        df["adj_factor"] = 1.0  # qfq already adjusted, factor = 1
+        df["adj_factor"] = 1.0  # hfq adjustment already applied above
 
         # Handle suspensions: volume=0 means suspended
         df.loc[df["volume"] <= 0, ["open", "high", "low", "close", "vwap"]] = np.nan

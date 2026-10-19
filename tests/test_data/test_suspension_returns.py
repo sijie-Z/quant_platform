@@ -73,6 +73,14 @@ def test_factor_prices_are_blank_on_suspended_days(pipeline):
     assert pipeline.get_close().where(suspended).notna().any().any()
 
 
+def test_adjusted_returns_have_no_corporate_action_jumps(pipeline):
+    """adj_factor moved without the raw price, so close_adj jumped ±20%."""
+    close = pipeline.prices["close_adj"].unstack("asset")
+    returns = close.pct_change(fill_method=None).abs()
+
+    assert returns.max().max() < 0.12
+
+
 def test_lagged_return_ic_is_zero_on_pure_noise(pipeline):
     returns = pipeline.returns
     lagged = returns.shift(1)
