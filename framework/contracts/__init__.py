@@ -1,9 +1,13 @@
 """Capability-layer Protocols (stable interfaces).
 
-Per docs/ARCHITECTURE_V2.md ADR-0004 (Protocol Before Plugin), interfaces are locked before
-implementations. Each Protocol here has at least one Reference Implementation
-(`ref/`); new providers MUST implement the existing Protocol rather than
-spawning a parallel interface.
+STATUS: PROPOSAL (2026-10) — six Protocols, zero conforming production
+implementations. Nothing that runs research imports this package; it is an
+interface proposal, not an enforced contract. See docs/DEAD_CODE_STATUS.md
+and issue #70.
+
+Per docs/ARCHITECTURE_V2.md ADR-0004 (Protocol Before Plugin), interfaces are
+locked before implementations. There is no `ref/` directory today: the
+"reference implementation" claim this docstring used to make was false.
 
 Protocols defined:
     MarketDataProvider   — daily OHLCV + fundamentals, with explicit adjust + bias flags

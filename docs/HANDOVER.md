@@ -235,9 +235,11 @@
 | #67/#68/#73/#78 | 文档状态标注：`framework/__init__.py` 去掉不存在的 CONSTITUTION/ARCHITECTURE/import-linter 引用与 `registry`/`trust` 导出；4 份架构文档加 STATUS 横幅，修正 import-linter 表述、风险阈值与 README 中的错误路径 | `framework/__init__.py`、`docs/*.md`、`README.md` |
 | #62 | IC 监控滚动计算从 O(n·window) 改为“每日 IC 只算一次 + 滚动平均”；测试耗时 233s → 7s，Spearman 调用 14,931 → 237 | `factors/ic_monitor.py` |
 | #69 | 双导入身份：`pyproject.toml` 改为把仓库根目录安装为 `quant_platform`（不再把 46 个子目录装成顶层包）；移除 flat 别名 sys.path 与导入；CI/Docker 去掉 PYTHONPATH 垫片；新增 `tests/test_architecture/test_import_identity.py` 守卫 | `pyproject.toml`、`.github/workflows/ci.yml`、`Dockerfile`、`tests/conftest.py` 及多处导入 |
+| #74 | 订单模型收敛：broker 层 `Order` 更名为 `BrokerOrder`（保留 `Order` 别名），三组枚举统一到 `execution.models`，新增与 OMS 模型的双向转换 `to_execution_order()` / `from_execution_order()`；broker 特有字段保留在 DTO 层 | `trading/broker.py` |
+| #70/#77 | 未接线模块标注：7 个零运行时导入的目录在 `__init__.py` 加 `STATUS:` 横幅，新增 `docs/DEAD_CODE_STATUS.md` 与守卫测试；删除/接入留作显式决策 | `framework/contracts/`、`services/`、`kernel/`、`shared/`、`regime_router/`、`compliance/`、`research/` |
 
 另外修掉了三处 pandas 3.x 兼容问题（`resample("M")`、`rolling(axis=1)`、零价格 `pct_change`），它们在本机全局 pandas 3.0.6 下会让 17 个测试失败；在仓库锁定的 2.1.3 下同样成立。
 
 验证：全量测试 **1678 passed / 3 skipped / 0 failed**（3m58s；#62 修复前同一套件 6m53s），ruff 全绿。
 
-仍未处理的交接项：#63（第一个真实研究）、#74（两份 Order）、#70/#77（契约与死代码）。
+仍未处理的交接项：#63（第一个真实研究，需要真实 A 股数据）；以及 #70/#77 中每个未接线目录的最终"接入 / 删除"决定。
