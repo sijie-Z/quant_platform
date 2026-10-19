@@ -159,3 +159,60 @@ class TestInstrumentKeyAliases:
         })
         assert approved is True
         assert breaches == []
+
+
+class TestDirectionAwareChecks:
+    """Sells reduce exposure and must not be blocked like buys."""
+
+    def _monitor(self, daily_pnl: float = 0.0) -> RiskMonitor:
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(
+            portfolio_value=10_000_000,
+            daily_pnl=daily_pnl,
+            positions={
+                "600519": {"value": 1_000_000, "weight": 0.10, "sector": "Tech"},
+            },
+            sector_weights={"Tech": 0.10},
+        )
+        return monitor
+
+    def test_selling_is_not_blocked_by_the_position_cap(self):
+        approved, breaches = self._monitor().check_pre_trade({
+            "ticker": "600519", "side": "sell", "quantity": 10_000, "price": 100,
+        })
+
+        assert approved is True
+        assert not any(b.breach_type == BreachType.POSITION_LIMIT for b in breaches)
+
+    def test_sell_is_allowed_after_a_daily_loss_breach(self):
+        approved, _ = self._monitor(daily_pnl=-400_000).check_pre_trade({
+            "ticker": "600519", "side": "sell", "quantity": 1_000, "price": 100,
+        })
+
+        assert approved is True
+
+    def test_kill_switch_still_allows_a_reducing_sell(self):
+        monitor = self._monitor()
+        monitor.kill_switch_active = True
+
+        approved, _ = monitor.check_pre_trade({
+            "ticker": "600519", "side": "sell", "quantity": 1_000, "price": 100,
+        })
+
+        assert approved is True
+
+    def test_sector_limit_includes_the_incoming_order(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(
+            portfolio_value=10_000_000,
+            daily_pnl=0,
+            positions={"NEW": {"value": 0, "weight": 0, "sector": "Tech"}},
+            sector_weights={"Tech": 0.29},
+        )
+
+        approved, breaches = monitor.check_pre_trade({
+            "ticker": "NEW", "side": "buy", "quantity": 5_000, "price": 100,
+        })
+
+        assert approved is False
+        assert any(b.breach_type == BreachType.SECTOR_LIMIT for b in breaches)

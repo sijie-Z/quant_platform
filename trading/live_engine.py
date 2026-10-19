@@ -251,8 +251,26 @@ class LiveEngine:
         n_stocks = len(self._returns.columns)
 
         # ── 平到期仓位 ──
+        # Expired positions must be SOLD, not filtered out of the list: the
+        # old one-line filter made their market value vanish from equity
+        # without crediting cash or charging the exit cost (#3).
         date_str = str(date)[:10]
-        self.state.positions = [p for p in self.state.positions if p.exit_date > date_str]
+        exit_price_row = self._prices.loc[date] if date in self._prices.index else None
+        exit_cost = COST_BPS / 10000
+        surviving = []
+        for pos in self.state.positions:
+            if pos.exit_date > date_str:
+                surviving.append(pos)
+                continue
+            px = exit_price_row.get(pos.asset) if exit_price_row is not None else None
+            if px is None or pd.isna(px) or px <= 0:
+                # No observable exit price: keep the position rather than
+                # silently vaporising its value.
+                surviving.append(pos)
+                continue
+            self.state.cash += pos.shares * float(px) * (1 - exit_cost)
+            self.state.total_trades += 1
+        self.state.positions = surviving
 
         # ── Vol filter ──
         market_vol = self._returns.mean(axis=1).rolling(20).std()

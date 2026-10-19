@@ -40,21 +40,31 @@ def sharpe_ratio(daily_returns: pd.Series, risk_free: float = 0.03) -> float:
 
 
 def sortino_ratio(daily_returns: pd.Series, risk_free: float = 0.03) -> float:
-    """Sortino ratio: uses downside deviation instead of total vol."""
+    """Sortino ratio: excess return over downside deviation.
+
+    Downside deviation is ``sqrt(mean(min(r - MAR, 0)^2))`` over *all*
+    observations. Taking the standard deviation of only the negative returns
+    (the old implementation) measures their dispersion around their own mean,
+    returns 0 for constant-sized losses, and ignores how often losses occur.
+    """
+    daily_returns = daily_returns.dropna()
+    if len(daily_returns) < 2:
+        return 0.0
     ann_ret = annualized_return(daily_returns)
-    downside = daily_returns[daily_returns < 0]
-    if len(downside) < 2:
+    daily_mar = risk_free / TRADING_DAYS_PER_YEAR
+    downside = np.minimum(daily_returns.to_numpy() - daily_mar, 0.0)
+    downside_dev = np.sqrt(np.mean(downside ** 2)) * np.sqrt(TRADING_DAYS_PER_YEAR)
+    if downside_dev < 1e-10:
         return 0.0
-    downside_std = downside.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-    if downside_std < 1e-10:
-        return 0.0
-    return (ann_ret - risk_free) / downside_std
+    return (ann_ret - risk_free) / downside_dev
 
 
 def max_drawdown(daily_returns: pd.Series) -> tuple[float, pd.Timestamp, pd.Timestamp]:
-    """Maximum drawdown: largest peak-to-trough decline.
+    """Maximum drawdown: largest peak-to-trough decline, measured from inception.
 
-    Uses Numba JIT acceleration when available, falling back to Pandas.
+    The wealth path is prepended with 1.0 before the peak/trough scan: starting
+    at the first *return* made a first-day loss invisible, so a series
+    ``[-10%, -10%]`` reported -10% instead of the true -19%.
 
     Returns:
         (max_dd, peak_date, trough_date)
@@ -64,24 +74,25 @@ def max_drawdown(daily_returns: pd.Series) -> tuple[float, pd.Timestamp, pd.Time
         max_drawdown_numba,
     )
 
+    values = daily_returns.dropna()
+    if len(values) == 0:
+        return 0.0, pd.NaT, pd.NaT
+
     if HAS_NUMBA:
-        max_dd, peak_idx, trough_idx = max_drawdown_numba(daily_returns)
+        max_dd, peak_idx, trough_idx = max_drawdown_numba(values)
+    else:
+        cumulative = np.concatenate(([1.0], (1 + values).cumprod().to_numpy()))
+        running_max = np.maximum.accumulate(cumulative)
+        drawdown = (cumulative - running_max) / running_max
+        max_dd = float(drawdown.min())
+        trough_idx = int(drawdown.argmin())
+        peak_idx = int(running_max[:trough_idx + 1].argmax())
 
-        # Convert indices back to dates
-        cumulative = (1 + daily_returns.dropna()).cumprod()
-        dates = cumulative.index
-        peak_date = dates[peak_idx]
-        trough_date = dates[trough_idx]
-        return max_dd, peak_date, trough_date
-
-    # Original Pandas implementation
-    cumulative = (1 + daily_returns).cumprod()
-    running_max = cumulative.expanding().max()
-    drawdown = (cumulative - running_max) / running_max
-    max_dd = drawdown.min()
-    trough_date = drawdown.idxmin()
-    peak_date = running_max.loc[:trough_date].idxmax()
-    return max_dd, peak_date, trough_date
+    # Index 0 is inception; index k (k >= 1) is the k-th return.
+    last = len(values) - 1
+    peak_date = values.index[min(max(peak_idx - 1, 0), last)]
+    trough_date = values.index[min(max(trough_idx - 1, 0), last)]
+    return float(max_dd), peak_date, trough_date
 
 
 def calmar_ratio(daily_returns: pd.Series) -> float:

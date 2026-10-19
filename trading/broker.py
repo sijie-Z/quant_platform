@@ -206,6 +206,15 @@ class BrokerInterface(ABC):
     def get_account(self) -> dict:
         """Get account info (cash, equity, etc.)."""
 
+    def new_trading_day(self) -> None:
+        """Release T+1 locks for a new trading day.
+
+        Default no-op: brokers that settle remotely (QMT/XTP) need no local
+        rollover. SimulatedBroker overrides it, and the live engine calls it
+        on every calendar-date change.
+        """
+        return None
+
 
 class SimulatedBroker(BrokerInterface):
     """Paper trading broker with real LOB matching.
@@ -359,6 +368,31 @@ class SimulatedBroker(BrokerInterface):
             order.error_msg = "Not connected"
             return order
 
+        # Market orders arrive with price 0. Without a reference price the
+        # affordability check asked for 0 shares and rejected every market
+        # buy; the book and slippage also need a reference.
+        if order.order_type == OrderType.MARKET and order.price <= 0:
+            reference = self._market_prices.get(order.code, 0.0)
+            book = self._order_books.get(order.code)
+            if reference <= 0 and book is not None:
+                depth = book.get_depth_snapshot(levels=1)
+                if depth.get("asks"):
+                    first = depth["asks"][0]
+                    reference = float(
+                        first["price"] if isinstance(first, dict) else first[0]
+                    )
+                elif depth.get("bids"):
+                    first = depth["bids"][0]
+                    reference = float(
+                        first["price"] if isinstance(first, dict) else first[0]
+                    )
+            if reference <= 0:
+                order.status = OrderStatus.REJECTED
+                order.error_msg = "No reference price for market order"
+                self._orders.append(order)
+                return order
+            order.price = reference
+
         # Validate lot size (per-instrument)
         lot_size = self._get_lot_size(order.code)
         if order.quantity % lot_size != 0:
@@ -420,6 +454,13 @@ class SimulatedBroker(BrokerInterface):
         for trade in trades:
             total_filled += trade.quantity
             total_value += trade.price * trade.quantity
+
+        # IOC semantics: the broker reports a rejection or partial fill, so
+        # the unfilled remainder must not rest in the book. Leaving it there
+        # let a later order trade against a sell the broker had already
+        # reported as rejected, minting shares.
+        if total_filled < order.quantity:
+            book.cancel_order(order.order_id)
 
         if total_filled == 0:
             # No liquidity — IOC-style: cancel
@@ -549,11 +590,23 @@ class SimulatedBroker(BrokerInterface):
         return None
 
     def update_market_prices(self, prices: dict[str, float]):
-        """Update position prices from real-time market data."""
+        """Update position prices and refresh synthetic book liquidity."""
         self._market_prices.update(prices)
         for code, pos in self._positions.items():
             if code in prices:
                 pos.update_price(prices[code])
+
+        # Re-seed the market-maker quotes around the new reference price.
+        # The book was seeded once, so a limit order at the *new* market price
+        # could fill against stale quotes from the old one (phantom profit).
+        for code, price in prices.items():
+            book = self._order_books.get(code)
+            if book is None or not price or price <= 0:
+                continue
+            for order_id, resting in list(getattr(book, "_orders", {}).items()):
+                if getattr(resting, "source", "") == "market_maker":
+                    book.cancel_order(order_id)
+            self._seed_book(book, code, float(price))
 
     def new_trading_day(self):
         """Reset T+1 restrictions. Call at start of each trading day."""

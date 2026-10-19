@@ -406,26 +406,25 @@ class BarraModel:
                 logger.warning("Factor '%s' not in exposures, using zeros", name)
                 factor_dfs.append(pd.DataFrame(0, index=dates, columns=returns.columns))
 
-        for date in dates:
-            # Build (asset x factor) exposure matrix for this date
-            exposure_rows = {}
-            for asset in returns.columns:
-                row = []
-                for fdf in factor_dfs:
-                    if date in fdf.index and asset in fdf.columns:
-                        val = fdf.loc[date, asset]
-                        row.append(val if not np.isnan(val) else 0)
-                    else:
-                        row.append(0)
-                exposure_rows[asset] = row
+        # Stack the exposure panels once. The old loop did ten scalar pandas
+        # lookups per asset per date (~5.5M at the default panel size), which
+        # dominated the cost of a Barra request.
+        stacked = np.stack(
+            [
+                frame.reindex(index=dates, columns=returns.columns)
+                .to_numpy(dtype=float)
+                for frame in factor_dfs
+            ],
+            axis=2,
+        )
+        stacked = np.nan_to_num(stacked, nan=0.0)
 
+        for i, date in enumerate(dates):
             exposures = pd.DataFrame(
-                exposure_rows.values(),
-                index=exposure_rows.keys(),
-                columns=self.factor_names,
+                stacked[i], index=returns.columns, columns=self.factor_names,
             )
 
-            daily_returns = returns.loc[date]
+            daily_returns = returns.iloc[i]
             result = self._cross_sectional_regression(daily_returns, exposures)
             result.date = str(date)
             self.factor_returns_history.append(result)

@@ -41,10 +41,22 @@ def estimate_covariance(
     """
     from quant_platform.utils.numba_accelerator import HAS_NUMBA, covariance_numba
 
-    recent = returns.iloc[-lookback:].dropna(axis=1, how="any")
+    window = returns.iloc[-lookback:]
+    # Keep assets with at least half the window populated, matching the
+    # engine's 50% filter. Requiring 100% (the old `dropna(how="any")`)
+    # silently removed every stock that was suspended even once -- and A-share
+    # suspensions are common -- which biased optimized portfolios toward
+    # continuously traded names and could starve the optimizer into its
+    # equal-weight fallback. Missing returns are treated as flat (0), the same
+    # convention the P&L simulation uses for a suspended holding.
+    coverage = window.notna().mean()
+    keep = coverage[coverage >= 0.5].index
+    recent = window[keep].fillna(0.0)
 
     if recent.shape[1] < 2:
-        raise ValueError(f"Need at least 2 assets with full data, got {recent.shape[1]}")
+        raise ValueError(
+            f"Need at least 2 assets with 50% data coverage, got {recent.shape[1]}"
+        )
 
     if method == "sample":
         cov = recent.cov().values

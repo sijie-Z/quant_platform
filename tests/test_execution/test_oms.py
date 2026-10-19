@@ -220,3 +220,37 @@ class TestSimulatedExchange:
         self.exchange.simulate_trading_day({"600519": 1800.0})
         assert order.status == OrderStatus.FILLED
         assert "600519" in self.om.positions
+
+
+class TestBookConsistency:
+    """Fills must not drive cash negative or over-sell a position."""
+
+    def test_an_oversized_buy_is_rejected_before_cash_moves(self):
+        om = OrderManager(initial_cash=10_000)
+        order = om.create_order("600519", "buy", 100)
+        om.submit_order(order.order_id)
+
+        with pytest.raises(ValueError, match="Insufficient cash"):
+            om.fill_order(order.order_id, price=100.0)
+
+        assert om.cash == 10_000
+        assert "600519" not in om.positions
+
+    def test_two_sells_cannot_share_the_same_available_shares(self):
+        om = OrderManager(initial_cash=1_000_000)
+        buy = om.create_order("600519", "buy", 100)
+        om.submit_order(buy.order_id)
+        om.fill_order(buy.order_id, price=10.0)
+        om.new_trading_day()  # release T+1
+
+        first = om.create_order("600519", "sell", 100)
+        second = om.create_order("600519", "sell", 100)
+        om.submit_order(first.order_id)
+        om.submit_order(second.order_id)
+
+        om.fill_order(first.order_id, price=11.0)
+        with pytest.raises(ValueError, match="Insufficient sellable position"):
+            om.fill_order(second.order_id, price=11.0)
+
+        assert "600519" not in om.positions
+        assert om.cash > 0

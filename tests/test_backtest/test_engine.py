@@ -72,6 +72,39 @@ class TestSimulatePnl:
         assert engine.turnover_history.iloc[0] == pytest.approx(0.5)
         assert engine.turnover_history.iloc[-1] == pytest.approx(0.30)
 
+    def test_weights_drift_between_rebalances(self):
+        """A held portfolio must not be silently rebalanced every day."""
+        dates = pd.date_range("2024-01-01", periods=3, freq="D")
+        returns = pd.DataFrame(
+            {"A": [0.0, 0.5, 0.5], "B": [0.0, 0.0, 0.0]}, index=dates,
+        )
+        engine = BacktestEngine(
+            rebalance_frequency="monthly",
+            cost_model=CostModel(commission=0, stamp_tax=0, slippage=0),
+        )
+        engine.weights_history = {dates[0]: pd.Series({"A": 0.5, "B": 0.5})}
+
+        engine._simulate_pnl(returns)
+
+        # day 1: 50/50 -> +25%. A's weight drifts to 60%, so day 2 earns 30%.
+        # Daily rebalancing would have produced 25% again.
+        assert engine.daily_returns.iloc[1] == pytest.approx(0.25)
+        assert engine.daily_returns.iloc[2] == pytest.approx(0.30)
+
+    def test_equal_weight_benchmark_uses_per_date_universe(self):
+        dates = pd.bdate_range("2024-01-01", periods=100)
+        returns = pd.DataFrame(0.0, index=dates, columns=["A", "B", "C"])
+        returns.loc[dates[:60], "C"] = np.nan
+        returns.loc[dates[60]:, "C"] = 0.05
+
+        engine = BacktestEngine(benchmark="equal_weight")
+        benchmark = engine._compute_equal_weight_benchmark(returns)
+
+        assert benchmark.loc[dates[59]] == pytest.approx(0.0)
+        # The late-listing asset enters on its first observable date; the old
+        # whole-sample filter dropped it from every date.
+        assert benchmark.loc[dates[60]] == pytest.approx(0.05 / 3)
+
 
 class TestSummaryReportsOptimizerFallbacks:
     def test_fallback_count_and_effective_optimizer_are_exposed(self):

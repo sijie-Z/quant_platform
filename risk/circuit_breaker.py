@@ -135,7 +135,13 @@ class RiskMonitor:
         if order.get("ticker") != instrument:
             order = {**order, "ticker": instrument}
 
-        if self.kill_switch_active:
+        side = str(order.get("side", "buy")).lower()
+        is_reducing = (
+            side in ("sell", "s")
+            and float(self.positions.get(instrument, {}).get("value", 0)) > 0
+        )
+
+        if self.kill_switch_active and not is_reducing:
             breaches.append(RiskBreach(
                 breach_type=BreachType.POSITION_LIMIT,
                 severity=RiskLevel.KILL,
@@ -159,14 +165,19 @@ class RiskMonitor:
         if sector_breach:
             breaches.append(sector_breach)
 
-        # 4. Daily loss check
+        # 4. Daily loss check. A sell that reduces exposure is how the book
+        # recovers from a breach; blocking it turns a bad day into a trap.
         loss_breach = self._check_daily_loss()
         if loss_breach:
+            if is_reducing:
+                loss_breach.auto_action = "warn"
             breaches.append(loss_breach)
 
         # 5. Drawdown check
         dd_breach = self._check_drawdown()
         if dd_breach:
+            if is_reducing:
+                dd_breach.auto_action = "warn"
             breaches.append(dd_breach)
 
         # Update risk level
@@ -213,20 +224,29 @@ class RiskMonitor:
         return None
 
     def _check_position_limit(self, order: dict) -> RiskBreach | None:
-        """Check single position size limit."""
+        """Check single position size limit, direction-aware.
+
+        The old formula added `price * quantity` for both sides, so selling a
+        position looked like opening one: a full exit of a 10% holding was
+        reported as a 110% position and blocked. Sells are risk-reducing and
+        pass this check; only an increasing order can breach the cap.
+        """
         ticker = order.get("ticker", "")
-        price = order.get("price", 0)
-        quantity = order.get("quantity", 0)
+        side = str(order.get("side", "buy")).lower()
+        price = float(order.get("price", 0) or 0)
+        quantity = float(order.get("quantity", 0) or 0)
 
         if self.portfolio_value <= 0:
             return None
 
-        # Current position + new order value
-        current_value = self.positions.get(ticker, {}).get("value", 0)
-        new_value = current_value + price * quantity
+        current_value = float(self.positions.get(ticker, {}).get("value", 0))
+        signed_notional = price * quantity
+        if side in ("sell", "s"):
+            signed_notional = -signed_notional
+        new_value = max(0.0, current_value + signed_notional)
         new_weight = new_value / self.portfolio_value
 
-        if new_weight > self.limits.max_single_position_pct:
+        if side in ("buy", "b") and new_weight > self.limits.max_single_position_pct:
             return RiskBreach(
                 breach_type=BreachType.POSITION_LIMIT,
                 severity=RiskLevel.RED if new_weight > self.limits.max_single_position_pct * 2 else RiskLevel.ORANGE,
@@ -239,19 +259,27 @@ class RiskMonitor:
         return None
 
     def _check_sector_limit(self, order: dict) -> RiskBreach | None:
-        """Check sector concentration limit."""
+        """Check sector concentration limit, including this order's delta."""
         ticker = order.get("ticker", "")
+        side = str(order.get("side", "buy")).lower()
         sector = self.positions.get(ticker, {}).get("sector", "Unknown")
 
-        current_sector_weight = self.sector_weights.get(sector, 0)
-        if current_sector_weight > self.limits.max_sector_pct:
+        current_sector_weight = float(self.sector_weights.get(sector, 0))
+        if side in ("buy", "b") and self.portfolio_value > 0:
+            price = float(order.get("price", 0) or 0)
+            quantity = float(order.get("quantity", 0) or 0)
+            projected = (current_sector_weight * self.portfolio_value + price * quantity) / self.portfolio_value
+        else:
+            projected = current_sector_weight
+
+        if side in ("buy", "b") and projected > self.limits.max_sector_pct:
             return RiskBreach(
                 breach_type=BreachType.SECTOR_LIMIT,
                 severity=RiskLevel.ORANGE,
-                message=f"Sector {sector} weight {current_sector_weight:.1%} exceeds limit {self.limits.max_sector_pct:.1%}",
-                current_value=current_sector_weight,
+                message=f"Sector {sector} weight {projected:.1%} exceeds limit {self.limits.max_sector_pct:.1%}",
+                current_value=projected,
                 limit_value=self.limits.max_sector_pct,
-                auto_action="warn",
+                auto_action="block",
             )
         return None
 

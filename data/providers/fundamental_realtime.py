@@ -258,10 +258,11 @@ class FundamentalDataProvider:
             code=code,
             pe_ttm=float(d.get("f9", 0) or 0),
             pb=float(d.get("f23", 0) or 0),
-            roe=float(d.get("f115", 0) or 0),
-            gross_margin=float(d.get("f114", 0) or 0),
-            net_margin=float(d.get("f116", 0) or 0),
-            revenue_growth=float(d.get("f117", 0) or 0),
+            # Eastmoney's f114/f115 are static/TTM PE, not margins, and
+            # f116/f117 are total/circulating market cap -- the old mapping
+            # reported the market cap as net_margin and revenue_growth.
+            market_cap=float(d.get("f116", 0) or 0),
+            circulating_cap=float(d.get("f117", 0) or 0),
         )
 
     def _fetch_sina(self, code: str) -> FundamentalMetrics:

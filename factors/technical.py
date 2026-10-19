@@ -311,10 +311,14 @@ class BreakoutIgnitionFactor(BaseFactor):
             # Use price change magnitude as volume proxy
             volume = prices.pct_change(fill_method=None).abs()
 
-        # Return shock: z-score of k-period return vs history
+        # Return shock: z-score of k-period return vs history.
+        # Compounded return in log space: rolling.apply(lambda: prod) ran once
+        # per asset per window (~42 s at the default panel size).
         ret = prices.pct_change(fill_method=None)
-        k_ret = ret.rolling(self._ret_win).apply(
-            lambda x: (1 + x).prod() - 1 if len(x) == self._ret_win else 0
+        k_ret = np.expm1(
+            np.log1p(ret).rolling(
+                self._ret_win, min_periods=self._ret_win,
+            ).sum()
         )
         ref_mean = k_ret.rolling(self._ref_win).mean()
         ref_std = k_ret.rolling(self._ref_win).std().replace(0, np.nan)

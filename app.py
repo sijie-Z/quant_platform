@@ -35,7 +35,24 @@ _DIST_DIR = _FRONTEND_DIR / "dist"
 
 
 class APITokenMiddleware(BaseHTTPMiddleware):
-    """Require a bearer token for /api routes when QUANT_API_TOKEN is set."""
+    """Require a bearer token for /api routes when QUANT_API_TOKEN is set.
+
+    When no token is configured, sensitive trading/OMS endpoints are limited
+    to loopback callers. Before this, the default configuration (and the
+    docker-compose file) served order placement, the OMS blotter and the kill
+    switch to any client that could reach the port.
+    """
+
+    SENSITIVE_PREFIXES = (
+        "/api/trading",
+        "/api/oms",
+        "/api/monitor/config",
+        "/api/monitor/kill-switch",
+        "/api/core/risk",
+        "/api/config",
+        "/api/portfolio/import",
+    )
+    LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
 
     async def dispatch(self, request: Request, call_next):
         token = os.environ.get("QUANT_API_TOKEN", "")
@@ -45,6 +62,13 @@ class APITokenMiddleware(BaseHTTPMiddleware):
             api_key = request.headers.get("X-API-Key", "")
             if api_key != token and auth != f"Bearer {token}":
                 return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
+        elif not token and path.startswith(self.SENSITIVE_PREFIXES):
+            host = request.client.host if request.client else ""
+            if host not in self.LOOPBACK_HOSTS:
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Set QUANT_API_TOKEN to call trading/OMS endpoints remotely"},
+                )
         return await call_next(request)
 
 

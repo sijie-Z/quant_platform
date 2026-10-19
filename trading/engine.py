@@ -17,6 +17,7 @@ See trading/signal_generator.py for details.
 
 from __future__ import annotations
 
+import math
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -156,6 +157,13 @@ class LiveTradingEngine:
         self._last_prices_update = ""
         self._cycle_log: list[CycleResult] = []
         self._session_id = ""
+        # Serialises the daemon loop against manual run-once triggers.
+        self._cycle_lock = threading.Lock()
+        # Refuse to size orders from quotes older than this.
+        self._max_quote_age_seconds = 120
+        # T+1 rollover and daily P&L baseline.
+        self._trading_day = ""
+        self._day_start_equity: float | None = None
 
         # NAV calculator
         self._nav_calc = None
@@ -360,9 +368,41 @@ class LiveTradingEngine:
             self._sm.transition(PortfolioState.HALTED, reason)
 
     def _execute_cycle(self) -> CycleResult:
+        """Run one cycle, serialised against the background loop.
+
+        `POST /trading/run-once` used to execute this from the FastAPI thread
+        while `_run_loop` executed it independently. Both read the same
+        position book and could place the same order twice -- duplicate real
+        orders with a live broker, corrupted positions in paper mode.
+        """
+        if not self._cycle_lock.acquire(blocking=False):
+            logger.warning("Cycle already running; skipping duplicate trigger")
+            account = self._broker.get_account()
+            return CycleResult(
+                cycle_id=self._cycle_count,
+                timestamp=datetime.now().isoformat(),
+                portfolio_value=account.get("total_equity", 0),
+                cash=account.get("cash", 0),
+                n_positions=account.get("n_positions", 0),
+            )
+        try:
+            return self._execute_cycle_body()
+        finally:
+            self._cycle_lock.release()
+
+    def _execute_cycle_body(self) -> CycleResult:
         self._cycle_count += 1
         now = datetime.now().isoformat()
         self._last_update = now
+
+        # New calendar day: release T+1 locks and reset the daily P&L
+        # baseline. Nothing in production ever called new_trading_day(), so
+        # shares bought by this engine stayed unsellable forever.
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self._trading_day:
+            self._trading_day = today
+            self._day_start_equity = None
+            self._broker.new_trading_day()
 
         # Recover once the kill switch has been cleared. HALTED only reaches
         # READY and INIT (core/state_machine.py:48), so resuming is two hops.
@@ -385,6 +425,30 @@ class LiveTradingEngine:
         # Step 1: Fetch prices → publish market.tick events
         self._fetch_prices()
 
+        # Refuse to place orders from stale quotes. A failed feed used to be
+        # swallowed, leaving the engine to size orders from the last good (or
+        # NaN) prices indefinitely.
+        if self._last_prices_update:
+            age = (
+                datetime.now() - datetime.fromisoformat(self._last_prices_update)
+            ).total_seconds()
+            if age > self._max_quote_age_seconds:
+                logger.error(
+                    "Quotes are %.0fs old (limit %ss); skipping order placement",
+                    age, self._max_quote_age_seconds,
+                )
+                self._bus.publish("system.error", {
+                    "error": f"stale market data: last update {self._last_prices_update}",
+                    "age_seconds": age,
+                }, source="engine")
+                account = self._broker.get_account()
+                cycle.portfolio_value = account.get("total_equity", 0)
+                cycle.cash = account.get("cash", 0)
+                cycle.n_positions = account.get("n_positions", 0)
+                if self._sm.state == PortfolioState.REBALANCING:
+                    self._sm.transition(PortfolioState.TRADING, "cycle skipped: stale quotes")
+                return cycle
+
         # Step 2: Generate signals → publish signal.generated events
         signals = self._generate_signals()
         cycle.signals = [s.__dict__ for s in signals]
@@ -401,16 +465,27 @@ class LiveTradingEngine:
         # Update risk monitor portfolio state
         positions_for_risk = {}
         sector_weights = {}
-        for pos in self._broker.get_positions():
+        positions = self._broker.get_positions()
+        for pos in positions:
+            weight = pos.market_value / max(total_equity, 1)
+            sector = getattr(pos, "sector", "") or "Unknown"
             positions_for_risk[pos.code] = {
                 "value": pos.market_value,
-                "weight": pos.market_value / max(total_equity, 1),
-                "sector": "Unknown",
+                "weight": weight,
+                "sector": sector,
             }
+            sector_weights[sector] = sector_weights.get(sector, 0.0) + weight
+
+        # Daily P&L, not cumulative-since-inception. Feeding total_pnl here
+        # meant a profitable run never tripped the daily-loss breaker and a
+        # cumulative loss beyond 3% blocked every order forever.
+        if self._day_start_equity is None:
+            self._day_start_equity = total_equity
+        daily_pnl = total_equity - self._day_start_equity
 
         self._risk.update_portfolio_state(
             portfolio_value=total_equity,
-            daily_pnl=account.get("total_pnl", 0),
+            daily_pnl=daily_pnl,
             positions=positions_for_risk,
             sector_weights=sector_weights,
         )
@@ -515,25 +590,34 @@ class LiveTradingEngine:
             from quant_platform.trading.realtime import RealTimeMarket
             rt = RealTimeMarket()
             quotes = rt.get_quotes(self._universe)
+            updated = 0
             for q in quotes:
-                self._current_prices[q.code] = q.price
+                # A NaN survives `float(value or 0)` in the feed and then
+                # poisons equity, sizing and the broker's marks. Drop it here.
+                price = float(q.price)
+                if not math.isfinite(price) or price <= 0:
+                    logger.warning("Dropping invalid quote for %s: %r", q.code, q.price)
+                    continue
+                self._current_prices[q.code] = price
+                updated += 1
                 if q.code not in self._price_history:
                     self._price_history[q.code] = []
-                self._price_history[q.code].append(q.price)
+                self._price_history[q.code].append(price)
                 if len(self._price_history[q.code]) > 60:
                     self._price_history[q.code] = self._price_history[q.code][-60:]
 
                 # Publish tick event
                 self._bus.publish("market.tick", {
-                    "code": q.code, "price": q.price,
+                    "code": q.code, "price": price,
                     "change_pct": q.change_pct, "volume": q.volume,
                 }, source="realtime")
 
             if isinstance(self._broker, SimulatedBroker):
                 self._broker.update_market_prices(self._current_prices)
 
-            self._last_prices_update = datetime.now().isoformat()
-            self._bus.publish("market.snapshot", {"count": len(quotes)}, source="realtime")
+            if updated:
+                self._last_prices_update = datetime.now().isoformat()
+            self._bus.publish("market.snapshot", {"count": updated}, source="realtime")
         except Exception as e:
             logger.warning("Price fetch failed: %s", e)
 
@@ -621,7 +705,7 @@ class LiveTradingEngine:
 
     def _signal_to_order(self, signal: TradeSignal, total_equity: float) -> Order | None:
         price = self._current_prices.get(signal.code)
-        if not price or price <= 0:
+        if price is None or not math.isfinite(price) or price <= 0:
             return None
 
         if signal.side == OrderSide.BUY:

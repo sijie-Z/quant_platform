@@ -257,17 +257,21 @@ class CapacityEstimator:
                                 capped_days += 1
                                 max_trade = vol_cny * self.max_participation
 
-                                # Extra impact cost for the capped portion
+                                # Extra impact cost for the capped portion.
+                                # `impact.total` is a per-share cost, so it
+                                # must be multiplied by the share count; the
+                                # old code added it as if it were currency.
                                 excess = trade_cny - max_trade
                                 vol_val = volatility.loc[date].get(asset, 0.02) if date in volatility.index else 0.02
                                 price_val = prc.get(asset, 100)
+                                shares = int(excess / max(price_val, 1))
                                 impact = self.impact_model.estimate(
-                                    order_quantity=int(excess / max(price_val, 1)),
+                                    order_quantity=shares,
                                     market_volume=int(vol_cny / max(price_val, 1)),
                                     volatility=vol_val,
                                     price=price_val,
                                 )
-                                capped_impact += impact.total
+                                capped_impact += impact.total * shares
 
                 # Standard turnover cost
                 turnover = abs(trade_weights).sum() / 2

@@ -132,20 +132,24 @@ def _max_drawdown_numba(cumulative: np.ndarray) -> tuple:
 
 
 def max_drawdown_pandas(returns: pd.Series) -> tuple:
-    """Pandas version."""
-    cumulative = (1 + returns).cumprod().values
+    """Pandas version, measured from inception."""
+    cumulative = np.concatenate(
+        ([1.0], (1 + returns.dropna()).cumprod().to_numpy())
+    )
     running_max = np.maximum.accumulate(cumulative)
     drawdown = (cumulative - running_max) / running_max
     max_dd = drawdown.min()
     trough_idx = drawdown.argmin()
     peak_idx = running_max[:trough_idx + 1].argmax()
-    return float(max_dd), peak_idx, trough_idx
+    return float(max_dd), int(peak_idx), int(trough_idx)
 
 
 def max_drawdown_numba(returns: pd.Series) -> tuple:
-    """Numba-accelerated version."""
+    """Numba-accelerated version, measured from inception."""
     if HAS_NUMBA:
-        cumulative = (1 + returns.dropna()).cumprod().values
+        cumulative = np.concatenate(
+            ([1.0], (1 + returns.dropna()).cumprod().to_numpy())
+        )
         return _max_drawdown_numba(cumulative.astype(np.float64))
     return max_drawdown_pandas(returns)
 

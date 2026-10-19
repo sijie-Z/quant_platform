@@ -43,23 +43,40 @@ class Store:
         self._db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # One long-lived connection per thread. Opening a fresh SQLite
+        # connection, re-issuing the WAL pragmas and closing it on every read
+        # and write cost ~2.8 ms per operation -- ~95x the cost of the insert
+        # itself -- and a live cycle performs hundreds of them.
+        self._local = threading.local()
         self._init_schema()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return conn
 
     @contextmanager
     def _conn(self):
-        """Get a database connection."""
-        conn = sqlite3.connect(self._db_path, timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.row_factory = sqlite3.Row
+        """Get this thread's database connection and commit/rollback."""
+        conn = self._get_connection()
         try:
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        finally:
+
+    def close(self):
+        """Close this thread's connection (call before deleting the DB file)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
             conn.close()
+            self._local.conn = None
 
     def _init_schema(self):
         """Create tables if they don't exist."""

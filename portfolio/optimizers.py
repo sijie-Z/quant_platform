@@ -324,8 +324,12 @@ class RiskParityOptimizer(PortfolioOptimizer):
                 "risk parity needs a covariance matrix",
             )
 
-        # Use top assets by signal to narrow universe
-        top_n = min(len(signal.dropna()), int(1.0 / self.constraints.max_weight))
+        # Narrow the universe, but keep more names than the minimum needed to
+        # satisfy sum(w)=1 under the cap. Selecting exactly ceil(1/max_weight)
+        # names (20 at the default 5% cap) made equal weight the only feasible
+        # solution; 2x the minimum leaves room for a real risk solution.
+        min_names = int(np.ceil(1.0 / self.constraints.max_weight))
+        top_n = min(len(signal.dropna()), max(20, 2 * min_names))
         selected = signal.dropna().nlargest(top_n).index
         selected = selected.intersection(cov_matrix.index)
         selected = selected.sort_values()
@@ -341,34 +345,64 @@ class RiskParityOptimizer(PortfolioOptimizer):
 
         n = len(selected)
         w = cp.Variable(n)
-        cp.quad_form(w, cov)
 
-        # Marginal risk contributions
-        marginal_risk = cov @ w
-        risk_contribution = cp.multiply(w, marginal_risk)
-
-        # Minimize variance of risk contributions (equal risk contribution)
-        objective = cp.Minimize(cp.sum_squares(risk_contribution - cp.sum(risk_contribution) / n))
-
+        # Convex log-barrier risk-parity formulation:
+        #   min 0.5*w'*Sigma*w - (1/n)*sum(log(w))
+        #   s.t. sum(w)=1, 0 < w <= cap
+        # The old "minimise the variance of risk contributions" objective is
+        # not DCP (cvxpy raised DCPError), and it only tried ECOS, which is
+        # not installed -- so this optimizer silently always fell back to
+        # equal weight.
+        objective = cp.Minimize(
+            0.5 * cp.quad_form(w, cov) - cp.sum(cp.log(w)) / n
+        )
         constraints_list = [
             cp.sum(w) == 1.0,
-            w >= 0,
+            w >= 1e-6,
             w <= self.constraints.max_weight,
         ]
+        if sector_map is not None and self.constraints.max_sector_exposure < 1.0:
+            sectors = sector_map.reindex(selected)
+            for sector in sectors.dropna().unique():
+                mask = (sectors == sector).values.astype(float)
+                if mask.sum() > 0:
+                    constraints_list.append(
+                        mask @ w <= self.constraints.max_sector_exposure
+                    )
 
-        try:
-            problem = cp.Problem(objective, constraints_list)
-            problem.solve(solver=cp.ECOS, verbose=False)
-        except Exception as exc:
+        solvers = [
+            solver for solver in ("CLARABEL", "SCS", "ECOS")
+            if solver in cp.installed_solvers()
+        ]
+        if not solvers:
             return self._equal_weight_fallback(
                 signal, cov_matrix, prices, prev_weights, sector_map,
-                f"risk parity solver failed: {exc}",
+                "no convex solver is installed",
             )
 
-        if w.value is None or not np.all(np.isfinite(w.value)):
+        solved = False
+        last_error = ""
+        problem = None
+        for solver in solvers:
+            try:
+                problem = cp.Problem(objective, constraints_list)
+                problem.solve(solver=solver, verbose=False)
+                if (
+                    problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                    and w.value is not None
+                    and np.all(np.isfinite(w.value))
+                ):
+                    solved = True
+                    break
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+
+        if not solved:
+            status = problem.status if problem is not None else "N/A"
             return self._equal_weight_fallback(
                 signal, cov_matrix, prices, prev_weights, sector_map,
-                "risk parity solver returned no finite solution",
+                f"risk parity solver failed ({status}): {last_error or 'no optimal solution'}",
             )
 
         weights = pd.Series(w.value, index=selected)

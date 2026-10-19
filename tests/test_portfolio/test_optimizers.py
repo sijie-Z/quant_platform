@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.portfolio.optimizers import (
     EqualWeightOptimizer,
@@ -140,3 +141,19 @@ def test_solver_failure_is_counted(monkeypatch):
     assert weights.sum() > 0
     assert optimizer.fallback_count == 1
     assert "solver" in (optimizer.last_fallback_reason or "")
+
+
+def test_risk_parity_is_not_silently_equal_weight():
+    """The old objective was non-DCP and only tried the missing ECOS solver,
+    so this optimizer always fell back to equal weight."""
+    signal, cov = _make_signal_and_cov(60)
+    constraints = PortfolioConstraints(max_weight=0.10)
+    optimizer = RiskParityOptimizer(constraints)
+
+    weights = optimizer.optimize(signal, cov)
+
+    assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
+    assert weights.sum() == pytest.approx(1.0, rel=1e-6)
+    assert weights.max() <= constraints.max_weight + 1e-6
+    # Equal weights have zero dispersion; a real risk solution does not.
+    assert weights.std() > 1e-4

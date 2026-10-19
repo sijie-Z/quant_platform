@@ -146,6 +146,28 @@ class OrderManager:
             commission = max(price * qty * COMMISSION_RATE, MIN_COMMISSION)
         tax = (price * qty * STAMP_TAX_RATE) if order.side == OrderSide.SELL else 0.0
 
+        # Validate against the live book before mutating anything. Without
+        # these checks a buy could drive cash negative (the OMS then reports a
+        # lower equity than it can fund) and two sells could both pass
+        # creation against the same `available` shares, the second one raising
+        # KeyError after the first had already credited cash.
+        if order.side == OrderSide.SELL:
+            position = self.positions.get(order.ticker)
+            if position is None or position.available < qty:
+                held = position.quantity if position else 0
+                available = position.available if position else 0
+                raise ValueError(
+                    f"Insufficient sellable position: {order.ticker} has "
+                    f"{available} available today (holding {held}), "
+                    f"trying to sell {qty}"
+                )
+        else:
+            required = price * qty + commission + tax
+            if required > self.cash + 1e-9:
+                raise ValueError(
+                    f"Insufficient cash: need {required:.2f}, have {self.cash:.2f}"
+                )
+
         # Calculate slippage vs arrival price
         arrival_price = order.limit_price or price
         slippage = abs(price - arrival_price) * qty

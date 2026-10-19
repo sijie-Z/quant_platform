@@ -39,7 +39,7 @@ from quant_platform.execution.paper_broker import (
     PaperBroker,
     PaperBrokerMetrics,
 )
-from quant_platform.risk.circuit_breaker import RiskMonitor
+from quant_platform.risk.circuit_breaker import RiskMonitor, get_risk_monitor
 from quant_platform.trading.broker import (
     Order,
     OrderSide,
@@ -186,7 +186,9 @@ class LiveRunner:
         self._bus = get_event_bus()
         self._audit = AuditLog(self._store, self._bus)
         self._sm = PortfolioStateMachine()
-        self._risk = RiskMonitor()
+        # Same singleton the API kill switch mutates. A private instance made
+        # the dashboard's kill switch invisible to this runner.
+        self._risk = get_risk_monitor()
 
         # Universe
         self._universe: list[str] = []
@@ -200,6 +202,7 @@ class LiveRunner:
         self._trade_count = 0
         self._peak_equity = initial_cash
         self._current_date = ""
+        self._day_start_equity: float | None = None
 
         # Reports
         self._daily_reports: list[DailyReport] = []
@@ -414,13 +417,19 @@ class LiveRunner:
             self._start_session()
 
         self._cycle_count += 1
+        previous_date = self._current_date
         self._current_date = date or datetime.now().strftime("%Y-%m-%d")
+        if previous_date and self._current_date != previous_date:
+            # A new trading day releases T+1-locked shares.
+            self._broker.new_trading_day()
+            self._day_start_equity = None
 
         if prices:
             self.set_prices(prices)
 
         # Mark to market before anything reads equity.
         self._mark_to_market()
+        self._update_risk_state()
 
         # Generate and execute signals
         signals = self._generate_signals()
@@ -583,6 +592,38 @@ class LiveRunner:
         """
         if isinstance(self._broker, SimulatedBroker) and self._current_prices:
             self._broker.update_market_prices(self._current_prices)
+
+    def _update_risk_state(self) -> None:
+        """Feed the shared risk monitor the current book.
+
+        The runner used to create a private RiskMonitor and never call
+        `update_portfolio_state`, so `portfolio_value` stayed 0 and every
+        position, daily-loss and drawdown check early-returned None: a 50%
+        single-name position sailed through.
+        """
+        account = self._broker.get_account()
+        equity = float(account.get("total_equity", 0) or 0)
+        if self._day_start_equity is None:
+            self._day_start_equity = equity
+
+        positions = {}
+        sector_weights = {}
+        for pos in self._broker.get_positions():
+            weight = pos.market_value / equity if equity > 0 else 0.0
+            sector = getattr(pos, "sector", "") or "Unknown"
+            positions[pos.code] = {
+                "value": pos.market_value,
+                "weight": weight,
+                "sector": sector,
+            }
+            sector_weights[sector] = sector_weights.get(sector, 0.0) + weight
+
+        self._risk.update_portfolio_state(
+            portfolio_value=equity,
+            daily_pnl=equity - self._day_start_equity,
+            positions=positions,
+            sector_weights=sector_weights,
+        )
 
     def _get_cash(self) -> float:
         acct = self._broker.get_account()

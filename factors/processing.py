@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LinearRegression
 
 from quant_platform.utils.logging import get_logger
 
@@ -110,46 +109,65 @@ def neutralize(
     if sector_map is not None and isinstance(sector_map, dict):
         sector_map = pd.Series(sector_map)
 
-    for date in factor.index:
-        row = result.loc[date].copy()
-        valid_mask = row.notna()
+    columns = factor.columns
+    values = factor.to_numpy(dtype=float, copy=True)
 
-        if valid_mask.sum() < 20:
+    # Build the static sector design once, not once per date per factor.
+    # `neutralize` is called for every factor; rebuilding get_dummies for
+    # each date made this function ~62% of the whole factor stage.
+    dummy = None
+    sector_valid = np.ones(len(columns), dtype=bool)
+    if sector_map is not None:
+        sectors = sector_map.reindex(columns)
+        sector_valid = sectors.notna().to_numpy()
+        coded = pd.Categorical(sectors)
+        codes = coded.codes
+        n_categories = len(coded.categories)
+        if n_categories > 1:
+            dummy = np.zeros((len(columns), n_categories - 1))
+            for position, code in enumerate(codes):
+                if code > 0:  # first category is the baseline
+                    dummy[position, code - 1] = 1.0
+        else:
+            dummy = np.zeros((len(columns), 0))
+
+    mcap = None
+    if market_cap is not None:
+        mcap = market_cap.reindex(index=factor.index, columns=columns).to_numpy(dtype=float)
+        mcap = np.log(np.clip(mcap, 1e8, None))
+
+    if dummy is None and mcap is None:
+        return result
+
+    for row_index, _date in enumerate(factor.index):
+        y = values[row_index]
+        present = ~np.isnan(y)
+        if present.sum() < 20:
             continue
 
-        assets = factor.columns[valid_mask]
-        y = row[valid_mask].values
+        asset_idx = np.flatnonzero(present)
+        features = [np.ones(len(asset_idx))]
+        if dummy is not None:
+            features.append(dummy[asset_idx])
+        if mcap is not None:
+            features.append(mcap[row_index, asset_idx].reshape(-1, 1))
+        X = np.column_stack(features)
 
-        # Build feature matrix X
-        features = []
-
-        if sector_map is not None:
-            asset_sectors = sector_map.reindex(assets)
-            sector_dummies = pd.get_dummies(asset_sectors, drop_first=True)
-            features.append(sector_dummies.values)
-
-        if market_cap is not None:
-            mcap_row = market_cap.loc[date].reindex(assets)
-            mcap_log = np.log(mcap_row.clip(lower=1e8))
-            features.append(mcap_log.values.reshape(-1, 1))
-
-        if not features:
+        valid = np.isfinite(X).all(axis=1)
+        if dummy is not None:
+            valid &= sector_valid[asset_idx]
+        if valid.sum() < 10:
             continue
 
-        X = np.column_stack(features) if len(features) > 1 else features[0]
+        y_valid = y[asset_idx][valid]
+        # Same least-squares fit as sklearn's LinearRegression(intercept=True)
+        # on sector dummies + log market cap, without constructing 20k models.
+        beta, *_ = np.linalg.lstsq(X[valid], y_valid, rcond=None)
+        residuals = np.full(len(asset_idx), np.nan)
+        residuals[valid] = y_valid - X[valid] @ beta
+        values[row_index, asset_idx] = residuals
 
-        # Handle any NaN in X
-        valid_rows = ~np.isnan(X).any(axis=1)
-        if valid_rows.sum() < 10:
-            continue
-
-        model = LinearRegression()
-        model.fit(X[valid_rows], y[valid_rows])
-        residuals = y - model.predict(X)
-
-        result.loc[date, assets] = residuals
-
-    return result
+    return pd.DataFrame(values, index=factor.index, columns=columns)
 
 
 def process_factor(

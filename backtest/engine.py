@@ -74,6 +74,17 @@ class BacktestEngine:
         self.optimizer_fallback_count = 0
         self.skipped_rebalances = 0
 
+    @staticmethod
+    def _compute_equal_weight_benchmark(returns: pd.DataFrame) -> pd.Series:
+        """Per-date equal weight over the assets with a return that day.
+
+        The old implementation filtered columns with a whole-sample
+        `dropna(thresh=50%)`, so an asset's future listing history decided
+        whether it entered the benchmark on early dates. Mean over each row
+        skips NaN and uses exactly what was observable that day.
+        """
+        return returns.mean(axis=1)
+
     def run(
         self,
         signal: pd.DataFrame,
@@ -102,8 +113,7 @@ class BacktestEngine:
 
         # Pre-compute benchmark daily returns
         if self.benchmark_type == "equal_weight":
-            bench_valid = returns.dropna(axis=1, thresh=int(len(returns) * 0.5))
-            self.benchmark_returns = bench_valid.mean(axis=1)
+            self.benchmark_returns = self._compute_equal_weight_benchmark(returns)
         else:
             self.benchmark_returns = benchmark_returns
 
@@ -352,6 +362,10 @@ class BacktestEngine:
                     rebalance_cost = self.cost_model.compute_costs(turnover * 2)
                 turnover_records.append((exec_date, turnover))
 
+                # Record what was actually executed. Reporting, exposure and
+                # capacity consume weights_history; storing the pre-clamp
+                # target made them describe a portfolio that was never held.
+                self.weights_history[rdate] = target_weights
                 current_weights = target_weights.copy()
                 next_idx += 1
 
@@ -361,6 +375,17 @@ class BacktestEngine:
             daily_ret_list.append(daily_ret)
 
             capital = capital * (1 + daily_ret)
+
+            # Drift the held weights with prices. The old code reused the
+            # target vector forever, which silently rebalanced to target every
+            # day: a winner was sold down daily, drift turnover never happened,
+            # and every reported backtest was a daily-rebalanced portfolio.
+            if current_weights.sum() > 1e-12:
+                growth = current_weights * (1.0 + daily_ret_assets.fillna(0.0))
+                cash_weight = max(0.0, 1.0 - float(current_weights.sum()))
+                total_value = float(growth.sum()) + cash_weight
+                if total_value > 1e-12:
+                    current_weights = growth / total_value
 
         self.daily_returns = pd.Series(daily_ret_list, index=all_dates, name="strategy_return")
         self.portfolio_values = self.initial_capital * (1 + self.daily_returns).cumprod()

@@ -182,18 +182,35 @@ def _latest_run_id() -> str:
 
 
 def _cleanup_old_runs():
-    """Remove oldest completed runs to keep memory bounded."""
-    if len(_run_store) <= _MAX_RUNS:
+    """Bound both the result store and the status store.
+
+    `_run_store` only receives successful runs, so cleaning it alone let every
+    failed run keep a full traceback in `_run_status` for the process
+    lifetime.
+    """
+    if len(_run_store) <= _MAX_RUNS and len(_run_status) <= _MAX_RUNS:
         return
-    completed = [
-        (rid, s.get("completed_at", ""))
+
+    finished = [
+        (rid, s.get("completed_at") or s.get("started_at") or "")
         for rid, s in _run_status.items()
         if s.get("status") in ("completed", "failed")
     ]
-    completed.sort(key=lambda x: x[1])
-    for rid, _ in completed[: len(completed) - _MAX_RUNS]:
+    finished.sort(key=lambda x: x[1])
+    excess = max(
+        len(_run_store) - _MAX_RUNS,
+        len(_run_status) - _MAX_RUNS,
+        1,
+    )
+    for rid, _ in finished[:excess]:
         _run_store.pop(rid, None)
         _run_status.pop(rid, None)
+
+    # Entries stuck in "running" have no completed_at; keep at most twice the
+    # cap and drop the oldest so a stuck producer cannot grow the dict forever.
+    while len(_run_status) > _MAX_RUNS * 2:
+        oldest = min(_run_status, key=lambda k: _run_status[k].get("started_at", ""))
+        _run_status.pop(oldest, None)
 
 
 def _get_config_with_overrides(overrides: dict[str, Any]) -> Any:
@@ -230,7 +247,13 @@ async def health():
 # ---------------------------------------------------------------------------
 
 @router.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket_endpoint(ws: WebSocket, token: str = ""):
+    # BaseHTTPMiddleware never sees WebSocket scopes, so the HTTP token guard
+    # does not cover this stream (which carries order.filled and risk events).
+    expected = os.environ.get("QUANT_API_TOKEN", "")
+    if expected and token != expected:
+        await ws.close(code=1008)
+        return
     # Capture the loop here: this is the one place guaranteed to be running on
     # it before events start flowing. See _on_bus_event.
     _remember_loop()
@@ -490,7 +513,9 @@ def _execute_pipeline(run_id: str, req: RunRequest):
     except Exception:
         _run_status[run_id].update(
             status="failed",
-            error=str(traceback.format_exc()),
+            # Keep only the tail: a failed run retained the full traceback
+            # (and every frame's locals-by-repr string) for the process life.
+            error=str(traceback.format_exc())[-4000:],
             completed_at=datetime.now().isoformat(),
         )
         logger.error("Pipeline %s failed: %s", run_id, traceback.format_exc())
@@ -503,15 +528,18 @@ def _update_status(run_id: str, progress: int, stage: str):
     _run_status[run_id].update(progress=progress, stage=stage)
     if stage == "done":
         _run_status[run_id].update(status="completed", completed_at=datetime.now().isoformat())
-    # Broadcast to WebSocket clients (non-blocking from thread)
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
+    # Broadcast to WebSocket clients (non-blocking from the worker thread).
+    # `asyncio.get_event_loop()` raises on Python 3.12 in a thread with no
+    # loop, so progress events were silently dropped; use the loop captured
+    # by the WebSocket endpoint instead.
+    loop = _main_loop
+    if loop is not None and loop.is_running():
+        try:
             asyncio.run_coroutine_threadsafe(
                 _broadcast_status(run_id, _run_status[run_id]), loop
             )
-    except RuntimeError:
-        pass  # No event loop running, skip broadcast
+        except RuntimeError:
+            pass
 
 
 @router.get("/run/{run_id}/status", response_model=RunStatus)
@@ -837,7 +865,13 @@ def _build_chart_data(
             monthly = {
                 "years": [str(y) for y in mdf.index.tolist()],
                 "months": list(range(1, 13)),
-                "data": mdf.values.tolist(),
+                # NaN is not JSON-compliant; Starlette rejects the response
+                # with a 500. A missing cell is null and the heatmap skips it.
+                "data": [
+                    [None if pd.isna(value) else round(float(value), 6)
+                     for value in row]
+                    for row in mdf.values.tolist()
+                ],
             }
 
     # Return distribution histogram
@@ -1370,7 +1404,7 @@ async def get_holdings():
 
 
 @router.get("/portfolio/live")
-async def get_live_portfolio():
+def get_live_portfolio():
     """Get live portfolio snapshot with current prices from baostock."""
     if not _holdings_data or not _holdings_data.get("holdings"):
         return {"error": "No holdings imported. Import CSV first."}
@@ -1469,7 +1503,7 @@ async def create_order(order_req: dict):
             ticker=order_req.get("ticker", ""),
             side=order_req.get("side", "buy"),
             quantity=int(order_req.get("quantity", 100)),
-            order_type=order_req.get("type", "market"),
+            order_type=order_req.get("order_type") or order_req.get("type", "market"),
             limit_price=order_req.get("limit_price"),
             strategy=order_req.get("strategy", ""),
         )
@@ -1506,6 +1540,14 @@ async def fill_order(fill_req: dict):
         }
     except Exception as e:
         raise HTTPException(400, str(e)) from e
+
+
+@router.post("/oms/new-trading-day")
+async def oms_new_trading_day():
+    """Roll the OMS book: release T+1 locks for a new trading day."""
+    oms = _get_oms()
+    oms.new_trading_day()
+    return {"status": "ok", "n_positions": len(oms.positions)}
 
 
 @router.get("/oms/blotter")
@@ -1556,7 +1598,7 @@ async def get_trade_cost_analysis():
 # ---------------------------------------------------------------------------
 
 @router.get("/market/baostock/health")
-async def baostock_health():
+def baostock_health():
     """Check if baostock is accessible."""
     try:
         import baostock as bs
@@ -1569,7 +1611,7 @@ async def baostock_health():
 
 
 @router.get("/market/baostock/stock/{code}")
-async def get_stock_realtime(code: str):
+def get_stock_realtime(code: str):
     """Get real-time price for a single stock from baostock."""
     try:
         import baostock as bs
@@ -1712,6 +1754,17 @@ async def run_monte_carlo(req: dict):
         raise HTTPException(400, "No completed run found. Run pipeline first.")
 
     result = _run_store[run_id]
+
+    try:
+        n_sims = int(req.get("n_simulations", 1000))
+        horizon = int(req.get("horizon_days", 252))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "n_simulations/horizon_days must be integers") from exc
+    if not 1 <= n_sims <= 10_000 or not 1 <= horizon <= 2_520:
+        raise HTTPException(
+            422, "n_simulations must be 1..10000 and horizon_days 1..2520",
+        )
+
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_executor, _run_monte_carlo, result, req)
 
@@ -1931,7 +1984,7 @@ def _detect_regime(result: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.post("/screen", response_model=ScreenResponse)
-async def screen_stocks(req: ScreenRequest):
+def screen_stocks(req: ScreenRequest):
     """Screen stocks using boolean factor rules.
 
     Computes factors for the configured universe then applies user-defined
@@ -2096,7 +2149,7 @@ async def check_order_risk(order: dict):
 # ---------------------------------------------------------------------------
 
 @router.post("/execution/smart-route")
-async def smart_route_order(req: dict):
+def smart_route_order(req: dict):
     """Create an execution plan, and optionally send it to the OMS.
 
     Set ``execute`` to true to turn every slice into a real OMS order
@@ -2113,7 +2166,12 @@ async def smart_route_order(req: dict):
     adv = req.get("avg_daily_volume", 1_000_000)
     urgency = req.get("urgency", "normal")
 
-    order = Order(ticker=ticker, side=OrderSide(side), quantity=quantity)
+    try:
+        order_side = OrderSide(side)
+    except ValueError as exc:
+        raise HTTPException(422, f"side must be 'buy' or 'sell', got {side!r}") from exc
+
+    order = Order(ticker=ticker, side=order_side, quantity=quantity)
     plan = SmartRouter.execute(order, avg_daily_volume=adv, urgency=urgency)
 
     response = {
@@ -2308,7 +2366,7 @@ async def strategy_update_pnl(req: dict):
 # ---------------------------------------------------------------------------
 
 @router.post("/data/quality")
-async def data_quality_check(req: dict):
+def data_quality_check(req: dict):
     """Run data quality checks on price data."""
     from quant_platform.data.quality import DataQualityMonitor
 
@@ -2327,7 +2385,7 @@ async def data_quality_check(req: dict):
         prices = result["prices"]
         if isinstance(prices, pd.DataFrame):
             monitor.check_prices(prices)
-            returns = prices.pct_change().dropna()
+            returns = prices.replace(0, np.nan).pct_change(fill_method=None).dropna()
             monitor.check_returns(returns)
     else:
         # Generate synthetic data for demo
@@ -2336,7 +2394,8 @@ async def data_quality_check(req: dict):
         prices = provider.get_prices("2023-01-01", "2024-12-31")
         if isinstance(prices, pd.DataFrame):
             monitor.check_prices(prices)
-            returns = prices.pct_change().dropna()
+            numeric = prices.select_dtypes(include=[np.number])
+            returns = numeric.mask(numeric == 0).pct_change(fill_method=None).dropna()
             monitor.check_returns(returns)
 
     report = monitor.get_report()
@@ -2532,7 +2591,7 @@ async def trading_manual_order(req: dict):
 
 
 @router.post("/trading/run-once")
-async def trading_run_once():
+def trading_run_once():
     """Run a single trading cycle manually."""
     engine = _get_live_engine()
     if not engine:
@@ -2546,7 +2605,7 @@ async def trading_run_once():
 # ---------------------------------------------------------------------------
 
 @router.get("/market/snapshot")
-async def market_snapshot():
+def market_snapshot():
     """Get real-time A-share market snapshot."""
     try:
         from quant_platform.trading.realtime import RealTimeMarket
@@ -2561,7 +2620,7 @@ async def market_snapshot():
 
 
 @router.get("/market/gainers")
-async def market_gainers():
+def market_gainers():
     """Get top gainers."""
     try:
         from quant_platform.trading.realtime import RealTimeMarket
@@ -2573,7 +2632,7 @@ async def market_gainers():
 
 
 @router.get("/market/losers")
-async def market_losers():
+def market_losers():
     """Get top losers."""
     try:
         from quant_platform.trading.realtime import RealTimeMarket
@@ -2585,7 +2644,7 @@ async def market_losers():
 
 
 @router.get("/market/sectors")
-async def market_sectors():
+def market_sectors():
     """Get sector data."""
     try:
         from quant_platform.trading.realtime import RealTimeMarket
@@ -2687,7 +2746,7 @@ async def core_risk_kill_switch(req: dict):
 # ────────────────────────────────────────────────────────────────
 
 @router.post("/ml/train", response_model=MLPerformanceResponse)
-async def ml_train(req: MLTrainRequest):
+def ml_train(req: MLTrainRequest):
     """Train ML model for alpha signal generation."""
     try:
         from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
@@ -2721,7 +2780,7 @@ async def ml_train(req: MLTrainRequest):
 
 
 @router.post("/ml/predict", response_model=MLSignalResponse)
-async def ml_predict(req: MLTrainRequest):
+def ml_predict(req: MLTrainRequest):
     """Generate ML-based alpha signals."""
     try:
         from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
@@ -2737,15 +2796,16 @@ async def ml_predict(req: MLTrainRequest):
             n_splits=req.n_splits,
         )
         generator = MLSignalGenerator(config=ml_config)
-        signal = generator.generate(
-            processed_factors,
-            returns,
-            force_retrain=req.force_retrain,
-        )
+        # `generate()` has no force_retrain parameter; passing it raised
+        # TypeError and this endpoint returned 500 on every request.
+        signal = generator.generate(processed_factors, returns)
 
         dates = [str(d) for d in signal.index]
         assets = list(signal.columns)
-        signal_data = signal.values.tolist()
+        signal_data = [
+            [None if pd.isna(value) else float(value) for value in row]
+            for row in signal.values.tolist()
+        ]
 
         return MLSignalResponse(dates=dates, assets=assets, signal=signal_data)
     except Exception as e:
@@ -2758,7 +2818,7 @@ async def ml_predict(req: MLTrainRequest):
 # ────────────────────────────────────────────────────────────────
 
 @router.post("/ic-monitor/compute", response_model=ICMonitorSummary)
-async def ic_monitor_compute(req: ICMonitorRequest):
+def ic_monitor_compute(req: ICMonitorRequest):
     """Compute IC statistics for all factors with decay detection."""
     try:
         from quant_platform.factors.ic_monitor import FactorICMonitor, ICMonitorConfig
@@ -2800,7 +2860,7 @@ async def ic_monitor_compute(req: ICMonitorRequest):
 
 
 @router.get("/ic-monitor/alerts")
-async def ic_monitor_alerts():
+def ic_monitor_alerts():
     """Get current IC decay alerts."""
     try:
         from quant_platform.factors.ic_monitor import FactorICMonitor
@@ -2852,7 +2912,7 @@ def _resolve_portfolio_weights(requested: dict[str, float] | None, prices: pd.Da
 
 
 @router.post("/barra/decompose", response_model=BarraRiskResponse)
-async def barra_decompose(req: BarraDecomposeRequest):
+def barra_decompose(req: BarraDecomposeRequest):
     """Decompose portfolio risk using Barra 10-factor model."""
     try:
         from quant_platform.risk.barra import BarraModel
@@ -2897,7 +2957,7 @@ async def barra_decompose(req: BarraDecomposeRequest):
 
 
 @router.post("/barra/covariance", response_model=BarraCovarianceResponse)
-async def barra_covariance(req: BarraDecomposeRequest):
+def barra_covariance(req: BarraDecomposeRequest):
     """Get Barra factor covariance matrix."""
     try:
         from quant_platform.risk.barra import BarraModel
@@ -2935,7 +2995,7 @@ async def barra_covariance(req: BarraDecomposeRequest):
 # ────────────────────────────────────────────────────────────────
 
 @router.post("/parallel/sweep", response_model=ParallelSweepResponse)
-async def parallel_sweep(req: ParallelSweepRequest):
+def parallel_sweep(req: ParallelSweepRequest):
     """Run parameter sweep in parallel using multiple processes."""
     try:
         from quant_platform.backtest.distributed import ParallelBacktester
@@ -3023,7 +3083,7 @@ def _get_ws_provider():
 
 
 @router.get("/ws-quotes/start")
-async def ws_quotes_start():
+def ws_quotes_start():
     """Start WebSocket quote provider."""
     provider = _get_ws_provider()
     provider.start()
@@ -3031,7 +3091,7 @@ async def ws_quotes_start():
 
 
 @router.get("/ws-quotes/stop")
-async def ws_quotes_stop():
+def ws_quotes_stop():
     """Stop WebSocket quote provider."""
     provider = _get_ws_provider()
     provider.stop()
@@ -3090,7 +3150,7 @@ def _get_l2_provider():
 
 
 @router.get("/l2/start")
-async def l2_start():
+def l2_start():
     """Start Level 2 data provider."""
     provider = _get_l2_provider()
     provider.start()
@@ -3098,7 +3158,7 @@ async def l2_start():
 
 
 @router.get("/l2/stop")
-async def l2_stop():
+def l2_stop():
     """Stop Level 2 data provider."""
     provider = _get_l2_provider()
     provider.stop()
@@ -3113,7 +3173,7 @@ async def l2_stats():
 
 
 @router.get("/l2/book/{code}", response_model=OrderBookResponse)
-async def l2_order_book(code: str):
+def l2_order_book(code: str):
     """Get order book for a stock."""
     provider = _get_l2_provider()
     if not provider.is_running:
@@ -3127,7 +3187,7 @@ async def l2_order_book(code: str):
 
 
 @router.get("/l2/ticks/{code}", response_model=list[TickDataResponse])
-async def l2_ticks(code: str, limit: int = 100):
+def l2_ticks(code: str, limit: int = 100):
     """Get recent tick data for a stock."""
     provider = _get_l2_provider()
     if not provider.is_running:
@@ -3139,7 +3199,7 @@ async def l2_ticks(code: str, limit: int = 100):
 
 
 @router.get("/l2/vwap/{code}", response_model=VWAPResponse)
-async def l2_vwap(code: str, n_ticks: int = 100):
+def l2_vwap(code: str, n_ticks: int = 100):
     """Compute VWAP from recent ticks."""
     provider = _get_l2_provider()
     if not provider.is_running:
@@ -3151,7 +3211,7 @@ async def l2_vwap(code: str, n_ticks: int = 100):
 
 
 @router.get("/l2/flow/{code}", response_model=TradeFlowResponse)
-async def l2_trade_flow(code: str, n_ticks: int = 100):
+def l2_trade_flow(code: str, n_ticks: int = 100):
     """Compute buy/sell trade flow imbalance."""
     provider = _get_l2_provider()
     if not provider.is_running:
@@ -3184,7 +3244,7 @@ async def fundamental_stats():
     return provider.stats
 
 @router.get("/fundamentals/{code}", response_model=FundamentalMetricsResponse)
-async def get_fundamentals(code: str):
+def get_fundamentals(code: str):
     """Get real-time fundamental metrics for a stock."""
     provider = _get_fundamental_provider()
     metrics = provider.get_fundamentals(code)
@@ -3192,7 +3252,7 @@ async def get_fundamentals(code: str):
 
 
 @router.post("/fundamentals/bulk", response_model=list[FundamentalMetricsResponse])
-async def get_fundamentals_bulk(codes: list[str]):
+def get_fundamentals_bulk(codes: list[str]):
     """Get fundamentals for multiple stocks."""
     provider = _get_fundamental_provider()
     metrics = provider.get_bulk(codes)
@@ -3200,7 +3260,7 @@ async def get_fundamentals_bulk(codes: list[str]):
 
 
 @router.post("/fundamentals/screen", response_model=FundamentalScreenResponse)
-async def screen_fundamentals(req: FundamentalScreenRequest):
+def screen_fundamentals(req: FundamentalScreenRequest):
     """Screen stocks by fundamental criteria."""
     from quant_platform.data.providers.fundamental_realtime import FundamentalScreener
     provider = _get_fundamental_provider()
@@ -3220,7 +3280,7 @@ async def screen_fundamentals(req: FundamentalScreenRequest):
 
 
 @router.post("/fundamentals/rank", response_model=FundamentalRankResponse)
-async def rank_fundamentals(req: FundamentalRankRequest):
+def rank_fundamentals(req: FundamentalRankRequest):
     """Rank stocks by a fundamental metric."""
     from quant_platform.data.providers.fundamental_realtime import FundamentalScreener
     provider = _get_fundamental_provider()

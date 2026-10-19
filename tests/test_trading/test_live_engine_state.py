@@ -75,3 +75,25 @@ def test_run_once_advances_the_watermark(engine_with_data):
     assert engine.state.last_processed_date == str(dates[0])[:10]
     # A second call for the same day is a no-op.
     assert engine.run_once(dates[0])["status"] == "already_processed"
+
+
+def test_expired_positions_are_sold_instead_of_disappearing():
+    """Issue #3: the old filter dropped expired positions without crediting cash."""
+    dates = pd.bdate_range("2024-01-01", periods=200)
+    returns = pd.DataFrame(0.0, index=dates, columns=["A"])
+    prices = pd.DataFrame(20.0, index=dates, columns=["A"])
+
+    engine = LiveEngine()
+    engine.load_history(returns, prices)
+    exit_day = engine._rebalance_dates[0]
+
+    engine.state.cash = 0.0
+    engine.state.equity_peak = 0.0
+    engine.state.positions = [
+        Position("A", "2024-01-01", str(exit_day)[:10], 100, 10.0),
+    ]
+
+    engine.run_once(exit_day)
+
+    assert engine.state.positions == []
+    assert engine.state.cash == pytest.approx(100 * 20.0 * (1 - 0.0015))

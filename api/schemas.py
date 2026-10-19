@@ -173,7 +173,7 @@ class MonthlyReturns(BaseModel):
 
     years: list[str] = Field(default_factory=list)
     months: list[int] = Field(default_factory=list)
-    data: list[list[float]] = Field(default_factory=list)
+    data: list[list[float | None]] = Field(default_factory=list)
 
 
 class ChartData(BaseModel):
