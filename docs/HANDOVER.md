@@ -319,3 +319,16 @@
 验证：全量测试 **1983 passed / 4 skipped / 0 failed**（2m55s），ruff 全绿。
 
 已知仍未处理：多租户隔离（#75 产品定位未定）；`framework/contracts/`、`kernel/` 等零导入目录的去留（#70/#77）仍是显式决策项。
+
+### 2026-10-20 第七轮（研究脚本与文档真实性）
+
+| 领域 | 修复 |
+|---|---|
+| 研究脚本 | `run_factor.py` / `tools/common_runner.py` 的 12 个月动量用 `.shift(-21)`，把未来 21 天收益嵌进因子（与 IC 的目标窗口完全重叠）；改为 `.shift(21)` 并加静态守卫测试。`run_factor.py` 回测在调仓日把当日已实现收益记到新权重上（一日前视）；改为次日生效，基准与策略同持有期对齐。`tools/run_xv_synthetic_vs_real.py` 把收益 DataFrame 当 benchmark Series 传给 `all_metrics`，每行 regime Sharpe 被静默记为 0；改传 benchmark Series 并记录异常 |
+| 真实数据股票池 | Baostock 的“500 只蓝筹”实际是排序截断后的 101 只深市主板（000001–000500）。改为优先 `query_stock_basic` 跨板分层抽样，失败时回退 60/68/00/30 交错候选池；缓存键加入完整代码列表哈希。历史 real-A-share 结论的样本范围需按新股票池重跑 |
+| 统计口径 | `run_market_structure_v3.py` 的重叠前向窗口用 `sqrt(n)` 计算 t 值；改为 Newey-West HAC（lag=ceil(H/21)）并保留 naive 列，规模分组从全样本均价改为当日价格横截面三分组（明确标注 price proxy）。`run_rq1_cluster_attribution.py` 原来对每日横截面均值求相关（测的是覆盖率噪声）；改为逐日资产交集上的横截面相关。`run_rq3_stability.py` 的 regime 标签被 ffill 到下月、`%Time` 用日历天（占比合计 70.2%）；改为当月标签与交易日分母 |
+| 文档 | README 快速开始补上 `quant_core` 与项目 editable 安装（否则 import 直接失败）。CLAUDE.md/AGENTS.md 校正：EventBus 只覆盖运行时核心、实盘为 7 因子、默认启用 21/注册 27、管理费 /365、LLM 是 DeepSeek、CI 是 3.11/3.12 + ruff/mypy、Store 11 张表、端点/视图/组件计数、涨跌停与整手在回测层的真实限制，并据此下调相关 A 评级。默认 alpha 方法改为 equal_weight，合成数据 embedded_alpha 标注为演示用途 |
+
+验证：全量测试 **2019 passed / 4 skipped / 0 failed**（2m55s），ruff 全绿。
+
+历史 `results/*.csv` 中的 RQ5/RQ6/RQ7 与 run_factor 报告需要用修正后的脚本在真实数据上重跑后才能引用；docstring/注释已注明口径。

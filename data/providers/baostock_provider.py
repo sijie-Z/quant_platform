@@ -6,6 +6,9 @@ Includes permanent caching for immutable historical data.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import random
 import time
 from pathlib import Path
 
@@ -17,6 +20,126 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 CACHE_DIR = Path(__file__).parent.parent.parent / ".cache" / "baostock"
+
+# Board prefixes used for stratified sampling: SH main, STAR, SZ main, ChiNext.
+_BOARD_PREFIXES = ("60", "68", "00", "30")
+_SH_PREFIXES = ("60", "68")
+_SZ_PREFIXES = ("00", "30")
+_MAJOR_LIST_SIZE = 500
+_SAMPLE_SEED = 42
+# Dedicated JSON cache: the generic parquet/CSV helpers expect a two-level
+# (date, asset) index and cannot read back a flat code list without pyarrow.
+_STOCK_BASIC_CACHE_FILE = "stock_basic_universe.json"
+
+
+def _interleave(buckets: list[list[str]]) -> list[str]:
+    """Round-robin merge so the head of the list already spans all boards."""
+    result: list[str] = []
+    active = [iter(bucket) for bucket in buckets if bucket]
+    while active:
+        remaining = []
+        for it in active:
+            try:
+                result.append(next(it))
+            except StopIteration:
+                continue
+            remaining.append(it)
+        active = remaining
+    return result
+
+
+def _ensure_exchange_quotas(quotas: dict[str, int], ordered: dict[str, list[str]], n: int) -> None:
+    """When ``n >= 2``, never let a non-empty exchange lose all its seats.
+
+    Proportional quotas can put every seat on one exchange for tiny, extremely
+    skewed samples; move one seat from the dominant exchange when that happens.
+    """
+    if n < 2:
+        return
+    for missing_group, other_group in ((_SH_PREFIXES, _SZ_PREFIXES), (_SZ_PREFIXES, _SH_PREFIXES)):
+        missing = [prefix for prefix in missing_group if prefix in ordered]
+        other = [prefix for prefix in other_group if prefix in ordered]
+        if not missing or not other:
+            continue
+        if sum(quotas[prefix] for prefix in missing) > 0:
+            continue
+        other_seats = sum(quotas[prefix] for prefix in other)
+        if other_seats < 2:  # cannot donate without emptying the other exchange
+            continue
+        donor = max((prefix for prefix in other if quotas[prefix] > 0), key=quotas.get)
+        recipient = max(missing, key=lambda prefix: (len(ordered[prefix]), prefix))
+        quotas[donor] -= 1
+        quotas[recipient] += 1
+
+
+def _stratified_sample(codes, n: int, seed: int = _SAMPLE_SEED) -> list[str]:
+    """Deterministically sample up to ``n`` codes across exchange boards.
+
+    Codes are bucketed by two-digit prefix (60/68/00/30), each bucket is sorted
+    and sampled with a fixed seed, so the result does not depend on the input
+    ordering. Quotas are proportional to bucket size via the largest-remainder
+    method; every non-empty board gets a seat when ``n`` allows it. The picked
+    codes are interleaved so slicing the head still covers both exchanges.
+    """
+    buckets: dict[str, set[str]] = {prefix: set() for prefix in _BOARD_PREFIXES}
+    for raw in codes:
+        if not str(raw).strip():
+            continue
+        code = str(raw).zfill(6)
+        if len(code) != 6 or not code.isdigit():
+            continue
+        prefix = code[:2]
+        if prefix in buckets:
+            buckets[prefix].add(code)
+    ordered = {prefix: sorted(bucket) for prefix, bucket in buckets.items() if bucket}
+    total = sum(len(bucket) for bucket in ordered.values())
+    if n <= 0 or total == 0:
+        return []
+
+    if total <= n:
+        quotas = {prefix: len(bucket) for prefix, bucket in ordered.items()}
+    else:
+        quotas: dict[str, int] = {}
+        remainders: dict[str, int] = {}
+        for prefix, bucket in ordered.items():
+            quota, remainder = divmod(n * len(bucket), total)
+            quotas[prefix] = quota
+            remainders[prefix] = remainder
+        # Guarantee a seat for every non-empty board when the budget allows.
+        if n >= len(ordered):
+            for prefix in quotas:
+                if quotas[prefix] == 0:
+                    quotas[prefix] = 1
+        assigned = sum(quotas.values())
+        by_remainder = sorted(ordered, key=lambda prefix: (-remainders[prefix], prefix))
+        while assigned < n:
+            progressed = False
+            for prefix in by_remainder:
+                if assigned >= n:
+                    break
+                if quotas[prefix] < len(ordered[prefix]):
+                    quotas[prefix] += 1
+                    assigned += 1
+                    progressed = True
+            if not progressed:
+                break
+        # The minimum-one-seat rule may overshoot when n is tiny; trim it back.
+        while assigned > n:
+            donor = max((p for p in quotas if quotas[p] > 1), key=quotas.get, default=None)
+            if donor is None:
+                break
+            quotas[donor] -= 1
+            assigned -= 1
+
+    _ensure_exchange_quotas(quotas, ordered, n)
+
+    rng = random.Random(seed)
+    picked = [
+        rng.sample(ordered[prefix], quotas[prefix])
+        for prefix in _BOARD_PREFIXES
+        if prefix in ordered
+    ]
+    return _interleave(picked)
 
 
 def _to_bs_code(code: str) -> str:
@@ -50,8 +173,8 @@ class BaostockDataProvider(DataProvider):
         self._bs = None
 
     def _login(self):
-        import baostock as bs
         if self._bs is None:
+            import baostock as bs
             lg = bs.login()
             if lg.error_code != "0":
                 raise RuntimeError(f"baostock login failed: {lg.error_msg}")
@@ -98,7 +221,12 @@ class BaostockDataProvider(DataProvider):
         self, codes: list[str], start_date: str, end_date: str
     ) -> pd.DataFrame:
         """Fetch daily OHLCV for multiple stocks from baostock."""
-        cache_key = f"daily_{start_date}_{end_date}_{len(codes)}"
+        # Hash the full sorted code list: keying on len(codes) alone made any
+        # two same-sized universes share one cache entry.
+        codes_digest = hashlib.md5(
+            ",".join(sorted(str(code).zfill(6) for code in codes)).encode()
+        ).hexdigest()[:8]
+        cache_key = f"daily_{start_date}_{end_date}_{len(codes)}_{codes_digest}"
         cached = self._load_cache(cache_key)
         if cached is not None and len(cached) > 0:
             logger.info("Cache hit: %s (%d rows)", cache_key, len(cached))
@@ -231,9 +359,81 @@ class BaostockDataProvider(DataProvider):
 
         return df
 
-    def _get_major_stocks_list(self) -> list[str]:
-        """Get list of ~500 major stocks to track."""
-        return sorted(self._get_major_stocks())[:500]
+    def _load_stock_universe_cache(self) -> list[str] | None:
+        if not self._cache_enabled:
+            return None
+        path = CACHE_DIR / _STOCK_BASIC_CACHE_FILE
+        if not path.exists():
+            return None
+        try:
+            codes = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(codes, list) or not codes:
+            return None
+        return [str(code).zfill(6) for code in codes]
+
+    def _save_stock_universe_cache(self, codes) -> None:
+        if not self._cache_enabled:
+            return
+        try:
+            path = CACHE_DIR / _STOCK_BASIC_CACHE_FILE
+            path.write_text(json.dumps(sorted(codes)), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("could not cache stock universe: %s", exc)
+
+    def _fetch_stock_basic_universe(self) -> list[str] | None:
+        """All listed A-share codes from baostock ``query_stock_basic``.
+
+        Returns None when the call is unavailable (older baostock, network
+        failure, error result) so the caller can fall back to a static pool.
+        """
+        try:
+            self._login()
+            bs = self._bs
+            rs = bs.query_stock_basic()
+            if rs.error_code != "0":
+                logger.warning("query_stock_basic returned error_code=%s", rs.error_code)
+                return None
+            fields = list(getattr(rs, "fields", None) or
+                          ["code", "code_name", "ipoDate", "outDate", "type", "status"])
+            i_code = fields.index("code") if "code" in fields else 0
+            i_type = fields.index("type") if "type" in fields else 4
+            i_status = fields.index("status") if "status" in fields else 5
+            codes = set()
+            while rs.next():
+                row = rs.get_row_data()
+                try:
+                    if row[i_type] != "1" or row[i_status] != "1":
+                        continue
+                    codes.add(_from_bs_code(row[i_code]))
+                except (IndexError, TypeError):
+                    continue
+            if rs.error_code != "0":
+                logger.warning("query_stock_basic failed mid-stream (%s)", rs.error_code)
+                return None
+            return sorted(codes) if codes else None
+        except Exception as exc:
+            logger.warning("query_stock_basic unavailable (%s); using fallback pool", exc)
+            return None
+
+    def _get_major_stocks_list(self, n: int = _MAJOR_LIST_SIZE) -> list[str]:
+        """Deterministic cross-board sample of ~``n`` listed A-share stocks.
+
+        Prefers baostock's real security list (``query_stock_basic``, type=1
+        stocks with status=1) and falls back to the static cross-exchange
+        candidate pool. Unlike the old ``sorted(...)[:500]`` this never
+        truncates to Shenzhen main-board codes only.
+        """
+        universe = self._load_stock_universe_cache()
+        if universe is None:
+            universe = self._fetch_stock_basic_universe()
+            if universe:
+                self._save_stock_universe_cache(universe)
+        if not universe:
+            logger.warning("stock universe unavailable; sampling the cross-exchange fallback pool")
+            universe = self._get_major_stocks()
+        return _stratified_sample(universe, n)
 
     def get_financials(
         self,

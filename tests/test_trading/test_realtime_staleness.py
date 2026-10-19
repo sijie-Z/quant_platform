@@ -40,7 +40,9 @@ def test_stale_cache_is_flagged_and_quotes_keep_the_fetch_time(monkeypatch):
             raise ConnectionError("east money unavailable")
         return _snapshot_frame()
 
-    monkeypatch.setattr(rt_mod.ak, "stock_zh_a_spot_em", fetch)
+    monkeypatch.setattr(
+        rt_mod.ak, "stock_zh_a_spot_em", fetch, raising=False,
+    )
 
     market = rt_mod.RealTimeMarket(cache_ttl=0)
     market.get_market_snapshot()

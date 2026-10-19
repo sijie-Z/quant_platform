@@ -166,6 +166,8 @@ def backtest(factor_panel, rets, all_dates, rebals, ny,
     next_rebal = next(rebal_iter, None)
 
     for date in all_dates:
+        pending_w = None
+        pending_cost = 0.0
         if next_rebal is not None and date >= next_rebal:
             if date in factor_panel.index:
                 f = factor_panel.loc[date].dropna()
@@ -180,18 +182,21 @@ def backtest(factor_panel, rets, all_dates, rebals, ny,
                         if sold:
                             to = sum(abs(current_w.get(a, 0)) for a in sold)
                             turnover_log.append(float(to))
-                            capital -= to * (C + P + S) * cost_multiplier * capital
+                            pending_cost = to * (C + P + S) * cost_multiplier
                     total = max(len(long_u) + len(short_u), 1)
-                    current_w = {}
+                    pending_w = {}
                     for a in long_u:
-                        current_w[a] = 1.0 / total
+                        pending_w[a] = 1.0 / total
                     for a in short_u:
-                        current_w[a] = -1.0 / total
+                        pending_w[a] = -1.0 / total
             try:
                 next_rebal = next(rebal_iter)
             except StopIteration:
                 next_rebal = None
 
+        # Today's return belongs to the portfolio held since the previous
+        # close. Weights decided at today's close (pending_w) must not earn
+        # today's already-realized t-1 -> t return; they take effect tomorrow.
         if current_w:
             daily = sum(current_w.get(a, 0) * rets.loc[date, a]
                        for a in current_w if a in rets.columns
@@ -200,6 +205,13 @@ def backtest(factor_panel, rets, all_dates, rebals, ny,
             capital *= (1 + daily)
         else:
             daily_rets.append(0.0)
+
+        # Trade happens at today's close: pay costs after the day's return,
+        # then activate the new target weights for the next trading day.
+        if pending_cost:
+            capital -= pending_cost * capital
+        if pending_w is not None:
+            current_w = pending_w
 
     dr = pd.Series(daily_rets, index=all_dates)
     cagr = (capital / INITIAL) ** (1 / ny) - 1
@@ -224,6 +236,7 @@ def style_benchmark(factor_panel, rets, all_dates, rebals, ny):
     next_rebal = next(rebal_iter, None)
 
     for date in all_dates:
+        pending_w = None
         if next_rebal is not None and date >= next_rebal:
             if date in factor_panel.index:
                 f = factor_panel.loc[date].dropna()
@@ -231,14 +244,16 @@ def style_benchmark(factor_panel, rets, all_dates, rebals, ny):
                     rank = f.rank(ascending=False)
                     long_u = rank.nsmallest(N_LONG).index.tolist()
                     total = max(len(long_u), 1)
-                    current_w = {}
+                    pending_w = {}
                     for a in long_u:
-                        current_w[a] = 1.0 / total
+                        pending_w[a] = 1.0 / total
             try:
                 next_rebal = next(rebal_iter)
             except StopIteration:
                 next_rebal = None
 
+        # Same next-day activation as backtest(): today's return is earned by
+        # the weights held since the previous close, not by today's decision.
         if current_w:
             daily = sum(current_w.get(a, 0) * rets.loc[date, a]
                        for a in current_w if a in rets.columns
@@ -247,6 +262,8 @@ def style_benchmark(factor_panel, rets, all_dates, rebals, ny):
             capital *= (1 + daily)
         else:
             daily_rets.append(0.0)
+        if pending_w is not None:
+            current_w = pending_w
 
     dr = pd.Series(daily_rets, index=all_dates)
     cagr = (capital / INITIAL) ** (1 / ny) - 1
@@ -306,7 +323,11 @@ def run_factor_report(factor_key):
     style = style_benchmark(factor_panel, rets, all_dates, rebals, ny)
 
     # Market benchmark
-    bench_dr = fwd_ret.mean(axis=1).reindex(base["daily_rets"].index).dropna()
+    # Align the market benchmark with the strategy's holding period: the
+    # strategy's daily_rets[t] is the return earned over day t (close t-1 ->
+    # close t), so the benchmark must be the equal-weight return over the same
+    # day -- not fwd_ret, which would compare day t against t -> t+1.
+    bench_dr = rets.mean(axis=1).reindex(base["daily_rets"].index).dropna()
     bench_cagr = float((1 + bench_dr).prod() ** (1 / ny) - 1)
     bench_sharpe = float((bench_dr.mean() / (bench_dr.std() + 1e-12)) * np.sqrt(252))
 

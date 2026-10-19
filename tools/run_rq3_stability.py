@@ -7,6 +7,14 @@ Protocol-frozen experiment: Alpha 什么时候有效？
 Experiment 3.1 — Year-by-year stability (fixed windows)
 Experiment 3.2 — Market regime decomposition (Bull/Bear/Sideways)
 
+Regime convention (revised): each trading day is labelled with the regime of
+ITS OWN calendar month (month M's benchmark return on month M's trading days).
+The previous implementation forward-filled month-end labels into the following
+month, so February traded on January's label (62.7% of trading days carried a
+stale label). Labels are contemporaneous and therefore usable only for ex-post
+performance decomposition, not as a tradable signal. Days without a benchmark
+label (e.g. before the benchmark starts) are explicitly skipped and counted.
+
 只记录结果，不解释。
 """
 
@@ -190,32 +198,78 @@ def compute_ic(signal, returns):
     return ic_summary(ic)
 
 
-def classify_regimes(benchmark_returns):
-    """Classify each month into Bull/Bear/Sideways based on benchmark returns.
+def classify_regimes(benchmark_returns, trading_days=None):
+    """Label each trading day with the regime of its OWN calendar month.
 
-    Returns: Series(index=date, value=regime_str)
+    Month M's compounded benchmark return is computed from the benchmark rows
+    inside M and applied to the trading days inside M (contemporaneous, ex-post
+    decomposition). No forward-fill into the next month: that made February
+    trade on January's label and mislabelled 62.7% of trading days.
+
+    Args:
+        benchmark_returns: Series of benchmark returns (pipeline convention).
+        trading_days: index of actual trading days to label. Defaults to the
+            benchmark's own index. Days whose month has no benchmark data get
+            NaN and are excluded by callers.
+
+    Returns: Series(index=trading_days, value=regime_str or NaN)
     """
+    if trading_days is None:
+        trading_days = (benchmark_returns.index if benchmark_returns is not None
+                        else pd.DatetimeIndex([]))
+    trading_days = pd.DatetimeIndex(trading_days).sort_values()
+
     if benchmark_returns is None or len(benchmark_returns) == 0:
-        return pd.Series("Sideways", index=pd.date_range(START_DATE, END_DATE, freq="ME"))
+        logger.warning("No benchmark returns — regime labels unavailable")
+        return pd.Series(np.nan, index=trading_days, name="regime", dtype=object)
 
-    monthly = benchmark_returns.resample(pd.offsets.MonthEnd()).apply(lambda x: (1 + x).prod() - 1)
-    regimes = {}
-    for date, ret in monthly.items():
+    benchmark_returns = benchmark_returns.dropna()
+    if benchmark_returns.empty:
+        logger.warning("Benchmark series is empty after dropping NaN — regime labels unavailable")
+        return pd.Series(np.nan, index=trading_days, name="regime", dtype=object)
+
+    # min_count=1 keeps an all-NaN month as NaN instead of silently compounding
+    # it to 0% (which would become a spurious "Sideways" label).
+    monthly = benchmark_returns.resample(pd.offsets.MonthEnd()).apply(
+        lambda x: (1 + x).prod(min_count=1) - 1
+    ).dropna()
+
+    def _label(ret):
         if ret > REGIME_THRESHOLDS["Bull"]:
-            regimes[date] = "Bull"
-        elif ret < REGIME_THRESHOLDS["Bear"]:
-            regimes[date] = "Bear"
-        else:
-            regimes[date] = "Sideways"
+            return "Bull"
+        if ret < REGIME_THRESHOLDS["Bear"]:
+            return "Bear"
+        return "Sideways"
 
-    # Forward-fill to daily
-    regime_series = pd.Series(regimes, name="regime")
-    regime_series.index = pd.DatetimeIndex(regime_series.index)
-    daily_regime = regime_series.reindex(
-        pd.date_range(START_DATE, END_DATE, freq="D"),
-        method="ffill"
-    )
-    return daily_regime
+    labels_by_month = {idx.to_period("M"): _label(ret) for idx, ret in monthly.items()}
+    day_labels = [labels_by_month.get(period, np.nan)
+                  for period in trading_days.to_period("M")]
+    return pd.Series(day_labels, index=trading_days, name="regime", dtype=object)
+
+
+def regime_shares(daily_regime):
+    """Percentage of *labelled* trading days in each regime (sums to 100).
+
+    Unlabelled days (NaN, e.g. before the benchmark starts) are excluded from
+    the denominator and must be reported separately.
+    """
+    labelled = daily_regime.dropna()
+    if labelled.empty:
+        return pd.Series(dtype=float)
+    return labelled.value_counts(normalize=True) * 100.0
+
+
+def regime_pct_time(regime_dates, daily_regime):
+    """``%Time`` for one regime: share of labelled trading days, in percent.
+
+    The denominator is the number of trading days carrying a regime label —
+    never calendar days. This is the single expression used by the report so
+    the displayed shares cannot drift from :func:`regime_shares`.
+    """
+    total_labelled = int(daily_regime.notna().sum())
+    if total_labelled == 0:
+        return 0.0
+    return len(regime_dates) / total_labelled * 100.0
 
 
 def print_yearly_results(results):
@@ -318,18 +372,31 @@ if __name__ == "__main__":
     # ==================================================================
     logger.info("[5/5] Running Experiment 3.2 — Regime decomposition...")
 
-    # Classify regimes
-    daily_regime = classify_regimes(benchmark)
-    regime_counts = daily_regime.value_counts()
-    total_days = len(daily_regime)
-    logger.info("  Regime distribution: %s", {k: f"{v/total_days*100:.1f}%" for k, v in regime_counts.items()})
+    # Classify regimes on the actual trading calendar. Each month's own
+    # return labels that month's trading days — no forward-fill into the
+    # next month (the old behaviour put January's label on February).
+    daily_regime = classify_regimes(benchmark, trading_days=returns.index)
+    labelled_days = daily_regime.dropna()
+    n_unlabelled = int(daily_regime.isna().sum())
+    total_trading_days = len(labelled_days)
+    logger.info("  Regime labels: %d/%d trading days labelled; %d unlabelled skipped",
+                total_trading_days, len(daily_regime), n_unlabelled)
+    if n_unlabelled:
+        unlabelled_index = daily_regime.index[daily_regime.isna()]
+        logger.info("  Unlabelled (skipped) days span %s → %s (no benchmark data for their month)",
+                    unlabelled_index.min().date(), unlabelled_index.max().date())
+    if total_trading_days == 0:
+        logger.warning("  No regime labels available — Experiment 3.2 will be empty")
+    else:
+        shares = regime_shares(labelled_days)
+        logger.info("  Regime distribution (%% of labelled trading days): %s",
+                    {k: f"{v:.1f}%" for k, v in shares.items()})
 
     regime_records = []
 
     for regime_name in ["Bull", "Bear", "Sideways"]:
-        # Get dates for this regime
-        regime_dates = daily_regime[daily_regime == regime_name].index
-        regime_dates_str = regime_dates.strftime("%Y-%m-%d")
+        # Dates carrying this regime label (NaN days are never matched)
+        regime_dates = daily_regime.index[daily_regime == regime_name]
 
         # Filter returns/prices to regime dates
         # IC: compute only on regime dates
@@ -344,8 +411,9 @@ if __name__ == "__main__":
             # IC: subset to regime dates that exist in returns
             common_dates = sorted(set(sig.index) & set(returns_aligned.index) & set(regime_dates))
             if len(common_dates) < 10:
-                logger.info("    %-18s %-10s → too few dates (%d), skipping",
-                            sig_name, regime_name, len(common_dates))
+                logger.info("    %-18s %-10s → too few dates (%d), skipping (regime covers %.1f%% of labelled days)",
+                            sig_name, regime_name, len(common_dates),
+                            regime_pct_time(regime_dates, daily_regime))
                 continue
 
             regime_sig = sig.loc[common_dates]
@@ -367,7 +435,9 @@ if __name__ == "__main__":
                 logger.warning("  Regime BT failed for %s %s: %s", sig_name, regime_name, e)
                 sharpe = 0
 
-            pct_time = len(common_dates) / total_days * 100
+            # Denominator is actual *labelled* trading days, not calendar days
+            # (the old 1826-day denominator made regime shares sum to ~70%).
+            pct_time = regime_pct_time(common_dates, daily_regime)
             row = {
                 "Cluster": sig_name, "Regime": regime_name,
                 "IC": ic_s.get("mean_ic", 0), "ICIR": ic_s.get("icir", 0),
