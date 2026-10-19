@@ -48,6 +48,9 @@
           </span>
         </div>
         <div class="card-body">
+          <div v-if="riskOverview.available === false" class="chart-unavailable" style="min-height:auto;justify-content:flex-start;text-align:left;padding-bottom:0">
+            {{ riskOverview.reason || (locale === 'zh-CN' ? '风控状态不可用' : 'Risk state unavailable') }}
+          </div>
           <!-- Factor Exposure Radar -->
           <div class="chart-title">{{ locale === 'zh-CN' ? 'Barra因子暴露' : 'Barra Factor Exposures' }}</div>
           <div
@@ -258,8 +261,9 @@ const { $t, locale } = useI18n()
 
 // ── State ──
 const riskOverview = reactive({
+  available: null, reason: '',
   factor_exposures: {}, sector_concentration: {}, current_drawdown: 0,
-  volatility: 0, var_95: 0, cvar_95: 0, risk_level: 'GREEN',
+  volatility: 0, var_95: 0, cvar_95: 0, risk_level: 'UNKNOWN',
   portfolio_value: 0, daily_pnl: 0, n_positions: 0,
   factor_exposures_available: null, factor_exposures_reason: '',
 })
@@ -614,8 +618,8 @@ function formatNum(v, decimals = 2) {
 }
 
 function riskColor(level) {
-  const map = { GREEN: '#34d399', YELLOW: '#fbbf24', ORANGE: '#fb923c', RED: '#f87171', KILL: '#ff0040' }
-  return map[level] || '#34d399'
+  const map = { GREEN: '#34d399', YELLOW: '#fbbf24', ORANGE: '#fb923c', RED: '#f87171', KILL: '#ff0040', UNKNOWN: '#8b9dc0' }
+  return map[level] || '#8b9dc0'
 }
 
 function alertTagClass(alert) {

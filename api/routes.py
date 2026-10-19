@@ -846,8 +846,10 @@ def _build_chart_data(
         br = benchmark_returns.reindex(sr.index).dropna()
         bench_equity = (1 + br).cumprod().tolist()
 
-    running_max = equity.expanding(min_periods=1).max()
-    drawdown = (equity / running_max - 1).tolist()
+    # Drawdown from the initial wealth of 1.0; see reporting.performance.
+    wealth = np.concatenate([[1.0], equity.to_numpy()])
+    running_max = np.maximum.accumulate(wealth)
+    drawdown = (wealth / running_max - 1)[1:].tolist()
 
     rolling_sharpe = None
     rolling_sharpe_dates = None
@@ -865,6 +867,10 @@ def _build_chart_data(
         monthly_ret = sr.resample(pd.offsets.MonthEnd()).apply(lambda x: (1 + x).prod() - 1)
         monthly_ret.index = monthly_ret.index.to_period("M")
         mdf = monthly_ret.groupby([monthly_ret.index.year, monthly_ret.index.month]).first().unstack()
+        # Fill in months with no observation so the array index matches the
+        # Jan-Dec axis the frontend and the HTML report draw. Without this a
+        # March-May run had its March value plotted under January.
+        mdf = mdf.reindex(columns=range(1, 13))
         if not mdf.empty:
             monthly = {
                 "years": [str(y) for y in mdf.index.tolist()],
@@ -2119,31 +2125,16 @@ def _get_risk_monitor():
 
 @router.get("/risk/status")
 async def get_risk_status():
-    """Get current risk monitor status."""
+    """Get the live risk monitor's current state.
+
+    This used to overwrite the process-wide monitor with the OMS book on
+    every GET. The OMS is a different book with a different initial capital,
+    and its `daily_pnl` is cumulative rather than daily, so a frontend poll
+    could ratchet `peak_value` to the OMS equity and make the next engine
+    cycle see a 90% drawdown and trip the kill switch. Risk state is owned by
+    the trading engine/runner, which publish their own snapshots.
+    """
     monitor = _get_risk_monitor()
-
-    # Update with latest OMS data if available
-    oms = _get_oms()
-    if oms.positions:
-        positions = {}
-        sector_weights = {}
-        for ticker, pos in oms.positions.items():
-            positions[ticker] = {
-                "value": pos.market_value,
-                "weight": pos.weight,
-                "sector": pos.sector or "Unknown",
-            }
-            sector = pos.sector or "Unknown"
-            sector_weights[sector] = sector_weights.get(sector, 0) + pos.weight
-
-        snapshot = oms.get_snapshot()
-        monitor.update_portfolio_state(
-            portfolio_value=snapshot.total_value,
-            daily_pnl=snapshot.daily_pnl,
-            positions=positions,
-            sector_weights=sector_weights,
-        )
-
     return monitor.get_status()
 
 
@@ -2484,7 +2475,7 @@ def _get_live_engine():
 
 
 @router.post("/trading/start")
-async def trading_start(req: dict):
+def trading_start(req: dict):
     """Start the live trading engine with full core architecture."""
     from quant_platform.trading.broker import SimulatedBroker
     from quant_platform.trading.engine import LiveTradingEngine
@@ -2578,7 +2569,7 @@ async def trading_start(req: dict):
 
 
 @router.post("/trading/stop")
-async def trading_stop():
+def trading_stop():
     """Stop the live trading engine."""
     engine = _get_live_engine()
     if engine:
@@ -2588,7 +2579,7 @@ async def trading_stop():
 
 
 @router.get("/trading/status")
-async def trading_status():
+def trading_status():
     """Get live trading engine status."""
     engine = _get_live_engine()
     if not engine:
@@ -2597,7 +2588,7 @@ async def trading_status():
 
 
 @router.get("/trading/positions")
-async def trading_positions():
+def trading_positions():
     """Get live trading positions."""
     engine = _get_live_engine()
     if not engine:
@@ -2606,7 +2597,7 @@ async def trading_positions():
 
 
 @router.get("/trading/account")
-async def trading_account():
+def trading_account():
     """Get live trading account info."""
     engine = _get_live_engine()
     if not engine:
@@ -2615,7 +2606,7 @@ async def trading_account():
 
 
 @router.get("/trading/cycles")
-async def trading_cycles():
+def trading_cycles():
     """Get recent trading cycles."""
     engine = _get_live_engine()
     if not engine:
@@ -2624,7 +2615,7 @@ async def trading_cycles():
 
 
 @router.post("/trading/order")
-async def trading_manual_order(req: dict):
+def trading_manual_order(req: dict):
     """Place a manual order."""
     engine = _get_live_engine()
     if not engine:
@@ -2661,7 +2652,15 @@ def market_snapshot():
         # Return top 50 by amount for performance
         top = df.nlargest(50, '成交额')
         records = top[['代码', '名称', '最新价', '涨跌幅', '成交额', '换手率', '市盈率-动态', '总市值']].to_dict('records')
-        return {"stocks": records, "total": len(df), "timestamp": datetime.now().isoformat()}
+        # Report when the data was fetched, not when this request was served.
+        data_timestamp = rt.snapshot_fetched_at or datetime.now().isoformat()
+        return {
+            "stocks": records,
+            "total": len(df),
+            "timestamp": data_timestamp,
+            "data_timestamp": data_timestamp,
+            "stale": rt.snapshot_is_stale,
+        }
     except Exception as e:
         raise HTTPException(500, str(e)) from e
 
@@ -3253,8 +3252,15 @@ def l2_vwap(code: str, n_ticks: int = 100):
         provider.start()
         import time
         time.sleep(0.3)
+    ticks = provider.get_ticks(code, limit=n_ticks)
+    if not ticks or sum(t.volume for t in ticks) <= 0:
+        # Returning vwap=0.0 with n_ticks=100 presented "no data" as a price.
+        raise HTTPException(404, f"No tick data for {code}")
     vwap = provider.compute_vwap(code, n_ticks=n_ticks)
-    return VWAPResponse(code=code, vwap=round(vwap, 4), n_ticks=n_ticks)
+    return VWAPResponse(
+        code=code, vwap=round(vwap, 4), n_ticks=len(ticks),
+        simulated=True, source="simulated",
+    )
 
 
 @router.get("/l2/flow/{code}", response_model=TradeFlowResponse)
@@ -3266,6 +3272,8 @@ def l2_trade_flow(code: str, n_ticks: int = 100):
         import time
         time.sleep(0.3)
     flow = provider.compute_trade_flow(code, n_ticks=n_ticks)
+    if flow["buy_volume"] + flow["sell_volume"] <= 0:
+        raise HTTPException(404, f"No directional tick data for {code}")
     return TradeFlowResponse(code=code, **flow)
 
 

@@ -79,6 +79,74 @@ class TestTimeSeriesCV:
         with pytest.raises(ValueError):
             list(cv.split(100))
 
+    def test_test_windows_do_not_overlap(self):
+        """The step was not floored at test_size, so adjacent test windows
+        shared most of their days (58 of 63 with the defaults on a 600-day
+        panel) and fold-level dispersion was computed on overlapping data."""
+        cv = TimeSeriesCV(n_splits=5, train_size=504, test_size=63, gap=10)
+
+        splits = list(cv.split(600))
+
+        test_sets = [set(test) for _, test in splits]
+        for earlier, later in zip(test_sets, test_sets[1:], strict=False):
+            assert earlier.isdisjoint(later)
+        # 600 days cannot support five 63-day test windows; produce what fits
+        # instead of silently overlapping them.
+        assert len(splits) == 1
+
+    def test_embargo_changes_the_fold_positions(self):
+        """`embargo` was only read in rolling mode's train_start, so in the
+        default expanding mode `embargo=0` and `embargo=10` produced
+        byte-identical folds."""
+        base = TimeSeriesCV(
+            n_splits=5, train_size=504, test_size=63, gap=10,
+        )
+        embargoed = TimeSeriesCV(
+            n_splits=5, train_size=504, test_size=63, gap=10, embargo=10,
+        )
+
+        base_splits = list(base.split(800))
+        emb_splits = list(embargoed.split(800))
+
+        assert len(emb_splits) <= len(base_splits)
+        assert emb_splits[1][1][0] - base_splits[1][1][0] == 10
+
+
+class TestCrossSectionalIC:
+    """`train()` used pooled `np.corrcoef` over the flattened panel, so a
+    date-level market-timing prediction scored a high "IC" with zero
+    cross-sectional skill."""
+
+    def test_date_level_predictions_have_no_cross_sectional_ic(self):
+        gen = MLSignalGenerator()
+        n_dates, n_assets = 20, 10
+        date_idx = np.repeat(np.arange(n_dates), n_assets)
+        dates = pd.bdate_range("2024-01-01", periods=n_dates).repeat(n_assets)
+        rng = np.random.default_rng(0)
+        y = date_idx + rng.normal(0, 1, n_dates * n_assets)
+        pred = date_idx.astype(float)  # constant within each date
+
+        # Pooled correlation is high...
+        assert np.corrcoef(y, pred)[0, 1] > 0.9
+        # ...but there is no per-date ranking skill to measure.
+        ics = gen._cross_sectional_ic(dates, y, pred)
+        assert ics.empty
+
+    def test_perfect_within_date_ranking_gives_ic_one(self):
+        gen = MLSignalGenerator()
+        n_dates, n_assets = 5, 8
+        dates = pd.bdate_range("2024-01-01", periods=n_dates).repeat(n_assets)
+        rng = np.random.default_rng(1)
+        y = rng.normal(size=n_dates * n_assets)
+        pred = np.tile(np.arange(n_assets, dtype=float), n_dates)
+        # Make y rank identically to pred within every date.
+        y = np.tile(np.arange(n_assets, dtype=float), n_dates) * 10 + y
+
+        ics = gen._cross_sectional_ic(dates, y, pred)
+
+        assert len(ics) == n_dates
+        assert ics.mean() == pytest.approx(1.0)
+
 
 class TestMLSignalConfig:
     def test_default_config(self):
@@ -170,6 +238,8 @@ class TestMLSignalGenerator:
 
     @pytest.mark.skipif(not HAS_LGB, reason="lightgbm not installed")
     def test_save_load_model(self, sample_factors, sample_forward_returns, tmp_path):
+        import json
+
         cfg = MLSignalConfig(model_type="lightgbm", n_splits=2)
         gen = MLSignalGenerator(config=cfg)
         gen.train(sample_factors, sample_forward_returns)
@@ -177,22 +247,40 @@ class TestMLSignalGenerator:
         model_path = str(tmp_path / "test_model.lgb")
         gen.save_model(model_path)
 
-        # Verify metadata JSON was created
-        meta_path = tmp_path / "test_model.json"
+        meta_path = tmp_path / "test_model.lgb.meta.json"
         assert meta_path.exists()
+        assert (tmp_path / "test_model.lgb").exists(), (
+            "LightGBM sklearn wrapper has no save_model; the booster must be "
+            "written explicitly"
+        )
+        meta = json.loads(meta_path.read_text())
+        assert meta["model_type"] == "lightgbm"
+        assert meta["feature_names"]
+        assert meta["train_end_date"]
 
-        # Load into new generator (model file may or may not exist depending on LGB version)
         gen2 = MLSignalGenerator(config=cfg)
-        model_file = tmp_path / "test_model.lgb"
-        if model_file.exists():
-            gen2.load_model(model_path)
-            assert gen2.model is not None
-        else:
-            # LightGBM sklearn wrapper may not save via save_model — verify metadata instead
-            import json
-            meta = json.loads(meta_path.read_text())
-            assert meta["model_type"] == "lightgbm"
-            assert "feature_importance" in meta
+        gen2.load_model(model_path)
+
+        assert gen2.model is not None
+        assert gen2._feature_names == meta["feature_names"]
+        assert gen2._train_end_date is not None
+        # The in-sample guard must survive the round trip: the model was
+        # trained through the last date, so `predict` has nothing OOS to say.
+        signal = gen2.predict(sample_factors)
+        assert signal.isna().to_numpy().all()
+
+    def test_save_untrained_model_is_an_error(self, tmp_path):
+        gen = MLSignalGenerator()
+        with pytest.raises(RuntimeError, match="not trained"):
+            gen.save_model(str(tmp_path / "model.lgb"))
+
+    def test_load_requires_the_metadata_sidecar(self, tmp_path):
+        model_path = tmp_path / "model.lgb"
+        model_path.write_bytes(b"not a model")
+        gen = MLSignalGenerator()
+
+        with pytest.raises(FileNotFoundError, match="metadata"):
+            gen.load_model(str(model_path))
 
 
 class TestModelPerformance:

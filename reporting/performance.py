@@ -62,9 +62,14 @@ def plot_drawdown(
     """Plot underwater (drawdown) chart."""
     fig, ax = plt.subplots(figsize=(12, 4))
 
-    cumulative = (1 + strategy_returns).cumprod()
-    running_max = cumulative.expanding(min_periods=1).max()
-    drawdown = (cumulative / running_max - 1) * 100
+    # Include the initial wealth of 1.0 as the first peak, matching
+    # backtest.metrics.max_drawdown. Starting from the first *return* made a
+    # loss on day one invisible to the running maximum.
+    growth = (1 + strategy_returns.fillna(0)).to_numpy()
+    wealth = np.concatenate([[1.0], growth])
+    running_max = np.maximum.accumulate(wealth)
+    dd_values = (wealth / running_max - 1)[1:] * 100
+    drawdown = pd.Series(dd_values, index=strategy_returns.index)
 
     ax.fill_between(drawdown.index, 0, drawdown.values, color="#d62728", alpha=0.3)
     ax.plot(drawdown.index, drawdown.values, color="#d62728", linewidth=0.5)
@@ -121,7 +126,12 @@ def plot_monthly_returns_heatmap(
     df = monthly.to_frame(name="return")
     df["year"] = df.index.year
     df["month"] = df.index.month
-    pivot = df.pivot_table(values="return", index="year", columns="month", aggfunc="sum") * 100
+    # `aggfunc="sum"` turns an all-NaN month into 0.0 (pandas' sum has
+    # min_count=0), plotting a real-looking 0% for a month with no data.
+    pivot = df.pivot_table(
+        values="return", index="year", columns="month",
+        aggfunc=lambda x: x.sum(min_count=1),
+    ) * 100
 
     fig, ax = plt.subplots(figsize=(10, len(pivot) * 0.8 + 1))
     month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",

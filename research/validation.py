@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from statistics import NormalDist
 
 import numpy as np
 
@@ -81,7 +82,9 @@ class FactorValidator:
         Args:
             returns: Array of strategy daily returns.
             num_trials: Number of strategies/parameters tested (N).
-            expected_max_sharpe: Override for E[max SR] under null.
+            expected_max_sharpe: Override for E[max SR] under null. Pass an
+                **annualized** Sharpe; it is converted to per-period units
+                internally.
 
         Returns:
             DeflatedSharpeResult with p-value and significance flag.
@@ -116,45 +119,50 @@ class FactorValidator:
                 significant=False,
             )
 
-        # Observed annualized Sharpe (assuming daily returns)
-        observed_sr = mu / sigma * math.sqrt(252)
+        # Work in per-period units. The old code compared an *annualized*
+        # Sharpe with the unit-variance order statistic sqrt(2 ln N) and
+        # plugged the annualized SR into a standard-error formula that
+        # expects a per-period one. The three terms were on different scales:
+        # a true annualized SR of 2.0 over 1260 days with N=10 came out at
+        # p=0.59, while a short-sample fluke could pass.
+        sr = mu / sigma
+        observed_sr = sr * math.sqrt(252)
 
-        # Higher moments
+        # Higher moments (kurtosis is non-excess in the DSR formula)
         skew = float(((returns - mu) ** 3).mean() / (sigma ** 3))
         excess_kurt = float(((returns - mu) ** 4).mean() / (sigma ** 4) - 3)
+        kurt = excess_kurt + 3.0
 
-        # Expected max Sharpe under null (analytical approximation)
+        # Variance of the per-period Sharpe estimator (Lo 2002 / Bailey &
+        # López de Prado 2014, eq. for V[SR]).
+        var_sr = max(
+            0.0,
+            (1 - skew * sr + (kurt - 1) / 4 * sr ** 2) / max(n - 1, 1),
+        )
+        se_sr = math.sqrt(var_sr)
+
         if expected_max_sharpe is None:
-            # E[max(SR_1, ..., SR_N)] ≈ √(2 ln N) for iid standard normals
-            # More accurate with finite-sample and non-normality correction
             if num_trials <= 1:
                 e_max_sr = 0.0
             else:
-                e_max_sr = math.sqrt(2 * math.log(num_trials))
-                # Finite-sample correction (Bailey & López de Prado)
+                # E[max(SR_1..SR_N)] with the Gumbel approximation:
+                # sqrt(V[SR]) * ((1-gamma)*Phi^-1(1-1/N)
+                #                + gamma*Phi^-1(1-1/(N e)))
                 euler_mascheroni = 0.5772156649
-                e_max_sr -= euler_mascheroni / (2 * math.sqrt(2 * math.log(num_trials))) if num_trials > 1 else 0
+                nd = NormalDist()
+                e_max_sr = math.sqrt(var_sr) * (
+                    (1 - euler_mascheroni) * nd.inv_cdf(1 - 1 / num_trials)
+                    + euler_mascheroni * nd.inv_cdf(1 - 1 / (num_trials * math.e))
+                )
         else:
-            e_max_sr = expected_max_sharpe
-
-        # Compute deflated p-value: P(SR_observed | H0: SR = E[max SR])
-        # Using the Jobson & Korkie (1981) test statistic with
-        # non-normality correction (Bailey & López de Prado 2014)
-        # SR_hat ~ N(SR_true, (1 + 0.5*SR_true^2 - skew*SR_true + (kurt-3)/4*SR_true^2) / (n-1))
-        # Under H0: SR_true = E[max SR]
-
-        # Standard error of Sharpe ratio estimate
-        se_sr = math.sqrt(
-            (1 + 0.5 * observed_sr ** 2 - skew * observed_sr
-             + (excess_kurt) / 4 * observed_sr ** 2) / (n - 1)
-        )
+            # The override is documented as an annualized Sharpe.
+            e_max_sr = expected_max_sharpe / math.sqrt(252)
 
         if se_sr < 1e-12:
-            deflated_p = 0.0 if observed_sr > e_max_sr else 1.0
+            deflated_p = 0.0 if sr > e_max_sr else 1.0
         else:
-            # Z-test: is observed SR significantly above E[max SR]?
-            z = (observed_sr - e_max_sr) / se_sr
-            # One-sided p-value (we want SR > E[max SR])
+            # Z-test: is the per-period SR above E[max SR]?
+            z = (sr - e_max_sr) / se_sr
             deflated_p = _norm_sf(z)
 
         significant = deflated_p < self.significance_level
@@ -167,7 +175,7 @@ class FactorValidator:
 
         return DeflatedSharpeResult(
             observed_sharpe=round(observed_sr, 6),
-            expected_max_sharpe=round(e_max_sr, 6),
+            expected_max_sharpe=round(e_max_sr * math.sqrt(252), 6),
             deflated_p_value=round(deflated_p, 6),
             num_trials=num_trials,
             skew=round(skew, 6),

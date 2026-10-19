@@ -56,6 +56,8 @@ class RealtimeQuote:
     bid_volumes: list[float] = field(default_factory=list)
     ask_volumes: list[float] = field(default_factory=list)
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    source: str = ""
+    simulated: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -67,6 +69,8 @@ class RealtimeQuote:
             "bid1_price": self.bid_prices[0] if self.bid_prices else 0,
             "ask1_price": self.ask_prices[0] if self.ask_prices else 0,
             "timestamp": self.timestamp,
+            "source": self.source,
+            "simulated": self.simulated,
         }
 
 
@@ -291,17 +295,31 @@ class WebSocketQuoteProvider:
                 items = data["data"] if isinstance(data["data"], list) else [data["data"]]
                 for item in items:
                     if isinstance(item, dict):
+                        # East Money push ids: f2 latest, f3 change %, f12
+                        # code, f14 name, f15 high, f16 low, f17 open,
+                        # f18 prev close, f5 volume (lots), f6 amount.
+                        # f17 (open) used to be read as the latest price and
+                        # f16 (low) as the open, so every consumer traded at
+                        # the day's opening print.
+                        raw_volume = item.get("volume")
+                        if raw_volume is None:
+                            # East Money reports volume in 手; normalise to
+                            # shares so sources are interchangeable.
+                            volume = float(item.get("f5", 0) or 0) * 100.0
+                        else:
+                            volume = float(raw_volume or 0)
                         q = RealtimeQuote(
                             code=str(item.get("code", item.get("f12", ""))),
                             name=item.get("name", item.get("f14", "")),
-                            price=float(item.get("price", item.get("f17", 0))),
-                            change_pct=float(item.get("change_pct", item.get("f3", 0))),
-                            volume=float(item.get("volume", item.get("f5", 0))),
-                            amount=float(item.get("amount", item.get("f6", 0))),
-                            high=float(item.get("high", item.get("f15", 0))),
-                            low=float(item.get("low", item.get("f16", 0))),
-                            open=float(item.get("open", item.get("f16", 0))),
-                            prev_close=float(item.get("prev_close", item.get("f18", 0))),
+                            price=float(item.get("price", item.get("f2", 0)) or 0),
+                            change_pct=float(item.get("change_pct", item.get("f3", 0)) or 0),
+                            volume=volume,
+                            amount=float(item.get("amount", item.get("f6", 0)) or 0),
+                            high=float(item.get("high", item.get("f15", 0)) or 0),
+                            low=float(item.get("low", item.get("f16", 0)) or 0),
+                            open=float(item.get("open", item.get("f17", 0)) or 0),
+                            prev_close=float(item.get("prev_close", item.get("f18", 0)) or 0),
+                            source=self._source,
                         )
                         quotes.append(q)
 
@@ -325,6 +343,7 @@ class WebSocketQuoteProvider:
                             ask_prices=[float(fields[i] or 0) for i in [21, 23, 25, 27, 29]],
                             bid_volumes=[float(fields[i] or 0) for i in [10, 12, 14, 16, 18]],
                             ask_volumes=[float(fields[i] or 0) for i in [20, 22, 24, 26, 28]],
+                            source=self._source,
                         )
                         if q.prev_close > 0:
                             q.change_amt = q.price - q.prev_close
@@ -404,6 +423,7 @@ class SimulatedWebSocketProvider:
     def stats(self) -> dict:
         return {
             "source": "simulated",
+            "simulated": True,
             "connected": self.is_connected,
             "subscribed": len(self._codes),
             "cached_quotes": len(self._quotes),
@@ -437,6 +457,8 @@ class SimulatedWebSocketProvider:
                 ask_prices=[round(price + i * 0.01, 2) for i in range(1, 6)],
                 bid_volumes=[round(self._rng.random() * 10000) for _ in range(5)],
                 ask_volumes=[round(self._rng.random() * 10000) for _ in range(5)],
+                source="simulated",
+                simulated=True,
             )
 
             with self._lock:

@@ -72,7 +72,11 @@ class NAVCalculator:
         initial_units: Initial total units (default: 10,000,000).
     """
 
-    TRADING_DAYS_PER_YEAR = 252
+    # Management fees accrue on calendar days: the accrual window is calendar
+    # time, so the annual rate is divided by 365. This used to count business
+    # days but divide by 252, which charged 262/252 of the stated annual fee
+    # in a normal year and up to six days of fees over a Spring Festival week.
+    DAYS_PER_YEAR = 365.0
 
     def __init__(
         self,
@@ -86,6 +90,7 @@ class NAVCalculator:
         self._annual_mgmt_fee = annual_mgmt_fee
         self._perf_fee_rate = perf_fee_rate
         self._initial_nav_per_unit = initial_nav_per_unit
+        self._initial_units = initial_units
         self._total_units = initial_units
         self._high_water_mark = initial_nav_per_unit
         # Fees are liabilities: once accrued they stay deducted from NAV until
@@ -148,29 +153,54 @@ class NAVCalculator:
 
         gross_assets = cash + market_value
 
-        # Previous record strictly before this date, and the number of trading
-        # days elapsed. `get_nav_history(days=2)` missed every Friday when run
-        # on Monday, which zeroed the daily return and collapsed cash.
-        previous = []
+        # Previous record strictly before this date, and the calendar days
+        # elapsed.
+        history: list[dict] = []
         try:
             history = self._store.get_nav_history(days=365 * 10)
-            previous = [row for row in history if str(row.get("date", "")) < date]
         except (AttributeError, Exception):
-            previous = []
+            history = []
+        previous = [row for row in history if str(row.get("date", "")) < date]
+        same_day = next(
+            (row for row in history if str(row.get("date", "")) == date), None,
+        )
+
+        if same_day is not None:
+            # Recalculation for a date that was already saved (a retry or a
+            # correction). Start again from the persisted state *before* that
+            # date; otherwise its fees and high-water mark are applied twice
+            # while save_nav overwrites the same row.
+            if previous:
+                row = previous[-1]
+                self._high_water_mark = float(
+                    row.get("high_water_mark", self._initial_nav_per_unit)
+                )
+                self._accrued_mgmt_fee = float(row.get("accrued_mgmt_fee", 0) or 0)
+                self._accrued_perf_fee = float(row.get("accrued_perf_fee", 0) or 0)
+                self._total_units = float(row.get("total_units", self._initial_units))
+            else:
+                self._high_water_mark = self._initial_nav_per_unit
+                self._accrued_mgmt_fee = 0.0
+                self._accrued_perf_fee = 0.0
+                self._total_units = self._initial_units
 
         elapsed_days = 1
         if previous:
             try:
-                elapsed_days = max(
-                    1, int(np.busday_count(str(previous[-1]["date"]), date)),
-                )
+                prev_dt = datetime.strptime(str(previous[-1]["date"])[:10], "%Y-%m-%d")
+                cur_dt = datetime.strptime(date[:10], "%Y-%m-%d")
+                elapsed_days = max(1, (cur_dt - prev_dt).days)
             except (TypeError, ValueError):
                 elapsed_days = 1
 
         # Management fee is a liability: accrue it cumulatively and deduct the
-        # whole accrual from gross assets every day. Charging it on the
-        # post-fee base makes the accrual compound, as a real fee does.
-        fee_base = max(0.0, gross_assets - self._accrued_mgmt_fee)
+        # whole accrual from gross assets every day. The base is net of all
+        # fees already owed, so neither accrual compounds on money that no
+        # longer belongs to investors.
+        fee_base = max(
+            0.0,
+            gross_assets - self._accrued_mgmt_fee - self._accrued_perf_fee,
+        )
         mgmt_fee = self._accrue_mgmt_fee(fee_base, days=elapsed_days)
         self._accrued_mgmt_fee += mgmt_fee
 
@@ -191,8 +221,9 @@ class NAVCalculator:
             perf_fee = 0.0
         self._accrued_perf_fee += perf_fee
 
-        # Net NAV
-        nav_total = gross_nav - perf_fee
+        # Net NAV. The whole accrued performance-fee liability stays deducted;
+        # subtracting only today's fee added every earlier fee back to NAV.
+        nav_total = gross_nav - self._accrued_perf_fee
         nav_per_unit = nav_total / self._total_units if self._total_units > 0 else 0
 
         # Returns
@@ -258,9 +289,9 @@ class NAVCalculator:
     def _accrue_mgmt_fee(self, nav: float, days: int = 1) -> float:
         """Management fee accrual.
 
-        mgmt_fee = NAV * annual_rate / 252 * elapsed_trading_days
+        mgmt_fee = NAV * annual_rate / 365 * elapsed calendar days
         """
-        return nav * self._annual_mgmt_fee / self.TRADING_DAYS_PER_YEAR * days
+        return nav * self._annual_mgmt_fee / self.DAYS_PER_YEAR * days
 
     def _accrue_perf_fee(self, nav_per_unit: float) -> float:
         """Performance fee with high-water mark.

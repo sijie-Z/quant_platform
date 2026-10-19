@@ -47,6 +47,7 @@ class APITokenMiddleware(BaseHTTPMiddleware):
     SENSITIVE_PREFIXES = (
         "/api/trading",
         "/api/oms",
+        "/api/risk",
         "/api/monitor/config",
         "/api/monitor/kill-switch",
         "/api/core/risk",

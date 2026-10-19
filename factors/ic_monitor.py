@@ -75,31 +75,13 @@ class FactorICMonitor:
         self.factor_stats: dict[str, FactorICStats] = {}
         self.ic_history: dict[str, pd.Series] = {}
 
-    def compute_rolling_ic(
+    def _daily_ic_series(
         self,
         factor: pd.DataFrame,
         forward_returns: pd.DataFrame,
-        window: int = 63,
     ) -> pd.Series:
-        """Compute rolling Rank IC between factor and forward returns.
-
-        Args:
-            factor: (date x asset) factor values
-            forward_returns: (date x asset) forward returns
-            window: rolling window size
-
-        Returns:
-            Series of daily IC values
-        """
+        """Raw per-date cross-sectional Rank IC."""
         common_dates = factor.index.intersection(forward_returns.index)
-        if len(common_dates) < window:
-            return pd.Series(dtype=float)
-
-        # Cross-sectional IC is a per-date quantity: compute it once for each
-        # date, then take the rolling mean. The old nested loop recomputed the
-        # same date's IC `window` times (14,931 Spearman calls for 237 output
-        # dates on a 300-day panel), which made this function O(n * window)
-        # and dominated the whole test suite (issue #62).
         daily_ic: dict[Any, float] = {}
         for date in common_dates:
             f_vals = factor.loc[date].dropna()
@@ -111,12 +93,38 @@ class FactorICMonitor:
                     ic = f_vals[common].corr(r_vals[common], method="spearman")
                 if not np.isnan(ic):
                     daily_ic[date] = float(ic)
+        return pd.Series(daily_ic, dtype=float).reindex(common_dates).dropna()
+
+    def compute_rolling_ic(
+        self,
+        factor: pd.DataFrame,
+        forward_returns: pd.DataFrame,
+        window: int = 63,
+    ) -> pd.Series:
+        """Smoothed IC series for display and trend detection.
+
+        This is a moving average of the raw daily ICs. It is deliberately not
+        the series on which ICIR and the positive ratio are computed: the
+        standard deviation of a 63-day moving average is much smaller than
+        the standard deviation of the daily ICs, which inflated ICIR roughly
+        sevenfold and reported 92% positive days for a 56% factor.
+
+        Args:
+            factor: (date x asset) factor values
+            forward_returns: (date x asset) forward returns
+            window: rolling window size
+
+        Returns:
+            Series of smoothed IC values indexed by date
+        """
+        daily_ic = self._daily_ic_series(factor, forward_returns)
+        if len(daily_ic) < window:
+            return pd.Series(dtype=float)
 
         # ic[t] = mean of daily ICs over the `window` dates before t, i.e. the
         # same window the old loop used (current date excluded).
-        ic_series = pd.Series(daily_ic, dtype=float).reindex(common_dates)
         ic_series = (
-            ic_series.rolling(window, min_periods=1)
+            daily_ic.rolling(window, min_periods=1)
             .mean()
             .shift(1)
             .iloc[window:]
@@ -141,12 +149,19 @@ class FactorICMonitor:
 
         self.ic_history[factor_name] = ic_series
 
-        # Current IC (most recent)
+        # ICIR and the positive ratio describe the daily IC distribution, not
+        # the 63-day moving average displayed above.
+        daily_ic = self._daily_ic_series(factor, forward_returns)
+        raw_ic = daily_ic.reindex(ic_series.index).dropna()
+        if len(raw_ic) < self.config.min_observations:
+            raw_ic = daily_ic
+
+        # Current IC (most recent smoothed value)
         current_ic = float(ic_series.iloc[-1])
 
-        # Rolling statistics
-        mean_ic = float(ic_series.mean())
-        std_ic = float(ic_series.std())
+        # Dispersion statistics on raw daily ICs
+        mean_ic = float(raw_ic.mean())
+        std_ic = float(raw_ic.std())
         icir = mean_ic / std_ic if std_ic > 0 else 0
 
         # IC trend (linear regression slope)
@@ -176,11 +191,11 @@ class FactorICMonitor:
         else:
             half_life = 9999  # Not decaying
 
-        # IC positive ratio
-        positive_ratio = float((ic_series > 0).mean())
+        # IC positive ratio on raw daily ICs
+        positive_ratio = float((raw_ic > 0).mean())
 
-        # Last significant date
-        significant = ic_series[ic_series.abs() > self.config.significance_threshold]
+        # Last significant date (raw IC)
+        significant = raw_ic[raw_ic.abs() > self.config.significance_threshold]
         last_sig = str(significant.index[-1]) if len(significant) > 0 else ""
 
         # Alert level

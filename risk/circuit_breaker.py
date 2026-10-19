@@ -96,9 +96,29 @@ class RiskMonitor:
         self.daily_pnl: float = 0.0
         self.positions: dict[str, dict] = {}  # ticker -> {value, weight, sector}
         self.sector_weights: dict[str, float] = {}
+        # Optional ticker -> sector map for names not yet held. Without it a
+        # new order's sector resolved to "Unknown", so the sector cap could
+        # not be evaluated before the position existed.
+        self.sector_map: dict[str, str] = {}
+        self._last_state_breach = ""
+        self._state_risk_level = RiskLevel.GREEN
 
         # Kill switch
         self.kill_switch_active = False
+
+    def set_sector_map(self, sector_map: dict[str, str]) -> None:
+        """Provide ticker -> sector classifications for pre-trade checks."""
+        self.sector_map = dict(sector_map)
+
+    def _resolve_sector(self, ticker: str, order: dict | None = None) -> str:
+        if order and order.get("sector"):
+            return str(order["sector"])
+        held = self.positions.get(ticker, {}).get("sector")
+        if held:
+            return str(held)
+        if ticker in self.sector_map:
+            return str(self.sector_map[ticker])
+        return "Unknown"
 
     def check_pre_trade(self, order: dict) -> tuple[bool, list[RiskBreach]]:
         """Run all pre-trade risk checks on an order.
@@ -262,7 +282,7 @@ class RiskMonitor:
         """Check sector concentration limit, including this order's delta."""
         ticker = order.get("ticker", "")
         side = str(order.get("side", "buy")).lower()
-        sector = self.positions.get(ticker, {}).get("sector", "Unknown")
+        sector = self._resolve_sector(ticker, order)
 
         current_sector_weight = float(self.sector_weights.get(sector, 0))
         if side in ("buy", "b") and self.portfolio_value > 0:
@@ -335,12 +355,87 @@ class RiskMonitor:
         positions: dict[str, dict],
         sector_weights: dict[str, float],
     ):
-        """Update the risk monitor's view of the portfolio."""
+        """Update the risk monitor's view of the portfolio.
+
+        The equity-based breakers are evaluated here as well as in
+        `check_pre_trade`. A fully invested book can breach the drawdown or
+        daily-loss limit without emitting a single order; previously the
+        risk level stayed GREEN and the kill switch never armed until someone
+        tried to trade.
+        """
         self.portfolio_value = portfolio_value
         self.daily_pnl = daily_pnl
         self.positions = positions
         self.sector_weights = sector_weights
         self.peak_value = max(self.peak_value, portfolio_value)
+
+        state_breaches: list[RiskBreach] = []
+        if not self.kill_switch_active:
+            for check in (self._check_daily_loss, self._check_drawdown):
+                breach = check()
+                if breach is not None:
+                    state_breaches.append(breach)
+
+        # The engine calls this every cycle; append the breach only when the
+        # condition changes, or the same warning would fill the breach log.
+        signature = ";".join(b.message for b in state_breaches)
+        if signature != self._last_state_breach:
+            self._last_state_breach = signature
+            for breach in state_breaches:
+                logger.warning("RISK BREACH [%s/%s]: %s",
+                               breach.severity.value, breach.breach_type.value,
+                               breach.message)
+                self.breaches.append(breach)
+
+        if state_breaches:
+            levels = [b.severity for b in state_breaches]
+            if RiskLevel.KILL in levels:
+                self._state_risk_level = RiskLevel.KILL
+            elif RiskLevel.RED in levels:
+                self._state_risk_level = RiskLevel.RED
+            else:
+                self._state_risk_level = RiskLevel.YELLOW
+            self.risk_level = self._state_risk_level
+        elif self._state_risk_level != RiskLevel.GREEN:
+            # Recovered: only undo a level that this method set, so an
+            # order-level breach does not get cleared by the next update.
+            self._state_risk_level = RiskLevel.GREEN
+            if self.risk_level in (RiskLevel.KILL, RiskLevel.RED, RiskLevel.YELLOW):
+                self.risk_level = RiskLevel.GREEN
+
+    def project_order(self, order: dict) -> None:
+        """Fold an approved, not-yet-filled buy into the exposure view.
+
+        During a rebalance cycle the engine checks orders one after another.
+        Each buy used to be compared against the book *before* the cycle, so
+        thirty 3%-of-equity orders all passed a 30% sector limit; the next
+        cycle then saw the whole sector and blocked every buy. Projecting the
+        approved order makes the remaining checks see the pending exposure.
+        The next `update_portfolio_state` replaces this view with the actual
+        book.
+        """
+        side = str(order.get("side", "buy")).lower()
+        if side not in ("buy", "b") or self.portfolio_value <= 0:
+            return
+        ticker = order.get("ticker") or order.get("symbol") or order.get("code")
+        if not ticker:
+            return
+        price = float(order.get("price", 0) or 0)
+        quantity = float(order.get("quantity", 0) or 0)
+        notional = price * quantity
+        if notional <= 0:
+            return
+
+        sector = self._resolve_sector(str(ticker), order)
+        weight = notional / self.portfolio_value
+        pos = self.positions.get(str(ticker))
+        if pos is None:
+            pos = {"value": 0.0, "weight": 0.0, "sector": sector}
+            self.positions[str(ticker)] = pos
+        pos["value"] = float(pos.get("value", 0.0)) + notional
+        pos["weight"] = float(pos.get("weight", 0.0)) + weight
+        pos["sector"] = sector
+        self.sector_weights[sector] = self.sector_weights.get(sector, 0.0) + weight
 
     def activate_kill_switch(self, reason: str = "Manual activation"):
         """Emergency kill switch — blocks all new orders."""

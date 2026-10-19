@@ -116,28 +116,43 @@ class InvestorPortal:
         inception_nav = float(df["nav_per_unit"].iloc[0])
         inception_date = str(df.index[0].date())
         # The lookback window is not inception. Read the earliest record we
-        # have so cumulative return and the inception date describe the fund,
-        # not the chart range.
+        # have so cumulative return, annualization and drawdown describe the
+        # fund, not the chart range.
+        all_records: list[dict] = []
         try:
             all_records = self._store.get_nav_history(days=365 * 30)
-            if all_records:
-                inception_date = str(all_records[0]["date"])
-                inception_nav = float(all_records[0]["nav_per_unit"])
         except Exception:
-            pass
+            all_records = []
+        if all_records:
+            inception_date = str(all_records[0]["date"])
+            inception_nav = float(all_records[0]["nav_per_unit"])
         cumulative_return = latest_nav / inception_nav - 1
 
-        # Annualize over elapsed time, not record count. Twelve monthly NAVs
-        # were treated as 12/252 years and reported 640% for a 10% year.
-        elapsed_years = (df.index[-1] - df.index[0]).days / 365.25
+        # Annualize over the fund's actual elapsed life. Using the first and
+        # last record of the 3-year lookback divided the *inception* return
+        # by a window as short as one day: a 6-year fund at +50% reported
+        # 17.65%/yr instead of ~7%.
+        try:
+            inception_dt = pd.Timestamp(inception_date)
+            elapsed_years = (df.index[-1] - inception_dt).days / 365.25
+        except (TypeError, ValueError):
+            elapsed_years = (df.index[-1] - df.index[0]).days / 365.25
         annualized_return = (
             (1 + cumulative_return) ** (1 / elapsed_years) - 1
             if elapsed_years > 0 else 0.0
         )
 
-        # Drawdown
-        peak = df["nav_per_unit"].expanding().max()
-        drawdown = (df["nav_per_unit"] - peak) / peak
+        # Drawdown over the full available history, for the same reason: a
+        # drawdown before the lookback window used to be invisible.
+        if all_records and "nav_per_unit" in all_records[0]:
+            full_nav = pd.Series(
+                [float(r["nav_per_unit"]) for r in all_records],
+                index=pd.to_datetime([r["date"] for r in all_records]),
+            ).sort_index().dropna()
+        else:
+            full_nav = df["nav_per_unit"]
+        peak = full_nav.expanding().max()
+        drawdown = (full_nav - peak) / peak
         max_drawdown = float(drawdown.min())
 
         # Volatility and Sharpe

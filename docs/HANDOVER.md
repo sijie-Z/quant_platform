@@ -269,4 +269,37 @@
 
 验证：全量测试 **1753 passed / 3 skipped / 0 failed**（3m08s），ruff 全绿。
 
-已知仍未处理：`strategy/gates.py` 中若干配置阈值未接线、多策略 orchestrator 的共享持仓归属、多租户隔离（#75 产品定位未定）。
+### 2026-10-19 第四轮审计（门禁 / 配置 / 多策略 / 前端）
+
+| 领域 | 修复 |
+|---|---|
+| 策略门禁 | 默认 `minimum_icir=0.0` 让 `abs(icir) >= 0` 对所有因子恒真，门禁永远不可能失败却仍报告"通过 ICIR 门禁"；默认改为 0.2，阈值 0 显式报告为"已禁用"。覆盖率门禁的调用方把 `n_assets_total` 和 `n_assets_with_data` 传成同一个数（自比较恒 PASS）；改为从价格面板实测覆盖率，宇宙未知时 SKIPPED 而不是伪造通过。删除从未被任何检查读取的配置字段；新增交易成本门禁，使用回测 summary 新增的 `annual_turnover` / `annual_cost_drag`（引擎按执行日累计成本） |
+| 配置接线 | `portfolio.risk_aversion`、`portfolio.covariance.ewma_half_life`、`risk.var.confidence` / `horizon` 此前只存在于 schema/YAML，没有任何调用方读取；现在分别接线到约束、协方差估计和报告 |
+| 多策略 | orchestrator 此前用**共享持仓簿**与每个策略的目标比较：两个策略各目标 100 股时，一笔成交让双方都以为已持有，下一次调仓双方各卖 100 股来回震荡。新增按 `order.strategy` 记账的逐策略持仓台账，调仓只看自己的持仓；逐策略 P&L 由自有份额的已实现+盯市计算，不再把整本账的盈亏记到每个策略头上 |
+| API/前端 | `/api/demo` 的回撤与月度收益改为小数，与 `/api/run` 及前端 `×100` 的约定一致；Monte Carlo 返回下采样后的 `terminal_values`（分布图此前永远空白）；MonitorDashboard 消费后端的 `available/reason` 并显示不可用原因，同时复用 ECharts 实例——此前每 15 秒轮询都会重新 `echarts.init` 同一节点，一个打开的页面每轮泄漏 8 个图表实例 |
+| 合规导出 | 带时区偏移的成交/委托时间与本地朴素日期窗口比较会抛 `TypeError`，被旧的 `except` 当作"无法解析"静默丢弃；现在先转换为本地时间再比较 |
+
+验证：全量测试 **1767 passed / 3 skipped / 0 failed**（3m21s），ruff 全绿。
+
+### 2026-10-19 第五轮审计（数据源 / 研究统计 / 运营 / 实盘风控）
+
+这一轮由四个并行审计 agent 覆盖此前未深挖的模块，修复均带回归测试。
+
+| 领域 | 修复 |
+|---|---|
+| 组合优化 | MVO 只尝试 `[ECOS, SCS]`，而 cvxpy 1.7 的轮子里没有 ECOS；同时换手上限在信号轮换超过预算时本身不可行。默认配置 **60 次调仓中 54 次静默回退等权**。改为只尝试已安装的求解器（CLARABEL 优先），并把既有持仓保留在候选集里，使换手约束可行——同一回测现在 **0 次回退**，`effective_optimizer=mean_variance` |
+| 基本面 | 实时接口失败时回退合成数据却没有任何标记，`stats` 仍报告 `eastmoney`；`hash(code)` 每个进程加盐，同一只股票的 PE/PB 每次重启都变。现在 `source`/`is_synthetic` 随响应返回、种子改用 `crc32`、EastMoney 改读正确的 f162/f167（含 /100 缩放）；筛选器把 0 当作"未知"而不是真实值（`pe_max=20` 不再通过所有股票） |
+| 行情/盘口 | 行情缓存过期后仍以"现在的 `datetime.now()`"作为响应时间；WebSocket 解析把 f17（开盘）当最新价、f16（最低）当开盘，成交量未统一为股；Level 2 全部为模拟数据却无任何标记，空 tick 时 VWAP 返回 `0.0`、流向返回 `50`。现在快照与报价携带真实抓取时间与 `stale`、WebSocket 字段映射与单位修正、所有 L2/WS 响应带 `simulated/source`，空数据返回 404 |
+| PostgreSQL | `get_prices` 只 pivot 第一个字段且多字段时列名重复（违反 `(date, asset)` MultiIndex 契约）；连接失败被构造函数吞掉，`main.py` 记录"Using PostgreSQL provider"后第一次调用崩溃。现在按契约返回 MultiIndex，构造失败抛 `ConnectionError` 触发真正的合成数据回退 |
+| 连接池 | 去重缓存键忽略 `kwargs` 与数据源，60 秒内把 close 请求的结果返回给 volume 请求；provider 返回 `None` 同时记成功与失败；缓存对象被调用方原地修改。键现在包含 kwargs，`None` 记为失败，缓存进出都做拷贝 |
+| NAV/运营 | 业绩报酬只在当天扣减、此前已计提的费用第二天又加回净值（每次结晶后出现一次假反弹）；管理费按工作日计数却除以 252（一年实际收 2.08%）；同一日期重算会再次计提。现在净值始终扣除累计费用负债、按日历天/365 计提、同日重算从该日之前的持久状态重新开始 |
+| 投资者/报告 | 年化收益用"全生命周期收益 ÷ 3 年窗口"，回撤只看窗口内；净值图回撤从首个收益日而不是初始 1.0 起算；月度热图把无数据月份画成 0.0%，HTML 热图按数组下标当月（3 月数据画在 1 月）。均已修正 |
+| 合规导出 | `get_trades/get_orders` 先取最新 10 万行再按日期过滤，历史区间可能导出空文件；P&L 固定只看 5 年。范围过滤已下推到 SQL |
+| 研究统计 | Deflated Sharpe 把年化 SR 与单位方差次序统计量、逐期标准误混用（真实年化 SR=2.0、1260 天、N=10 被算成 p=0.59）；ROE 研究把财报"报告期结束日"当作"公告日"，最多提前 4 个月使用（现已按法定披露截止日映射并更新 trust metadata）；ML 的 IC 用整面板 pooled correlation（只有市场择时的预测也能拿 0.7）、ICIR 是 2-5 个 fold 均值的离散度；LightGBM 模型只写了 JSON 元数据、加载后 `predict` 重新引入样本内信号；walk-forward 的测试窗互相重叠且 embargo 在 expanding 模式下无效。均已修正 |
+| Registry/门禁 | `is_trusted` 只看 validity，`begin_run` 默认 `status=failed, validity=valid`，失败/未完成的 run 也算可信；验证报告的 `overall` 只看步骤是否崩溃，门禁 FAIL/REJECTED 与跳过的 walk-forward 仍报 `pass` 并退出 0。现在可信要求 `status=success`，overall 由门禁与必需步骤共同决定 |
+| IC 监控 | ICIR 与"IC 为正比例"在 63 日移动平均序列上计算（真实 0.19 被报成 1.34、56% 报成 92%）；现在离散度统计使用原始逐日 IC，平滑序列只用于展示与趋势 |
+| 实盘/API | `POST /api/risk/kill-switch` 不在无 token 时的回环白名单内（docker-compose 默认无 token 且端口公开），远程可解除熔断；`GET /api/risk/status` 会用 OMS 账本覆盖实盘风控状态（下一次引擎周期看到 90% 回撤并触发熔断）；回撤/日亏只在有订单时检查；扇区检查对新股票一律 "Unknown" 且同批订单不累计；熔断后引擎直接跳过周期、从不执行其声称的"flatten"；盘前持仓同步检查从不比较任何东西；6 个交易端点用 `async def` 执行阻塞 RPC。均已修正：`/api/risk` 纳入敏感前缀、GET 不再改状态、组合更新即评估权益熔断、扇区映射与在途订单投影、熔断时卖出可用份额、持仓同步真实比较并在收盘后清理幽灵持仓、阻塞端点改同步、风险概览返回 `available/reason` 而不是 200 + GREEN |
+
+验证：全量测试 **1808 passed / 4 skipped / 0 failed**（4m09s），ruff 全绿。
+
+已知仍未处理：多租户隔离（#75 产品定位未定）；`framework/contracts/`、`kernel/` 等零导入目录的去留（#70/#77）仍是显式决策项。

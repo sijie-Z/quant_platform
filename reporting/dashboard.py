@@ -234,37 +234,37 @@ def generate_dashboard(
 # ------------------------------------------------------------------
 
 def _analyze_drawdown_detail(returns: pd.Series) -> dict | None:
-    """Analyze maximum drawdown event with dates and duration."""
-    cumulative = (1 + returns.dropna()).cumprod()
-    running_max = cumulative.expanding(min_periods=1).max()
-    drawdown = (cumulative / running_max - 1)
+    """Analyze maximum drawdown event with dates and duration.
+
+    The initial wealth of 1.0 is part of the wealth path. Leaving it out made
+    a first-day loss invisible and reported the first trading day as the peak.
+    """
+    sr = returns.dropna()
+    if len(sr) == 0:
+        return None
+
+    wealth = np.concatenate([[1.0], np.cumprod((1 + sr).to_numpy())])
+    running_max = np.maximum.accumulate(wealth)
+    drawdown = wealth / running_max - 1
 
     if drawdown.min() >= 0:
         return None
 
-    trough_idx = drawdown.idxmin()
-    trough_date = returns.index[trough_idx] if isinstance(trough_idx, int) else trough_idx
-    if not isinstance(trough_date, pd.Timestamp):
-        return None
+    trough_pos = int(drawdown.argmin())
+    peak_pos = int(np.argmax(wealth[:trough_pos]))
+    # Position 0 is the inception value of 1.0; label it with the first
+    # trading date rather than inventing a date.
+    peak_date = sr.index[0] if peak_pos == 0 else sr.index[peak_pos - 1]
+    trough_date = sr.index[trough_pos - 1]
+    peak_value = wealth[peak_pos]
 
-    # Find peak: highest point before trough
-    pre_trough = cumulative.loc[:trough_date]
-    if len(pre_trough) == 0:
-        return None
-    peak_date = pre_trough.idxmax()
-    if not isinstance(peak_date, pd.Timestamp):
-        return None
-
-    # Find recovery: first date after trough where cumulative >= peak
-    peak_value = cumulative.loc[peak_date]
-    post_trough = cumulative.loc[trough_date:]
-    recovery_mask = post_trough >= peak_value
-    if recovery_mask.any():
-        recovery_date = recovery_mask[recovery_mask].index[0]
-        recovery_days = (recovery_date - peak_date).days
-    else:
-        recovery_date = None
-        recovery_days = None
+    recovery_date = None
+    recovery_days = None
+    for pos in range(trough_pos + 1, len(wealth)):
+        if wealth[pos] >= peak_value:
+            recovery_date = sr.index[pos - 1]
+            recovery_days = (recovery_date - peak_date).days
+            break
 
     duration_days = (trough_date - peak_date).days
 

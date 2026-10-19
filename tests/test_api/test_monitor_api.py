@@ -361,7 +361,9 @@ class TestKillSwitch:
 class TestResponseModels:
     def test_risk_overview_defaults(self):
         r = RiskOverviewResponse()
-        assert r.risk_level == "GREEN"
+        # An unread risk state is not a green all-clear.
+        assert r.available is False
+        assert r.risk_level == "UNKNOWN"
         assert r.portfolio_value == 0.0
 
     def test_tca_summary_defaults(self):

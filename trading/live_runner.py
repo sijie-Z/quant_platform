@@ -375,6 +375,14 @@ class LiveRunner:
             logger.warning("Order blocked: %s %s", code, [b.message for b in breaches])
             return None
 
+        # Include the approved-but-unfilled exposure in the checks for the
+        # remaining signals of this cycle.
+        if hasattr(self._risk, "project_order"):
+            self._risk.project_order({
+                "ticker": code, "side": sig["side"],
+                "quantity": qty, "price": price,
+            })
+
         order = Order(
             code=code, side=side,
             order_type=OrderType.LIMIT,

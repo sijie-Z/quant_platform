@@ -405,7 +405,13 @@ class PostgresDataProvider(DataProvider):
                 conn.execute(text("SELECT 1"))
             self._connected = True
         except Exception as e:
+            # main.py relies on a construction failure to fall back to
+            # synthetic data, which the class docstring promises. Swallowing
+            # the error here produced a half-connected provider: main logged
+            # "Using PostgreSQL data provider" and the first pipeline call
+            # aborted with ConnectionError instead of falling back.
             logger.warning("PostgreSQL not available: %s", e)
+            raise ConnectionError(f"PostgreSQL not available: {e}") from e
 
     def get_prices(
         self,
@@ -427,10 +433,16 @@ class PostgresDataProvider(DataProvider):
             return df
         df["date"] = pd.to_datetime(df["date"])
         pivot_cols = fields or ["open", "high", "low", "close", "volume", "turnover", "adj_factor"]
-        result = df.pivot(index="date", columns="code", values=pivot_cols[0])
-        if fields and len(fields) > 1:
-            for f in fields[1:]:
-                result = pd.concat([result, df.pivot(index="date", columns="code", values=f)], axis=1)
+        missing = [c for c in pivot_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Unknown price fields: {missing}")
+
+        # Contract (data/providers/base.py): MultiIndex (date, asset) with one
+        # column per field. The old pivot returned a date x code frame holding
+        # only `fields[0]` (open by default), and concatenating several pivots
+        # produced duplicate column labels instead of a MultiIndex.
+        result = df.set_index(["date", "code"])[pivot_cols].sort_index()
+        result.index = result.index.set_names(["date", "asset"])
         return result
 
     def get_financials(

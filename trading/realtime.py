@@ -84,6 +84,18 @@ class RealTimeMarket:
         self._cache_ttl = cache_ttl
         self._snapshot_cache: pd.DataFrame | None = None
         self._snapshot_time: float = 0
+        self._snapshot_fetched_at: str = ""
+        self._snapshot_stale: bool = False
+
+    @property
+    def snapshot_fetched_at(self) -> str:
+        """When the cached snapshot was actually fetched from the exchange."""
+        return self._snapshot_fetched_at
+
+    @property
+    def snapshot_is_stale(self) -> bool:
+        """True when the last refresh failed and a cached frame is being served."""
+        return self._snapshot_stale
 
     def get_market_snapshot(self, force_refresh: bool = False) -> pd.DataFrame:
         """Get real-time snapshot of ALL A-shares (~5000 stocks).
@@ -102,12 +114,21 @@ class RealTimeMarket:
             df = ak.stock_zh_a_spot_em()
             self._snapshot_cache = df
             self._snapshot_time = now
+            self._snapshot_fetched_at = datetime.now().isoformat()
+            self._snapshot_stale = False
             logger.info("Market snapshot refreshed: %d stocks", len(df))
             return df
         except Exception as e:
             logger.error("Failed to get market snapshot: %s", e)
             if self._snapshot_cache is not None:
-                logger.warning("Returning stale cache")
+                # Serving the old frame is fine for resilience, but it must
+                # not be presented as a live quote: the API used to stamp the
+                # response with `datetime.now()` regardless of cache age.
+                self._snapshot_stale = True
+                logger.warning(
+                    "Returning stale market cache fetched at %s",
+                    self._snapshot_fetched_at or "unknown",
+                )
                 return self._snapshot_cache
             raise
 
@@ -145,6 +166,10 @@ class RealTimeMarket:
                     market_cap=float(row.get('总市值', 0) or 0),
                     circulating_cap=float(row.get('流通市值', 0) or 0),
                     amplitude=float(row.get('振幅', 0) or 0),
+                    # The quote's time is when the snapshot was fetched, not
+                    # when this object was constructed: a cached frame must
+                    # not look like a fresh tick.
+                    timestamp=self._snapshot_fetched_at or datetime.now().isoformat(),
                 )
                 quotes.append(q)
             except (ValueError, TypeError) as e:

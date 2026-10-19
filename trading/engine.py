@@ -30,6 +30,7 @@ from quant_platform.core.events import EventBus, get_event_bus
 from quant_platform.core.scheduler import TradingScheduler
 from quant_platform.core.state_machine import PortfolioState, PortfolioStateMachine
 from quant_platform.core.store import Store
+from quant_platform.execution.models import OrderType
 from quant_platform.risk.circuit_breaker import RiskMonitor
 from quant_platform.risk.healthcheck import HealthCheck, SystemBlockError
 from quant_platform.risk.realtime_engine import RealTimeRiskEngine
@@ -196,6 +197,7 @@ class LiveTradingEngine:
             event_bus=self._bus,
             broker=self._broker,
             risk_monitor=self._risk,
+            local_positions=lambda: self._store.get_positions(self._tenant_id),
         )
         try:
             health.run_all_sync()
@@ -361,6 +363,46 @@ class LiveTradingEngine:
 
             self._stop_event.wait(timeout=self._rebalance_interval)
 
+    def _deleverage(self, cycle: CycleResult) -> None:
+        """Sell every available share while the kill switch is active.
+
+        Only `pos.available` is sold, so T+1-locked shares bought today are
+        left for the next cycle. De-risking sells are exempt from the kill
+        switch by design (`RiskMonitor.check_pre_trade`), which is exactly
+        the behaviour this method implements.
+        """
+        for pos in self._broker.get_positions():
+            quantity = int(pos.available)
+            if quantity <= 0:
+                continue
+            price = self._current_prices.get(pos.code, 0.0)
+            order = Order(
+                code=pos.code,
+                side=OrderSide.SELL,
+                order_type=OrderType.MARKET,
+                quantity=quantity,
+                price=price if price > 0 else 0.0,
+            )
+            try:
+                result = self._broker.place_order(order)
+            except Exception as exc:
+                logger.error("De-risking sell failed for %s: %s", pos.code, exc)
+                continue
+
+            cycle.orders.append(result.to_dict())
+            if result.status == OrderStatus.FILLED:
+                self._trade_count += 1
+                self._audit.log_order(
+                    result.to_dict(), AuditAction.ORDER_FILLED,
+                    reason="kill switch de-risking",
+                )
+                self._bus.publish("order.filled", result.to_dict(), source="broker")
+            else:
+                self._audit.log_order(
+                    result.to_dict(), AuditAction.ORDER_SUBMITTED,
+                    reason="kill switch de-risking",
+                )
+
     def _halt(self, reason: str) -> None:
         """Move the state machine to HALTED.
 
@@ -422,9 +464,19 @@ class LiveTradingEngine:
         cycle = CycleResult(cycle_id=self._cycle_count, timestamp=now)
 
         if self._risk.kill_switch_active:
-            logger.critical("Kill switch active, skipping cycle %d", self._cycle_count)
+            logger.critical("Kill switch active: de-risking, no new exposure")
             self._bus.publish("risk.kill_switch", {"active": True}, source="risk")
             self._audit.log_risk_breach("kill_switch", {"active": True}, severity="critical")
+            # The early return used to happen before signal generation, so
+            # the reducing sells that the pre-trade checks deliberately allow
+            # were never created: the switch halted the engine with the whole
+            # book still exposed. Sell every available share instead, and
+            # still report the account in the cycle result.
+            account = self._broker.get_account()
+            cycle.portfolio_value = account.get("total_equity", 0)
+            cycle.cash = account.get("cash", 0)
+            cycle.n_positions = account.get("n_positions", 0)
+            self._deleverage(cycle)
             self._halt("kill switch active")
             return cycle
 
@@ -526,6 +578,13 @@ class LiveTradingEngine:
                 }, source="risk")
                 continue
 
+            # The approved order has not filled yet. Include its exposure in
+            # the checks for the rest of this cycle, otherwise a batch of
+            # buys all pass a sector limit none of them would pass after the
+            # previous ones filled.
+            if hasattr(self._risk, "project_order"):
+                self._risk.project_order(order_dict)
+
             result = self._broker.place_order(order)
             cycle.orders.append(result.to_dict())
             if result.status == OrderStatus.FILLED:
@@ -569,6 +628,16 @@ class LiveTradingEngine:
         # `Store._migrate_positions_primary_key`).
         for pos in self._broker.get_positions():
             self._store.save_position({**pos.to_dict(), "tenant_id": self._tenant_id})
+
+        # Prune rows for names no longer held. Positions were only upserted,
+        # so a closed position stayed in the store forever: the monitor and
+        # the NAV calculator kept reporting phantom holdings, and the next
+        # startup's position-sync check would compare against them.
+        held_codes = {p.code for p in self._broker.get_positions()}
+        for row in self._store.get_positions(self._tenant_id):
+            code = row.get("code")
+            if code and code not in held_codes:
+                self._store.delete_position(code, tenant_id=self._tenant_id)
 
         # Publish portfolio event
         self._bus.publish("portfolio.snapshot", {

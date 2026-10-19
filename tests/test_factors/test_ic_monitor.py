@@ -105,6 +105,40 @@ class TestFactorICMonitor:
         assert 0 <= stats.ic_positive_ratio <= 1
         assert stats.alert_level in ("green", "yellow", "red")
 
+    def test_icir_uses_raw_daily_ics_not_the_smoothed_series(self):
+        """ICIR and the positive ratio were computed on a 63-day moving
+        average, whose standard deviation is far smaller than the daily
+        IC's: a true ICIR of 0.19 was reported as 1.34 and a 56% positive
+        rate as 92%."""
+        rng = np.random.default_rng(7)
+        n_dates, n_assets = 260, 20
+        dates = pd.bdate_range("2023-01-02", periods=n_dates)
+        assets = [f"S{i:02d}" for i in range(n_assets)]
+        ranks = np.tile(np.arange(n_assets, dtype=float), (n_dates, 1))
+        factor = pd.DataFrame(ranks, index=dates, columns=assets)
+        forward_returns = pd.DataFrame(
+            ranks * 2 + rng.normal(0, 8, (n_dates, n_assets)),
+            index=dates, columns=assets,
+        )
+
+        cfg = ICMonitorConfig(rolling_window=63, min_observations=20)
+        monitor = FactorICMonitor(config=cfg)
+        stats = monitor.compute_factor_stats("f", factor, forward_returns)
+
+        raw = monitor._daily_ic_series(factor, forward_returns)
+        rolling = monitor.compute_rolling_ic(factor, forward_returns, 63)
+        raw_sub = raw.reindex(rolling.index).dropna()
+
+        assert stats.rolling_icir == pytest.approx(
+            raw_sub.mean() / raw_sub.std(),
+        )
+        assert stats.ic_positive_ratio == pytest.approx(
+            float((raw_sub > 0).mean()),
+        )
+        # The smoothed series would have reported a much larger ICIR.
+        smoothed_icir = rolling.mean() / rolling.std()
+        assert abs(smoothed_icir) > 1.5 * abs(stats.rolling_icir)
+
     def test_compute_all(self, multi_factor_data):
         factors, forward_returns = multi_factor_data
         cfg = ICMonitorConfig(rolling_window=63, min_observations=30)

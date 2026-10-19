@@ -19,6 +19,8 @@ Usage:
 
 from __future__ import annotations
 
+import copy
+import json
 import threading
 import time
 from dataclasses import dataclass, field
@@ -137,10 +139,10 @@ class DataProviderPool:
 
         Tries sources in priority order. Falls back automatically.
         """
-        cache_key = f"prices_{start_date}_{end_date}"
+        cache_key = self._make_cache_key("prices", start_date, end_date, kwargs)
         cached = self._check_cache(cache_key)
         if cached is not None:
-            return cached
+            return self._copy_result(cached)
 
         for name, provider in self._get_ordered_providers():
             health = self._health[name]
@@ -153,8 +155,12 @@ class DataProviderPool:
                 result = provider.get_prices(start_date, end_date, **kwargs)
                 latency = (time.perf_counter() - start) * 1000
 
+                if result is None:
+                    raise ValueError("provider returned None")
                 health.record_success(latency)
-                self._set_cache(cache_key, result)
+                # Store a copy: the caller receives `result` and may mutate
+                # it, which used to corrupt the cache for the next request.
+                self._set_cache(cache_key, self._copy_result(result))
                 logger.info("Data from %s (%.0fms, %d rows)", name, latency, len(result))
                 return result
 
@@ -172,10 +178,10 @@ class DataProviderPool:
         **kwargs,
     ) -> pd.DataFrame | None:
         """Get financial data from the best available source."""
-        cache_key = f"financials_{start_date}_{end_date}"
+        cache_key = self._make_cache_key("financials", start_date, end_date, kwargs)
         cached = self._check_cache(cache_key)
         if cached is not None:
-            return cached
+            return self._copy_result(cached)
 
         for name, provider in self._get_ordered_providers():
             health = self._health[name]
@@ -190,8 +196,10 @@ class DataProviderPool:
                 result = provider.get_financials(start_date, end_date, **kwargs)
                 latency = (time.perf_counter() - start) * 1000
 
+                if result is None:
+                    raise ValueError("provider returned None")
                 health.record_success(latency)
-                self._set_cache(cache_key, result)
+                self._set_cache(cache_key, self._copy_result(result))
                 return result
 
             except Exception as e:
@@ -234,6 +242,28 @@ class DataProviderPool:
         self._cache.clear()
 
     # ── Internal ──
+
+    @staticmethod
+    def _make_cache_key(
+        prefix: str, start_date: str, end_date: str, kwargs: dict,
+    ) -> str:
+        """The cache key includes kwargs, not just the date range.
+
+        Without it, a request for one field set was served the cached result
+        of a different one for 60 seconds.
+        """
+        try:
+            suffix = json.dumps(kwargs, sort_keys=True, default=str)
+        except TypeError:
+            suffix = repr(sorted(kwargs.items(), key=lambda item: item[0]))
+        return f"{prefix}_{start_date}_{end_date}_{suffix}"
+
+    @staticmethod
+    def _copy_result(value: Any) -> Any:
+        """Return a copy so a caller cannot mutate the shared cache."""
+        if isinstance(value, pd.DataFrame):
+            return value.copy()
+        return copy.deepcopy(value)
 
     def _get_ordered_providers(self):
         """Get providers sorted by priority (lowest first)."""

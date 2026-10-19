@@ -130,6 +130,42 @@ class TestHealthCheckFail:
         assert "risk_limits" in str(exc_info.value)
 
 
+class TestPositionSync:
+    """The check used to return `positions is not None` and never compared
+    the broker book with the local/Store book."""
+
+    class _Pos:
+        def __init__(self, code, quantity):
+            self.code = code
+            self.quantity = quantity
+
+    def test_matching_books_pass(self):
+        broker = MockBroker(positions=[self._Pos("600519", 100)])
+        health = HealthCheck(
+            broker=broker,
+            local_positions=[{"code": "600519", "quantity": 100}],
+        )
+        assert health._check_position_sync() is True
+
+    def test_quantity_mismatch_fails(self):
+        broker = MockBroker(positions=[self._Pos("600519", 100)])
+        health = HealthCheck(
+            broker=broker,
+            local_positions=[{"code": "600519", "quantity": 200}],
+        )
+        assert health._check_position_sync() is False
+
+    def test_missing_local_name_fails(self):
+        broker = MockBroker(positions=[
+            self._Pos("600519", 100), self._Pos("000001", 200),
+        ])
+        health = HealthCheck(
+            broker=broker,
+            local_positions=[{"code": "600519", "quantity": 100}],
+        )
+        assert health._check_position_sync() is False
+
+
 class TestEventBusIntegration:
     """Verify events are published correctly."""
 

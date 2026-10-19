@@ -289,11 +289,18 @@ const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov
 // ["data","months","years"] and the heatmap plotted row arrays and labels.
 const monthly = monthlyData || {{}};
 const years = Array.isArray(monthly.years) ? monthly.years.map(String) : [];
+// Position values by their actual month, not by array index. Older payloads
+// carried only the months that had data (a March-May run was plotted as
+// Jan-Mar).
+const monthNumbers = Array.isArray(monthly.months) && monthly.months.length
+  ? monthly.months
+  : [1,2,3,4,5,6,7,8,9,10,11,12];
 const heatData = [];
 years.forEach((y, yi) => {{
   const row = (monthly.data && monthly.data[yi]) || [];
   row.forEach((v, mi) => {{
-    if (v !== null && v !== undefined) heatData.push([mi, yi, v]);
+    const month = Number(monthNumbers[mi]) || (mi + 1);
+    if (v !== null && v !== undefined) heatData.push([month - 1, yi, v]);
   }});
 }});
 const mChart = echarts.init(document.getElementById('monthlyChart'));

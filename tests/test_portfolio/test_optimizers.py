@@ -61,6 +61,89 @@ def test_mean_variance_constraints():
     assert weights.max() <= constraints.max_weight + 1e-6
 
 
+def test_prior_holding_outside_todays_signal_is_not_an_optimization_variable():
+    """A suspended/delisted holding cannot be a cvxpy variable.
+
+    Keeping prior holdings in the candidate set must not blindly union names
+    that are absent from the signal and covariance; that raised KeyError on
+    the first real pipeline run.
+    """
+    assets = [f"S{i:03d}" for i in range(30)]
+    cov = pd.DataFrame(np.eye(30) * 0.04, index=assets, columns=assets)
+    signal = pd.Series(1.0, index=assets)
+    prev = pd.Series(1.0 / 31, index=assets + ["DELISTED"])
+
+    optimizer = MeanVarianceOptimizer(PortfolioConstraints(
+        max_weight=0.05, max_turnover=0.30, risk_aversion=1.0,
+    ))
+    weights = optimizer.optimize(signal, cov, prev_weights=prev)
+
+    assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
+    assert abs(float(weights.sum()) - 1.0) < 1e-3
+
+
+def test_signal_rotation_beyond_turnover_budget_stays_feasible():
+    """When the new signal rotates out more than the turnover budget, the
+    fixed `dropped` term alone exceeded the constraint's right-hand side.
+
+    No portfolio could satisfy the problem, the solver reported infeasible,
+    and every such rebalance silently fell back to equal weight (54 of 60
+    rebalances on the default pipeline).
+    """
+    assets = [f"S{i:03d}" for i in range(200)]
+    cov = pd.DataFrame(np.eye(200) * 0.04, index=assets, columns=assets)
+
+    first = pd.Series(0.0, index=assets)
+    first.iloc[:100] = 1.0
+    second = pd.Series(0.0, index=assets)
+    second.iloc[100:] = 1.0
+
+    optimizer = MeanVarianceOptimizer(PortfolioConstraints(
+        max_weight=0.05, max_turnover=0.30, risk_aversion=1.0,
+    ))
+
+    w1 = optimizer.optimize(first, cov)
+    assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
+
+    w2 = optimizer.optimize(second, cov, prev_weights=w1)
+
+    assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
+    assert abs(float(w2.sum()) - 1.0) < 1e-3
+
+
+def test_mean_variance_uses_an_installed_solver():
+    """The solver loop hardcoded `[cp.ECOS, cp.SCS]`.
+
+    ECOS is not included in cvxpy 1.7 wheels, so the first attempt always
+    failed and every solve depended on SCS, which reported `infeasible` on the
+    default 100-asset constrained problem. With `n_optimizer_fallbacks`
+    reporting the truth, the default mean-variance configuration showed 54
+    fallbacks across ~60 rebalances -- it had effectively been equal weight.
+    """
+    import cvxpy as cp
+
+    signal, cov = _make_signal_and_cov(100)
+    sector_map = pd.Series(
+        [f"SEC{i % 10}" for i in range(100)], index=signal.index,
+    )
+    constraints = PortfolioConstraints(
+        max_weight=0.05, max_sector_exposure=0.30, max_turnover=0.30,
+        risk_aversion=1.0,
+    )
+    optimizer = MeanVarianceOptimizer(constraints)
+
+    first = optimizer.optimize(signal, cov, sector_map=sector_map)
+    optimizer.optimize(
+        signal.abs()[::-1], cov, prev_weights=first, sector_map=sector_map,
+    )
+
+    assert any(
+        solver in cp.installed_solvers()
+        for solver in ("CLARABEL", "ECOS", "SCS")
+    )
+    assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
+
+
 def test_risk_parity_basic():
     signal, cov = _make_signal_and_cov()
     constraints = PortfolioConstraints()

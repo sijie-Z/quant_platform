@@ -180,6 +180,11 @@ class RunStore:
                 )
             query += " WHERE COALESCE(validity, 'valid')=?"
             params.append(validity)
+            if validity in self.TRUSTED_STATES:
+                # Validity defaults to 'valid' and `begin_run` opens rows as
+                # 'failed', so filtering on validity alone returned runs that
+                # never produced a result. A trusted result requires success.
+                query += " AND status='success'"
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
 
@@ -188,11 +193,14 @@ class RunStore:
         return [dict(r) for r in rows]
 
     def is_trusted(self, run_id: str) -> bool:
-        """Whether a run's result is still plain 'valid'."""
+        """Whether a run completed successfully and is still plain 'valid'."""
         run = self.get_run(run_id)
         if run is None:
             return False
-        return (run.get("validity") or "valid") in self.TRUSTED_STATES
+        return (
+            run.get("status") == "success"
+            and (run.get("validity") or "valid") in self.TRUSTED_STATES
+        )
 
     # ── Result validity ─────────────────────────────────────────────────
     #

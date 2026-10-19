@@ -216,3 +216,67 @@ class TestDirectionAwareChecks:
 
         assert approved is False
         assert any(b.breach_type == BreachType.SECTOR_LIMIT for b in breaches)
+
+
+class TestPortfolioUpdatesRunTheEquityBreakers:
+    """Breakdowns were evaluated only inside `check_pre_trade`.
+
+    A fully invested book can lose 30% without emitting a single order, so
+    the drawdown breaker never fired and the risk level stayed GREEN until
+    someone tried to trade.
+    """
+
+    def test_drawdown_beyond_the_kill_threshold_arms_the_switch(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+        monitor.update_portfolio_state(700_000, 0, {}, {})
+
+        assert monitor.kill_switch_active is True
+        assert monitor.get_status()["risk_level"] == RiskLevel.KILL.value
+
+    def test_daily_loss_sets_a_red_level(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+        monitor.update_portfolio_state(1_000_000, -40_000, {}, {})
+
+        assert monitor.get_status()["risk_level"] == RiskLevel.RED.value
+        assert monitor.kill_switch_active is False
+
+    def test_repeated_updates_do_not_flood_the_breach_log(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+        monitor.update_portfolio_state(700_000, 0, {}, {})
+        count = len(monitor.breaches)
+
+        monitor.update_portfolio_state(700_000, 0, {}, {})
+
+        assert len(monitor.breaches) == count
+
+
+class TestPendingOrdersShareTheSectorBudget:
+    def test_a_batch_of_buys_cannot_all_pass_the_sector_limit(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+        codes = [f"S{i}" for i in range(8)]
+        monitor.set_sector_map({code: "Tech" for code in codes})
+
+        approved_flags = []
+        for code in codes:
+            order = {
+                "ticker": code, "side": "buy", "quantity": 1_000, "price": 40.0,
+            }
+            approved, _ = monitor.check_pre_trade(order)
+            approved_flags.append(approved)
+            if approved:
+                monitor.project_order(order)
+
+        # 4% of equity each: seven orders reach 28%, the eighth would be 32%.
+        assert approved_flags[:7] == [True] * 7
+        assert approved_flags[7] is False
+
+    def test_unknown_sector_comes_from_the_sector_map(self):
+        monitor = RiskMonitor()
+        monitor.set_sector_map({"600519": "食品饮料"})
+
+        assert monitor._resolve_sector("600519") == "食品饮料"
+        assert monitor._resolve_sector("000001") == "Unknown"

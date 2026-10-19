@@ -86,6 +86,45 @@ class TestDeflatedSharpeTest:
         # With E[max SR] = 0, any positive Sharpe should be significant
         assert result.significant is True
 
+    def test_annualized_and_per_period_scales_are_not_mixed(self):
+        """Regression for the scale bug.
+
+        The old code compared an annualized observed Sharpe with the
+        unit-variance order statistic sqrt(2 ln N) -- no sqrt(T) scaling --
+        and put the annualized SR into a standard-error formula that expects
+        a per-period SR. A genuine annualized SR of 2.0 over 1260 days with
+        10 trials was reported as p=0.59.
+        """
+        validator = FactorValidator(significance_level=0.05)
+        rng = np.random.default_rng(0)
+        daily_sr = 2.0 / np.sqrt(252)
+        # Twenty years: sampling noise on the realized Sharpe is small enough
+        # that the test measures the formula, not one draw.
+        returns = rng.normal(daily_sr * 0.01, 0.01, size=5040)
+
+        result = validator.deflated_sharpe_test(returns, num_trials=10)
+
+        assert result.significant is True
+        assert result.deflated_p_value < 0.01
+        # The reported expected max is annualized, like the observed Sharpe.
+        assert result.expected_max_sharpe > 0
+        assert result.expected_max_sharpe < result.observed_sharpe
+
+    def test_a_short_sample_fluke_is_not_significant(self):
+        """High annualized Sharpe over a short sample with many trials.
+
+        The same defect made 5.0 annualized over 126 days with 100 trials
+        look significant (p≈0) when the correct DSR is around 0.2-0.3.
+        """
+        validator = FactorValidator(significance_level=0.05)
+        rng = np.random.default_rng(1)
+        daily_sr = 5.0 / np.sqrt(252)
+        returns = rng.normal(daily_sr * 0.01, 0.01, size=126)
+
+        result = validator.deflated_sharpe_test(returns, num_trials=100)
+
+        assert result.significant is False
+
 
 class TestMultipleTestingCorrection:
     """Benjamini-Hochberg and Bonferroni correction."""

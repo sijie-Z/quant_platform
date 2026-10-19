@@ -189,6 +189,24 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
         if cov_matrix is not None:
             top_assets = top_assets.intersection(cov_matrix.index)
 
+        # Keep existing holdings in the candidate set. When the signal rotates
+        # more than the turnover budget out of the top-N, the `dropped` term
+        # in the turnover constraint alone exceeds its right-hand side, so no
+        # portfolio satisfies it and the solver reports infeasible -- every
+        # such rebalance silently fell back to equal weight. With the old
+        # holdings available, the optimizer can choose to keep them and trade
+        # within the cap.
+        if prev_weights is not None and self.constraints.max_turnover < 1.0:
+            held = prev_weights[prev_weights.abs() > 1e-12].index
+            # A held name can be absent from today's signal (suspended or
+            # dropped from the universe) and from the covariance window.
+            # Those cannot be optimisation variables; their weight is the
+            # `dropped` term instead.
+            held = held.intersection(signal.index)
+            if cov_matrix is not None:
+                held = held.intersection(cov_matrix.index)
+            top_assets = top_assets.union(held)
+
         if len(top_assets) < 2:
             return self._equal_weight_fallback(
                 signal, cov_matrix, prices, prev_weights, sector_map,
@@ -240,14 +258,44 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
                     prev_weights.index.difference(assets)
                 ).abs().sum()
             )
-            constraints_list.append(
-                cp.sum(cp.abs(w - prev_w)) + dropped <= 2 * self.constraints.max_turnover
+            budget = 2 * self.constraints.max_turnover - dropped
+            if budget < -1e-9:
+                # Only possible when a prior holding is missing from the
+                # covariance universe and could not be added above. Selling
+                # it alone would exceed the turnover cap, so no solution to
+                # the constrained problem exists; the engine clamps realised
+                # turnover at execution time.
+                logger.warning(
+                    "MVO: %.2f of prior holdings are outside the covariance "
+                    "universe and exceed the turnover budget; turnover "
+                    "constraint skipped for this rebalance", dropped,
+                )
+            else:
+                constraints_list.append(
+                    cp.sum(cp.abs(w - prev_w)) <= max(0.0, budget)
+                )
+
+        # Try only solvers that are actually installed. This loop used to be
+        # `[cp.ECOS, cp.SCS]`; ECOS is absent from cvxpy 1.7 wheels, so the
+        # first attempt always failed and every rebalance depended on SCS,
+        # which reports `infeasible` on these problems far more often than
+        # CLARABEL. The default mean-variance config silently fell back to
+        # equal weight on 54 of ~60 rebalances.
+        solvers = [
+            solver for solver in ("CLARABEL", "ECOS", "SCS")
+            if solver in cp.installed_solvers()
+        ]
+        if not solvers:
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                "no convex solver is installed",
             )
 
         solved = False
         used_solver = "none"
+        attempts = []
         problem = None
-        for solver in [cp.ECOS, cp.SCS]:
+        for solver in solvers:
             try:
                 problem = cp.Problem(objective, constraints_list)
                 problem.solve(solver=solver, verbose=False)
@@ -258,17 +306,18 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
                     and np.all(np.isfinite(solution))
                 ):
                     solved = True
-                    used_solver = str(solver)
+                    used_solver = solver
                     break
+                attempts.append(f"{solver}={problem.status}")
             except Exception as e:
-                logger.debug("MVO solver %s failed: %s", str(solver), e)
+                logger.debug("MVO solver %s failed: %s", solver, e)
+                attempts.append(f"{solver}=error")
                 continue
 
         if not solved:
-            status = problem.status if problem is not None else "N/A"
             return self._equal_weight_fallback(
                 signal, cov_matrix, prices, prev_weights, sector_map,
-                f"MVO solver failed (solver={used_solver}, n={n}, status={status})",
+                f"MVO solver failed ({', '.join(attempts) or 'no attempt'}, n={n})",
             )
 
         logger.info("MVO SUCCESS: solver=%s n=%d status=%s w_min=%.4f w_max=%.4f",

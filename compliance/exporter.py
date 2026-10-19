@@ -107,7 +107,8 @@ class ComplianceExporter:
             ExportResult with file path and record count.
         """
         trades = self._store.get_trades(
-            tenant_id=tenant_id or "", limit=100_000
+            tenant_id=tenant_id or "", limit=100_000,
+            start_date=start, end_date=end,
         )
         filtered = self._filter_by_date(trades, "executed_at", start, end)
 
@@ -149,7 +150,8 @@ class ComplianceExporter:
             ExportResult with file path and record count.
         """
         orders = self._store.get_orders(
-            tenant_id=tenant_id or "", limit=100_000
+            tenant_id=tenant_id or "", limit=100_000,
+            start_date=start, end_date=end,
         )
         filtered = self._filter_by_date(orders, "created_at", start, end)
 
@@ -190,7 +192,9 @@ class ComplianceExporter:
         Returns:
             ExportResult with file path and record count.
         """
-        pnl = self._store.get_pnl_history(days=365 * 5)
+        # The window is applied in SQL. The old fixed five-year lookback
+        # silently truncated any request whose start was older than that.
+        pnl = self._store.get_pnl_history(start_date=start, end_date=end)
         filtered = self._filter_by_date(pnl, "timestamp", start, end)
 
         risk_fields = [

@@ -120,8 +120,8 @@ class TestCalculateDailyNav:
             date=_D2, cash=5_000_000, market_value=5_000_000,
         )
         assert nav.mgmt_fee > 0
-        # Daily mgmt fee = 10M * 0.02 / 252 ≈ 793.65
-        assert 700 < nav.mgmt_fee < 900
+        # Daily mgmt fee = 10M * 0.02 / 365 ≈ 547.95 (calendar-day accrual)
+        assert 500 < nav.mgmt_fee < 600
 
     def test_perf_fee_zero_when_below_hwm(self, calc):
         nav = calc.calculate_daily_nav(
@@ -209,7 +209,7 @@ class TestSaveNav:
 class TestFeeAccrual:
     def test_mgmt_fee_formula(self, calc):
         fee = calc._accrue_mgmt_fee(10_000_000)
-        expected = 10_000_000 * 0.02 / 252
+        expected = 10_000_000 * 0.02 / 365
         assert fee == pytest.approx(expected, rel=1e-6)
 
     def test_perf_fee_zero_below_hwm(self, calc):
@@ -275,10 +275,87 @@ class TestFeeAccrualAcrossDays:
             calc.save_nav(nav)
             navs.append(nav)
 
-        # The fee is a liability: NAV must decline every day.
+        # The fee is a liability: NAV must decline every day. The accrual
+        # runs on calendar days (annual rate / 365), so the elapsed gap over
+        # a weekend is two extra days.
         assert navs[-1].nav_total < navs[0].nav_total
-        expected = 10_000_000 * (1 - 0.02 / 252) ** 5
-        assert navs[-1].nav_total == pytest.approx(expected, rel=1e-6)
+        base = 10_000_000.0
+        prev_day = None
+        for day in dates:
+            days = 1 if prev_day is None else max(1, (day - prev_day).days)
+            base -= base * 0.02 / 365 * days
+            prev_day = day
+        assert navs[-1].nav_total == pytest.approx(base, rel=1e-6)
+
+    def test_performance_fee_is_not_added_back_on_the_next_day(self, store):
+        """The accrued fee is a liability.
+
+        Only the current day's fee was subtracted, so after any
+        crystallisation a flat day reported the whole prior fee as new profit
+        and NAV/unit jumped.
+        """
+        calc = NAVCalculator(store, annual_mgmt_fee=0.0, perf_fee_rate=0.20)
+        dates = pd.bdate_range(end=_TODAY.strftime("%Y-%m-%d"), periods=3)
+
+        nav1 = calc.calculate_daily_nav(
+            date=str(dates[0].date()), cash=5_000_000, market_value=5_000_000,
+        )
+        calc.save_nav(nav1)
+        nav2 = calc.calculate_daily_nav(
+            date=str(dates[1].date()), cash=5_000_000, market_value=6_000_000,
+        )
+        calc.save_nav(nav2)
+
+        assert nav2.perf_fee == pytest.approx(200_000, rel=1e-6)
+
+        # Third day: assets unchanged, no new high.
+        nav3 = calc.calculate_daily_nav(
+            date=str(dates[2].date()), cash=5_000_000, market_value=6_000_000,
+        )
+
+        assert nav3.perf_fee == 0.0
+        assert nav3.nav_total == pytest.approx(nav2.nav_total, rel=1e-9)
+        assert nav3.daily_return == pytest.approx(0.0, abs=1e-12)
+
+    def test_recalculating_the_same_date_does_not_double_charge(self, store):
+        """A retry for the same date used to accrue another day of fees and
+        overwrite the row with double the liability."""
+        calc = NAVCalculator(store, annual_mgmt_fee=0.02, perf_fee_rate=0.0)
+        date = _D2
+
+        first = calc.calculate_daily_nav(
+            date=date, cash=5_000_000, market_value=5_000_000,
+        )
+        calc.save_nav(first)
+
+        second = calc.calculate_daily_nav(
+            date=date, cash=5_000_000, market_value=5_000_000,
+        )
+
+        assert second.mgmt_fee == pytest.approx(first.mgmt_fee, rel=1e-9)
+        assert second.accrued_mgmt_fee == pytest.approx(
+            first.accrued_mgmt_fee, rel=1e-9,
+        )
+        assert second.nav_total == pytest.approx(first.nav_total, rel=1e-9)
+
+    def test_management_fee_counts_calendar_days(self, store):
+        """A Friday-to-Monday gap is three calendar days, not one trading
+        day, and the annual rate is divided by 365."""
+        calc = NAVCalculator(store, annual_mgmt_fee=0.02, perf_fee_rate=0.0)
+        first = calc.calculate_daily_nav(
+            date="2024-01-05", cash=5_000_000, market_value=5_000_000,
+        )
+        calc.save_nav(first)
+
+        second = calc.calculate_daily_nav(
+            date="2024-01-08", cash=5_000_000, market_value=5_000_000,
+        )
+
+        # The fee base is net of fees already accrued.
+        expected = (
+            second.cash + second.market_value - first.accrued_mgmt_fee
+        ) * 0.02 / 365 * 3
+        assert second.mgmt_fee == pytest.approx(expected, rel=1e-6)
 
     def test_performance_fee_is_charged_once_per_new_high(self, store):
         calc = NAVCalculator(store, annual_mgmt_fee=0.0, perf_fee_rate=0.20)

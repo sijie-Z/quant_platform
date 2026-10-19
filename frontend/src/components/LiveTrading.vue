@@ -404,7 +404,8 @@ async function fetchMarket() {
   try {
     const r = await getMarketSnapshot()
     marketStocks.value = (r.stocks || []).slice(0, 30)
-    marketTime.value = r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : ''
+    const time = r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : ''
+    marketTime.value = time ? (r.stale ? `⚠ ${time}` : time) : ''
   } catch (_) {}
 }
 

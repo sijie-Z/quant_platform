@@ -246,17 +246,30 @@ class ResearchValidator:
         steps.append(step7)
         report.factor_rankings = step7.details.get("rankings", [])
 
-        # Compile summary
+        # Compile summary. "Pass" has to describe the gate report and the
+        # required steps, not merely the absence of a crashed step: a failed
+        # IC-quality gate or a skipped walk-forward used to report "pass" and
+        # exit 0.
         n_completed = sum(1 for s in steps if s.status == "completed")
         n_failed = sum(1 for s in steps if s.status == "failed")
+        skipped_steps = [s.name for s in steps if s.status == "skipped"]
         n_warnings = sum(len(s.warnings) for s in steps) + len(global_warnings)
+        gate_status = (report.gate_result or {}).get("overall_status", "")
+        needs_review = (
+            n_failed > 0
+            or bool(skipped_steps)
+            or gate_status in ("FAIL", "REJECTED")
+        )
         report.summary = {
             "mode": mode,
             "steps_completed": n_completed,
             "steps_failed": n_failed,
+            "steps_skipped": len(skipped_steps),
+            "skipped_steps": skipped_steps,
+            "gate_status": gate_status,
             "total_warnings": n_warnings,
             "n_factors_evaluated": len(ic_results),
-            "overall": "pass" if n_failed == 0 else "needs_review",
+            "overall": "needs_review" if needs_review else "pass",
         }
 
         report.steps = steps

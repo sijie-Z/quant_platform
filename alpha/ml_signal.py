@@ -154,20 +154,32 @@ class TimeSeriesCV:
 
         Split out from `split()` so the same arithmetic can be applied to a
         date axis or to a row axis.
+
+        Test windows are non-overlapping. The step used to be
+        `(available - test_size) // (n_splits-1)` with no floor at
+        `test_size`, so with the default settings on a 600-day panel each
+        test window shared 58 of its 63 days with the next one and the
+        fold-level mean/std were computed on overlapping samples. `embargo`
+        also had no effect in expanding mode because nothing referenced it in
+        the step. When the data cannot support `n_splits` windows, fewer
+        folds are produced (the last may be shorter than `test_size`).
         """
         min_size = self.train_size + self.gap + self.test_size
         if n_units < min_size:
             raise ValueError(f"Need at least {min_size} units, got {n_units}")
 
-        # Step size accounts for test_size + embargo (next fold's train starts after embargo)
         available = n_units - self.train_size - self.gap
-        step = max(1, (available - self.test_size) // max(self.n_splits - 1, 1))
+        step = self.test_size + max(0, self.embargo)
+        # Full non-overlapping windows; if even one does not fit, keep a
+        # single shorter test window rather than refusing to validate.
+        max_folds = available // step if available >= step else 1
+        n_folds = min(self.n_splits, max_folds)
 
-        for i in range(self.n_splits):
+        for i in range(n_folds):
             if self.mode == "expanding":
                 train_start = 0
-            else:  # rolling
-                train_start = max(0, i * step - self.embargo * i)
+            else:  # rolling: fixed-length training window
+                train_start = i * step
 
             train_end = self.train_size + i * step
             test_start = train_end + self.gap  # purge gap
@@ -283,6 +295,8 @@ class MLSignalGenerator:
         self.performance_history: list[ModelPerformance] = []
         self.feature_importance: dict[str, float] = {}
         self._last_train_date = None
+        self._train_end_date = None
+        self._feature_names: list[str] | None = None
 
     def _create_model(self):
         """Create the underlying ML model."""
@@ -295,7 +309,12 @@ class MLSignalGenerator:
                 raise ImportError("lightgbm not installed: pip install lightgbm")
             return lgb.LGBMRegressor(**self.config.lgb_params)
         elif self.config.model_type == "ensemble":
-            return None  # Will create both
+            # There is no ensemble implementation: the factory returned None
+            # and training then failed with AttributeError.
+            raise ValueError(
+                "model_type='ensemble' is not implemented; use 'xgboost' or "
+                "'lightgbm'"
+            )
         else:
             raise ValueError(f"Unknown model type: {self.config.model_type}")
 
@@ -426,6 +445,7 @@ class MLSignalGenerator:
         )
 
         cv_results = []
+        fold_test_ic_series: list[pd.Series] = []
         # Split on dates, not rows: X_full has one row per (date, asset), so a
         # row-based split would put the same trading day in both train and test.
         for fold, (train_idx, test_idx) in enumerate(cv.split_by_dates(row_dates)):
@@ -440,8 +460,19 @@ class MLSignalGenerator:
             train_pred = model.predict(X_train)
             test_pred = model.predict(X_test)
 
-            train_ic = float(np.corrcoef(y_train, train_pred)[0, 1]) if len(y_train) > 10 else 0
-            test_ic = float(np.corrcoef(y_test, test_pred)[0, 1]) if len(y_test) > 10 else 0
+            # Cross-sectional (rank) IC per date. `np.corrcoef` on the
+            # flattened panel mixed time-series and cross-sectional variation:
+            # predictions that carried only market timing scored 0.7 pooled
+            # correlation with zero stock-selection skill.
+            train_ics = self._cross_sectional_ic(
+                row_dates[train_idx], y_train, train_pred,
+            )
+            test_ics = self._cross_sectional_ic(
+                row_dates[test_idx], y_test, test_pred,
+            )
+            train_ic = float(train_ics.mean()) if len(train_ics) else 0.0
+            test_ic = float(test_ics.mean()) if len(test_ics) else 0.0
+            fold_test_ic_series.append(test_ics)
 
             cv_results.append({
                 "fold": fold,
@@ -463,16 +494,25 @@ class MLSignalGenerator:
         # Remember which dates the fitted model has seen, so that `predict`
         # does not hand back in-sample predictions as if they were signals.
         self._train_end_date = max(row_dates) if len(row_dates) else None
+        self._feature_names = list(feature_names)
 
         # Feature importance
         if hasattr(self.model, 'feature_importances_'):
             importances = self.model.feature_importances_
             self.feature_importance = dict(zip(feature_names, importances.tolist(), strict=False))
 
-        # Aggregate CV metrics
-        test_ics = [r["test_ic"] for r in cv_results]
-        mean_test_ic = float(np.mean(test_ics))
-        std_test_ic = float(np.std(test_ics)) if len(test_ics) > 1 else 0
+        # Aggregate CV metrics over the unique test dates, not over the 2-5
+        # fold means: the latter was the dispersion of a handful of numbers,
+        # not an ICIR.
+        if fold_test_ic_series:
+            all_test_ics = pd.concat(fold_test_ic_series)
+            all_test_ics = all_test_ics[~all_test_ics.index.duplicated()]
+        else:
+            all_test_ics = pd.Series(dtype=float)
+        mean_test_ic = float(all_test_ics.mean()) if len(all_test_ics) else 0.0
+        std_test_ic = (
+            float(all_test_ics.std(ddof=1)) if len(all_test_ics) > 1 else 0.0
+        )
         test_icir = mean_test_ic / std_test_ic if std_test_ic > 0 else 0
 
         perf = ModelPerformance(
@@ -491,6 +531,31 @@ class MLSignalGenerator:
                      self.config.model_type, mean_test_ic, test_icir, len(feature_names))
 
         return perf
+
+    @staticmethod
+    def _cross_sectional_ic(dates, y_true, y_pred) -> pd.Series:
+        """Rank IC per date from flattened (date, asset) rows.
+
+        Dates with fewer than five assets, or with constant predictions or
+        labels, are skipped: Spearman is undefined there.
+        """
+        frame = pd.DataFrame({
+            "date": np.asarray(dates),
+            "y": np.asarray(y_true, dtype=float),
+            "p": np.asarray(y_pred, dtype=float),
+        })
+        ics: dict[object, float] = {}
+        for date, group in frame.groupby("date", sort=True):
+            if (
+                len(group) < 5
+                or group["y"].nunique() < 2
+                or group["p"].nunique() < 2
+            ):
+                continue
+            ic = group["y"].corr(group["p"], method="spearman")
+            if pd.notna(ic):
+                ics[date] = float(ic)
+        return pd.Series(ics, dtype=float)
 
     def predict(self, factors: dict[str, pd.DataFrame]) -> pd.DataFrame:
         """Generate ML signals for dates the fitted model has not seen.
@@ -518,7 +583,15 @@ class MLSignalGenerator:
         first_factor = list(factors.values())[0]
         dates = first_factor.index
         assets = first_factor.columns
-        feature_names = sorted(factors.keys())[:self.config.top_n_features]
+        feature_names = (
+            list(self._feature_names)
+            if self._feature_names else sorted(factors.keys())[:self.config.top_n_features]
+        )
+        missing = [name for name in feature_names if name not in factors]
+        if missing:
+            raise ValueError(
+                f"Model was trained on factors missing from the input: {missing}"
+            )
 
         signal_data = np.full((len(dates), len(assets)), np.nan)
 
@@ -694,45 +767,104 @@ class MLSignalGenerator:
         return signal
 
     def save_model(self, path: str):
-        """Save model to disk."""
+        """Save model and its metadata sidecar to disk.
+
+        The LightGBM sklearn wrapper has no `save_model`; the fitted booster
+        does. The old code wrote only the JSON sidecar for LightGBM, so
+        `load_model` either raised FileNotFoundError or installed an unfitted
+        estimator. The sidecar also carries the feature list and the last
+        training date, without which a loaded model silently loses the
+        in-sample guard in `predict`.
+        """
         if self.model is None:
-            return
+            raise RuntimeError("Model not trained. Call train() first.")
         model_path = Path(path)
         model_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if hasattr(self.model, 'save_model'):
+        if self.config.model_type == "lightgbm":
+            if not HAS_LGB:
+                raise ImportError("lightgbm not installed")
+            booster = getattr(self.model, "booster_", None)
+            if booster is None:
+                raise RuntimeError("LightGBM model has no fitted booster_")
+            booster.save_model(str(model_path))
+        elif self.config.model_type == "xgboost":
+            if not HAS_XGB:
+                raise ImportError("xgboost not installed")
             self.model.save_model(str(model_path))
+        else:
+            raise ValueError(
+                f"Cannot save model_type={self.config.model_type!r}"
+            )
 
-        # Save metadata
         meta = {
             "model_type": self.config.model_type,
+            "feature_names": list(self._feature_names or []),
+            "top_n_features": self.config.top_n_features,
             "feature_importance": self.feature_importance,
+            "train_end_date": (
+                str(self._train_end_date) if self._train_end_date else None
+            ),
             "last_train_date": str(self._last_train_date) if self._last_train_date else None,
             "performance_history": [
                 {
                     "date": p.date,
+                    "model_type": p.model_type,
+                    "train_ic": p.train_ic,
                     "test_ic": p.test_ic,
+                    "train_icir": p.train_icir,
                     "test_icir": p.test_icir,
+                    "n_train_samples": p.n_train_samples,
+                    "n_test_samples": p.n_test_samples,
                 }
                 for p in self.performance_history
             ],
         }
-        meta_path = model_path.with_suffix(".json")
+        meta_path = Path(str(model_path) + ".meta.json")
         meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
 
     def load_model(self, path: str):
-        """Load model from disk."""
+        """Load a model and its metadata sidecar from disk."""
         model_path = Path(path)
         if not model_path.exists():
             raise FileNotFoundError(f"Model not found: {path}")
 
-        model = self._create_model()
-        if hasattr(model, 'load_model'):
-            model.load_model(str(model_path))
-        self.model = model
+        meta_path = Path(str(model_path) + ".meta.json")
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"Model metadata not found: {meta_path}. Re-save the model with "
+                "save_model()."
+            )
+        meta = json.loads(meta_path.read_text())
 
-        meta_path = model_path.with_suffix(".json")
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text())
-            self.feature_importance = meta.get("feature_importance", {})
-            self._last_train_date = meta.get("last_train_date")
+        model_type = meta.get("model_type", self.config.model_type)
+        if model_type == "lightgbm":
+            if not HAS_LGB:
+                raise ImportError("lightgbm not installed")
+            # A raw Booster predicts on the same feature matrix as the
+            # sklearn wrapper.
+            self.model = lgb.Booster(model_file=str(model_path))
+        elif model_type == "xgboost":
+            if not HAS_XGB:
+                raise ImportError("xgboost not installed")
+            model = xgb.XGBRegressor(**self.config.xgb_params)
+            model.load_model(str(model_path))
+            self.model = model
+        else:
+            raise ValueError(f"Cannot load model_type={model_type!r}")
+
+        # The artifact's own type and feature list win over the current
+        # config: a model trained as xgboost must not be predicted through a
+        # lightgbm configuration.
+        self.config.model_type = model_type
+        names = meta.get("feature_names")
+        self._feature_names = list(names) if names else None
+
+        train_end = meta.get("train_end_date")
+        self._train_end_date = pd.Timestamp(train_end) if train_end else None
+        last_train = meta.get("last_train_date")
+        self._last_train_date = pd.Timestamp(last_train) if last_train else None
+        self.feature_importance = meta.get("feature_importance", {})
+        self.performance_history = [
+            ModelPerformance(**p) for p in meta.get("performance_history", [])
+        ]

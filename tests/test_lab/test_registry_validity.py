@@ -25,9 +25,39 @@ def two_runs(store):
     # hash>`, so identical inputs within the same second collide on the primary
     # key. That collision is a separate defect; this fixture sidesteps it so
     # these tests stay about validity.
+    run_ids = []
     for i in (1, 2):
-        store.begin_run(f"slice_{i}", {"factor": "roe", "n": i})
+        run_ids.append(store.begin_run(f"slice_{i}", {"factor": "roe", "n": i}))
+    # Rows open as status='failed' until finish_run flips them; a trusted
+    # filter now requires a successful run.
+    for run_id in run_ids:
+        store.finish_run(run_id, status="success")
     return store.list_runs()
+
+
+class TestTrustRequiresSuccess:
+    def test_a_failed_run_is_not_trusted(self, store):
+        """`begin_run` inserts status='failed' and validity defaults to
+        'valid'; is_trusted used to return True for a run that never
+        produced a result."""
+        run_id = store.begin_run("slice", {"n": 1})
+
+        assert store.is_trusted(run_id) is False
+        assert store.list_runs(validity="valid") == []
+
+    def test_a_successful_run_is_trusted(self, store):
+        run_id = store.begin_run("slice", {"n": 2})
+        store.finish_run(run_id, status="success")
+
+        assert store.is_trusted(run_id) is True
+        assert [r["run_id"] for r in store.list_runs(validity="valid")] == [run_id]
+
+    def test_an_invalidated_success_is_not_trusted(self, store):
+        run_id = store.begin_run("slice", {"n": 3})
+        store.finish_run(run_id, status="success")
+        store.mark_validity(run_id, "invalidated", "BUG-03")
+
+        assert store.is_trusted(run_id) is False
 
 
 class TestSchema:

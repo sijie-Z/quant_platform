@@ -148,6 +148,29 @@ class TestExportTradeLog:
 
         assert result.n_records == 2
 
+    def test_store_applies_the_range_before_the_row_limit(self, store):
+        """The exporter used to fetch the newest 100k rows and filter after.
+
+        Once the book had more rows than that, an old date range returned an
+        empty file with n_records=0 and no error. Verify the range is in the
+        SQL, before LIMIT.
+        """
+        for trade_id, ts in (
+            ("old", "2023-06-15T10:00:00"),
+            ("new", "2024-06-15T10:00:00"),
+        ):
+            store.save_trade({
+                "trade_id": trade_id, "order_id": f"o-{trade_id}",
+                "code": "600519", "side": "buy", "quantity": 100,
+                "price": 100, "executed_at": ts,
+            })
+
+        rows = store.get_trades(
+            limit=1, start_date="2023-01-01", end_date="2023-12-31",
+        )
+
+        assert [r["trade_id"] for r in rows] == ["old"]
+
     def test_export_empty(self, exporter, store):
         result = exporter.export_trade_log(
             start="2024-01-01", end="2024-12-31",

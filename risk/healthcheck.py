@@ -113,12 +113,15 @@ class HealthCheck:
         data_source: Any = None,
         risk_monitor: Any = None,
         min_cash: float = 0.0,
+        local_positions: Any = None,
     ):
         self._bus = event_bus or get_event_bus()
         self._broker = broker
         self._data_source = data_source
         self._risk_monitor = risk_monitor
         self._min_cash = min_cash
+        # Callable returning the local/Store position rows, or a list.
+        self._local_positions = local_positions
 
     def run_all_sync(self) -> HealthCheckReport:
         """Run all checks synchronously.
@@ -300,13 +303,55 @@ class HealthCheck:
             return False
 
     def _check_position_sync(self) -> bool:
-        """Check if local positions match broker positions."""
+        """Compare the broker's book with the local/Store book.
+
+        The check used to return `positions is not None` -- it never compared
+        anything, so a broker book that disagreed with the engine's records
+        (manual trades, a crash after a fill) still passed and the engine
+        sized orders from the wrong book.
+        """
         if self._broker is None:
             return True
         try:
-            positions = self._broker.get_positions()
-            # Basic sanity: positions list is accessible
-            return positions is not None
+            broker_positions = self._broker.get_positions()
+            if broker_positions is None:
+                return False
+
+            local = self._local_positions
+            if local is None:
+                # Without a local book there is nothing to compare against;
+                # the broker call itself succeeded, so only connectivity is
+                # verified.
+                logger.warning(
+                    "Position sync check has no local book; verifying broker "
+                    "account access only",
+                )
+                return True
+            if callable(local):
+                local = local()
+
+            local_map = {}
+            for row in local or []:
+                code = str(row.get("code") or row.get("ticker") or "")
+                if code:
+                    local_map[code] = int(row.get("quantity", 0) or 0)
+            broker_map = {
+                str(p.code): int(getattr(p, "quantity", 0) or 0)
+                for p in broker_positions
+            }
+
+            mismatches = [
+                f"{code}: broker={broker_map.get(code, 0)} local={local_map.get(code, 0)}"
+                for code in sorted(set(local_map) | set(broker_map))
+                if local_map.get(code, 0) != broker_map.get(code, 0)
+            ]
+            if mismatches:
+                logger.error(
+                    "Position mismatch between broker and local book: %s",
+                    "; ".join(mismatches[:5]),
+                )
+                return False
+            return True
         except Exception as e:
             logger.error("Position sync check failed: %s", e)
             return False

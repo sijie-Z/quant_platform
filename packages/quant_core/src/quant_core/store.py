@@ -324,8 +324,15 @@ class Store:
             ))
 
     def get_orders(self, status: str = "", code: str = "", limit: int = 100,
-                   tenant_id: str = "") -> list[dict]:
-        """Get orders with optional filters."""
+                   tenant_id: str = "",
+                   start_date: str = "", end_date: str = "") -> list[dict]:
+        """Get orders with optional filters.
+
+        `start_date`/`end_date` are ISO dates (YYYY-MM-DD) applied in SQL.
+        Compliance exports used to fetch the newest `limit` rows and filter
+        afterwards, so a requested historical range could come back empty
+        once the book had more rows than the limit.
+        """
         with self._conn() as conn:
             query = "SELECT * FROM orders WHERE 1=1"
             params: list = []
@@ -338,6 +345,12 @@ class Store:
             if code:
                 query += " AND code = ?"
                 params.append(code)
+            if start_date:
+                query += " AND created_at >= ?"
+                params.append(start_date)
+            if end_date:
+                query += " AND created_at <= ?"
+                params.append(end_date + "T23:59:59")
             query += " ORDER BY created_at DESC LIMIT ?"
             params.append(limit)
             rows = conn.execute(query, params).fetchall()
@@ -414,29 +427,31 @@ class Store:
             ))
 
     def get_trades(self, code: str = "", limit: int = 100,
-                   tenant_id: str = "") -> list[dict]:
-        """Get trade history."""
+                   tenant_id: str = "",
+                   start_date: str = "", end_date: str = "") -> list[dict]:
+        """Get trade history.
+
+        `start_date`/`end_date` are ISO dates applied in SQL so a historical
+        export is not limited to the newest rows.
+        """
         with self._conn() as conn:
+            query = "SELECT * FROM trades WHERE 1=1"
+            params: list = []
             if code:
-                if tenant_id:
-                    rows = conn.execute(
-                        "SELECT * FROM trades WHERE code = ? AND tenant_id = ? "
-                        "ORDER BY executed_at DESC LIMIT ?",
-                        (code, tenant_id, limit)).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT * FROM trades WHERE code = ? ORDER BY executed_at DESC LIMIT ?",
-                        (code, limit)).fetchall()
-            else:
-                if tenant_id:
-                    rows = conn.execute(
-                        "SELECT * FROM trades WHERE tenant_id = ? "
-                        "ORDER BY executed_at DESC LIMIT ?",
-                        (tenant_id, limit)).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT * FROM trades ORDER BY executed_at DESC LIMIT ?",
-                        (limit,)).fetchall()
+                query += " AND code = ?"
+                params.append(code)
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            if start_date:
+                query += " AND executed_at >= ?"
+                params.append(start_date)
+            if end_date:
+                query += " AND executed_at <= ?"
+                params.append(end_date + "T23:59:59")
+            query += " ORDER BY executed_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
 
     # ── P&L History ──
@@ -458,13 +473,29 @@ class Store:
                 snapshot.get('sharpe_ratio', 0),
             ))
 
-    def get_pnl_history(self, days: int = 30) -> list[dict]:
-        """Get P&L history for the last N days."""
+    def get_pnl_history(self, days: int = 30,
+                        start_date: str = "", end_date: str = "") -> list[dict]:
+        """Get P&L history.
+
+        `days` is the default window. Explicit `start_date`/`end_date`
+        (YYYY-MM-DD) override it, so a compliance export can request a
+        period older than the default window.
+        """
         with self._conn() as conn:
-            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-            rows = conn.execute(
-                "SELECT * FROM pnl_history WHERE timestamp > ? ORDER BY timestamp",
-                (cutoff,)).fetchall()
+            query = "SELECT * FROM pnl_history WHERE 1=1"
+            params: list = []
+            if start_date:
+                query += " AND timestamp >= ?"
+                params.append(start_date)
+            else:
+                cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+                query += " AND timestamp > ?"
+                params.append(cutoff)
+            if end_date:
+                query += " AND timestamp <= ?"
+                params.append(end_date + "T23:59:59")
+            query += " ORDER BY timestamp"
+            rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
 
     # ── Signals ──

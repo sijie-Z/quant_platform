@@ -349,6 +349,7 @@ class WebSocketStatsResponse(BaseModel):
     cached_quotes: int
     message_count: int = 0
     last_message_age_s: float | None = None
+    simulated: bool = False
 
 
 class RealtimeQuoteResponse(BaseModel):
@@ -365,12 +366,17 @@ class RealtimeQuoteResponse(BaseModel):
     bid1_price: float = 0.0
     ask1_price: float = 0.0
     timestamp: str = ""
+    source: str = ""
+    simulated: bool = False
 
 
 # --- Level 2 schemas ---
 
 class OrderBookResponse(BaseModel):
     code: str
+    timestamp: str = ""
+    simulated: bool = True
+    source: str = "simulated"
     best_bid: float = 0.0
     best_ask: float = 0.0
     mid_price: float = 0.0
@@ -390,12 +396,16 @@ class TickDataResponse(BaseModel):
     volume: float
     amount: float
     direction: str = ""
+    simulated: bool = True
+    source: str = "simulated"
 
 
 class VWAPResponse(BaseModel):
     code: str
     vwap: float
     n_ticks: int
+    simulated: bool = True
+    source: str = "simulated"
 
 
 class TradeFlowResponse(BaseModel):
@@ -404,6 +414,8 @@ class TradeFlowResponse(BaseModel):
     sell_volume: float
     net_flow: float
     buy_pct: float
+    simulated: bool = True
+    source: str = "simulated"
 
 
 class Level2StatsResponse(BaseModel):
@@ -411,6 +423,8 @@ class Level2StatsResponse(BaseModel):
     books_cached: int
     total_ticks: int
     running: bool
+    simulated: bool = True
+    source: str = "simulated"
 
 
 # --- Fundamental schemas ---
@@ -429,6 +443,8 @@ class FundamentalMetricsResponse(BaseModel):
     debt_ratio: float = 0.0
     dividend_yield: float = 0.0
     market_cap: float = 0.0
+    source: str = ""
+    is_synthetic: bool = False
 
 
 class FundamentalScreenRequest(BaseModel):

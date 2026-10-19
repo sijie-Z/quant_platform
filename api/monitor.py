@@ -32,6 +32,10 @@ router = APIRouter(prefix="/api/monitor")
 
 
 class RiskOverviewResponse(BaseModel):
+    available: bool = Field(
+        False, description="Whether the risk state below was actually read"
+    )
+    reason: str = Field("", description="Why the risk overview is unavailable")
     factor_exposures: dict[str, float] = Field(default_factory=dict, description="Barra 10 factor exposures")
     factor_exposures_available: bool = Field(
         False,
@@ -46,7 +50,7 @@ class RiskOverviewResponse(BaseModel):
     volatility: float = Field(0.0, description="Annualized volatility")
     var_95: float = Field(0.0, description="95% VaR")
     cvar_95: float = Field(0.0, description="95% CVaR")
-    risk_level: str = Field("GREEN", description="Risk level")
+    risk_level: str = Field("UNKNOWN", description="Risk level (UNKNOWN when unread)")
     portfolio_value: float = Field(0.0)
     daily_pnl: float = Field(0.0)
     n_positions: int = Field(0)
@@ -158,24 +162,32 @@ def _get_bus():
 @router.get("/risk-overview", response_model=RiskOverviewResponse)
 async def get_risk_overview():
     """Aggregate risk data: factor exposures, concentration, drawdown, VaR."""
-    result = RiskOverviewResponse()
+    result = RiskOverviewResponse(available=False, risk_level="UNKNOWN")
     result.factor_exposures_reason = (
         "no Barra decomposition is cached for the live book; "
         "POST /api/barra/decompose with portfolio weights to compute one"
     )
 
-    # Get risk status from RiskMonitor
+    # Get risk status from RiskMonitor. A failure here must not look like a
+    # healthy zero-risk portfolio: the old code returned 200 with
+    # risk_level="GREEN", portfolio_value=0 and vol=0 on any error.
     risk = _get_risk()
-    if risk:
+    if risk is None:
+        result.reason = (
+            "risk monitor is not available; the trading engine has not "
+            "started or its state could not be read"
+        )
+    else:
         try:
             status = risk.get_status()
-            result.risk_level = status.get("risk_level", "GREEN")
+            result.risk_level = status.get("risk_level", "UNKNOWN")
             result.portfolio_value = status.get("portfolio_value", 0)
             result.daily_pnl = status.get("daily_pnl", 0)
             result.current_drawdown = abs(status.get("current_drawdown", 0))
             result.n_positions = status.get("n_positions", 0)
-        except Exception:
-            pass
+            result.available = True
+        except Exception as e:
+            result.reason = f"risk status unavailable: {e}"
 
     # Get positions from store for concentration analysis
     store = _get_store()
@@ -209,6 +221,10 @@ async def get_risk_overview():
                     result.volatility = round(float(returns.std() * np.sqrt(252)), 6)
         except Exception as e:
             logger.debug("Risk overview partial: %s", e)
+            if result.available:
+                result.reason = f"positions/VaR unavailable: {e}"
+            else:
+                result.reason = result.reason or f"risk data unavailable: {e}"
 
     return result
 

@@ -1396,12 +1396,27 @@ def cmd_gate(args) -> int:
     except Exception:
         pass
 
+    # The command's docstring promised backtest metrics, but it never loaded
+    # or computed any, so the drawdown and trading-cost gates were permanently
+    # SKIPPED. Run the backtest so those gates see real numbers.
+    backtest_summary = None
+    try:
+        signal = _generate_signal(config, processed_factors, returns)
+        bt_results = _run_backtest(
+            config, signal, prices, returns, benchmark,
+            sector_map, fin_unstacked,
+        )
+        backtest_summary = bt_results.get("summary")
+    except Exception as exc:
+        logger.warning("Gate backtest failed; drawdown/cost gates will be skipped: %s", exc)
+
     # Run gates
     runner = GateRunner(gate_config)
     report = runner.run(
         strategy_name=args.strategy,
         ic_results=ic_results,
         wf_results=wf_result,
+        backtest_summary=backtest_summary,
         n_factors=n_factors,
         n_params=n_params,
         n_assets_total=n_assets_total,

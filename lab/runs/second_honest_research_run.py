@@ -43,11 +43,18 @@ SLICE = "second_honest_research_run"
 DATA_META = {
     "provider": "akshare",
     "adjust": "none",  # financial data, no OHLCV adjustment needed
-    "basis": "fiscal_year_end",
+    "basis": "statutory_publication_deadline",
     "cross_sectional_use": True,
     "interface": "stock_financial_analysis_indicator",
-    "trust_warning": ["quarterly_point_in_time", "no_pe_ttm_precision"],
-    "description": "AkShare quarterly financial indicators; ROE from latest fiscal year",
+    "trust_warning": [
+        "publication_deadline_not_actual_announcement_date",
+        "no_pe_ttm_precision",
+    ],
+    "description": (
+        "AkShare quarterly financial indicators; ROE dated at the statutory "
+        "publication deadline (annual/Q1 Apr 30, interim Aug 31, Q3 Oct 31), "
+        "not the fiscal period end"
+    ),
 }
 UNIVERSE_META = {
     "provider": "CurrentConstituentUniverseProvider",
@@ -98,12 +105,36 @@ def _fetch_prices_for_fwd(
     return panel
 
 
+def _report_available_date(period_end: pd.Timestamp) -> pd.Timestamp:
+    """Conservative statutory publication deadline for a fiscal period.
+
+    `日期` from the indicator endpoint is the *period end*, not the
+    announcement date. Carrying ROE forward from 2023-12-31 made the FY2023
+    report visible on 2024-01-01 although annual reports are due by
+    April 30, i.e. up to four months of look-ahead in every IC and Sharpe.
+    These deadlines are the CSRC limits: annual and Q1 by April 30, interim
+    by August 31, Q3 by October 31.
+    """
+    month = period_end.month
+    if month == 12:
+        return pd.Timestamp(year=period_end.year + 1, month=4, day=30)
+    if month == 3:
+        return pd.Timestamp(year=period_end.year, month=4, day=30)
+    if month == 6:
+        return pd.Timestamp(year=period_end.year, month=8, day=31)
+    if month == 9:
+        return pd.Timestamp(year=period_end.year, month=10, day=31)
+    # Unknown frequency: do not let it become visible before 60 days.
+    return period_end + pd.Timedelta(days=60)
+
+
 def _fetch_roe_scores(codes: list[str]) -> pd.DataFrame:
-    """Build a (date x asset) ROE factor panel.
+    """Build a (date x asset) ROE factor panel, point-in-time.
 
     AkShare's stock_financial_analysis_indicator returns quarterly records
-    with the latest '净资产收益率(%)' per quarter. We group by fiscal-year-end
-    date and carry forward the latest reported ROE until the next report.
+    with the latest '净资产收益率(%)' per quarter. Each record is dated at its
+    statutory publication deadline (see `_report_available_date`) and is
+    carried forward from that date only.
 
     Returns date (pd.Timestamp) x asset (code) DataFrame.
     """
@@ -117,15 +148,18 @@ def _fetch_roe_scores(codes: list[str]) -> pd.DataFrame:
                 )
                 if df is None or df.empty or roe_col not in df.columns:
                     break
-                # '日期' column holds reporting-date end
+                # '日期' column holds the fiscal period end; map it to when the
+                # report can actually be known.
                 sub = df[["日期", roe_col]].rename(
-                    columns={"日期": "date", roe_col: "roe"}
+                    columns={"日期": "period_end", roe_col: "roe"}
                 )
-                sub["date"] = pd.to_datetime(sub["date"])
+                sub["period_end"] = pd.to_datetime(sub["period_end"])
                 sub["roe"] = pd.to_numeric(sub["roe"], errors="coerce")
-                sub = sub.dropna(subset=["roe"])
+                sub = sub.dropna(subset=["roe", "period_end"])
+                sub["date"] = sub["period_end"].map(_report_available_date)
+                sub = sub.sort_values("period_end")
                 sub["code"] = code
-                records.append(sub)
+                records.append(sub[["date", "roe", "code"]])
                 break
             except Exception:
                 time_module.sleep(1)
@@ -136,10 +170,9 @@ def _fetch_roe_scores(codes: list[str]) -> pd.DataFrame:
         return pd.DataFrame()
 
     stacked = pd.concat(records, ignore_index=True)
-    # Sort and forward-fill: for every date, the latest reported ROE is used
-    stacked = stacked.sort_values(["code", "date"])
-    stacked["roe"] = stacked.groupby("code")["roe"].ffill()
-    # Build wide panel
+    # Build wide panel keyed on availability dates. When two reports become
+    # available on the same day (annual + Q1 on April 30), `last` keeps the
+    # one with the later period end, which is the newer information.
     panel = stacked.pivot_table(
         index="date", columns="code", values="roe", aggfunc="last"
     )
