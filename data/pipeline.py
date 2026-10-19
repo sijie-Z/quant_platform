@@ -28,6 +28,7 @@ class DataPipeline:
         exclude_st: bool = True,
         exclude_suspended: bool = True,
         max_suspension_days: int = 30,
+        benchmark_is_trailing: bool | None = None,
     ):
         self.provider = provider
         self.start_date = pd.Timestamp(start_date)
@@ -61,10 +62,27 @@ class DataPipeline:
         self._st_timeseries: pd.DataFrame | None = None
         self._industry_changes: pd.DataFrame | None = None
 
+        # Benchmark convention.  Provider benchmarks are trailing returns
+        # (r_t = P_t / P_{t-1} - 1) while `self.returns` is forward
+        # (r_t = P_{t+1} / P_t - 1).  `_align` shifts provider benchmarks by
+        # one day when this flag is True.  A benchmark that is already in
+        # forward convention -- e.g. the backtest engine's internal
+        # equal-weight benchmark, which averages `returns` date by date --
+        # must not be shifted again: pass `benchmark_is_trailing=False` or
+        # set the provider attribute with the same name.
+        self.benchmark_is_trailing: bool = True
+        self._benchmark_is_trailing_override: bool | None = benchmark_is_trailing
+
+        # Cached (date x asset) point-in-time sector panel.
+        self._sector_panel: pd.DataFrame | None = None
+
     def run(self) -> None:
         """Execute the full ETL pipeline."""
         logger.info("Running data pipeline: %s to %s",
                      self.start_date.date(), self.end_date.date())
+
+        # Per-run caches; a second run() must not serve the first one's panel.
+        self._sector_panel = None
 
         self.metadata = self.provider.get_metadata()
         # Ensure date columns are datetime (Baostock returns strings)
@@ -88,6 +106,17 @@ class DataPipeline:
         self.benchmark = self.provider.get_benchmark(
             str(self.start_date.date()), str(self.end_date.date())
         )
+        # External providers return trailing (t-day) benchmark returns; the
+        # engine's internal equal-weight benchmark is built from `returns`
+        # (already forward) and never passes through here.  An explicit
+        # constructor argument wins; otherwise the provider may declare its
+        # convention, defaulting to trailing.
+        if self._benchmark_is_trailing_override is not None:
+            self.benchmark_is_trailing = self._benchmark_is_trailing_override
+        else:
+            self.benchmark_is_trailing = bool(
+                getattr(self.provider, "benchmark_is_trailing", True)
+            )
 
         self._clean_prices()
         self._apply_pit_tradability_mask()
@@ -399,6 +428,79 @@ class DataPipeline:
         latest = available.loc[idx]
         return dict(zip(latest["asset"], latest["industry"], strict=False))
 
+    def has_industry_history(self) -> bool:
+        """True when the provider supplied a non-empty industry-change table.
+
+        Distinguishes "no history at all" -- where the static metadata map is
+        the only answer ``get_industry_map`` can give and is therefore a
+        legitimate fallback -- from "history exists but does not classify
+        these dates", where falling back to the static (whole-sample) map
+        would reintroduce the look-ahead this panel exists to remove.
+        """
+        return (
+            self._industry_changes is not None
+            and not self._industry_changes.empty
+        )
+
+    def get_sector_panel(self) -> pd.DataFrame:
+        """Point-in-time sector panel (date x asset).
+
+        Row t is exactly ``get_industry_map(date_t)``: the classification in
+        effect *on* that date.  Using this panel for neutralization keeps a
+        historical reclassification from leaking into earlier cross-sections
+        (the static metadata map is a single whole-sample classification --
+        typically the latest known one -- and is a look-ahead whenever the
+        provider ships industry changes).
+
+        Providers without an industry-change history fall back to the static
+        metadata ``sector`` map repeated for every date -- the same answer
+        ``get_industry_map`` gives them -- so callers see one shape either
+        way.  The panel is cached per run.
+        """
+        if self._sector_panel is not None:
+            return self._sector_panel
+
+        if self.prices is None:
+            return pd.DataFrame()
+
+        dates = pd.DatetimeIndex(
+            self.prices.index.get_level_values("date").unique()
+        ).sort_values()
+        assets = pd.Index(self.get_valid_assets())
+        if len(assets) == 0:
+            assets = pd.Index(
+                self.prices.index.get_level_values("asset").unique(),
+                name="asset",
+            )
+
+        has_history = self.has_industry_history()
+        if has_history:
+            # One get_industry_map() call per date -- hoisted out of the
+            # asset loop. Calling it per (date, asset) made the panel
+            # quadratic: 46,800 calls / ~98s at 390x120, ~35 minutes at the
+            # default 1,304x500 sample.
+            rows = []
+            for date in dates:
+                mapping = self.get_industry_map(date)
+                rows.append([mapping.get(asset) for asset in assets])
+            panel = pd.DataFrame(rows, index=dates, columns=assets)
+        elif self.metadata is not None and "sector" in self.metadata.columns:
+            base = self.metadata["sector"].reindex(assets).to_numpy(
+                dtype=object, copy=True,
+            )
+            panel = pd.DataFrame(
+                [base.copy() for _ in range(len(dates))],
+                index=dates,
+                columns=assets,
+            )
+        else:
+            panel = pd.DataFrame(index=dates, columns=assets, dtype=object)
+
+        panel.index.name = "date"
+        panel.columns.name = "asset"
+        self._sector_panel = panel
+        return panel
+
     # ------------------------------------------------------------------
     # Price cleaning
     # ------------------------------------------------------------------
@@ -445,19 +547,46 @@ class DataPipeline:
         self.prices = df
 
     def _remove_long_suspensions(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Drop assets with a consecutive suspension run longer than the limit."""
+        """Drop assets that never trade; keep history around long gaps.
+
+        The old rule removed an asset from the *entire sample* whenever any
+        consecutive NaN run exceeded the limit. A stock that suspended for 35
+        days in 2024 vanished from every 2021-2023 cross-section, and a stock
+        listing 40 days into the sample was dropped although it traded
+        afterwards -- universe membership on early dates was decided by later
+        events. Long gaps already remain NaN (the forward-fill is capped at
+        `max_suspension_days`), so NaN-aware consumers skip those dates
+        without losing the asset's valid history.
+        """
         close = df["close"].unstack("asset")
-        drop_assets = []
+
+        never_traded = [
+            asset for asset in close.columns
+            if close[asset].isna().all()
+        ]
+        if never_traded:
+            df = df[
+                ~df.index.get_level_values("asset").isin(never_traded)
+            ]
+            logger.info(
+                "Dropping %d assets with no price observations", len(never_traded),
+            )
+
+        gapped = []
         for asset in close.columns:
+            if asset in never_traded:
+                continue
             is_nan = close[asset].isna()
             groups = (is_nan != is_nan.shift()).cumsum()
             run_lengths = is_nan.astype(int).groupby(groups).transform("sum")
             if (run_lengths > self.max_suspension_days).any():
-                drop_assets.append(asset)
-        if drop_assets:
-            logger.info("Dropping %d assets with long suspensions: %s",
-                        len(drop_assets), drop_assets[:10])
-            df = df[~df.index.get_level_values("asset").isin(drop_assets)]
+                gapped.append(asset)
+        if gapped:
+            logger.info(
+                "Assets with suspension gaps longer than %d days (history "
+                "retained, gap stays NaN): %d, e.g. %s",
+                self.max_suspension_days, len(gapped), gapped[:10],
+            )
         return df
 
     # ------------------------------------------------------------------
@@ -495,12 +624,31 @@ class DataPipeline:
     # ------------------------------------------------------------------
 
     def _align(self) -> None:
-        """Ensure all datasets share the same date/asset index."""
+        """Ensure all datasets share the same date/asset index.
+
+        The benchmark needs more than a reindex.  `returns[t]` spans t -> t+1,
+        but every external provider's benchmark series is trailing:
+        `benchmark[t] = P_t / P_{t-1} - 1`.  Aligning them by date alone lines
+        the strategy's t -> t+1 return up against the benchmark's t-1 -> t
+        return -- one day of offset.  A strategy that tracks the index exactly
+        then shows a tracking error of roughly sqrt(2) times the index
+        volatility instead of ~0.  Shifting the trailing series by -1 puts it
+        in the same forward convention as `returns`.  Benchmarks already in
+        forward convention (flagged via `benchmark_is_trailing=False` or the
+        provider attribute) are left alone; the engine's internal equal-weight
+        benchmark never reaches this method at all.
+        """
         dates = self.prices.index.get_level_values("date").unique()
         assets = self.prices.index.get_level_values("asset").unique()
 
         # Align benchmark to price dates
-        self.benchmark = self.benchmark.reindex(dates)
+        if self.benchmark is not None:
+            benchmark = self.benchmark
+            if self.benchmark_is_trailing:
+                # trailing[t] = P_t/P_{t-1}-1  ->  forward[t] = P_{t+1}/P_t-1
+                # shift is positional, so order the labels first.
+                benchmark = benchmark.sort_index().shift(-1)
+            self.benchmark = benchmark.reindex(dates)
 
         # Align financials
         self.financials = self.financials[
@@ -523,6 +671,10 @@ class DataPipeline:
         that differences across the fill sees a fake zero followed by a
         multi-day move. Blanking those rows makes pandas propagate NaN across
         both boundaries instead of fabricating a reversal.
+
+        The ST-exclusion mask travels in ``attrs["excluded_mask"]``: factor
+        computation forward-fills the price path for level continuity, and it
+        must re-blank these rows instead of resurrecting ST names.
         """
         close = self.prices["close_adj"].unstack("asset")
         if "is_suspended" in self.prices.columns:
@@ -530,15 +682,30 @@ class DataPipeline:
                 self.prices["is_suspended"].unstack("asset").fillna(False).astype(bool)
             )
             close = close.mask(suspended)
+        if self.st_eligible is not None and not self.st_eligible.empty:
+            close.attrs["excluded_mask"] = (
+                ~self.st_eligible
+            ).reindex(
+                index=close.index, columns=close.columns, fill_value=False,
+            )
         return close
 
+    def _blank_st_rows(self, panel: pd.DataFrame) -> pd.DataFrame:
+        """Apply the PIT ST exclusion to an unstacked panel."""
+        if self.st_eligible is None or self.st_eligible.empty:
+            return panel
+        excluded = (~self.st_eligible).reindex(
+            index=panel.index, columns=panel.columns, fill_value=False,
+        )
+        return panel.mask(excluded)
+
     def get_volume(self) -> pd.DataFrame:
-        """Return volume (unstacked: date x asset)."""
-        return self.prices["volume"].unstack("asset")
+        """Return volume (unstacked: date x asset), ST rows blanked."""
+        return self._blank_st_rows(self.prices["volume"].unstack("asset"))
 
     def get_turnover(self) -> pd.DataFrame:
-        """Return turnover rate (unstacked: date x asset)."""
-        return self.prices["turnover"].unstack("asset")
+        """Return turnover rate (unstacked: date x asset), ST rows blanked."""
+        return self._blank_st_rows(self.prices["turnover"].unstack("asset"))
 
     def get_market_cap(self) -> pd.DataFrame:
         """Return market cap from financials (unstacked: date x asset)."""

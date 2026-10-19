@@ -133,3 +133,38 @@ class TestLoadConfigDoesNotMutateItsInput:
         assert cfg.portfolio.constraints.max_weight == 0.05
         assert cfg.portfolio.covariance.method == "ledoit_wolf"
         assert cfg.risk.var.method == "historical"
+
+
+class TestFactorSectionParsing:
+    def test_params_and_processing_are_kept(self):
+        """Both were flattened away, so editing them changed nothing."""
+        cfg = load_config(raw={
+            "factors": {
+                "technical": {
+                    "momentum_1m": {"enabled": True, "params": {"period": 10}},
+                },
+                "fundamental": {},
+                "processing": {
+                    "winsorize": {"enabled": True, "lower": 0.02, "upper": 0.98},
+                    "standardize": {"enabled": True, "method": "rank"},
+                    "neutralize": {"enabled": True, "by": ["sector"]},
+                },
+            },
+        })
+
+        assert cfg.factors.params["momentum_1m"] == {"period": 10}
+        assert cfg.factors.processing["standardize"]["method"] == "rank"
+        assert cfg.factors.enabled_technicals == ("momentum_1m",)
+        assert cfg.factors.enabled_fundamentals == ()
+
+    def test_an_explicitly_empty_section_enables_nothing(self):
+        """`tuple(enabled) or default` silently re-enabled every default."""
+        cfg = load_config(raw={"factors": {"technical": {}, "fundamental": {}}})
+
+        assert cfg.factors.enabled_technicals == ()
+        assert cfg.factors.enabled_fundamentals == ()
+
+    def test_omitting_the_sections_keeps_the_defaults(self):
+        cfg = load_config(raw={})
+
+        assert "momentum_1m" in cfg.factors.enabled_technicals

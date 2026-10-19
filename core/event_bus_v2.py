@@ -354,11 +354,11 @@ class EventStore:
             return result
 
     def get_by_topic(self, topic: str, limit: int = 100) -> list[Event]:
-        """Get recent events matching a topic (prefix match)."""
+        """Get recent events matching a topic pattern."""
+        from quant_platform.core.topic_matching import topic_matches
+
         recent = self.get_recent(limit * 3)  # Get more to filter
-        matching = [e for e in recent if e.topic == topic or
-                    (topic.endswith('.*') and e.topic.startswith(topic[:-2])) or
-                    (topic.endswith('.**') and e.topic.startswith(topic[:-3]))]
+        matching = [e for e in recent if topic_matches(e.topic, topic)]
         return matching[-limit:]
 
     def replay_from_wal(self) -> list[Event]:
@@ -471,8 +471,13 @@ class AsyncEventBus:
         # Dead letter queue
         self._dlq = DeadLetterQueue()
 
-        # Consumer tasks
+        # Consumer tasks, keyed by subscription. `id(queue)` alone can be
+        # reused after a cancelled subscription's queue is collected, so a
+        # monotonic counter provides the identity; the map lets unsubscribe
+        # find the key from the queue.
         self._consumer_tasks: dict[str, asyncio.Task] = {}
+        self._queue_keys: dict[int, str] = {}
+        self._consumer_seq = 0
 
         # Metrics
         self._metrics = {
@@ -552,9 +557,27 @@ class AsyncEventBus:
                     handler_name, topic, q_size)
         self._ensure_consumer(topic, handler, queue, stats, 'sync')
 
+    def _consumer_key(self, queue) -> str:
+        """Consumer tasks are keyed by subscription, not handler name.
+
+        Two handlers named `on_tick` (or a handler re-subscribed after
+        unsubscribe) shared a key, so the second subscription never got a
+        consumer: its events sat in an undrained queue until publish blocked
+        on the full queue.
+        """
+        key = self._queue_keys.get(id(queue))
+        if key is None:
+            with self._lock:
+                key = self._queue_keys.get(id(queue))
+                if key is None:
+                    self._consumer_seq += 1
+                    key = f"consumer:{self._consumer_seq}"
+                    self._queue_keys[id(queue)] = key
+        return key
+
     def _start_consumer_task(self, topic, handler, queue, stats, handler_type):
         """Create the consumer task for one handler. Loop thread only."""
-        key = f"{topic}:{stats.handler_name}"
+        key = self._consumer_key(queue)
         if key in self._consumer_tasks:
             return
         if handler_type == 'async':
@@ -575,7 +598,7 @@ class AsyncEventBus:
         """
         if not self._started or self._loop is None or not self._loop.is_running():
             return
-        key = f"{topic}:{stats.handler_name}"
+        key = self._consumer_key(queue)
         if key in self._consumer_tasks:
             return
 
@@ -592,13 +615,38 @@ class AsyncEventBus:
             )
 
     def unsubscribe(self, topic: str, handler: SyncHandler | AsyncHandler):
-        """Remove a handler subscription."""
+        """Remove a handler subscription and stop its consumer task."""
+        removed_queues = []
         with self._lock:
             if topic in self._handlers:
-                self._handlers[topic] = [
-                    (h, q, s, t) for h, q, s, t in self._handlers[topic]
-                    if h != handler
-                ]
+                kept = []
+                for h, q, s, t in self._handlers[topic]:
+                    if h == handler:
+                        removed_queues.append(q)
+                    else:
+                        kept.append((h, q, s, t))
+                self._handlers[topic] = kept
+
+        loop = self._loop
+        if not removed_queues or loop is None:
+            return
+
+        def _cancel_consumers():
+            for queue in removed_queues:
+                key = self._queue_keys.pop(id(queue), None)
+                if key is None:
+                    continue
+                task = self._consumer_tasks.pop(key, None)
+                if task is not None:
+                    task.cancel()
+
+        try:
+            if loop.is_running():
+                loop.call_soon_threadsafe(_cancel_consumers)
+            else:
+                _cancel_consumers()
+        except RuntimeError:
+            _cancel_consumers()
 
     def add_interceptor(self, fn: Interceptor):
         """Add a pre-publish interceptor. Return None to suppress event."""
@@ -723,32 +771,10 @@ class AsyncEventBus:
 
     @staticmethod
     def _topic_matches(topic: str, pattern: str) -> bool:
-        """Check if topic matches pattern.
+        """Check if topic matches pattern (shared semantics, see topic_matching)."""
+        from quant_platform.core.topic_matching import topic_matches
 
-        Patterns:
-        - Exact: "order.filled" matches only "order.filled"
-        - Single wildcard: "order.*" matches "order.filled", "order.cancelled"
-        - Double wildcard: "**" matches everything
-        """
-        if pattern == '**':
-            return True
-        if pattern == topic:
-            return True
-
-        # Split into parts
-        pattern_parts = pattern.split('.')
-        topic_parts = topic.split('.')
-
-        if len(pattern_parts) != len(topic_parts):
-            return False
-
-        for pp, tp in zip(pattern_parts, topic_parts, strict=False):
-            if pp == '*':
-                continue
-            if pp != tp:
-                return False
-
-        return True
+        return topic_matches(topic, pattern)
 
     # ── Consumer Loops ──
 

@@ -7,6 +7,7 @@ Supports A-share specific rules: T+1, stamp tax (sell-side only), lot sizes of 1
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -133,12 +134,39 @@ class OrderManager:
         quantity: int | None = None,
         commission: float | None = None,
     ) -> Order:
-        """Process a fill (partial or full)."""
+        """Process a fill (partial or full).
+
+        Raises:
+            ValueError: if the order is complete, the price is not a finite
+                positive number, or the requested quantity is not a finite
+                positive number. Validation happens before any cash or
+                position mutation.
+        """
         order = self.orders[order_id]
         if order.is_complete:
             raise ValueError(f"Order {order_id} is already {order.status}")
 
-        qty = quantity or order.remaining_quantity
+        # Validate before mutating anything. The HTTP layer refuses non-positive
+        # prices, but internal callers (SimulatedExchange, execution algorithms)
+        # go straight to the OMS; a NaN price used to produce a NaN commission
+        # and poison the whole book.
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid fill price: {price!r}") from None
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(f"Invalid fill price: {price!r}")
+
+        # `quantity or remaining` treated an explicit 0 as "fill everything".
+        qty = order.remaining_quantity if quantity is None else quantity
+        try:
+            qty_valid = math.isfinite(qty) and qty > 0
+        except TypeError:
+            qty_valid = False
+        if not qty_valid:
+            raise ValueError(f"Invalid fill quantity: {qty!r}")
+        if order.remaining_quantity <= 0:
+            raise ValueError(f"Order {order_id} has no remaining quantity")
         qty = min(qty, order.remaining_quantity)
 
         # Calculate costs
@@ -235,6 +263,12 @@ class OrderManager:
             if total_qty > 0:
                 pos.avg_cost = (pos.avg_cost * pos.quantity + cost) / total_qty
             pos.quantity = total_qty
+            # Mark to the fill price immediately. Without this, current_price
+            # and market_value stayed at zero until the next update_prices()
+            # call, so get_snapshot() right after a buy valued the position at
+            # nothing and reported the whole purchase as a loss.
+            pos.last_updated = fill.timestamp
+            pos.update_price(fill.price)
             # Today's purchase is T+1 locked: quantity grows, `available` does
             # not. `new_trading_day()` releases it.
 
@@ -251,6 +285,9 @@ class OrderManager:
             # Remove position if fully sold
             if pos.quantity <= 0:
                 del self.positions[ticker]
+            else:
+                pos.last_updated = fill.timestamp
+                pos.update_price(fill.price)
 
     def new_trading_day(self) -> None:
         """Roll the book: everything held overnight becomes sellable.
@@ -272,8 +309,18 @@ class OrderManager:
     # ── Portfolio Analytics ──
 
     def get_snapshot(self) -> PortfolioSnapshot:
-        """Generate current portfolio snapshot."""
-        positions_value = sum(p.market_value for p in self.positions.values())
+        """Generate current portfolio snapshot.
+
+        A position whose price has never been marked is valued at cost
+        (``avg_cost * quantity``) rather than zero, so an unmarked book does
+        not report the entire holding as a loss.
+        """
+        def marked_value(pos: Position) -> float:
+            if pos.current_price > 0:
+                return pos.market_value
+            return pos.avg_cost * pos.quantity
+
+        positions_value = sum(marked_value(p) for p in self.positions.values())
         total_unrealized = sum(p.unrealized_pnl for p in self.positions.values())
         total_realized = sum(p.realized_pnl for p in self.positions.values())
 
@@ -282,7 +329,8 @@ class OrderManager:
 
         # Calculate weights
         for pos in self.positions.values():
-            pos.weight = pos.market_value / total_value if total_value > 0 else 0
+            value = marked_value(pos)
+            pos.weight = value / total_value if total_value > 0 else 0
 
         snapshot = PortfolioSnapshot(
             timestamp=datetime.now().isoformat(),
@@ -303,9 +351,17 @@ class OrderManager:
         return snapshot
 
     def get_order_blotter(self, tenant_id: str = "") -> list[dict]:
-        """Get all orders as a list of dicts, optionally filtered by tenant."""
+        """Get all orders as a list of dicts, optionally filtered by tenant.
+
+        This used to iterate `self.blotter`, which only receives orders once
+        they are complete (filled/cancelled/rejected). Pending, submitted and
+        partially filled orders were invisible to `/api/oms/blotter` even
+        though they existed and had already moved cash or positions.
+        """
         result = []
-        for order in self.blotter:
+        for order in sorted(
+            self.orders.values(), key=lambda o: o.created_at, reverse=True,
+        ):
             if tenant_id and order.tenant_id != tenant_id:
                 continue
             result.append({
@@ -315,6 +371,9 @@ class OrderManager:
                 "side": order.side.value,
                 "type": order.order_type.value,
                 "quantity": order.quantity,
+                "remaining_quantity": max(
+                    0, order.quantity - order.filled_quantity,
+                ),
                 "avg_fill_price": round(order.avg_fill_price, 2),
                 "filled_quantity": order.filled_quantity,
                 "commission": order.total_commission,
@@ -427,19 +486,54 @@ class SimulatedExchange:
                 order.notes = f"No market data for {order.ticker}"
                 continue
 
+            # Never match against an unusable print: NaN/inf would poison the
+            # fill price (and every downstream P&L), <=0 is not a price. Skip
+            # the order rather than filling or rejecting it on bad data.
+            try:
+                market_price = float(price)
+            except (TypeError, ValueError):
+                logger.warning("Skipping %s: non-numeric market price %r",
+                               order.ticker, price)
+                continue
+            if not math.isfinite(market_price) or market_price <= 0:
+                logger.warning("Skipping %s: invalid market price %r",
+                               order.ticker, price)
+                continue
+
             # Apply slippage model
             if order.order_type == OrderType.MARKET:
                 # Market orders get ~5bps slippage
                 slippage_factor = 1.0005 if order.side == OrderSide.BUY else 0.9995
-                fill_price = round(price * slippage_factor, 2)
+                fill_price = round(market_price * slippage_factor, 2)
             elif order.order_type == OrderType.LIMIT:
-                if order.side == OrderSide.BUY and order.limit_price < price:
-                    continue  # Limit not reached
-                if order.side == OrderSide.SELL and order.limit_price > price:
+                try:
+                    limit_price = float(order.limit_price)
+                except (TypeError, ValueError):
+                    logger.warning("Skipping %s: invalid limit price %r",
+                                   order.ticker, order.limit_price)
                     continue
-                fill_price = order.limit_price
+                if not math.isfinite(limit_price) or limit_price <= 0:
+                    logger.warning("Skipping %s: invalid limit price %r",
+                                   order.ticker, order.limit_price)
+                    continue
+                if order.side == OrderSide.BUY and limit_price < market_price:
+                    continue  # Limit not reached
+                if order.side == OrderSide.SELL and limit_price > market_price:
+                    continue
+                # When executable, the trade prints at the better of the two:
+                # a buy never pays above the market, a sell never receives less.
+                fill_price = (
+                    min(limit_price, market_price)
+                    if order.side == OrderSide.BUY
+                    else max(limit_price, market_price)
+                )
             else:
-                fill_price = price
+                fill_price = market_price
+
+            if not math.isfinite(fill_price) or fill_price <= 0:
+                logger.warning("Skipping %s: computed fill price %r",
+                               order.ticker, fill_price)
+                continue
 
             self.order_manager.fill_order(order.order_id, fill_price)
 

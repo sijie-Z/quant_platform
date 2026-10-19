@@ -42,6 +42,7 @@ dependencies = [
     "shap==0.46.0",
     "pyyaml==6.0.2",
     "python-dotenv==1.0.0",
+    "tzdata==2026.2",
     "openpyxl==3.1.5",
     "adata>=1.0.0",
 ]
@@ -67,13 +68,57 @@ quant = "quant_platform.main:main"
 # created a second module identity (`data.x` vs `quant_platform.data.x`) and
 # split every module-level singleton in two (issue #69).
 #
-# This mapping is designed for editable installs (`pip install -e .`), which
-# is what CI and the Dockerfile use. A non-editable wheel would contain only
-# `quant_platform/__init__.py`; enumerate subpackages here if that is needed.
-packages = ["quant_platform"]
+# Subpackages must be listed explicitly. With only the root package, a
+# non-editable `pip install .` produced a wheel containing four top-level
+# modules and none of the subpackages, so the installed CLI failed on import.
+# `package-dir` maps the `quant_platform` prefix to the repo root, so the
+# remaining dotted path (`data.providers`) resolves to `./data/providers`.
+# `tests/test_architecture/test_package_manifest.py` fails if a new
+# subpackage is added without updating this list.
+packages = [
+    "quant_platform",
+    "quant_platform.agent",
+    "quant_platform.alpha",
+    "quant_platform.api",
+    "quant_platform.backtest",
+    "quant_platform.compliance",
+    "quant_platform.config",
+    "quant_platform.core",
+    "quant_platform.core.protocols",
+    "quant_platform.data",
+    "quant_platform.data.providers",
+    "quant_platform.execution",
+    "quant_platform.factors",
+    "quant_platform.factors.expressions",
+    "quant_platform.factors.store",
+    "quant_platform.framework",
+    "quant_platform.framework.contracts",
+    "quant_platform.kernel",
+    "quant_platform.lab",
+    "quant_platform.lab.registry",
+    "quant_platform.lab.reports",
+    "quant_platform.lab.runs",
+    "quant_platform.operations",
+    "quant_platform.portfolio",
+    "quant_platform.regime_router",
+    "quant_platform.reporting",
+    "quant_platform.research",
+    "quant_platform.risk",
+    "quant_platform.services",
+    "quant_platform.shared",
+    "quant_platform.trading",
+    "quant_platform.utils",
+    "quant_platform.utils.cyext",
+]
 
 [tool.setuptools.package-dir]
 quant_platform = "."
+
+[tool.setuptools.package-data]
+# `load_config(None)` resolves the default YAML relative to the installed
+# package. Wheels do not include non-code files unless declared here, so a
+# pip-installed `quant` command failed with FileNotFoundError.
+"quant_platform.config" = ["*.yaml"]
 
 # ---------------------------------------------------------------------------
 # ruff — fast Python linter (replaces flake8 + isort + autoflake)

@@ -86,3 +86,40 @@ def test_websocket_requires_the_token_when_configured(monkeypatch):
 
     with client.websocket_connect("/api/ws?token=secret") as ws:
         ws.send_text("ping")
+
+
+class _FakeWebSocket:
+    def __init__(self, host):
+        from types import SimpleNamespace
+
+        self.client = SimpleNamespace(host=host)
+        self.close_code = None
+        self.accepted = False
+
+    async def close(self, code=1000):
+        self.close_code = code
+
+    async def accept(self):
+        self.accepted = True
+
+    async def receive_text(self):
+        raise WebSocketDisconnect()
+
+
+@pytest.mark.asyncio
+async def test_websocket_is_loopback_only_without_a_token(monkeypatch):
+    """The stream carries order.filled/risk events; the HTTP middleware does
+    not see WebSocket scopes, so it needs the same loopback restriction."""
+    monkeypatch.delenv("QUANT_API_TOKEN", raising=False)
+    from quant_platform.api.routes import websocket_endpoint
+
+    remote = _FakeWebSocket("203.0.113.5")
+    await websocket_endpoint(remote)
+
+    assert remote.close_code == 1008
+    assert remote.accepted is False
+
+    local = _FakeWebSocket("127.0.0.1")
+    await websocket_endpoint(local)
+
+    assert local.accepted is True

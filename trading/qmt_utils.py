@@ -85,30 +85,37 @@ def to_qmt_order_type(side: OrderSide) -> int:
 
 
 class QMTOrderStatus(IntEnum):
-    """QMT order status codes (xtconstant)."""
-    UNREPORTED = 0
-    WAIT_REPORTING = 1
-    REPORTED = 2
-    WAIT_CANCEL = 10
-    PART_CANCELED = 11
-    CANCELED = 12
-    PART_FILLED = 22
-    FILLED = 23
-    PART_CANCEL_FILLED = 24
-    WAIT_SENDING = 50
+    """QMT order status codes (xtconstant.xt_order_status).
+
+    xtquant reports ``XtOrder.order_status`` with these values. The table
+    previously used 0/1/2/10/11/12/22/23/24/50 -- codes from a different
+    API -- so every real XtOrder status fell through to PENDING.
+    """
+    UNREPORTED = 48
+    WAIT_REPORTING = 49
+    REPORTED = 50
+    REPORTED_CANCEL = 51        # reported, cancellation pending
+    PARTSUCC_CANCEL = 52        # partially filled, cancellation pending
+    PART_CANCEL = 53            # partially filled, rest cancelled
+    CANCELED = 54
+    PART_SUCC = 55
+    SUCCEEDED = 56
+    JUNK = 57                   # rejected / invalid order
+    UNKNOWN = 255
 
 
 QMT_STATUS_MAP: dict[int, OrderStatus] = {
-    0:  OrderStatus.PENDING,
-    1:  OrderStatus.PENDING,
-    2:  OrderStatus.SUBMITTED,
-    10: OrderStatus.SUBMITTED,
-    11: OrderStatus.PARTIAL,
-    12: OrderStatus.CANCELLED,
-    22: OrderStatus.PARTIAL,
-    23: OrderStatus.FILLED,
-    24: OrderStatus.PARTIAL,
-    50: OrderStatus.PENDING,
+    QMTOrderStatus.UNREPORTED: OrderStatus.PENDING,
+    QMTOrderStatus.WAIT_REPORTING: OrderStatus.PENDING,
+    QMTOrderStatus.REPORTED: OrderStatus.SUBMITTED,
+    QMTOrderStatus.REPORTED_CANCEL: OrderStatus.SUBMITTED,
+    QMTOrderStatus.PARTSUCC_CANCEL: OrderStatus.PARTIAL,
+    QMTOrderStatus.PART_CANCEL: OrderStatus.CANCELLED,
+    QMTOrderStatus.CANCELED: OrderStatus.CANCELLED,
+    QMTOrderStatus.PART_SUCC: OrderStatus.PARTIAL,
+    QMTOrderStatus.SUCCEEDED: OrderStatus.FILLED,
+    QMTOrderStatus.JUNK: OrderStatus.REJECTED,
+    QMTOrderStatus.UNKNOWN: OrderStatus.PENDING,
 }
 
 

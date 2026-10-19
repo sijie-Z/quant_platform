@@ -13,7 +13,6 @@ Walk-Forward validation meaningful.
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from quant_platform.factors.evaluation import ic_summary, rank_ic
@@ -206,33 +205,43 @@ def _build_row(
 ) -> pd.Series | None:
     """Build a single row of weighted factor values for one date.
 
-    The sum is mask-aware per asset: a missing value in one factor no longer
-    blanks every other factor's view of that asset. Plain addition propagated
-    NaN, so one factor with partial coverage emptied most of the signal.
+    Missing factor values are filled with 0 -- the cross-sectional mean of a
+    z-scored factor -- and the denominator is the *fixed* sum of |weight|, not
+    the weight of the factors that happen to be present for each asset.
+
+    The previous mask-aware denominator renormalised per asset: an asset
+    missing the dominant factor had its remaining weight scaled back up to 1,
+    so under 0.8/0.2 weights it was scored on the 0.2 factor alone and could
+    outrank an asset that had both. A missing value must be neutral, not a
+    promotion.
     """
+    total_abs = sum(
+        abs(weights.get(name, 0.0)) for name in aligned
+    )
+    if total_abs < 1e-10:
+        return None
+
     numerator = None
-    denominator = None
+    has_values = False
     for name, factor in aligned.items():
         w = weights.get(name, 0.0)
         if abs(w) < 1e-10:
             continue
         if date not in factor.index:
+            # Its weight still counts in the fixed denominator: an absent
+            # factor is a zero, not an excuse to scale the rest up.
             continue
+        has_values = True
         vals = factor.loc[date]
-        if not vals.notna().any():
-            continue
-
         contribution = (vals * w).fillna(0.0)
-        coverage = vals.notna().astype(float) * abs(w)
         if numerator is None:
-            numerator, denominator = contribution, coverage
+            numerator = contribution
         else:
             numerator = numerator.add(contribution, fill_value=0.0)
-            denominator = denominator.add(coverage, fill_value=0.0)
 
-    if numerator is None or denominator is None:
+    if numerator is None or not has_values:
         return None
-    return numerator / denominator.replace(0.0, np.nan)
+    return numerator / total_abs
 
 
 def _asset_universe(factors: dict[str, pd.DataFrame]) -> pd.Index:
@@ -314,30 +323,32 @@ def _weighted_sum(
     factors: dict[str, pd.DataFrame],
     weights: dict[str, float],
 ) -> pd.DataFrame:
-    """Weighted factor average, mask-aware per (date, asset).
+    """Weighted factor average with a fixed denominator.
 
-    Plain `result + df * w` propagated NaN across factors. A single factor
-    with partial coverage therefore blanked the asset for every date, and the
-    default factor set produced an almost entirely empty signal.
+    Missing cells are filled with 0 (the cross-sectional mean of a z-scored
+    factor) and the denominator is ``sum(abs(w))`` over the weighted factors,
+    identical for every asset. The old mask-aware denominator dropped a
+    missing factor from both numerator and denominator, so an asset missing a
+    heavily-weighted factor was renormalised onto the light factors and could
+    outrank a complete asset. Coverage must not change the scale.
     """
+    total_abs = 0.0
     numerator = None
-    denominator = None
     for name, df in factors.items():
         w = weights.get(name, 0.0)
         if abs(w) < 1e-10:
             continue
+        total_abs += abs(w)
         contribution = (df * w).fillna(0.0)
-        coverage = df.notna().astype(float) * abs(w)
         if numerator is None:
-            numerator, denominator = contribution, coverage
+            numerator = contribution
         else:
             numerator = numerator.add(contribution, fill_value=0.0)
-            denominator = denominator.add(coverage, fill_value=0.0)
 
-    if numerator is None or denominator is None:
+    if numerator is None or total_abs < 1e-10:
         raise ValueError("No valid factors to combine")
 
-    return numerator / denominator.replace(0.0, np.nan)
+    return numerator / total_abs
 
 
 def combine_vote(

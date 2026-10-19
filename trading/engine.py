@@ -127,7 +127,9 @@ class LiveTradingEngine:
         self._store = store or Store()
         self._bus = bus or get_event_bus()
         self._sm = state_machine or PortfolioStateMachine()
-        self._audit = audit or AuditLog(self._store, self._bus)
+        self._audit = audit or AuditLog(
+            self._store, self._bus, tenant_id=tenant_id,
+        )
         self._risk = risk_monitor or RealTimeRiskEngine(
             max_daily_loss=0.03,
             max_drawdown=0.15,

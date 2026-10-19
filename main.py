@@ -21,6 +21,11 @@ from quant_platform.utils.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
+# Effective provider used by the most recent `_load_data()` call. The cache
+# key is computed before loading, so the caller compares this afterwards and
+# refuses to cache a silent fallback under the requested provider's key.
+_LAST_DATA_PROVIDER = ""
+
 
 # ---------------------------------------------------------------------------
 # Shared pipeline core — used by run / compare / sweep
@@ -37,14 +42,35 @@ def _resolve_config_path(config_path_arg) -> Path:
     return Path(__file__).resolve().parent / "config" / "default.yaml"
 
 
-def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
+def _sector_panel_is_usable(panel, has_history: bool) -> bool:
+    """Whether a sector panel should be attached to the metadata frame.
+
+    An all-NaN panel with no industry history (the provider ships no
+    classification at all) must not be attached: `neutralize` treats any
+    supplied panel as authoritative, which would turn the old no-op static
+    path into intercept-only demeaning. But when the provider *does* ship
+    history -- even one whose entries all fall outside the sample -- the
+    all-NaN panel is meaningful: it forbids falling back to the whole-sample
+    static map, which would leak future classifications.
+    """
+    if panel is None:
+        return False
+    return has_history or bool(panel.notna().to_numpy().any())
+
+
+def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
     """Load and clean data. Returns (prices, returns, benchmark, metadata, financials, turnover).
 
     Respects the config.data.provider setting:
-    - "baostock":  Baostock free A-share data (default, no API key needed)
+    - "baostock":  Baostock free A-share data
     - "tushare":   Tushare Pro (requires TUSHARE_TOKEN env var)
     - "postgres":  PostgreSQL stored data
     - "synthetic": Synthetic data (for testing only)
+
+    `use_tushare`/`use_baostock` are explicit CLI overrides. They default to
+    False so the config decides; the old `use_tushare=True` default silently
+    replaced a configured synthetic/postgres provider whenever a Tushare
+    token happened to be present in the environment.
     """
     from quant_platform.data.pipeline import DataPipeline
     from quant_platform.data.providers.baostock_provider import BaostockDataProvider
@@ -52,12 +78,14 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
     from quant_platform.data.providers.tushare_loader import TushareProvider
 
     provider = None
+    provider_name = ""
     configured_provider = getattr(config.data, 'provider', 'synthetic')
 
     # Try configured provider first
     if configured_provider == "baostock" or use_baostock:
         try:
             provider = BaostockDataProvider()
+            provider_name = "baostock"
             logger.info("Using Baostock real data provider (free, no API key)")
         except Exception as e:
             logger.warning("Baostock unavailable (%s)", e)
@@ -68,6 +96,7 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
                 start_date=config.data.start_date,
                 end_date=config.data.end_date,
             )
+            provider_name = "tushare"
             logger.info("Using Tushare real data provider")
         except (RuntimeError, ImportError) as e:
             logger.warning("Tushare unavailable (%s), falling back...", e)
@@ -76,6 +105,7 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
         try:
             from quant_platform.data.providers.postgres_provider import PostgresDataProvider
             provider = PostgresDataProvider()
+            provider_name = "postgres"
             logger.info("Using PostgreSQL data provider")
         except Exception as e:
             logger.warning("PostgreSQL unavailable (%s), falling back...", e)
@@ -93,6 +123,7 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
             embedded_alpha=embedded,
             alpha_strength=alpha_strength,
         )
+        provider_name = "synthetic"
 
     # Optional: wrap in ValidatedProvider for cross-source validation
     validated = getattr(config.data, 'validated', False)
@@ -122,11 +153,49 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
     )
     pipeline.run()
 
+    metadata = pipeline.metadata
+    # The point-in-time sector panel rides along on the metadata frame so the
+    # 6-tuple return contract stays intact (api/routes.py, backtest/distributed
+    # and risk/lookahead_detector unpack it). `_compute_factors` reads it from
+    # `metadata.attrs` and falls back to the static map when it is absent.
+    # Only pay for the panel when sector neutralization is configured.
+    factors_cfg = getattr(config, "factors", None)
+    processing_cfg = (
+        getattr(factors_cfg, "processing", {}) if factors_cfg is not None else {}
+    )
+    if not isinstance(processing_cfg, dict):
+        processing_cfg = {}
+    neutralize_cfg = processing_cfg.get("neutralize", {}) or {}
+    wants_sector = neutralize_cfg.get("enabled", True) and "sector" in (
+        neutralize_cfg.get("by", ["sector", "log_market_cap"])
+    )
+    sector_panel = None
+    if wants_sector:
+        try:
+            panel = pipeline.get_sector_panel()
+        except Exception as exc:  # defensive: panel failure must not kill the run
+            logger.warning(
+                "Sector panel unavailable (%s); using static sector map", exc,
+            )
+            panel = None
+        # An all-NaN panel (no sector metadata and no industry history) would
+        # otherwise flip the no-op static-map path into an intercept-only
+        # demean; leave metadata untouched in that case. History that simply
+        # does not cover the sample still counts as "panel usable": it must
+        # keep neutralize from falling back to the static map.
+        if _sector_panel_is_usable(panel, pipeline.has_industry_history()):
+            sector_panel = panel
+    if metadata is not None and sector_panel is not None:
+        metadata.attrs["sector_panel"] = sector_panel
+
+    global _LAST_DATA_PROVIDER
+    _LAST_DATA_PROVIDER = provider_name or configured_provider
+
     return (
         pipeline.get_factor_prices(),
         pipeline.returns,
         pipeline.benchmark,
-        pipeline.metadata,
+        metadata,
         pipeline.financials,
         pipeline.get_turnover(),
     )
@@ -154,11 +223,21 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
     fin_unstacked = financials.unstack("asset") if financials is not None else None
 
     raw_factors = {}
+    factor_params = (
+        getattr(config.factors, "params", {}) if config is not None else {}
+    )
     for factor_name in registry.list_all():
         if enabled_factors is not None and factor_name not in enabled_factors:
             continue
         cls = registry.get(factor_name)
-        inst = cls()
+        try:
+            inst = cls(**factor_params.get(factor_name, {}))
+        except TypeError as exc:
+            logger.warning(
+                "Invalid params for %s in config, using defaults: %s",
+                factor_name, exc,
+            )
+            inst = cls()
         try:
             kwargs = {}
             if turnover is not None:
@@ -174,18 +253,65 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
     logger.info("Computed %d factors: %s", len(raw_factors), list(raw_factors.keys()))
 
     sector_map = metadata.get("sector", {}) if metadata is not None else {}
+    # Point-in-time sector panel attached by `_load_data`; absent when the
+    # caller built metadata itself (lookahead detector, cached results), in
+    # which case the static map is the documented fallback.
+    sector_panel = (
+        getattr(metadata, "attrs", {}).get("sector_panel")
+        if metadata is not None else None
+    )
     mcap = fin_unstacked.get("market_cap") if fin_unstacked is not None else None
+
+    # `factors.processing` used to be dropped during parsing, so changing
+    # winsorize/standardize/neutralize settings produced identical factors.
+    processing = (
+        getattr(config.factors, "processing", {}) if config is not None else {}
+    )
+    w_cfg = processing.get("winsorize", {}) or {}
+    s_cfg = processing.get("standardize", {}) or {}
+    n_cfg = processing.get("neutralize", {}) or {}
+    neutralize_by = n_cfg.get("by", ["sector", "log_market_cap"])
 
     processed_factors = {}
     for name, factor in raw_factors.items():
         processed_factors[name] = process_factor(
-            factor, sector_map=sector_map, market_cap=mcap,
+            factor,
+            winsorize_enabled=w_cfg.get("enabled", True),
+            winsorize_lower=w_cfg.get("lower", 0.01),
+            winsorize_upper=w_cfg.get("upper", 0.99),
+            standardize_enabled=s_cfg.get("enabled", True),
+            standardize_method=s_cfg.get("method", "zscore"),
+            neutralize_enabled=n_cfg.get("enabled", True),
+            sector_map=sector_map if "sector" in neutralize_by else None,
+            market_cap=(
+                mcap
+                if ("log_market_cap" in neutralize_by or "market_cap" in neutralize_by)
+                else None
+            ),
+            # Point-in-time classification when the pipeline supplied one;
+            # otherwise process_factor uses the static sector_map above.
+            sector_panel=(
+                sector_panel
+                if sector_panel is not None and "sector" in neutralize_by
+                else None
+            ),
+            factor_name=name,
         )
 
     ic_results = {}
     for name, factor in processed_factors.items():
         ic = rank_ic(factor, returns)
-        ic_results[name] = ic_summary(ic)
+        summary = ic_summary(ic)
+        ic_results[name] = summary
+        if summary.get("n_obs", 0) < 10:
+            # A factor whose processed panel yields no evaluable
+            # cross-sections contributes nothing to the signal. Say so
+            # instead of reporting a NaN row as if it were a weak factor.
+            logger.warning(
+                "Factor %s has only %d evaluable IC observations and will "
+                "not contribute to the alpha signal",
+                name, summary.get("n_obs", 0),
+            )
 
     return processed_factors, ic_results, sector_map, fin_unstacked
 
@@ -261,11 +387,20 @@ def cmd_run(args) -> int:
     with open(config_path, encoding="utf-8") as f:
         raw_config = yaml.safe_load(f)
 
-    cache_key = PipelineCache.make_config_hash(raw_config)
+    config = load_config(raw=raw_config)
+
+    use_baostock = bool(getattr(args, "use_baostock", False))
+    requested_provider = (
+        "baostock" if use_baostock
+        else getattr(config.data, "provider", "synthetic")
+    )
+    cache_key = PipelineCache.make_config_hash(
+        raw_config,
+        provider=requested_provider,
+        overrides={"use_baostock": use_baostock},
+    )
     cache = PipelineCache(args.cache_dir)
     use_cache = not args.force and not args.no_cache
-
-    config = load_config(raw=raw_config)
 
     # Auto-save config version before running
     from quant_platform.utils.version_manager import VersionManager
@@ -298,10 +433,18 @@ def cmd_run(args) -> int:
         prices, returns, benchmark, metadata, financials, turnover = data_tuple
         logger.info("Data loaded from cache")
     else:
-        prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_baostock=args.use_baostock)
-        if use_cache:
+        prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_baostock=use_baostock)
+        # A silent fallback (e.g. Tushare configured but unreachable) must not
+        # be stored under the requested provider's key: after credentials are
+        # fixed that entry would keep serving synthetic data.
+        if use_cache and requested_provider == _LAST_DATA_PROVIDER:
             cache.save_stage("data_v2", cache_key,
                              (prices, returns, benchmark, metadata, financials, turnover))
+        elif use_cache:
+            logger.warning(
+                "Not caching data: requested provider '%s' fell back to '%s'",
+                requested_provider, _LAST_DATA_PROVIDER,
+            )
 
     # ------------------------------------------------------------------
     # 2. Factors

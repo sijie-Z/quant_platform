@@ -153,14 +153,27 @@ def generate_dashboard(
     # --- Factor rankings ---
     if ic_results:
         lines.extend(["", "--- FACTOR IC RANKINGS ---"])
-        ranked = sorted(ic_results.items(), key=lambda x: x[1].get("mean_ic", 0), reverse=True)
+        ranked = sorted(
+            ic_results.items(),
+            key=lambda x: (np.isnan(x[1].get("mean_ic", np.nan)),
+                           -abs(x[1].get("mean_ic", 0) or 0)),
+        )
         for name, ic_sum in ranked:
             mean_ic = ic_sum.get("mean_ic", 0)
             icir = ic_sum.get("icir", 0)
-            ir = ic_sum.get("information_ratio", 0)
+            n_obs = ic_sum.get("n_obs", 0)
+            # `ic_summary` never returned an information ratio; the old line
+            # printed a fabricated IR=+0.00 for every factor. Report the
+            # number of evaluable cross-sections instead.
+            if mean_ic is None or not np.isfinite(mean_ic):
+                lines.append(
+                    f"    {name:<22s} IC=n/a  (only {n_obs} evaluable observations)"
+                )
+                continue
             direction = "+" if mean_ic > 0 else " " if mean_ic == 0 else "-"
             lines.append(
-                f"  {direction} {name:<22s} IC={mean_ic:+.4f}  ICIR={icir:+.2f}  IR={ir:+.2f}"
+                f"  {direction} {name:<22s} IC={mean_ic:+.4f}  "
+                f"ICIR={icir:+.2f}  N={n_obs}"
             )
 
     if exposure:

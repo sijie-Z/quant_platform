@@ -41,6 +41,18 @@ class TestThePipelineCompletes:
         assert status["status"] == "completed", status.get("error")
         assert completed_run in routes._run_store
 
+    def test_the_data_quality_report_is_retained(self, completed_run):
+        """The run record does not keep the price panel; the panel endpoint
+        used to 422 for every completed run."""
+        record = routes._run_store[completed_run]
+        report = record["data_quality"]
+
+        assert report["total_checks"] > 0
+        assert "pass_rate" in report
+
+        served = routes.data_quality_check({"run_id": completed_run})
+        assert served["total_checks"] == report["total_checks"]
+
     def test_the_stored_record_is_plain_python(self, completed_run):
         """Not Pydantic models. Every consumer reads it as a dict of dicts --
         `result.get("chart_data", {}).get("equity", [])` in the Monte Carlo,

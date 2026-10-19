@@ -51,3 +51,51 @@ def test_rank_ic_numba_averages_ties_like_scipy():
         accel.rank_ic_numba(factor.iloc[:, order], returns.iloc[:, order]).iloc[0]
     )
     assert permuted == pytest.approx(accelerated, abs=1e-12)
+
+
+def test_ledoit_wolf_kernel_compiles_and_matches_sklearn():
+    """`returns.mean(axis=0)` is not a valid numba overload.
+
+    The kernel raised TypingError for every call with >=5 assets; the engine
+    swallowed the exception and ran the backtest with `cov=None` (identity
+    covariance for MVO, equal-weight fallback for risk parity).
+    """
+    if not accel.HAS_NUMBA:
+        pytest.skip("numba unavailable")
+
+    from sklearn.covariance import LedoitWolf
+
+    rng = np.random.default_rng(0)
+    n, p = 252, 20
+    market = rng.normal(0, 0.01, (n, 1))
+    returns = pd.DataFrame(
+        market + rng.normal(0, 0.02, (n, p)),
+        index=pd.bdate_range("2023-01-02", periods=n),
+        columns=[f"S{i:02d}" for i in range(p)],
+    )
+
+    cov = accel.covariance_numba(returns)
+    reference = LedoitWolf().fit(returns.values).covariance_
+
+    assert cov.shape == (p, p)
+    assert np.allclose(cov.values, cov.values.T)
+    assert np.linalg.eigvalsh(cov.values).min() > -1e-12
+    # Different shrinkage targets (constant-correlation vs scaled identity),
+    # so exact equality is not expected; the estimates must be close.
+    np.testing.assert_allclose(cov.values, reference, atol=1e-3)
+
+
+def test_estimate_covariance_ledoit_wolf_does_not_raise():
+    from quant_platform.portfolio.covariance import estimate_covariance
+
+    rng = np.random.default_rng(3)
+    returns = pd.DataFrame(
+        rng.normal(0, 0.01, (120, 12)),
+        index=pd.bdate_range("2023-01-02", periods=120),
+        columns=[f"S{i:02d}" for i in range(12)],
+    )
+
+    cov = estimate_covariance(returns, method="ledoit_wolf")
+
+    assert cov.shape == (12, 12)
+    assert np.isfinite(cov.values).all()

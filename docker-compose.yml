@@ -7,8 +7,11 @@ services:
       - "8000:8000"
     environment:
       - TUSHARE_TOKEN=${TUSHARE_TOKEN:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # The LLM analyzers call DeepSeek through the OpenAI-compatible SDK;
+      # OPENAI_API_KEY here did nothing because the code reads DEEPSEEK_API_KEY.
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - LOG_LEVEL=INFO
+      - TZ=Asia/Shanghai
     volumes:
       - quant-data:/app/results
       - quant-cache:/app/.quant_cache

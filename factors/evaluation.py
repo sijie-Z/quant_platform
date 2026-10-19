@@ -112,7 +112,10 @@ def ic_summary(ic_series: pd.Series) -> dict:
     """
     valid = ic_series.dropna()
     if len(valid) < 10:
-        return {"mean_ic": np.nan, "std_ic": np.nan, "icir": np.nan, "ic_positive_ratio": np.nan}
+        return {
+            "mean_ic": np.nan, "std_ic": np.nan, "icir": np.nan,
+            "ic_positive_ratio": np.nan, "n_obs": int(len(valid)),
+        }
 
     mean_ic = valid.mean()
     std_ic = valid.std()
@@ -124,6 +127,7 @@ def ic_summary(ic_series: pd.Series) -> dict:
         "std_ic": std_ic,
         "icir": icir,
         "ic_positive_ratio": positive_ratio,
+        "n_obs": int(len(valid)),
     }
 
 

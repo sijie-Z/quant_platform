@@ -123,7 +123,25 @@ def apply_fill(order: Order, fill: Fill) -> None:
     Args:
         order: The order being filled.
         fill: The fill to apply.
+
+    Raises:
+        ValueError: if the order is not in a fillable state
+            (SUBMITTED/PARTIAL) or the fill quantity is not in
+            ``(0, order.remaining_quantity]``. The check runs before the
+            fill is appended or any state changes, so a rejected fill leaves
+            the order untouched.
     """
+    if order.status not in (OrderStatus.SUBMITTED, OrderStatus.PARTIAL):
+        raise ValueError(
+            f"Cannot fill order in {order.status} state "
+            f"(expected SUBMITTED or PARTIAL)"
+        )
+    if not (0 < fill.quantity <= order.remaining_quantity):
+        raise ValueError(
+            f"Invalid fill quantity {fill.quantity}: order {order.order_id} "
+            f"has {order.remaining_quantity} remaining"
+        )
+
     order.fills.append(fill)
     order.updated_at = fill.timestamp or datetime.now().isoformat(timespec="seconds")
 

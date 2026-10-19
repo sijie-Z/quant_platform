@@ -82,20 +82,40 @@ class TestOrderTypeMapping:
 
 
 class TestStatusMapping:
-    def test_reported_maps_to_submitted(self):
-        assert qmt_status_to_internal(2) == OrderStatus.SUBMITTED
+    """xtquant order_status uses 48-57, not 0-24.
 
-    def test_filled_maps_to_filled(self):
-        assert qmt_status_to_internal(23) == OrderStatus.FILLED
+    The previous table mapped 0/1/2/10/11/12/22/23/24/50, values that are
+    not XtOrder order_status codes at all, so every real status fell through
+    to the PENDING default (and 50 was explicitly wrong as well).
+    """
+
+    def test_unreported_and_wait_reporting_are_pending(self):
+        assert qmt_status_to_internal(48) == OrderStatus.PENDING
+        assert qmt_status_to_internal(49) == OrderStatus.PENDING
+
+    def test_reported_maps_to_submitted(self):
+        assert qmt_status_to_internal(50) == OrderStatus.SUBMITTED
 
     def test_canceled_maps_to_cancelled(self):
-        assert qmt_status_to_internal(12) == OrderStatus.CANCELLED
+        assert qmt_status_to_internal(54) == OrderStatus.CANCELLED
 
-    def test_partial_fill(self):
-        assert qmt_status_to_internal(22) == OrderStatus.PARTIAL
+    def test_part_succ_maps_to_partial(self):
+        assert qmt_status_to_internal(55) == OrderStatus.PARTIAL
+
+    def test_succeeded_maps_to_filled(self):
+        assert qmt_status_to_internal(56) == OrderStatus.FILLED
+
+    def test_junk_maps_to_rejected(self):
+        assert qmt_status_to_internal(57) == OrderStatus.REJECTED
 
     def test_unknown_maps_to_pending(self):
         assert qmt_status_to_internal(999) == OrderStatus.PENDING
+
+    def test_old_non_status_codes_are_not_lifecycle_updates(self):
+        # 2/12/22/23 are xtconstant order/side constants, not order states.
+        # They must no longer masquerade as SUBMITTED/CANCELLED/etc.
+        for bogus in (0, 1, 2, 10, 11, 12, 22, 23, 24):
+            assert qmt_status_to_internal(bogus) == OrderStatus.PENDING
 
 
 # ── Error descriptions ──
@@ -250,6 +270,21 @@ class TestQMTBrokerOrders:
         assert result.status == OrderStatus.REJECTED
         assert "not connected" in result.error_msg.lower()
 
+    @pytest.mark.parametrize("reject_value", [0, -1, None])
+    def test_order_stock_failure_is_rejected(self, reject_value):
+        """order_stock returning <=0 (or None) is a rejection, not a fill."""
+        broker = self.broker
+        broker._trader.order_stock.return_value = reject_value
+        order = Order(code="600519", side=OrderSide.BUY,
+                      order_type=OrderType.LIMIT, quantity=100, price=1800.0)
+
+        result = broker.place_order(order)
+
+        assert result.status == OrderStatus.REJECTED
+        assert result.broker_order_id == ""
+        assert result.error_msg
+        broker._trader.order_stock.assert_called_once()
+
     def test_place_order_market(self):
         broker = self.broker
         order = Order(code="300750", side=OrderSide.SELL,
@@ -265,10 +300,25 @@ class TestQMTBrokerOrders:
         order.status = OrderStatus.SUBMITTED
         broker._orders = [order]
 
-        broker._trader.cancel_order_stock.return_value = None
+        broker._trader.cancel_order_stock.return_value = 0
         result = broker.cancel_order(order.order_id)
         assert result is True
         broker._trader.cancel_order_stock.assert_called_once()
+
+    def test_cancel_rejected_by_qmt_is_not_reported_as_success(self):
+        """cancel_order_stock returns !=0 on failure; the old code returned
+        True without ever looking at the result."""
+        broker = self.broker
+        order = Order(code="600519", side=OrderSide.BUY, quantity=100, price=1800.0)
+        order.broker_order_id = "12345"
+        order.status = OrderStatus.SUBMITTED
+        broker._orders = [order]
+
+        broker._trader.cancel_order_stock.return_value = -1
+        result = broker.cancel_order(order.order_id)
+
+        assert result is False
+        assert order.status == OrderStatus.SUBMITTED  # not confirmed cancelled
 
     def test_cancel_order_not_found(self):
         broker = self.broker
@@ -420,7 +470,7 @@ class TestCallbackLifecycle:
 
         class XtOrder:
             order_id = 12345
-            order_status = 22
+            order_status = 55  # ORDER_PART_SUCC
             traded_volume = 40
             traded_price = 10.2
 
@@ -428,6 +478,20 @@ class TestCallbackLifecycle:
 
         assert order.status == OrderStatus.PARTIAL
         assert order.filled_quantity == 40
+
+    def test_order_update_applies_a_filled_status(self):
+        broker, order = self._broker_with_order()
+
+        class XtOrder:
+            order_id = 12345
+            order_status = 56  # ORDER_SUCCEEDED
+            traded_volume = 100
+            traded_price = 10.5
+
+        broker._on_order_update(XtOrder())
+
+        assert order.status == OrderStatus.FILLED
+        assert order.filled_quantity == 100
 
     def test_error_callback_matches_an_integer_id(self):
         broker, order = self._broker_with_order()
@@ -450,3 +514,57 @@ class TestCallbackLifecycle:
         broker._on_async_response({"order_id": 12345})
 
         assert order.status == OrderStatus.SUBMITTED
+
+
+class TestStaleCallbacksCannotDowngrade:
+    """A late lifecycle callback must not undo a terminal state.
+
+    After the status map was fixed, an out-of-order XtOrder snapshot (e.g.
+    ORDER_PART_SUCC delivered after ORDER_SUCCEEDED) would still overwrite a
+    FILLED/REJECTED/CANCELLED order, because the handler assigned whatever
+    the callback carried.
+    """
+
+    @staticmethod
+    def _broker_with_order(status, filled=0):
+        broker = QMTBroker.__new__(QMTBroker)
+        broker._orders = []
+        order = Order(
+            code="600519", side=OrderSide.BUY,
+            order_type=OrderType.LIMIT, quantity=100, price=10.0,
+        )
+        order.broker_order_id = "12345"
+        order.status = status
+        order.filled_quantity = filled
+        broker._orders.append(order)
+        return broker, order
+
+    @pytest.mark.parametrize("terminal", [
+        OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED,
+    ])
+    def test_terminal_states_are_never_downgraded(self, terminal):
+        broker, order = self._broker_with_order(terminal)
+
+        class StaleXtOrder:
+            order_id = 12345
+            order_status = 55  # ORDER_PART_SUCC, stale
+            traded_volume = 0
+            traded_price = 0.0
+
+        broker._on_order_update(StaleXtOrder())
+
+        assert order.status == terminal
+
+    def test_stale_report_callback_does_not_demote_a_partial_fill(self):
+        broker, order = self._broker_with_order(OrderStatus.PARTIAL, filled=40)
+
+        class StaleXtOrder:
+            order_id = 12345
+            order_status = 50  # ORDER_REPORTED arrives late
+            traded_volume = 40
+            traded_price = 10.2
+
+        broker._on_order_update(StaleXtOrder())
+
+        assert order.status == OrderStatus.PARTIAL
+        assert order.filled_quantity == 40

@@ -236,6 +236,8 @@ class CapacityEstimator:
         schedule_idx = 0
 
         for date in all_dates:
+            day_cost_rate = 0.0
+            day_impact_rate = 0.0
             if schedule_idx < len(schedule) and date >= schedule[schedule_idx][0]:
                 _exec_date, next_rdate = schedule[schedule_idx]
                 target_weights = weights_history.get(next_rdate, current_weights)
@@ -244,6 +246,7 @@ class CapacityEstimator:
                 # Compute trade notional
                 trade_weights = target_weights - current_weights
                 trade_notional = trade_weights * capital
+                executed_weights = target_weights.copy()
 
                 # Apply participation rate cap
                 capped_impact = 0.0
@@ -261,11 +264,19 @@ class CapacityEstimator:
                             participation_rates.append(participation)
 
                             if participation > self.max_participation:
-                                # Cap the trade
+                                # Actually cap the trade: the old code only
+                                # recorded an impact number and still put the
+                                # full target into `current_weights`, so the
+                                # reported returns were identical at every AUM.
                                 capped_days += 1
                                 max_trade = vol_cny * self.max_participation
+                                scale = max_trade / trade_cny
+                                executed_weights[asset] = (
+                                    current_weights.get(asset, 0.0)
+                                    + trade_weights.get(asset, 0.0) * scale
+                                )
 
-                                # Extra impact cost for the capped portion.
+                                # Extra impact cost for the deferred portion.
                                 # `impact.total` is a per-share cost, so it
                                 # must be multiplied by the share count; the
                                 # old code added it as if it were currency.
@@ -281,29 +292,36 @@ class CapacityEstimator:
                                 )
                                 capped_impact += impact.total * shares
 
-                # Standard turnover cost
-                turnover = abs(trade_weights).sum() / 2
+                # Standard turnover cost on what was actually executed
+                executed_trade = executed_weights - current_weights
+                turnover = abs(executed_trade).sum() / 2
                 total_turnover += turnover
                 # Two-way traded value: compute_costs halves stamp tax on the
                 # assumption that half of its input is sells, so it needs
                 # buys + sells, not the one-sided turnover kept above.
                 cost_rate = self.cost_model.compute_costs(turnover * 2)
+                day_cost_rate = cost_rate
                 capital -= cost_rate * capital
 
                 # Extra impact cost
                 if capped_impact > 0 and capital > 0:
                     impact_bps = (capped_impact / capital) * 10000
                     total_impact_bps += impact_bps
+                    day_impact_rate = capped_impact / capital
                     capital -= capped_impact
 
-                current_weights = target_weights.copy()
+                current_weights = executed_weights
                 schedule_idx += 1
 
-            # Daily P&L, with weights drifting between rebalances.
+            # Daily P&L, with weights drifting between rebalances. Costs are
+            # liabilities of the day they are paid, so the reported return is
+            # net of them -- the old series was gross and the AUM curve was
+            # identical at every capital level.
             daily_ret_assets = returns.loc[date].reindex(current_weights.index, fill_value=0.0)
             portfolio_return = (current_weights * daily_ret_assets).sum()
-            daily_returns_list.append(portfolio_return)
-            capital = capital * (1 + portfolio_return)
+            net_return = portfolio_return - day_cost_rate - day_impact_rate
+            daily_returns_list.append(net_return)
+            capital = capital * (1 + net_return)
 
             if current_weights.sum() > 1e-12:
                 growth = current_weights * (1.0 + daily_ret_assets.fillna(0.0))
@@ -312,24 +330,16 @@ class CapacityEstimator:
                 if total_value > 1e-12:
                     current_weights = growth / total_value
 
-        # Compute metrics
+        # Compute metrics with the same definitions as the backtest summary
         daily_returns = pd.Series(daily_returns_list, index=all_dates)
 
-        if len(daily_returns) > 0 and daily_returns.std() > 0:
-            total_ret = float((1 + daily_returns).prod() - 1)
-            n = len(daily_returns)
-            ann_return = float((1 + total_ret) ** (252 / n) - 1) if n else 0.0
-            ann_vol = float(daily_returns.std() * math.sqrt(252))
-            sharpe = ann_return / ann_vol if ann_vol > 0 else 0
-            wealth = np.concatenate(
-                ([1.0], (1 + daily_returns).cumprod().to_numpy())
-            )
-            max_dd = float((wealth / np.maximum.accumulate(wealth) - 1).min())
-        else:
-            ann_return = 0.0
-            sharpe = 0.0
-            total_ret = 0.0
-            max_dd = 0.0
+        from quant_platform.backtest.metrics import all_metrics
+
+        metrics = all_metrics(daily_returns)
+        ann_return = float(metrics.get("annual_return", 0.0))
+        sharpe = float(metrics.get("sharpe_ratio", 0.0))
+        total_ret = float(metrics.get("total_return", 0.0))
+        max_dd = float(metrics.get("max_drawdown", 0.0))
 
         avg_participation = float(np.mean(participation_rates)) if participation_rates else 0.0
         max_participation = float(np.max(participation_rates)) if participation_rates else 0.0

@@ -5,6 +5,26 @@ const api = axios.create({
   timeout: 300000, // 5 min for long pipeline runs
 })
 
+// Optional bearer token, mirroring the backend's QUANT_API_TOKEN mode.
+// Without this every panel 401s while /api/health (unauthenticated) keeps
+// the header showing "connected".
+const API_TOKEN = import.meta.env.VITE_QUANT_API_TOKEN || ''
+if (API_TOKEN) {
+  api.interceptors.request.use((config) => {
+    config.headers = config.headers || {}
+    config.headers.Authorization = `Bearer ${API_TOKEN}`
+    return config
+  })
+}
+
+export function importPortfolioHoldings(data) {
+  return api.post('/portfolio/import', { data }).then(r => r.data)
+}
+
+export function getLivePortfolio() {
+  return api.get('/portfolio/live').then(r => r.data)
+}
+
 export function getConfig() {
   return api.get('/config').then(r => r.data)
 }
@@ -295,31 +315,54 @@ export function triggerMonitorKillSwitch(params) {
   return api.post('/monitor/kill-switch', params).then(r => r.data)
 }
 
-// WebSocket for real-time pipeline status
+// WebSocket for real-time pipeline status.
+//
+// Returns a handle whose close() permanently stops reconnection. The old
+// version returned only the first socket and reconnected unconditionally
+// from onclose, so `ws.close()` in a component's unmount handler scheduled a
+// new, unowned socket three seconds later — one leaked connection per visit.
+// When the API token is configured, it must travel in the query string
+// because browsers cannot set headers on a WebSocket handshake.
 export function createStatusSocket(onMessage, onError) {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const ws = new WebSocket(`${protocol}//${location.host}/api/ws`)
+  const token = import.meta.env.VITE_QUANT_API_TOKEN || ''
+  const query = token ? `?token=${encodeURIComponent(token)}` : ''
+  let socket = null
+  let timer = null
+  let disposed = false
 
-  ws.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data)
-      if (onMessage) onMessage(data)
-    } catch (_) {}
-  }
+  const connect = () => {
+    if (disposed) return
+    socket = new WebSocket(`${protocol}//${location.host}/api/ws${query}`)
 
-  ws.onerror = (err) => {
-    if (onError) onError(err)
-  }
-
-  ws.onclose = () => {
-    // Auto-reconnect after 3s
-    setTimeout(() => {
+    socket.onmessage = (event) => {
       try {
-        const ws2 = createStatusSocket(onMessage, onError)
-        return ws2
+        const data = JSON.parse(event.data)
+        if (onMessage) onMessage(data)
       } catch (_) {}
-    }, 3000)
+    }
+
+    socket.onerror = (err) => {
+      if (onError) onError(err)
+    }
+
+    socket.onclose = () => {
+      if (disposed) return
+      timer = setTimeout(connect, 3000)
+    }
   }
 
-  return ws
+  connect()
+
+  return {
+    get socket() { return socket },
+    close() {
+      disposed = true
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      try { if (socket) socket.close() } catch (_) {}
+    },
+  }
 }

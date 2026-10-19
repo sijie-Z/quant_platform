@@ -87,6 +87,7 @@ _MAX_RUNS = 50  # Keep at most this many completed runs in memory
 
 # WebSocket connection manager for real-time updates
 _ws_clients: set[WebSocket] = set()
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
 
 # The server's event loop, captured by the first WebSocket connection. Events
 # are published from worker threads, which cannot look their own loop up.
@@ -251,9 +252,18 @@ async def websocket_endpoint(ws: WebSocket, token: str = ""):
     # BaseHTTPMiddleware never sees WebSocket scopes, so the HTTP token guard
     # does not cover this stream (which carries order.filled and risk events).
     expected = os.environ.get("QUANT_API_TOKEN", "")
-    if expected and token != expected:
-        await ws.close(code=1008)
-        return
+    if expected:
+        if token != expected:
+            await ws.close(code=1008)
+            return
+    else:
+        # With no token configured the HTTP guard limits trading/OMS/risk
+        # routes to loopback; the event stream carries the same information
+        # and must not be open to remote clients either.
+        host = ws.client.host if ws.client else ""
+        if host not in _LOOPBACK_HOSTS:
+            await ws.close(code=1008)
+            return
     # Capture the loop here: this is the one place guaranteed to be running on
     # it before events start flowing. See _on_bus_event.
     _remember_loop()
@@ -347,6 +357,20 @@ def _execute_pipeline(run_id: str, req: RunRequest):
         _update_status(run_id, 10, "data")
         prices, returns, benchmark, metadata, financials, turnover = _load_data(
             config, use_tushare=req.use_tushare, use_baostock=req.use_baostock)
+
+        # Compute the quality report while the price panel exists, and keep
+        # the small summary with the run. The run record does not retain the
+        # panel itself, so `/api/data/quality?run_id=...` used to return 422
+        # for every completed run.
+        try:
+            from quant_platform.data.quality import DataQualityMonitor
+            dq = DataQualityMonitor()
+            dq.check_prices(prices)
+            dq.check_returns(returns)
+            data_quality_report = dq.get_report()
+        except Exception as exc:
+            logger.warning("Data quality check failed for run %s: %s", run_id, exc)
+            data_quality_report = {"error": str(exc)}
 
         # Stage 2: Factors
         _update_status(run_id, 30, "factors")
@@ -506,6 +530,7 @@ def _execute_pipeline(run_id: str, req: RunRequest):
                 parametric_var=risk.get("parametric_var", 0),
                 historical_cvar=risk.get("historical_cvar", 0),
             ).model_dump(),
+            "data_quality": data_quality_report,
             "stress_tests": [s.model_dump() for s in stress_tests],
             "factors": [f.model_dump() for f in factor_items],
             "exposure": exposure_info.model_dump(),
@@ -1420,7 +1445,9 @@ async def get_holdings():
 def get_live_portfolio():
     """Get live portfolio snapshot with current prices from baostock."""
     if not _holdings_data or not _holdings_data.get("holdings"):
-        return {"error": "No holdings imported. Import CSV first."}
+        # An HTTP error, not a 200 with an `error` key: the frontend treated
+        # the latter as a valid empty portfolio and reported success.
+        raise HTTPException(409, "No holdings imported. Import CSV first.")
 
     holdings = pd.DataFrame(_holdings_data["holdings"])
     codes = holdings["code"].tolist()
@@ -1461,6 +1488,13 @@ def get_live_portfolio():
 
         bs.logout()
 
+        if not prices:
+            raise HTTPException(
+                503,
+                "No live prices available from baostock; try again during "
+                "the trading session.",
+            )
+
         # Merge holdings with prices (vectorized)
         holdings["close"] = holdings["code"].map(prices)
         holdings["preclose"] = holdings["code"].map(preclose_prices)
@@ -1490,8 +1524,11 @@ def get_live_portfolio():
                              "market_value", "pnl", "pnl_pct"]].to_dict(orient="records"),
             "timestamp": datetime.now().isoformat(),
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": str(e), "holdings_count": len(codes)}
+        # 200 + {"error": ...} looked like a successful empty portfolio.
+        raise HTTPException(503, f"Live portfolio unavailable: {e}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -2394,6 +2431,21 @@ async def strategy_update_pnl(req: dict):
 # Data Quality
 # ---------------------------------------------------------------------------
 
+def _returns_from_quality_prices(prices: pd.DataFrame) -> pd.DataFrame:
+    """Build a date x asset return frame from a price panel.
+
+    A `(date, asset)` MultiIndex panel must be unstacked first: `pct_change`
+    on the flat frame differences consecutive *rows*, i.e. different stocks
+    on the same date, which reported tens of thousands of fake anomalies.
+    """
+    if isinstance(prices.index, pd.MultiIndex):
+        field = "close" if "close" in prices.columns else prices.columns[0]
+        wide = prices[field].unstack("asset")
+    else:
+        wide = prices
+    return wide.replace(0, np.nan).pct_change(fill_method=None).dropna()
+
+
 @router.post("/data/quality")
 def data_quality_check(req: dict):
     """Run data quality checks on price data."""
@@ -2410,12 +2462,14 @@ def data_quality_check(req: dict):
         max_nan_rate=req.get("max_nan_rate", 0.02),
     )
 
+    if result and "data_quality" in result:
+        # Computed when the run executed, while the price panel was in memory.
+        return result["data_quality"]
     if result and "prices" in result:
         prices = result["prices"]
         if isinstance(prices, pd.DataFrame):
             monitor.check_prices(prices)
-            returns = prices.replace(0, np.nan).pct_change(fill_method=None).dropna()
-            monitor.check_returns(returns)
+            monitor.check_returns(_returns_from_quality_prices(prices))
     elif run_id:
         # The run record does not retain its price panel. Checking an unrelated
         # synthetic sample and presenting it as this run's quality was worse
@@ -2432,9 +2486,7 @@ def data_quality_check(req: dict):
         prices = provider.get_prices("2023-01-01", "2024-12-31")
         if isinstance(prices, pd.DataFrame):
             monitor.check_prices(prices)
-            numeric = prices.select_dtypes(include=[np.number])
-            returns = numeric.mask(numeric == 0).pct_change(fill_method=None).dropna()
-            monitor.check_returns(returns)
+            monitor.check_returns(_returns_from_quality_prices(prices))
 
     report = monitor.get_report()
     return report

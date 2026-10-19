@@ -55,23 +55,26 @@ class MomentumFactor(BaseFactor):
 
 
 class Momentum1M(MomentumFactor):
-    def __init__(self):
-        super().__init__(period=21, name="momentum_1m", skip=0)
+    # The fixed-period subclasses must accept an override: the YAML ships
+    # `params: {period: 21}` for every factor, and `cls(**params)` otherwise
+    # raised TypeError and fell back to defaults silently.
+    def __init__(self, period: int = 21):
+        super().__init__(period=period, name="momentum_1m", skip=0)
 
 
 class Momentum3M(MomentumFactor):
-    def __init__(self):
-        super().__init__(period=63, name="momentum_3m", skip=0)
+    def __init__(self, period: int = 63):
+        super().__init__(period=period, name="momentum_3m", skip=0)
 
 
 class Momentum6M(MomentumFactor):
-    def __init__(self):
-        super().__init__(period=126, name="momentum_6m", skip=0)
+    def __init__(self, period: int = 126):
+        super().__init__(period=period, name="momentum_6m", skip=0)
 
 
 class Momentum12M(MomentumFactor):
-    def __init__(self):
-        super().__init__(period=252, name="momentum_12m", skip=21)
+    def __init__(self, period: int = 252):
+        super().__init__(period=period, name="momentum_12m", skip=21)
 
 
 # ---------------------------------------------------------------------------
@@ -98,13 +101,13 @@ class VolatilityFactor(BaseFactor):
 
 
 class Volatility20D(VolatilityFactor):
-    def __init__(self):
-        super().__init__(period=20, name="volatility_20d")
+    def __init__(self, period: int = 20):
+        super().__init__(period=period, name="volatility_20d")
 
 
 class Volatility60D(VolatilityFactor):
-    def __init__(self):
-        super().__init__(period=60, name="volatility_60d")
+    def __init__(self, period: int = 60):
+        super().__init__(period=period, name="volatility_60d")
 
 
 # ---------------------------------------------------------------------------

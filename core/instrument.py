@@ -107,7 +107,13 @@ class Instrument:
         return self.notional(price, quantity) * rate
 
     def stamp_tax(self, price: float, quantity: int, side: str = "buy") -> float:
-        """Calculate stamp tax. Only applies to sell side for equities."""
+        """Calculate stamp tax. Only applies to sell side for equities.
+
+        Futures and options are always exempt, whatever `stamp_tax_rate`
+        says: the tax is a securities-transaction levy on cash equities.
+        """
+        if self.is_derivative:
+            return 0.0
         if side != "sell":
             return 0.0
         rate = self.stamp_tax_rate if self.stamp_tax_rate is not None else 0.001
@@ -165,22 +171,39 @@ class Instrument:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Instrument:
-        """Create from config dict."""
+        """Create from config dict.
+
+        Missing keys fall back to defaults for the *declared* asset class.
+        Previously every missing key took the stock default, so a futures
+        contract read from config without explicit overrides got a 0.1%
+        stamp tax, a 100-contract lot size and T+1 settlement. Futures and
+        options trade in single contracts, settle T+0 and are stamp-tax
+        exempt; stocks/ETFs keep the A-share rules.
+        """
         at = data.get("asset_type", "stock")
         if isinstance(at, str):
             at = InstrumentType(at)
+        derivative = at in (InstrumentType.FUTURE, InstrumentType.OPTION)
+        if derivative:
+            default_stamp_tax: float | None = 0.0
+            default_lot_size = 1
+            default_t_plus = 0
+        else:
+            default_stamp_tax = None  # stamp_tax() then applies the A-share 0.1%
+            default_lot_size = 100
+            default_t_plus = 1
         return cls(
             symbol=data.get("symbol", ""),
             asset_type=at,
             exchange=data.get("exchange", "SSE"),
             multiplier=data.get("multiplier", 1.0),
             tick_size=data.get("tick_size", 0.01),
-            lot_size=data.get("lot_size", 100),
+            lot_size=data.get("lot_size", default_lot_size),
             margin_rate=data.get("margin_rate", 1.0),
             commission_rate=data.get("commission_rate"),
             commission_per_lot=data.get("commission_per_lot", 0.0),
-            stamp_tax_rate=data.get("stamp_tax_rate"),
-            t_plus=data.get("t_plus", 1),
+            stamp_tax_rate=data.get("stamp_tax_rate", default_stamp_tax),
+            t_plus=data.get("t_plus", default_t_plus),
             price_limit=data.get("price_limit", 0.10),
             underlying=data.get("underlying", ""),
             expiry=data.get("expiry", ""),

@@ -17,13 +17,17 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from quant_platform.core.events import EventBus, get_event_bus
+from quant_platform.core.exchange_calendar import is_trading_day
 from quant_platform.core.state_machine import PortfolioState, PortfolioStateMachine
 from quant_platform.core.store import Store
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_EXCHANGE_TZ = "Asia/Shanghai"
 
 
 @dataclass
@@ -57,11 +61,17 @@ class TradingScheduler:
         store: Store,
         bus: EventBus | None = None,
         rebalance_interval: int = 300,  # seconds
+        exchange_tz: str = DEFAULT_EXCHANGE_TZ,
     ):
         self._sm = state_machine
         self._store = store
         self._bus = bus or get_event_bus()
         self._rebalance_interval = rebalance_interval
+        # Market hours are Shanghai wall-clock times. `datetime.now()` on a
+        # UTC container (the shipped Docker image) put the session seven
+        # hours off: "closed" during the real session and "trading_am" at
+        # 17:30 Beijing.
+        self._tz = ZoneInfo(exchange_tz)
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -69,6 +79,14 @@ class TradingScheduler:
         self._session_id = ""
         self._last_rebalance = 0
         self._cycle_count = 0
+
+    def _now(self) -> datetime:
+        return datetime.now(self._tz)
+
+    @staticmethod
+    def _naive_local(now: datetime) -> str:
+        """ISO timestamp in exchange local time, naive like the rest of the store."""
+        return now.replace(tzinfo=None).isoformat()
 
     def start(self):
         """Start the scheduler."""
@@ -83,7 +101,7 @@ class TradingScheduler:
         self._store.save_session({
             "session_id": self._session_id,
             "status": "active",
-            "started_at": datetime.now().isoformat(),
+            "started_at": self._naive_local(self._now()),
         })
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -106,7 +124,7 @@ class TradingScheduler:
         self._store.save_session({
             "session_id": self._session_id,
             "status": "stopped",
-            "stopped_at": datetime.now().isoformat(),
+            "stopped_at": self._naive_local(self._now()),
         })
 
         self._bus.publish("scheduler.stopped", {
@@ -116,17 +134,30 @@ class TradingScheduler:
 
         logger.info("Scheduler stopped. Cycles: %d", self._cycle_count)
 
-    def get_market_session(self) -> MarketSession:
-        """Get current market session info."""
-        now = datetime.now()
+    def get_market_session(self, now: datetime | None = None) -> MarketSession:
+        """Get current market session info.
+
+        `now` is an injection point for tests; production uses the exchange
+        timezone, not the host clock.
+        """
+        now = now or self._now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=self._tz)
+        else:
+            now = now.astimezone(self._tz)
+
         t = now.hour * 100 + now.minute
-        weekday = now.weekday()
 
         session = MarketSession(date=now.strftime("%Y-%m-%d"))
 
-        if weekday >= 5:
+        # Weekends and exchange holidays are both non-trading days. The
+        # holiday table lives in core/exchange_calendar.py (extendable via
+        # QUANT_EXCHANGE_HOLIDAYS).
+        if not is_trading_day(now.date()):
             session.is_trading_day = False
-            session.status = "closed_weekend"
+            session.status = (
+                "closed_weekend" if now.weekday() >= 5 else "closed_holiday"
+            )
             return session
 
         if t < 915:
@@ -203,8 +234,18 @@ class TradingScheduler:
             self._sm.transition(PortfolioState.READY, "post-market complete")
 
     def _do_eod_reconciliation(self):
-        """End-of-day reconciliation: save P&L snapshot, log events."""
+        """End-of-day reconciliation: save P&L snapshot, log events.
+
+        Runs at most once per exchange-local date. Without a persisted
+        marker a scheduler restarted after the close wrote a second snapshot
+        for the same day, double-counting that day in P&L history.
+        """
+        today = self._now().strftime("%Y-%m-%d")
         try:
+            if self._store.has_eod_reconciliation(today):
+                logger.info("EOD reconciliation already done for %s; skipping", today)
+                return
+
             positions = self._store.get_positions()
             market_value = sum(p.get('market_value', 0) for p in positions)
 
@@ -213,13 +254,14 @@ class TradingScheduler:
             last_equity = pnl_history[-1]['total_equity'] if pnl_history else 1_000_000
 
             snapshot = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": self._naive_local(self._now()),
                 "total_equity": last_equity,
                 "cash": last_equity - market_value,
                 "market_value": market_value,
                 "n_positions": len(positions),
             }
             self._store.save_pnl_snapshot(snapshot)
+            self._store.mark_eod_reconciliation(today, snapshot["timestamp"])
 
             self._bus.publish("eod.reconciliation", {
                 "positions": len(positions),

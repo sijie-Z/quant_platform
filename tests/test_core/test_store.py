@@ -361,3 +361,220 @@ class TestEngineState:
         db = str(tmp_path / "state.db")
         Store(db).save_engine_state({"v": 3}, "s")
         assert Store(db).get_engine_state("s") == {"v": 3}
+
+
+class TestPartialOrderSavesKeepTheRestOfTheRow:
+    """A broker fill DTO carries only the fields the broker knows about.
+
+    `save_order` used `INSERT OR REPLACE`, which deletes the row and
+    reinserts it from the incoming dict, so every column absent from a
+    later partial save was reset to its default. `OrderResult.to_dict()`
+    (trading/broker.py) has no strategy_id/signal_id/broker_order_id, so a
+    fill silently erased the attribution written when the order was
+    submitted.
+    """
+
+    @staticmethod
+    def _submitted(store, **overrides):
+        order = {
+            "order_id": "o1", "code": "600519", "side": "buy",
+            "quantity": 100, "price": 1800.0, "status": "submitted",
+            "strategy_id": "momentum", "signal_id": "sig-1",
+            "broker_order_id": "broker-9", "tenant_id": "fund_a",
+            "created_at": "2026-01-05T09:30:00",
+        }
+        order.update(overrides)
+        store.save_order(order)
+
+    @staticmethod
+    def _fill_dto(**overrides):
+        """The shape `trading/broker.py:OrderResult.to_dict()` returns."""
+        dto = {
+            "order_id": "o1", "code": "600519", "side": "buy",
+            "order_type": "limit", "quantity": 100, "price": 1800.0,
+            "filled_quantity": 100, "filled_price": 1800.0,
+            "status": "filled", "commission": 5.4, "tax": 0.0,
+            "slippage": 0.0, "error_msg": "",
+            "created_at": "2026-01-05T09:30:00",
+            "updated_at": "2026-01-05T15:00:00",
+        }
+        dto.update(overrides)
+        return dto
+
+    def test_a_fill_does_not_blank_the_attribution_columns(self, store):
+        self._submitted(store)
+
+        store.save_order(self._fill_dto())
+
+        row = store.get_orders()[0]
+        assert row["strategy_id"] == "momentum"
+        assert row["signal_id"] == "sig-1"
+        assert row["broker_order_id"] == "broker-9"
+
+    def test_supplied_columns_still_overwrite(self, store):
+        self._submitted(store)
+
+        store.save_order(self._fill_dto())
+
+        row = store.get_orders()[0]
+        assert row["status"] == "filled"
+        assert row["filled_quantity"] == 100
+        assert row["commission"] == 5.4
+        assert row["updated_at"] == "2026-01-05T15:00:00"
+
+    def test_a_missing_tenant_does_not_rewrite_the_row_tenant(self, store):
+        self._submitted(store)
+
+        store.save_order(self._fill_dto())  # no tenant_id in the DTO
+
+        assert store.get_orders()[0]["tenant_id"] == "fund_a"
+
+    def test_created_at_survives_an_update_that_omits_it(self, store):
+        self._submitted(store)
+
+        store.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0,
+                          "filled_quantity": 100, "status": "filled"})
+
+        assert store.get_orders()[0]["created_at"] == "2026-01-05T09:30:00"
+
+    def test_a_first_insert_uses_the_sql_defaults_it_does_not_supply(self, store):
+        store.save_order({"order_id": "o2", "code": "000001", "side": "sell",
+                          "quantity": 200, "price": 10.0})
+
+        row = store.get_orders()[0]
+        assert row["tenant_id"] == "default"
+        assert row["order_type"] == "limit"
+        assert row["status"] == "pending"
+        assert row["filled_quantity"] == 0
+        assert row["strategy_id"] == ""
+        assert row["created_at"], "created_at has no SQL default and must be set"
+        assert row["updated_at"]
+
+
+class TestMultipleFillsForOneOrder:
+    """`trade_id` used to default to `order_id`.
+
+    An order filled in several prints got one UNIQUE conflict per extra
+    print: by then `save_order` had already replaced the order row, and the
+    trade (and its audit event) were lost.
+    """
+
+    def _order(self, store):
+        store.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0, "status": "submitted"})
+
+    def test_two_fills_are_both_recorded(self, store):
+        self._order(store)
+        base = {"order_id": "o1", "code": "600519", "side": "buy", "quantity": 50}
+
+        store.save_trade({**base, "price": 1800.0})
+        store.save_trade({**base, "price": 1801.0})
+
+        trades = store.get_trades()
+        assert len(trades) == 2
+        assert len({t["trade_id"] for t in trades}) == 2
+        assert sorted(t["price"] for t in trades) == [1800.0, 1801.0]
+
+    def test_an_explicit_trade_id_is_kept(self, store):
+        self._order(store)
+        store.save_trade({"trade_id": "t1", "order_id": "o1", "code": "600519",
+                          "side": "buy", "quantity": 50, "price": 1800.0})
+
+        assert store.get_trades()[0]["trade_id"] == "t1"
+
+
+class TestSaveOrderWithTrade:
+    def test_writes_the_order_and_the_trade_together(self, store):
+        store.save_order_with_trade(
+            {"order_id": "o1", "code": "600519", "side": "buy",
+             "quantity": 100, "price": 1800.0, "status": "filled"},
+            {"order_id": "o1", "code": "600519", "side": "buy",
+             "quantity": 100, "price": 1800.0},
+        )
+
+        assert len(store.get_orders()) == 1
+        assert len(store.get_trades()) == 1
+        assert store.get_trades()[0]["trade_id"] != "o1", "uuid4, not the order id"
+
+    def test_a_bad_trade_rolls_the_order_back(self, store):
+        """One transaction: no half-written order when the fill is invalid."""
+        with pytest.raises(KeyError):
+            store.save_order_with_trade(
+                {"order_id": "o1", "code": "600519", "side": "buy",
+                 "quantity": 100, "price": 1800.0, "status": "filled"},
+                {"order_id": "o1", "code": "600519", "side": "buy"},  # no quantity
+            )
+
+        assert store.get_orders() == []
+        assert store.get_trades() == []
+
+    def test_a_second_fill_updates_the_order_and_appends_the_trade(self, store):
+        order = {"order_id": "o1", "code": "600519", "side": "buy",
+                 "quantity": 100, "price": 1800.0, "status": "partially_filled",
+                 "strategy_id": "momentum"}
+        store.save_order_with_trade(
+            order,
+            {"order_id": "o1", "code": "600519", "side": "buy",
+             "quantity": 50, "price": 1800.0},
+        )
+        store.save_order_with_trade(
+            {**order, "status": "filled", "filled_quantity": 100},
+            {"order_id": "o1", "code": "600519", "side": "buy",
+             "quantity": 50, "price": 1801.0},
+        )
+
+        assert len(store.get_orders()) == 1
+        assert len(store.get_trades()) == 2
+        row = store.get_orders()[0]
+        assert row["status"] == "filled"
+        assert row["strategy_id"] == "momentum"
+
+
+class TestEodReconciliationMarker:
+    def test_marker_round_trip(self, store):
+        assert store.has_eod_reconciliation("2026-10-20") is False
+
+        store.mark_eod_reconciliation("2026-10-20", "2026-10-20T15:30:00")
+
+        assert store.has_eod_reconciliation("2026-10-20") is True
+        assert store.has_eod_reconciliation("2026-10-19") is False
+
+    def test_marking_the_same_day_twice_keeps_one_row(self, tmp_path):
+        db = str(tmp_path / "eod.db")
+        store = Store(db)
+        store.mark_eod_reconciliation("2026-10-20", "first")
+        store.mark_eod_reconciliation("2026-10-20", "second")
+
+        import sqlite3
+        conn = sqlite3.connect(db)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM eod_reconciliation").fetchone()[0]
+        finally:
+            conn.close()
+        assert count == 1
+
+    def test_an_existing_database_gains_the_table(self, tmp_path):
+        """Databases written before the table existed must migrate on open."""
+        import sqlite3
+
+        db = str(tmp_path / "legacy.db")
+        first = Store(db)
+        first.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0})
+        first.close()
+
+        # Simulate a database created before the eod_reconciliation table.
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE eod_reconciliation")
+        conn.commit()
+        conn.close()
+
+        reopened = Store(db)
+        assert reopened.has_eod_reconciliation("2026-10-20") is False
+        reopened.mark_eod_reconciliation("2026-10-20")
+
+        assert reopened.has_eod_reconciliation("2026-10-20") is True
+        assert len(reopened.get_orders()) == 1, "existing rows are untouched"
+

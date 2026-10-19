@@ -91,6 +91,25 @@ class TestOrderManager:
         blotter = self.om.get_order_blotter()
         assert len(blotter) == 1
 
+    def test_blotter_includes_open_and_partial_orders(self):
+        """Only completed orders were appended to `self.blotter`, so pending,
+        submitted and partially filled orders never reached the API."""
+        pending = self.om.create_order("600519", "buy", 100)
+        submitted = self.om.create_order("000001", "buy", 200)
+        self.om.submit_order(submitted.order_id)
+        partial = self.om.create_order("300750", "buy", 300)
+        self.om.submit_order(partial.order_id)
+        self.om.fill_order(partial.order_id, price=100.0, quantity=100)
+
+        blotter = {
+            row["order_id"]: row for row in self.om.get_order_blotter()
+        }
+
+        assert blotter[pending.order_id]["status"] == "pending"
+        assert blotter[submitted.order_id]["status"] == "submitted"
+        assert blotter[partial.order_id]["status"] == "partial"
+        assert blotter[partial.order_id]["remaining_quantity"] == 200
+
     def test_tca(self):
         order = self.om.create_order("600519", "buy", 100)
         self.om.submit_order(order.order_id)
@@ -181,6 +200,103 @@ class TestT1Settlement:
         assert self.om.positions["600519"].quantity == 100
 
 
+class TestFillValidation:
+    """fill_order must reject bad input before touching cash or positions.
+
+    The HTTP layer already refused price <= 0, but internal callers (and the
+    simulated exchange) went straight into the OMS, where a NaN price produced
+    a NaN commission and a zero/negative quantity could corrupt the book.
+    """
+
+    def setup_method(self):
+        self.om = OrderManager(initial_cash=10_000_000)
+
+    def _submitted_buy(self, qty: int = 100):
+        order = self.om.create_order("600519", "buy", qty)
+        self.om.submit_order(order.order_id)
+        return order
+
+    @pytest.mark.parametrize(
+        "price", [0.0, -1.0, float("nan"), float("inf"), float("-inf")],
+    )
+    def test_invalid_price_raises_before_any_mutation(self, price):
+        order = self._submitted_buy()
+        cash_before = self.om.cash
+
+        with pytest.raises(ValueError):
+            self.om.fill_order(order.order_id, price=price)
+
+        assert order.fills == []
+        assert self.om.cash == cash_before
+        assert self.om.positions == {}
+
+    @pytest.mark.parametrize("qty", [0, -100])
+    def test_non_positive_quantity_raises_before_any_mutation(self, qty):
+        order = self._submitted_buy()
+        cash_before = self.om.cash
+
+        with pytest.raises(ValueError):
+            self.om.fill_order(order.order_id, price=100.0, quantity=qty)
+
+        assert order.fills == []
+        assert self.om.cash == cash_before
+        assert self.om.positions == {}
+
+
+class TestMarkToMarketAfterFill:
+    """A buy must mark its position at the fill price immediately.
+
+    `_process_fill` updated quantity and avg_cost but left current_price and
+    market_value at zero, so `get_snapshot()` right after a buy showed cash
+    reduced by the purchase and positions worth nothing -- the whole purchase
+    looked like a loss.
+    """
+
+    def test_buy_marks_position_at_fill_price(self):
+        om = OrderManager(initial_cash=1_000_000)
+        order = om.create_order("600519", "buy", 100)
+        om.submit_order(order.order_id)
+        om.fill_order(order.order_id, price=1000.0)
+
+        pos = om.positions["600519"]
+        assert pos.current_price == 1000.0
+        assert pos.market_value == 100_000.0
+
+        snap = om.get_snapshot()
+        assert snap.positions_value == 100_000.0
+        assert snap.total_value == pytest.approx(om.cash + 100_000.0, abs=0.01)
+        # Only fees below the initial cash, not the whole purchase.
+        assert snap.total_value > 999_000
+
+    def test_partial_sell_marks_the_remaining_position(self):
+        om = OrderManager(initial_cash=1_000_000)
+        buy = om.create_order("600519", "buy", 200)
+        om.submit_order(buy.order_id)
+        om.fill_order(buy.order_id, price=10.0)
+        om.new_trading_day()
+
+        sell = om.create_order("600519", "sell", 100)
+        om.submit_order(sell.order_id)
+        om.fill_order(sell.order_id, price=12.0)
+
+        pos = om.positions["600519"]
+        assert pos.quantity == 100
+        assert pos.current_price == 12.0
+        assert pos.market_value == 1200.0
+
+    def test_snapshot_values_a_position_without_a_price_at_cost(self):
+        """A position whose price was never marked must not count as zero."""
+        from quant_platform.execution.models import Position
+
+        om = OrderManager(initial_cash=1_000_000)
+        om.positions["600519"] = Position(
+            ticker="600519", quantity=100, avg_cost=50.0,
+        )
+
+        snap = om.get_snapshot()
+        assert snap.positions_value == 5000.0
+
+
 class TestSimulatedExchange:
     def setup_method(self):
         self.exchange = SimulatedExchange()
@@ -220,6 +336,58 @@ class TestSimulatedExchange:
         self.exchange.simulate_trading_day({"600519": 1800.0})
         assert order.status == OrderStatus.FILLED
         assert "600519" in self.om.positions
+
+
+class TestSimulatedExchangePriceValidation:
+    """Bad prints must not become fills, and limits must fill at the better price."""
+
+    def setup_method(self):
+        self.exchange = SimulatedExchange()
+        self.om = OrderManager(initial_cash=10_000_000)
+        self.exchange.set_order_manager(self.om)
+
+    @pytest.mark.parametrize(
+        "bad_price", [float("nan"), float("inf"), float("-inf"), 0.0, -5.0],
+    )
+    def test_invalid_market_price_is_skipped(self, bad_price):
+        order = self.om.create_order("600519", "buy", 100, order_type="market")
+        self.om.submit_order(order.order_id)
+
+        self.exchange.update_market({"600519": bad_price})
+        self.exchange.match_orders()
+
+        assert order.status == OrderStatus.SUBMITTED
+        assert order.fills == []
+        assert self.om.cash == 10_000_000
+
+    def test_limit_buy_fills_at_the_better_market_price(self):
+        order = self.om.create_order(
+            "600519", "buy", 100, order_type="limit", limit_price=1800.0,
+        )
+        self.om.submit_order(order.order_id)
+
+        self.exchange.update_market({"600519": 1770.0})
+        self.exchange.match_orders()
+
+        assert order.status == OrderStatus.FILLED
+        assert order.fills[0].price == 1770.0  # min(limit, market)
+
+    def test_limit_sell_fills_at_the_better_market_price(self):
+        buy = self.om.create_order("600519", "buy", 100)
+        self.om.submit_order(buy.order_id)
+        self.om.fill_order(buy.order_id, price=1000.0)
+        self.om.new_trading_day()
+
+        sell = self.om.create_order(
+            "600519", "sell", 100, order_type="limit", limit_price=1700.0,
+        )
+        self.om.submit_order(sell.order_id)
+
+        self.exchange.update_market({"600519": 1720.0})
+        self.exchange.match_orders()
+
+        assert sell.status == OrderStatus.FILLED
+        assert sell.fills[0].price == 1720.0  # max(limit, market)
 
 
 class TestBookConsistency:

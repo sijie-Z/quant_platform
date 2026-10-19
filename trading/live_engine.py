@@ -85,11 +85,42 @@ class LiveEngine:
         """加载历史数据用于状态初始化."""
         self._returns = returns
         self._prices = prices
-        # 预计算调仓日
+        # `returns[t]` is the forward return t -> t+1. The signal at t must
+        # only use returns realized by the close of t, i.e. `returns[t-1]`.
+        self._realized_returns = returns.shift(1)
+        # Candidate rebalance dates for batch replay. Live runs decide from
+        # `last_rebalance` because the daemon calls `run_once` with the
+        # latest data date, which need not land on a multiple of HOLD_H.
         dates = returns.index
-        self._rebalance_dates = [dates[i] for i in range(HOLD_H, len(dates) - SIGNAL_H, HOLD_H)]
-        self.state.next_rebalance = str(self._rebalance_dates[0])[:10] if self._rebalance_dates else ""
+        self._rebalance_dates = [dates[i] for i in range(HOLD_H, len(dates), HOLD_H)]
+        self.state.next_rebalance = str(self._first_rebalance_after(HOLD_H))[:10] if len(dates) > HOLD_H else ""
         logger.info("History loaded: %d days, %d rebalance dates", len(returns), len(self._rebalance_dates))
+
+    def _first_rebalance_after(self, day_idx: int) -> pd.Timestamp:
+        dates = self._returns.index
+        if day_idx < len(dates):
+            return dates[day_idx]
+        return dates[-1]
+
+    def _is_due_for_rebalance(self, date: pd.Timestamp) -> bool:
+        """Whether this date is a scheduled rebalance.
+
+        Batch replay yields every date and expects one entry every HOLD_H
+        sessions. The daemon yields only the latest date, so membership in a
+        precomputed list meant it never rebalanced at all.
+        """
+        idx = self._returns.index.get_loc(date)
+        if idx < HOLD_H:
+            return False
+        if not self.state.last_rebalance:
+            return True
+        try:
+            last_idx = self._returns.index.get_loc(
+                pd.Timestamp(self.state.last_rebalance)
+            )
+        except KeyError:
+            return True
+        return idx - last_idx >= HOLD_H
 
     # ── 状态持久化 ──
 
@@ -174,16 +205,17 @@ class LiveEngine:
         self._update_equity(date)
 
         # 2. 检查是否需要调仓
-        is_rebalance = date in self._rebalance_dates
+        is_rebalance = self._is_due_for_rebalance(date)
 
         if is_rebalance:
             result["action"] = self._execute_rebalance(date)
             self.state.last_rebalance = date_str
 
             # 更新下次调仓日
-            idx = self._rebalance_dates.index(date) if date in self._rebalance_dates else -1
-            if idx >= 0 and idx + 1 < len(self._rebalance_dates):
-                self.state.next_rebalance = str(self._rebalance_dates[idx + 1])[:10]
+            idx = self._returns.index.get_loc(date)
+            next_idx = idx + HOLD_H
+            if next_idx < len(self._returns.index):
+                self.state.next_rebalance = str(self._returns.index[next_idx])[:10]
 
         # 3. 检查 kill switch
         drawdown = (self.state.equity_peak - self.state.current_equity) / self.state.equity_peak
@@ -273,13 +305,20 @@ class LiveEngine:
         self.state.positions = surviving
 
         # ── Vol filter ──
-        market_vol = self._returns.mean(axis=1).rolling(20).std()
-        vol_thresh = market_vol.quantile(VOL_PERCENTILE)
-        if date in market_vol.index and market_vol[date] > vol_thresh:
+        market_vol = self._realized_returns.mean(axis=1).rolling(20).std()
+        # Threshold over information available on `date`; the full-sample
+        # quantile let the filter see the future.
+        history_vol = market_vol.loc[:date].dropna()
+        vol_thresh = (
+            history_vol.quantile(VOL_PERCENTILE) if len(history_vol) else np.nan
+        )
+        if date in market_vol.index and not pd.isna(vol_thresh) and market_vol[date] > vol_thresh:
             return "skip_high_vol"
 
         # ── 信号 ──
-        past_ret = self._returns.rolling(SIGNAL_H, min_periods=SIGNAL_H).apply(
+        past_ret = self._realized_returns.rolling(
+            SIGNAL_H, min_periods=SIGNAL_H,
+        ).apply(
             lambda x: np.prod(1 + x) - 1 if len(x) > 0 else 0, raw=True
         )
         pr = past_ret.iloc[day_idx]
@@ -317,12 +356,9 @@ class LiveEngine:
                 entry_price=ep,
             ))
             total_spent += spent
-
-        self.state.cash -= total_spent  # 买入不扣成本, 卖出时扣
-        if total_spent > 0:
             self.state.total_trades += 1
 
-        self.state.total_trades += 1
+        self.state.cash -= total_spent  # 买入不扣成本, 卖出时扣
         return f"enter_{n}"
 
     def _emergency_flat(self, date: pd.Timestamp):

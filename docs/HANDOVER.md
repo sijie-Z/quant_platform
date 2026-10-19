@@ -303,4 +303,19 @@
 
 验证：全量测试 **1813 passed / 4 skipped / 0 failed**（3m10s），ruff 全绿。
 
+### 2026-10-20 第六轮审计（核心架构 / 回测内核 / 执行撮合 / 前端契约）
+
+四个只读审计 agent + 五个并行执行 agent（每个执行包都跑了内部对抗评审）覆盖上一轮未深挖的模块。
+
+| 领域 | 修复 |
+|---|---|
+| 核心架构 | 调度器用宿主机本地时间判断 A 股时段（官方容器是 UTC：真实盘中判为 closed、17:30 判为 trading_am）；改为 Asia/Shanghai，并新增 2024–2026 交易所休市表（含法定节假日，可用 `QUANT_EXCHANGE_HOLIDAYS` 追加），容器设置 `TZ`。EventBus 消费者按 handler 名字注册，同名 handler / 退订后重订会丢事件并最终把队列塞满；改为按订阅计数身份注册、退订时取消任务。两套事件总线的通配符语义不一致（`market.*` 在旧总线匹配 `market_data.tick`，`order.**` 在新总线从不匹配）；统一为一个段感知匹配器。审计日志不传租户，订单/成交/信号全落到 default，且平仓会删除所有租户的同名持仓；现在显式携带租户，signals/events 增加 tenant_id 列并迁移。`save_order` 的 INSERT OR REPLACE 会把未提供的列清空；改为按键 UPSERT，同一订单多次成交获得唯一 trade_id 并在同一事务写入。EOD 对账无幂等标记，重启后同日重复写快照；新增 `eod_reconciliation` 表。`Instrument.from_dict` 给期货/期权套用了股票默认（印花税 0.1%、t_plus=1）；按资产类型取默认 |
+| 回测内核 | 固定版本的 numba 不支持 `returns.mean(axis=0)`，Ledoit-Wolf 内核从未编译成功：异常被引擎吞掉后 MVO 用单位阵、RiskParity 每个调仓回退等权，而 summary 仍写配置的风险模型。重写为正确的常相关 Ledoit-Wolf 公式（与 sklearn 误差 <1e-3），并让协方差失败记录 `n_covariance_failures` 而不是静默。容量模型只把成本扣在内部 sizing 资金上、报告仍旧是毛收益，且参与率超限只记一个冲击数、从不缩减交易，所有 AUM 档位收益完全相同；现在真实缩减交易、成本/冲击从报告收益扣除，指标改用与主回测相同的 Sharpe/MDD 定义。冲击成本路径把已含佣金/印花税的 total_cost 再加一遍、且按股的冲击与货币金额直接相加；改为只返回冲击并统一折算为收益率。印花税对买入也收 0.05%、清仓只收一半；引擎改为按资产拆分买卖名义额。并行 sweep 的 Sharpe/MDD 与主回测口径不同，且文档示例的 `optimizer`/`n_stocks` 平铺键被 setattr 成死属性（每格配置相同）；改为复用 metrics 并校验/映射参数键。Black-Litterman 用年化风险厌恶配日协方差，先验日均约 5.7%；统一为单位后年化超额约 6% |
+| 数据/因子 | 长停牌会把资产从**整个样本**删除（2024 年停牌导致 2021–2023 也没有它；晚上市 40 天也被删）；改为只删从未有价格的资产，长缺口保留 NaN。合成数据的晚上市股票首日 `close` 由 NaN 前值乘出，之后永远 NaN，30 日 ffill 还制造上市前价格；修正上市日种子并遮蔽上市前。`BaseFactor.run` 的全面板 ffill 把 ST/上市遮蔽重新填上，ST 股票重新进入每个截面；现在只对停牌缺口 ffill 并按 PIT ST 掩码回填 NaN，成交量/换手也在 ST 日置空。合成财报按原始公告日 reindex 到交易日，周末/节假日发布的报告被静默丢弃（20 份只剩 14–16）；映射到下一个交易日。中性化用静态行业 map，PIT 行业变更（143 条记录）从未生效；新增 `get_sector_panel()` 并在因子处理中按日期使用（默认数据 522×120 面板约 1.1s）。市值因子被回归到自身，处理后只剩 1.3% 方差；跳过自身市值中性化。PCA/对称正交化用全样本估计（未来函数）且 PCA 对特征向量求平均；改为截至 t 的扩张窗口与确定性符号。数据质量检查把 `(date, asset)` MultiIndex 当宽表，跨股票算 pct_change（4 万条假异常）、新鲜度永远 0 天；入口统一 unstack 并只用价格列做异常检测 |
+| 实盘执行 | QMT 状态映射用了另一套 API 的 0/1/2/…/50，真实 xtquant 的 48–57 全部落到 PENDING（56 已成交也会被陈旧回调降级）；改用真实枚举并保护终态。QMT 忽略 `order_stock` 的 -1 与 `cancel_order_stock` 的非 0 返回，失败被报告成功。OMS 成交接受负数量（买 -100 股反而增加现金、生成负持仓）；在任何账务变更前拒绝。成交后不更新 `current_price/market_value`，刚买入的组合快照出现等于全部买入额的假亏损；立即 mark-to-market，未定价持仓按成本估值。PaperBroker 在订单簿已撮合后改写 `filled_quantity`，导致后续成交超量 28%；改为入簿前缩减。ExecutionEngine 接受超量成交、并向已撤销订单追加成交记录；append 前校验状态与剩余量。模拟交易所用 NaN/0 行情成交、可成交限价按限价而不是更优价成交；已修正。TCA 的 dataframe 入口用全样本均值与最后一行收盘价作基准（未来函数），文档列布局下基准为 0；要求执行日期并只取当日数据 |
+| Alpha/工具 | 情感因子缓存键不含 asset/analyzer/model，不同股票共享分数、API 失败的关键词回退被永久缓存、非原子写会清空全部缓存；改为完整键、失败不落盘、原子替换。组合层缺失因子在分子分母同时剔除，缺主因子的资产反而排名更高；改为缺失填 0、分母固定。Prometheus 指标从未被调用（Grafana 全空），导出无锁；新增 HTTP 中间件并在 app 接入。缓存键不含 provider/回退/代码版本，`--use-baostock` 会命中合成缓存；新增 schema/键版本与 provider/override 入参，回退数据不写请求 provider 的键。`config.data.provider` 被默认 `use_tushare=True` 覆盖（有 token 时合成/postgres 配置失效）；改为配置决定、CLI 显式覆盖。因子 `params` 与 `factors.processing` 在解析时被丢弃（改 YAML 无任何效果），空 section 还会重新启用默认因子集；已接线并让固定周期因子接受覆盖 |
+| 打包/前端 | 非 editable 的 `pip install .` 产出的 wheel 只有 4 个顶层 .py，所有子包缺失、配置 YAML 也不在包里；显式列出 33 个子包并声明 package-data，新增清单守卫测试。WebSocket 在无 token 时对远程开放（携带订单/风控事件）；纳入回环限制。数据质量面板对每次已完成 run 都 422（run 记录不存价格面板）；改为 run 时计算并随结果保存。OMS blotter 只显示已完成订单，挂单/部分成交永远不出现；改为返回全部订单与剩余量。LivePortfolio 把 200+`{"error"}` 当成功、WS 重连无法停止、因子排名用绝对 ICIR 重复计数、参数热图显示 “NaN”、风控标签键名不匹配；均已修正。`QUANT_API_TOKEN` 模式补充前端构建期 token 支持，docker-compose 的 `OPENAI_API_KEY` 改为代码真正读取的 `DEEPSEEK_API_KEY` |
+
+验证：全量测试 **1983 passed / 4 skipped / 0 failed**（2m55s），ruff 全绿。
+
 已知仍未处理：多租户隔离（#75 产品定位未定）；`framework/contracts/`、`kernel/` 等零导入目录的去留（#70/#77）仍是显式决策项。

@@ -87,7 +87,10 @@ def test_restart_rehydrates_positions_cash_and_watermark(store, monkeypatch):
         "equity_peak": 10_000_000.0,
         "current_equity": 10_000_000.0,
         "total_trades": 7,
-        "last_rebalance": "2024-05-01",
+        # Marked as just rebalanced so this test isolates state rehydration;
+        # a due rebalance on the latest date is covered in
+        # tests/test_trading/test_live_engine_state.py.
+        "last_rebalance": str(dates[-1])[:10],
         "next_rebalance": "2024-08-01",
         "vol_series": [],
         "status": "running",

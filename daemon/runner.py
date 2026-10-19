@@ -17,8 +17,10 @@ import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+from quant_platform.core.exchange_calendar import is_trading_day
 from quant_platform.core.store import Store
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
@@ -28,7 +30,7 @@ from quant_platform.trading.live_engine import LiveEngine
 logger = logging.getLogger(__name__)
 
 DAYS_OPEN = [0, 1, 2, 3, 4]  # Mon-Fri
-RUN_HOUR = 16  # 16:00 daily (market close)
+RUN_HOUR = 16  # 16:00 daily (market close), Asia/Shanghai
 MAX_RESTARTS = 3
 RESTART_WINDOW_HOURS = 24
 
@@ -54,11 +56,14 @@ class Daemon:
         # instead of resetting cash to 10M and positions to empty.
         self.store = store or Store()
         self.strategy_id = strategy_id
+        # The daemon runs in a container that is usually UTC; 16:00 must be
+        # 16:00 in Shanghai.
+        self._tz = ZoneInfo("Asia/Shanghai")
 
     def should_run_today(self) -> bool:
         """今天是否应该运行."""
-        now = datetime.now()
-        if now.weekday() not in DAYS_OPEN:
+        now = datetime.now(self._tz)
+        if not is_trading_day(now.date()):
             return False
         if now.hour < RUN_HOUR:
             return False
@@ -87,7 +92,16 @@ class Daemon:
         self.engine.load_history(pipeline.returns, pipeline.get_close())
 
         previous_equity: float | None = None
-        snapshot = self.store.get_engine_state(self.strategy_id)
+        try:
+            snapshot = self.store.get_engine_state(self.strategy_id)
+        except (ValueError, TypeError, AttributeError) as exc:
+            # `get_engine_state` decodes JSON itself; a corrupt row raised
+            # before the guarded restore below and sent the daemon into a
+            # crash/restart loop instead of reporting state_corrupt.
+            logger.critical("Persisted engine state is unreadable: %s", exc)
+            result["status"] = "state_corrupt"
+            result["alerts"].append(f"Engine state unreadable: {exc}")
+            return result
         if snapshot is not None:
             try:
                 self.engine.restore_snapshot(snapshot)
@@ -142,6 +156,10 @@ class Daemon:
                 logger.critical(
                     "Failed to persist engine state: %s", traceback.format_exc(),
                 )
+                # Reporting "ok" with a stale snapshot loses a day after the
+                # next restart (last_processed_date did not advance).
+                result["status"] = "state_save_failed"
+                result["alerts"].append("Failed to persist engine state")
 
         self.last_run_date = datetime.now().strftime("%Y-%m-%d")
         logger.info(
@@ -160,6 +178,10 @@ class Daemon:
                     if result["status"] == "killed":
                         logger.warning("Kill switch triggered. Waiting for manual recovery.")
                         break
+                    if result["status"] == "ok":
+                        # A successful run resets the crash budget; otherwise
+                        # three crashes spread over months would still exit.
+                        self.restart_count = 0
                 else:
                     logger.debug("Not time to run yet")
                 time.sleep(interval_seconds)

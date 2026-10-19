@@ -314,7 +314,14 @@ class BarraCovarianceResponse(BaseModel):
 # --- Parallel backtest schemas ---
 
 class ParallelSweepRequest(BaseModel):
-    param_grid: dict[str, list] = Field(description="Parameter grid: {param_name: [values]}")
+    param_grid: dict[str, list] = Field(
+        description=(
+            "Parameter grid: {name: [values]}. Flat aliases optimizer/"
+            "n_stocks/alpha_method/rebalance_frequency/covariance_method "
+            "and dotted config paths (portfolio.optimizer) are supported; "
+            "unknown keys are rejected before any worker starts."
+        ),
+    )
     base_overrides: dict[str, Any] = Field(default_factory=dict, description="Base config overrides")
     metric: str = Field(default="sharpe_ratio", description="Optimization metric")
     max_workers: int | None = Field(default=None, description="Max parallel workers")

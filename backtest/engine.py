@@ -75,6 +75,7 @@ class BacktestEngine:
         self.optimizer_outcomes: dict[pd.Timestamp, dict] = {}
         self.optimizer_fallback_count = 0
         self.skipped_rebalances = 0
+        self.covariance_failures = 0
         # Sum of per-rebalance costs in return units. Reported in the summary
         # so the strategy gates can evaluate the configured cost-drag limit.
         self.total_cost_drag = 0.0
@@ -133,6 +134,7 @@ class BacktestEngine:
         self.optimizer_outcomes = {}
         self.optimizer_fallback_count = 0
         self.skipped_rebalances = 0
+        self.covariance_failures = 0
         prev_weights = None
         # One optimizer instance for the whole run, so its fallback counter
         # accumulates; a fresh instance per rebalance hid every fallback.
@@ -188,8 +190,18 @@ class BacktestEngine:
                     lookback=min(self.covariance_lookback, len(ret_window)),
                     ewma_half_life=self.covariance_ewma_half_life,
                 )
-            except Exception:
+            except Exception as exc:
+                # A silently swallowed failure here ran the whole backtest
+                # on an identity covariance (MVO) or equal-weight fallback
+                # (risk parity) while the summary still named the configured
+                # risk model. The Ledoit-Wolf kernel used to fail to compile,
+                # which is exactly how that happened.
                 cov = None
+                self.covariance_failures += 1
+                logger.warning(
+                    "Covariance estimation failed at %s (%s): %s",
+                    str(rdate)[:10], self.covariance_method, exc,
+                )
 
             # Optimize
             fallbacks_before = optimizer.fallback_count
@@ -239,6 +251,7 @@ class BacktestEngine:
             else f"{self.optimizer_name}+equal_weight_fallback"
         )
         summary["n_skipped_rebalances"] = self.skipped_rebalances
+        summary["n_covariance_failures"] = self.covariance_failures
 
         years = len(self.daily_returns) / 252.0
         summary["annual_turnover"] = (
@@ -377,7 +390,23 @@ class BacktestEngine:
                     # and halves stamp tax on the assumption that half of it is
                     # sells -- which only holds for the *two-way* traded value.
                     # Passing one-sided turnover halved every component.
-                    rebalance_cost = self.cost_model.compute_costs(turnover * 2)
+                    #
+                    # Stamp tax is a sell-side tax: passing only the total
+                    # two-way value with `is_sell=None` made the model assume
+                    # half of it was sells, so an initial from-cash build paid
+                    # 0.05% on buys it never owed and a full liquidation paid
+                    # only half of the 0.1% it did owe. Hand the model the
+                    # actual per-asset buy and sell notionals instead.
+                    delta = target_weights - current_weights
+                    buy_value = delta.clip(lower=0.0)
+                    sell_value = (-delta).clip(lower=0.0)
+                    rebalance_cost = float(
+                        self.cost_model.compute_costs(
+                            turnover * 2,
+                            buy_turnover=buy_value,
+                            sell_turnover=sell_value,
+                        ).sum()
+                    )
                     self.total_cost_drag += rebalance_cost
                 turnover_records.append((exec_date, turnover))
 

@@ -116,7 +116,7 @@
 <script setup>
 import { ref } from 'vue'
 import { useI18n } from '../i18n/index.js'
-import axios from 'axios'
+import { getLivePortfolio, importPortfolioHoldings } from '../api/index.js'
 
 const { $t, locale } = useI18n()
 
@@ -177,13 +177,18 @@ async function onFileUpload(e) {
     }
 
     // Import to backend
-    await axios.post('/api/portfolio/import', { data })
+    await importPortfolioHoldings(data)
 
-    // Fetch live prices
-    const result = await axios.get('/api/portfolio/live')
-    portfolio.value = result.data
-
-    emit('toast', { message: locale.value === 'zh-CN' ? `已导入 ${data.length} 条持仓，${portfolio.value.n_with_price} 条有行情` : `Imported ${data.length} holdings, got prices for ${portfolio.value.n_with_price}`, type: 'success' })
+    // Fetch live prices. The import already succeeded, so a price-feed
+    // failure must not be reported as an import failure.
+    try {
+      const result = await getLivePortfolio()
+      if (result?.error) throw new Error(result.error)
+      portfolio.value = result
+      emit('toast', { message: locale.value === 'zh-CN' ? `已导入 ${data.length} 条持仓，${portfolio.value.n_with_price} 条有行情` : `Imported ${data.length} holdings, got prices for ${portfolio.value.n_with_price}`, type: 'success' })
+    } catch (priceErr) {
+      emit('toast', { message: locale.value === 'zh-CN' ? `已导入 ${data.length} 条持仓；行情获取失败: ${priceErr.message}` : `Imported ${data.length} holdings; prices unavailable: ${priceErr.message}`, type: 'warning' })
+    }
   } catch (err) {
     emit('toast', { message: locale.value === 'zh-CN' ? `导入失败: ${err.message}` : `Import failed: ${err.message}`, type: 'error' })
   } finally {
@@ -195,8 +200,9 @@ async function refreshPrices() {
   if (!portfolio.value) return
   refreshing.value = true
   try {
-    const result = await axios.get('/api/portfolio/live')
-    portfolio.value = result.data
+    const result = await getLivePortfolio()
+    if (result?.error) throw new Error(result.error)
+    portfolio.value = result
     emit('toast', { message: locale.value === 'zh-CN' ? '行情已更新' : 'Prices updated', type: 'success' })
   } catch (err) {
     emit('toast', { message: locale.value === 'zh-CN' ? `刷新失败: ${err.message}` : `Refresh failed: ${err.message}`, type: 'error' })

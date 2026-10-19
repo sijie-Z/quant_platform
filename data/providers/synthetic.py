@@ -339,13 +339,23 @@ class SyntheticDataProvider(DataProvider):
         init_prices = np.exp(self.rng.uniform(np.log(5), np.log(200), size=n_assets))
 
         # Close prices: cumulative product of (1 + r)
+        listing = self._metadata["listing_date"].values
         close_prices = np.zeros((n_dates, n_assets))
         close_prices[0] = init_prices * (1 + returns.iloc[0].values)
+        # Pre-listing days must be missing from the very first row. Setting
+        # them only inside the loop left day 0 priced, and the 30-day
+        # forward-fill then invented up to 30 pre-listing closes from it.
+        close_prices[0, self._dates[0] < listing] = np.nan
 
         for t in range(1, n_dates):
-            # Handle listing: stocks not yet listed have NaN
-            mask = self._dates[t] >= self._metadata["listing_date"].values
-            close_prices[t] = close_prices[t - 1] * (1 + returns.iloc[t].values)
+            mask = self._dates[t] >= listing
+            previous = close_prices[t - 1].copy()
+            # A stock listing today has no previous close; seed it from its
+            # initial price. Multiplying the previous row's NaN made the
+            # stock NaN for the rest of the sample.
+            newly_listed = mask & np.isnan(previous)
+            previous[newly_listed] = init_prices[newly_listed]
+            close_prices[t] = previous * (1 + returns.iloc[t].values)
             close_prices[t, ~mask] = np.nan
 
         # Open, High, Low: intraday randomness
@@ -355,7 +365,11 @@ class SyntheticDataProvider(DataProvider):
         open_prices = close_prices * open_ratio
         # For t>0, open is based on prior close with gap
         for t in range(1, n_dates):
-            open_prices[t] = close_prices[t - 1] * open_ratio[t]
+            previous = close_prices[t - 1].copy()
+            newly_listed = (self._dates[t] >= listing) & np.isnan(previous)
+            previous[newly_listed] = init_prices[newly_listed]
+            open_prices[t] = previous * open_ratio[t]
+        open_prices[np.isnan(close_prices)] = np.nan
 
         high_prices = np.maximum(open_prices, close_prices) * (1 + intraday_range / 2)
         low_prices = np.minimum(open_prices, close_prices) * (1 - intraday_range / 2)
@@ -550,7 +564,36 @@ class SyntheticDataProvider(DataProvider):
         # back to the start of the sample.
         pit = df.reset_index()
         pit["fiscal_period_end"] = pit["date"]
-        pit["date"] = pit["publish_date"]
+        pit["publish_date"] = pd.to_datetime(pit["publish_date"])
+
+        # A publication date is a calendar date; the panel only has trading
+        # days. Reindexing straight onto `publish_date` silently dropped every
+        # report published on a weekend/holiday (the (date, asset) key simply
+        # did not exist), leaving 14-16 of 20 quarters. Map each report to the
+        # first trading day on/after its publication instead: the information
+        # was public by then, and no report is lost.
+        publish_values = pit["publish_date"].to_numpy()
+        positions = all_dates.searchsorted(publish_values, side="left")
+
+        # A report published after the last trading day in the sample is not
+        # visible in-sample at all; publishing it on the last day would be a
+        # look-ahead. Drop it explicitly (with a count) instead of letting
+        # reindex lose it silently.
+        in_sample = positions < len(all_dates)
+        dropped = int((~in_sample).sum())
+        if dropped:
+            logger.debug(
+                "Financials: %d asset-reports published after the last "
+                "trading day (%s) are outside the sample",
+                dropped, all_dates[-1].date(),
+            )
+        pit = pit.loc[in_sample].copy()
+        pit["date"] = all_dates[positions[in_sample]]
+
+        # A later report for the same asset/day wins; quarters are ~91 days
+        # apart so this should never trigger, but duplicate index labels would
+        # make reindex raise.
+        pit = pit.drop_duplicates(subset=["date", "asset"], keep="last")
         pit = pit.set_index(["date", "asset"]).sort_index()
 
         # Forward-fill to daily frequency by joining with all dates

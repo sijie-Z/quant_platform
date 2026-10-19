@@ -51,9 +51,28 @@ class AuditLog:
     3. Python logger (stdout/file)
     """
 
-    def __init__(self, store: Store, bus: EventBus | None = None):
+    def __init__(
+        self,
+        store: Store,
+        bus: EventBus | None = None,
+        tenant_id: str = "",
+    ):
         self._store = store
         self._bus = bus or get_event_bus()
+        # An explicit tenant wins over the context: engines create their
+        # AuditLog on one thread and log from a worker, where the ContextVar
+        # set in the constructor is not visible.
+        self._tenant_id = tenant_id
+
+    def _tenant(self) -> str:
+        if self._tenant_id:
+            return self._tenant_id
+        try:
+            from quant_platform.core.context import TenantContext
+
+            return TenantContext.get_current().tenant_id
+        except Exception:
+            return "default"
 
     def log(
         self,
@@ -69,6 +88,7 @@ class AuditLog:
 
         record = {
             "event_id": event_id,
+            "tenant_id": self._tenant(),
             "topic": f"audit.{action.value}",
             "data": {
                 "action": action.value,
@@ -76,6 +96,7 @@ class AuditLog:
                 "details": details or {},
                 "reason": reason,
                 "result": result,
+                "tenant_id": self._tenant(),
             },
             "source": component,
             "timestamp": time.time(),
@@ -96,6 +117,7 @@ class AuditLog:
         """Log a signal generation."""
         self._store.save_signal({
             "signal_id": uuid.uuid4().hex[:12],
+            "tenant_id": self._tenant(),
             "code": code,
             "direction": direction,
             "strength": strength,
@@ -112,10 +134,15 @@ class AuditLog:
 
     def log_order(self, order: dict, action: AuditAction, reason: str = ""):
         """Log an order event."""
-        self._store.save_order(order)
+        tenant_id = self._tenant()
+        order = {**order, "tenant_id": order.get("tenant_id") or tenant_id}
         if action == AuditAction.ORDER_FILLED:
-            self._store.save_trade({
-                "trade_id": order.get("order_id", ""),
+            # Order + fill in one transaction: a second fill on the same
+            # order used to fail on the trades UNIQUE key *after* the order
+            # row had been written, losing the fill and its audit record.
+            # The store generates the trade_id (uuid4).
+            self._store.save_order_with_trade(order, {
+                "tenant_id": tenant_id,
                 "order_id": order["order_id"],
                 "code": order["code"],
                 "side": order["side"],
@@ -124,6 +151,8 @@ class AuditLog:
                 "commission": order.get("commission", 0),
                 "tax": order.get("tax", 0),
             })
+        else:
+            self._store.save_order(order)
         self.log(
             action,
             component="broker",
@@ -139,10 +168,14 @@ class AuditLog:
 
     def log_position(self, position: dict, action: AuditAction):
         """Log a position change."""
+        tenant_id = self._tenant()
         if action == AuditAction.POSITION_CLOSED:
-            self._store.delete_position(position["code"])
+            # Without the tenant this deleted every tenant's row for the code.
+            self._store.delete_position(position["code"], tenant_id=tenant_id)
         else:
-            self._store.save_position(position)
+            self._store.save_position({
+                **position, "tenant_id": position.get("tenant_id") or tenant_id,
+            })
         self.log(
             action,
             component="portfolio",
@@ -168,7 +201,10 @@ class AuditLog:
             result="warning",
         )
 
-    def get_recent(self, action: str = "", limit: int = 50) -> list[dict]:
-        """Get recent audit events."""
+    def get_recent(self, action: str = "", limit: int = 50,
+                   tenant_id: str = "") -> list[dict]:
+        """Get recent audit events, optionally for one tenant."""
         topic = f"audit.{action}" if action else ""
-        return self._store.get_events(topic=topic, limit=limit)
+        return self._store.get_events(
+            topic=topic, limit=limit, tenant_id=tenant_id,
+        )

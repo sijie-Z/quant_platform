@@ -28,12 +28,25 @@ logger = get_logger(__name__)
 
 DEFAULT_CACHE_DIR = Path("./.quant_cache")
 
+# Bump whenever the data layer changes the meaning or layout of what it
+# produces (columns, adjustment convention, PIT handling, ...). Cached stages
+# written under an older schema must not be replayed as if identical.
+# 4: benchmarks aligned to the forward-return convention; metadata may carry
+#    a PIT sector panel.
+DATA_SCHEMA_VERSION = 4
+
+# Bump when the key recipe itself changes, so entries written by an older
+# recipe cannot collide with new ones.
+CACHE_KEY_VERSION = 2
+
 
 class PipelineCache:
     """Caches pipeline stages to disk for fast re-runs.
 
-    Cache key = MD5 hash of the relevant config subset, ensuring
-    that config changes invalidate the cache automatically.
+    Cache key = MD5 hash of the config subset plus everything that changes the
+    produced data but lives outside the YAML: the data provider actually used
+    (a silent fallback to synthetic must not share the requested provider's
+    slot), explicit CLI/environment overrides, and the data schema version.
     """
 
     def __init__(self, cache_dir: str | Path = DEFAULT_CACHE_DIR):
@@ -44,9 +57,42 @@ class PipelineCache:
         return self.cache_dir / f"{stage}_{cache_key}.pkl"
 
     @staticmethod
-    def make_config_hash(config_dict: dict[str, Any]) -> str:
-        """Create a deterministic hash from config dict."""
-        config_str = json.dumps(config_dict, sort_keys=True, default=str)
+    def make_config_hash(
+        config_dict: dict[str, Any],
+        provider: str | None = None,
+        overrides: dict[str, Any] | None = None,
+        schema_version: int | str | None = None,
+    ) -> str:
+        """Create a deterministic hash from everything that determines a run.
+
+        Args:
+            config_dict: The raw config mapping (as loaded from YAML).
+            provider: The provider that will actually produce the data. Pass
+                the *effective* provider -- if a silent fallback to synthetic
+                happened, hashing the requested provider would make the run
+                read the requested provider's cached output.
+            overrides: Explicit overrides applied on top of the YAML (CLI
+                flags, environment-derived settings). Their presence and values
+                both matter, so ``{"use_baostock": False}`` and no overrides at
+                all produce different keys only if they change behaviour.
+            schema_version: Data-layer schema version; defaults to
+                ``DATA_SCHEMA_VERSION``.
+
+        The raw YAML alone is not a run identity: ``--use-baostock``, an
+        environment token enabling a real provider, a silent fallback, or a
+        code change to the data schema all alter the output while leaving the
+        YAML untouched.
+        """
+        payload = {
+            "key_version": CACHE_KEY_VERSION,
+            "config": config_dict,
+            "provider": provider,
+            "overrides": overrides or {},
+            "schema_version": (
+                DATA_SCHEMA_VERSION if schema_version is None else schema_version
+            ),
+        }
+        config_str = json.dumps(payload, sort_keys=True, default=str)
         return hashlib.md5(config_str.encode()).hexdigest()[:12]
 
     def load_stage(self, stage: str, cache_key: str) -> Any | None:

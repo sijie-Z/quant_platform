@@ -51,7 +51,6 @@ import numpy as np
 from quant_platform.execution.order_book import (
     BookOrder,
     OrderBook,
-    Trade,
 )
 from quant_platform.execution.order_book import (
     OrderType as BookOrderType,
@@ -255,59 +254,49 @@ class PaperBroker:
         prob = self._partial_fill_rate * min(size_ratio, 5.0)
         return self._rng.random() < prob
 
-    def _simulate_partial_fill(self, order: BookOrder,
-                                trades: list[Trade]) -> list[Trade]:
-        """Simulate partial fill by randomly reducing filled quantity.
+    def _available_liquidity(self, book: OrderBook, order: BookOrder) -> int:
+        """Quantity the book could immediately match against ``order``."""
+        depth = book.get_depth_snapshot(levels=10_000)
+        levels = depth["asks"] if order.side == BookSide.BUY else depth["bids"]
 
-        Models the real-world phenomenon where large orders get split
-        across multiple fills over time.
+        available = 0
+        for level in levels:
+            price = level["price"]
+            if order.order_type == BookOrderType.LIMIT:
+                if order.side == BookSide.BUY and price > order.price:
+                    break
+                if order.side == BookSide.SELL and price < order.price:
+                    break
+            available += level["quantity"]
+            if available >= order.quantity:
+                return order.quantity
+        return available
+
+    def _apply_partial_fill(self, book: OrderBook, order: BookOrder) -> bool:
+        """Size a partial fill *before* the order reaches the matching engine.
+
+        The old `_simulate_partial_fill` let `OrderBook.add_order` match the
+        whole aggressor and then rewrote ``order.filled_quantity`` downwards.
+        The resting remainder kept the pre-rewrite quantity, so a later order
+        could trade against shares that had already been matched away, and
+        the book's trade volume disagreed with the broker's fill records.
+
+        Shrinking the aggressor first keeps the order, the book and the
+        reported fills consistent. Returns True if the order was shrunk.
         """
-        if not trades or len(trades) == 0:
-            return trades
+        available = self._available_liquidity(book, order)
+        if available <= 0:
+            return False
+        if not self._should_partial_fill(order.quantity, available):
+            return False
 
-        total_filled = sum(t.quantity for t in trades)
-        if total_filled <= order.quantity * 0.1:  # Already <10% filled
-            return trades
-
-        # Probability of partial fill
-        if not self._should_partial_fill(order.quantity, total_filled):
-            return trades
-
-        # Fill 30-80% of what the LOB would have filled
+        # Fill 30-80% of what the LOB would have filled.
         fill_pct = self._rng.uniform(0.3, 0.8)
-        target_fill = max(1, int(total_filled * fill_pct))
-
-        # Scale down trades proportionally.
-        #
-        # This loop used to decrement `scale` by each trade's own share:
-        #
-        #     scale -= new_qty / trade.quantity
-        #
-        # Since `new_qty` is `trade.quantity * scale`, the subtraction leaves
-        # `scale` at ~0 after the first iteration, so every later trade fell to
-        # the `max(1, ...)` floor. Trades of [1000, 1000, 1000, 500] with a 50%
-        # target came out as [500, 1, 1, 1] -- roughly one trade's worth, far
-        # below the 30-80% of available volume the method is supposed to fill.
-        scale = target_fill / total_filled
-        result = []
-        for trade in trades:
-            new_qty = min(trade.quantity, max(1, int(trade.quantity * scale)))
-            result.append(Trade(
-                trade_id=trade.trade_id,
-                symbol=trade.symbol,
-                price=trade.price,
-                quantity=new_qty,
-                aggressor_side=trade.aggressor_side,
-                maker_order_id=trade.maker_order_id,
-                taker_order_id=trade.taker_order_id,
-                timestamp_ns=trade.timestamp_ns,
-            ))
-
-        # Mark order as partial
-        order.filled_quantity = sum(t.quantity for t in result)
+        target = max(1, int(min(order.quantity, available) * fill_pct))
+        order.quantity = target
 
         self._metrics.partial_fills += 1
-        return result
+        return True
 
     # ── Cancel Failure Logic ──
 
@@ -485,10 +474,12 @@ class PaperBroker:
             source="paper_broker",
         )
 
-        trades = book.add_order(book_order)
+        # Decide the partial fill before the order enters the matching engine.
+        # Rewriting filled_quantity after matching left the resting remainder
+        # larger than the quantity the book had actually matched away.
+        self._apply_partial_fill(book, book_order)
 
-        # Apply partial fill simulation
-        trades = self._simulate_partial_fill(book_order, trades)
+        trades = book.add_order(book_order)
 
         # Calculate results
         total_filled = sum(t.quantity for t in trades)

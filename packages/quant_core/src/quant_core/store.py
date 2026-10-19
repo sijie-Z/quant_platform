@@ -9,6 +9,7 @@ Tables:
     sessions    — trading session records
     events      — event log for audit trail
     config      — strategy configuration snapshots
+    eod_reconciliation — once-per-day marker for the end-of-day run
 
 Usage:
     store = Store('data/trading.db')
@@ -25,6 +26,7 @@ import logging
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -153,6 +155,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS signals (
                     signal_id TEXT PRIMARY KEY,
+                    tenant_id TEXT DEFAULT 'default',
                     code TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     strength REAL NOT NULL,
@@ -177,6 +180,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL,
+                    tenant_id TEXT DEFAULT 'default',
                     topic TEXT NOT NULL,
                     data TEXT DEFAULT '{}',
                     source TEXT DEFAULT '',
@@ -211,6 +215,14 @@ class Store:
                     strategy_id TEXT PRIMARY KEY,
                     state_json  TEXT NOT NULL,
                     updated_at  TEXT NOT NULL
+                );
+
+                -- One marker per completed end-of-day reconciliation.
+                -- CREATE TABLE IF NOT EXISTS doubles as the migration for
+                -- databases written before this table existed.
+                CREATE TABLE IF NOT EXISTS eod_reconciliation (
+                    date TEXT PRIMARY KEY,
+                    timestamp TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);
@@ -248,7 +260,7 @@ class Store:
 
     def _migrate_tenant_id(self, conn: sqlite3.Connection) -> None:
         """Add tenant_id column to existing tables if missing."""
-        for table in ("orders", "trades", "positions"):
+        for table in ("orders", "trades", "positions", "signals", "events"):
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if "tenant_id" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT DEFAULT 'default'")
@@ -300,28 +312,53 @@ class Store:
 
     # ── Orders ──
 
+    #: Columns of `orders`, in schema order. `save_order` writes only the
+    #: columns the caller actually supplies.
+    _ORDER_FIELDS = (
+        "order_id", "tenant_id", "code", "side", "order_type", "quantity",
+        "price", "filled_quantity", "filled_price", "status", "commission",
+        "tax", "slippage", "broker_order_id", "error_msg", "strategy_id",
+        "signal_id", "created_at", "updated_at",
+    )
+    #: Columns the schema declares NOT NULL without a SQL default.
+    _ORDER_REQUIRED = ("order_id", "code", "side", "quantity", "price")
+
     def save_order(self, order: dict):
-        """Save or update an order."""
+        """Insert an order, or update only the fields the caller supplied.
+
+        The previous `INSERT OR REPLACE` deleted the row and rebuilt it from
+        the incoming dict, so a later partial save -- e.g. the fill DTO a
+        broker returns, which carries neither `strategy_id` nor `signal_id`
+        -- reset every omitted column to its default. This upsert touches
+        only the caller's columns; on first insert the SQL defaults fill the
+        rest (created_at/updated_at have none, so they get a timestamp).
+        """
         with self._lock, self._conn() as conn:
-            conn.execute("""
-                    INSERT OR REPLACE INTO orders
-                    (order_id, tenant_id, code, side, order_type, quantity, price,
-                     filled_quantity, filled_price, status, commission, tax,
-                     slippage, broker_order_id, error_msg, strategy_id, signal_id,
-                     created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                order['order_id'], order.get('tenant_id', 'default'),
-                order['code'], order['side'],
-                order.get('order_type', 'limit'), order['quantity'], order['price'],
-                order.get('filled_quantity', 0), order.get('filled_price', 0),
-                order.get('status', 'pending'), order.get('commission', 0),
-                order.get('tax', 0), order.get('slippage', 0),
-                order.get('broker_order_id', ''), order.get('error_msg', ''),
-                order.get('strategy_id', ''), order.get('signal_id', ''),
-                order.get('created_at', datetime.now().isoformat()),
-                order.get('updated_at', datetime.now().isoformat()),
-            ))
+            self._save_order(conn, order)
+
+    def _save_order(self, conn: sqlite3.Connection, order: dict) -> None:
+        values = {k: order[k] for k in self._ORDER_FIELDS if k in order}
+        for key in self._ORDER_REQUIRED:
+            if key not in values:
+                raise KeyError(key)
+
+        insert = dict(values)
+        now = datetime.now().isoformat()
+        insert.setdefault("tenant_id", "default")
+        insert.setdefault("created_at", now)
+        insert.setdefault("updated_at", now)
+
+        insert_cols = [c for c in self._ORDER_FIELDS if c in insert]
+        # Only caller-supplied columns are overwritten; tenant_id keeps the
+        # row's existing value unless the caller names one.
+        update_cols = [c for c in values if c != "order_id"]
+        sql = (
+            f"INSERT INTO orders ({', '.join(insert_cols)}) "
+            f"VALUES ({', '.join('?' for _ in insert_cols)}) "
+            "ON CONFLICT(order_id) DO UPDATE SET "
+            + ", ".join(f"{c} = excluded.{c}" for c in update_cols)
+        )
+        conn.execute(sql, tuple(insert[c] for c in insert_cols))
 
     def get_orders(self, status: str = "", code: str = "", limit: int = 100,
                    tenant_id: str = "",
@@ -410,21 +447,41 @@ class Store:
     # ── Trades ──
 
     def save_trade(self, trade: dict):
-        """Record an executed trade."""
+        """Record an executed trade.
+
+        `trade_id` defaults to a fresh uuid4, not to `order_id`: an order can
+        fill in several prints, and the old default made the second one hit
+        the `trades` UNIQUE constraint.
+        """
         with self._lock, self._conn() as conn:
-            conn.execute("""
-                    INSERT INTO trades
-                    (trade_id, tenant_id, order_id, code, side, quantity, price,
-                     commission, tax, executed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                trade.get('trade_id', trade.get('order_id', '')),
-                trade.get('tenant_id', 'default'),
-                trade['order_id'], trade['code'], trade['side'],
-                trade['quantity'], trade['price'],
-                trade.get('commission', 0), trade.get('tax', 0),
-                trade.get('executed_at', datetime.now().isoformat()),
-            ))
+            self._save_trade(conn, trade)
+
+    def _save_trade(self, conn: sqlite3.Connection, trade: dict) -> None:
+        conn.execute("""
+                INSERT INTO trades
+                (trade_id, tenant_id, order_id, code, side, quantity, price,
+                 commission, tax, executed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+            trade.get('trade_id') or uuid.uuid4().hex,
+            trade.get('tenant_id', 'default'),
+            trade['order_id'], trade['code'], trade['side'],
+            trade['quantity'], trade['price'],
+            trade.get('commission', 0), trade.get('tax', 0),
+            trade.get('executed_at', datetime.now().isoformat()),
+        ))
+
+    def save_order_with_trade(self, order: dict, trade: dict):
+        """Write an order and its fill atomically (one transaction).
+
+        The two used to be saved in separate transactions, so a failing
+        trade insert left the order row already updated and its fill -- and
+        audit record -- missing. Sharing one `_conn()` block makes the pair
+        all-or-nothing. `trade` may omit `trade_id`; a uuid4 is generated.
+        """
+        with self._lock, self._conn() as conn:
+            self._save_order(conn, order)
+            self._save_trade(conn, trade)
 
     def get_trades(self, code: str = "", limit: int = 100,
                    tenant_id: str = "",
@@ -498,6 +555,30 @@ class Store:
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
 
+    # ── EOD Reconciliation ──
+
+    def has_eod_reconciliation(self, date: str) -> bool:
+        """Whether the end-of-day reconciliation ran for `date` (YYYY-MM-DD)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM eod_reconciliation WHERE date = ?", (date,)
+            ).fetchone()
+            return row is not None
+
+    def mark_eod_reconciliation(self, date: str, timestamp: str | None = None):
+        """Record that the EOD reconciliation for `date` has completed.
+
+        The marker lives in SQLite so it survives a process restart; without
+        it a scheduler restarted after the close appended a second P&L
+        snapshot for the same day.
+        """
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO eod_reconciliation (date, timestamp) "
+                "VALUES (?, ?)",
+                (date, timestamp or datetime.now().isoformat()),
+            )
+
     # ── Signals ──
 
     def save_signal(self, signal: dict):
@@ -505,28 +586,33 @@ class Store:
         with self._lock, self._conn() as conn:
             conn.execute("""
                     INSERT OR REPLACE INTO signals
-                    (signal_id, code, direction, strength, factor_values,
+                    (signal_id, tenant_id, code, direction, strength, factor_values,
                      strategy_id, generated_at, consumed)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                signal['signal_id'], signal['code'], signal['direction'],
+                signal['signal_id'], signal.get('tenant_id', 'default'),
+                signal['code'], signal['direction'],
                 signal['strength'], json.dumps(signal.get('factor_values', {})),
                 signal.get('strategy_id', ''),
                 signal.get('generated_at', datetime.now().isoformat()),
                 signal.get('consumed', 0),
             ))
 
-    def get_signals(self, consumed: int = -1, limit: int = 100) -> list[dict]:
+    def get_signals(self, consumed: int = -1, limit: int = 100,
+                    tenant_id: str = "") -> list[dict]:
         """Get signals. consumed=-1 for all, 0 for unconsumed, 1 for consumed."""
         with self._conn() as conn:
+            query = "SELECT * FROM signals WHERE 1=1"
+            params: list = []
             if consumed >= 0:
-                rows = conn.execute(
-                    "SELECT * FROM signals WHERE consumed = ? ORDER BY generated_at DESC LIMIT ?",
-                    (consumed, limit)).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM signals ORDER BY generated_at DESC LIMIT ?",
-                    (limit,)).fetchall()
+                query += " AND consumed = ?"
+                params.append(consumed)
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            query += " ORDER BY generated_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
             result = []
             for r in rows:
                 d = dict(r)
@@ -610,26 +696,31 @@ class Store:
         """Log an event for audit trail."""
         with self._lock, self._conn() as conn:
             conn.execute("""
-                    INSERT INTO events (event_id, topic, data, source, timestamp, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO events (event_id, tenant_id, topic, data, source, timestamp, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (
-                event.get('event_id', ''), event.get('topic', ''),
+                event.get('event_id', ''), event.get('tenant_id', 'default'),
+                event.get('topic', ''),
                 json.dumps(event.get('data', {})),
                 event.get('source', ''), event.get('timestamp', time.time()),
                 datetime.now().isoformat(),
             ))
 
-    def get_events(self, topic: str = "", limit: int = 100) -> list[dict]:
-        """Get event log."""
+    def get_events(self, topic: str = "", limit: int = 100,
+                   tenant_id: str = "") -> list[dict]:
+        """Get event log, optionally filtered by tenant."""
         with self._conn() as conn:
+            query = "SELECT * FROM events WHERE 1=1"
+            params: list = []
             if topic:
-                rows = conn.execute(
-                    "SELECT * FROM events WHERE topic = ? ORDER BY timestamp DESC LIMIT ?",
-                    (topic, limit)).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM events ORDER BY timestamp DESC LIMIT ?",
-                    (limit,)).fetchall()
+                query += " AND topic = ?"
+                params.append(topic)
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
             result = []
             for r in rows:
                 d = dict(r)

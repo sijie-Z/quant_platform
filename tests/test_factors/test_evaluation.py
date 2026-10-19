@@ -148,3 +148,14 @@ class TestRankIcAlignsTheTwoAxes:
         pd.testing.assert_series_equal(
             accelerated, fallback, check_exact=False, rtol=1e-9, atol=1e-12,
         )
+
+
+def test_ic_summary_reports_the_number_of_observations():
+    """The dashboard needs to distinguish "weak factor" from "no data"."""
+    few = ic_summary(pd.Series([0.01, -0.02, 0.03, 0.04, -0.01]))
+
+    assert few["n_obs"] == 5
+    assert np.isnan(few["mean_ic"])
+
+    many = ic_summary(pd.Series(np.linspace(-0.05, 0.05, 20)))
+    assert many["n_obs"] == 20

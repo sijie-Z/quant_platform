@@ -86,12 +86,22 @@ class BaseFactor(ABC):
         momentum value for the next 252 days (momentum_12m coverage fell to
         0/85 on real-shaped data). Factor levels therefore use the stale
         forward-filled close; the IC target remains the masked return panel.
+
+        The panel also blanks ST asset-days (the PIT tradability mask). Those
+        rows must stay blank: a blanket `ffill()` used to fill them with a
+        stale close, so ST names re-entered every cross-section. The mask is
+        carried in `attrs["excluded_mask"]` by `DataPipeline.get_factor_prices`.
+
         Set ``fill_suspensions = False`` on a factor that genuinely needs the
         blanks.
         """
-        price_panel = (
-            prices.ffill() if getattr(self, "fill_suspensions", True) else prices
-        )
+        if getattr(self, "fill_suspensions", True):
+            excluded = prices.attrs.get("excluded_mask")
+            price_panel = prices.ffill()
+            if excluded is not None:
+                price_panel = price_panel.mask(excluded)
+        else:
+            price_panel = prices
         if financials is not None:
             values = self.compute(price_panel, financials=financials, **kwargs)
         else:

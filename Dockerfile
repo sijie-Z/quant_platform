@@ -25,6 +25,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Market hours are Asia/Shanghai wall-clock times. The base image is UTC, so
+# without this the scheduler would open the session at 17:30 Beijing and stay
+# closed during the real session.
+ENV TZ=Asia/Shanghai
+
 COPY requirements.txt .
 # Cache mount keeps pip's wheel cache across builds, so a retry after a
 # network hiccup only re-fetches the package that failed. The cache lives

@@ -2,6 +2,7 @@
 
 import logging
 
+import numpy as np
 import pandas as pd
 import pytest
 from quant_platform.backtest.cost_model import CostModel
@@ -131,3 +132,142 @@ class TestSlippageModelFallbackIsNotSilent:
 
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
         assert impact_cost != pytest.approx(fixed_cost, rel=0.01)
+
+
+class TestImpactCostUnitsAndNoDoubleCharging:
+    """Regression: the impact path mixed units and charged commission twice.
+
+    `_compute_impact_cost` returned `ExecutionCostCalculator.calculate().total_cost`,
+    which already contains commission (including the CNY 5.00 minimum) and
+    stamp tax, and it adds a *per-share* impact figure to those currency
+    amounts. `compute_costs` then added commission and stamp tax again. A 30%
+    turnover rebalance therefore "cost" 5.0 -- five times the traded value --
+    instead of the few basis points the fixed-slippage path charges.
+
+    Units are pinned in `CostModel.compute_costs`: `daily_volume` is the
+    asset's average daily traded value in CNY (人民币成交额), not share count.
+    """
+
+    _RATES = dict(commission=0.0003, stamp_tax=0.001, slippage=0.0005)
+
+    def test_impact_cost_is_on_the_same_scale_as_fixed_slippage(self):
+        impact = CostModel(slippage_model="impact", **self._RATES).compute_costs(
+            0.30, daily_volume=1_000_000, volatility=0.02,
+        )
+        fixed = CostModel(slippage_model="fixed", **self._RATES).compute_costs(0.30)
+
+        assert impact < 1e-2, f"impact cost {impact} is not return-sized"
+        assert 0.1 * fixed < impact < 10 * fixed, (
+            f"impact {impact} and fixed {fixed} are not the same order of magnitude"
+        )
+
+    def test_one_million_cny_trade_impact_is_bounded(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, slippage_model="impact",
+        )
+        notional = 1_000_000.0
+        cost = model.compute_costs(
+            notional, daily_volume=10_000_000_000, volatility=0.02,
+        )
+        fraction = cost / notional
+
+        # A CNY 1m order in a name trading CNY 10bn a day must stay a
+        # bounded fraction of notional. The old code returned a flat CNY 5
+        # minimum commission (5e-6 of notional, below the lower bound) plus a
+        # per-share impact figure; multiplying by price/quantity wrongly gives
+        # tens of percent.
+        assert 1e-5 < fraction < 2e-2, (
+            f"impact on a CNY 1m trade is {fraction:.2%} of notional; "
+            "either the unit conversion or the minimum commission leaked in"
+        )
+
+    def test_impact_path_charges_commission_once(self):
+        common = dict(stamp_tax=0.0, slippage=0.0, slippage_model="impact")
+        charged = CostModel(commission=0.001, **common).compute_costs(
+            1_000_000, daily_volume=10_000_000_000, volatility=0.02,
+        )
+        uncharged = CostModel(commission=0.0, **common).compute_costs(
+            1_000_000, daily_volume=10_000_000_000, volatility=0.02,
+        )
+
+        # The only difference between the two models is the commission rate;
+        # the delta must be exactly turnover * rate (charged once, not inside
+        # the impact calculator as well).
+        assert charged - uncharged == pytest.approx(1_000_000 * 0.001)
+
+
+class TestVectorPathAlignsSeriesByLabel:
+    """The vectorised paths used to rely on pandas label alignment; converting
+    straight to numpy pairs values by position, so a volume Series in a
+    different order silently mispriced every asset."""
+
+    def test_proportional_path_aligns_by_label(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.001,
+            slippage_model="proportional",
+        )
+        turnover = pd.Series([1_000_000.0, 1_000_000.0], index=["A", "B"])
+        # Deliberately reversed order: B liquid, A illiquid.
+        volume = pd.Series([100_000_000.0, 1_000_000.0], index=["B", "A"])
+
+        cost = model.compute_costs(turnover, daily_volume=volume)
+
+        # A: 1e6 / 1e6 = 1 -> full 0.001; B: 1e6 / 1e8 -> sqrt(0.01) = 0.1x.
+        assert cost.loc["A"] == pytest.approx(1_000_000 * 0.001)
+        assert cost.loc["B"] == pytest.approx(1_000_000 * 0.001 * 0.1)
+
+    def test_impact_path_aligns_by_label(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, slippage_model="impact",
+        )
+        turnover = pd.Series([1_000_000.0, 1_000_000.0], index=["A", "B"])
+        volume = pd.Series([10_000_000_000.0, 100_000_000.0], index=["B", "A"])
+        volatility = pd.Series([0.02, 0.02], index=["A", "B"])
+
+        cost = model.compute_costs(
+            turnover, daily_volume=volume, volatility=volatility,
+        )
+
+        assert cost.loc["A"] / 1_000_000 == pytest.approx(0.02 * np.sqrt(0.01))
+        assert cost.loc["B"] / 1_000_000 == pytest.approx(0.02 * np.sqrt(0.0001))
+
+
+class TestVectorPathInputShapes:
+    """`compute_costs` documents scalar/Series/array turnover; the vector
+    paths must accept all three, including a scalar trade value against a
+    per-asset volume vector (broadcast, not the single-order calculator)."""
+
+    def test_ndarray_turnover_is_supported(self):
+        model = CostModel(commission=0.001, stamp_tax=0.0, slippage=0.0)
+
+        cost = model.compute_costs(np.array([1_000_000.0, 2_000_000.0]))
+
+        assert cost.tolist() == pytest.approx([1_000.0, 2_000.0])
+
+    def test_scalar_trade_against_per_asset_volume_uses_the_vector_rule(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, slippage_model="impact",
+        )
+        volume = pd.Series([10_000_000_000.0, 100_000_000.0], index=["A", "B"])
+        volatility = pd.Series([0.02, 0.02], index=["A", "B"])
+
+        cost = model.compute_costs(
+            1_000_000, daily_volume=volume, volatility=volatility,
+        )
+
+        assert isinstance(cost, pd.Series)
+        # A: participation 1e-4; B: participation 1e-2.
+        assert cost.loc["A"] == pytest.approx(1_000_000 * 0.02 * np.sqrt(1e-4))
+        assert cost.loc["B"] == pytest.approx(1_000_000 * 0.02 * np.sqrt(1e-2))
+
+    def test_ndarray_buy_sell_split_is_supported(self):
+        model = CostModel(commission=0.001, stamp_tax=0.001, slippage=0.0)
+
+        cost = model.compute_costs(
+            np.array([0.5, 0.5]),
+            buy_turnover=np.array([0.5, 0.0]),
+            sell_turnover=np.array([0.0, 0.5]),
+        )
+
+        # Buy: commission only. Sell: commission + full 0.1% stamp tax.
+        assert cost.tolist() == pytest.approx([0.0005, 0.001])

@@ -39,6 +39,9 @@ shap==0.46.0
 # Config
 pyyaml==6.0.2
 python-dotenv==1.0.0
+# zoneinfo database: Windows has no system tz database and slim Linux images
+# may lack one, which would break the Asia/Shanghai market clock.
+tzdata==2026.2
 
 # Testing
 pytest==7.4.3

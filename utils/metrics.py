@@ -103,6 +103,16 @@ class Histogram:
         with self._lock:
             return self._count
 
+    def snapshot(self) -> tuple[dict[float, int], float, int]:
+        """Consistent (counts, sum, count) copy taken under the lock.
+
+        Exporting iterated ``counts`` directly while ``observe`` incremented
+        it, which could raise "dictionary changed size during iteration" (a
+        new bucket appearing mid-loop) or emit torn bucket counts.
+        """
+        with self._lock:
+            return dict(self.counts), self._sum, self._count
+
 
 class MetricsCollector:
     """Thread-safe Prometheus-compatible metrics collector.
@@ -155,56 +165,76 @@ class MetricsCollector:
                         self._help[name] = help
         return self._histograms[key]
 
+    def _snapshot_metrics(
+        self,
+    ) -> tuple[list[Counter], list[Gauge], list[Histogram], dict[str, str]]:
+        """Take a consistent copy of the metric registries.
+
+        Metric creation inserts into these dicts under ``_lock``; iterating
+        them live meant a thread registering a new label while another
+        exported could raise "dictionary changed size during iteration".
+        """
+        with self._lock:
+            counters = list(self._counters.values())
+            gauges = list(self._gauges.values())
+            histograms = list(self._histograms.values())
+            help_map = dict(self._help)
+        return counters, gauges, histograms, help_map
+
     def export_text(self) -> str:
         """Export all metrics in Prometheus text format."""
         lines = []
+        counters, gauges, histograms, help_map = self._snapshot_metrics()
 
         # Counters
-        for key, c in self._counters.items():
-            if c.name in self._help:
-                lines.append(f"# HELP {c.name} {self._help[c.name]}")
+        for c in counters:
+            if c.name in help_map:
+                lines.append(f"# HELP {c.name} {help_map[c.name]}")
             lines.append(f"# TYPE {c.name} counter")
             label_str = self._format_labels(c.labels)
             lines.append(f"{c.name}{label_str} {c.get()}")
 
         # Gauges
-        for key, g in self._gauges.items():
-            if g.name in self._help:
-                lines.append(f"# HELP {g.name} {self._help[g.name]}")
+        for g in gauges:
+            if g.name in help_map:
+                lines.append(f"# HELP {g.name} {help_map[g.name]}")
             lines.append(f"# TYPE {g.name} gauge")
             label_str = self._format_labels(g.labels)
             lines.append(f"{g.name}{label_str} {g.get()}")
 
         # Histograms
-        for key, h in self._histograms.items():
-            if h.name in self._help:
-                lines.append(f"# HELP {h.name} {self._help[h.name]}")
+        for h in histograms:
+            if h.name in help_map:
+                lines.append(f"# HELP {h.name} {help_map[h.name]}")
             lines.append(f"# TYPE {h.name} histogram")
             label_str = self._format_labels(h.labels)
-            for bucket, count in h.counts.items():
+            counts, total_sum, total_count = h.snapshot()
+            for bucket, count in counts.items():
                 le = "+Inf" if bucket == float("inf") else str(bucket)
                 bucket_labels = dict(h.labels)
                 bucket_labels["le"] = le
                 bl = self._format_labels(bucket_labels)
                 lines.append(f"{h.name}_bucket{bl} {count}")
-            lines.append(f"{h.name}_sum{label_str} {h.get_sum()}")
-            lines.append(f"{h.name}_count{label_str} {h.get_count()}")
+            lines.append(f"{h.name}_sum{label_str} {total_sum}")
+            lines.append(f"{h.name}_count{label_str} {total_count}")
 
         return "\n".join(lines) + "\n"
 
     def get_snapshot(self) -> dict[str, Any]:
         """Get a JSON-friendly snapshot of all metrics."""
         snapshot = {}
-        for key, c in self._counters.items():
-            snapshot[c.name] = {"type": "counter", "value": c.get(), "labels": c.labels}
-        for key, g in self._gauges.items():
-            snapshot[g.name] = {"type": "gauge", "value": g.get(), "labels": g.labels}
-        for key, h in self._histograms.items():
+        counters, gauges, histograms, _ = self._snapshot_metrics()
+        for c in counters:
+            snapshot[c.name] = {"type": "counter", "value": c.get(), "labels": dict(c.labels)}
+        for g in gauges:
+            snapshot[g.name] = {"type": "gauge", "value": g.get(), "labels": dict(g.labels)}
+        for h in histograms:
+            _, total_sum, total_count = h.snapshot()
             snapshot[h.name] = {
                 "type": "histogram",
-                "sum": h.get_sum(),
-                "count": h.get_count(),
-                "labels": h.labels,
+                "sum": total_sum,
+                "count": total_count,
+                "labels": dict(h.labels),
             }
         return snapshot
 
@@ -287,3 +317,84 @@ def instrument_pipeline_stage(stage_name: str):
         wrapper.__doc__ = func.__doc__
         return wrapper
     return decorator
+
+
+class HTTPMetricsMiddleware:
+    """Pure-ASGI middleware recording request counts and latency.
+
+    Emits the metric names the Grafana dashboard already queries:
+    - ``api_requests_total{method,path,status}`` (counter)
+    - ``api_errors_total{method,path,error}`` (counter, unhandled exceptions)
+    - ``api_duration_seconds{method,path}`` (histogram)
+
+    The ``path`` label uses the matched route template (``/api/run/{id}``)
+    when Starlette resolved one, so a path parameter does not create an
+    unbounded label set.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = time.perf_counter()
+        status_holder = {"status": 0}
+        error_name: str | None = None
+
+        async def send_wrapper(message):
+            if message.get("type") == "http.response.start":
+                status_holder["status"] = int(message.get("status", 0))
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as exc:
+            error_name = type(exc).__name__
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            route = scope.get("route")
+            path = getattr(route, "path", None) or scope.get("path", "unknown")
+            method = scope.get("method", "UNKNOWN")
+            status = status_holder["status"] or (500 if error_name else 0)
+
+            m = get_metrics()
+            m.counter(
+                "api_requests_total",
+                labels={"method": method, "path": path, "status": str(status)},
+                help="HTTP requests handled by the API",
+            ).inc()
+            m.histogram(
+                "api_duration_seconds",
+                labels={"method": method, "path": path},
+                help="HTTP request latency in seconds",
+            ).observe(elapsed)
+            if error_name is not None:
+                m.counter(
+                    "api_errors_total",
+                    labels={"method": method, "path": path, "error": error_name},
+                    help="Unhandled HTTP handler exceptions",
+                ).inc()
+
+
+def install_http_middleware(app):
+    """Wire HTTP request metrics into a FastAPI/Starlette (or bare ASGI) app.
+
+    This module owns the instrumentation because ``app.py`` and
+    ``api/routes.py`` are outside the current change set. Wiring is one line,
+    at application construction time (before startup)::
+
+        from quant_platform.utils.metrics import install_http_middleware
+        install_http_middleware(app)
+
+    For a Starlette app the middleware is registered in place and the app is
+    returned; for a bare ASGI callable it returns the wrapped app.
+    """
+    add_middleware = getattr(app, "add_middleware", None)
+    if callable(add_middleware):
+        add_middleware(HTTPMetricsMiddleware)
+        return app
+    return HTTPMetricsMiddleware(app)

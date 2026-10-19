@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -134,9 +135,22 @@ class LLMSentimentFactor(BaseFactor):
         else:
             self.analyzer = KeywordSentimentAnalyzer()
 
-        # In-memory cache: {(headline_hash, date): score}
-        self._cache: dict[str, float] = {}
+        # In-memory cache: {cache_key: {"score": float, "retryable": bool}}.
+        # The key covers everything that can change a score (headline, asset,
+        # analyzer type, model, prompt version and date). The previous key was
+        # just (headline, date), so the same headline scored for stock A was
+        # served to stock B, and a DeepSeek -> keyword fallback was persisted
+        # as if it were the model's answer.
+        self._cache: dict[str, dict] = {}
+        self._unsaved_entries = 0
         self._load_cache()
+
+    # Cache layout version. Bumped whenever the key composition or the entry
+    # shape changes: an old file cannot be trusted under the new key, so it is
+    # ignored rather than migrated.
+    _CACHE_VERSION = 2
+
+    _CACHE_FILENAME = "sentiment_cache.json"
 
     @property
     def name(self) -> str:
@@ -257,57 +271,163 @@ class LLMSentimentFactor(BaseFactor):
     def _analyze_headline(self, headline: str, asset: str, date: pd.Timestamp) -> float:
         """Analyze sentiment of a single headline.
 
-        Results cached by (headline, date) hash to avoid redundant calls.
+        Results are cached under a key covering the headline, asset, analyzer
+        type, model, prompt version and date. A fallback score (the LLM call
+        failed and the keyword analyzer answered instead) stays in memory for
+        this session but is *not* written to disk and is retried on the next
+        call, so an outage cannot pin a degraded score into the cache.
         """
-        cache_key = hashlib.md5(
-            f"{headline}|{date.date()}".encode()
-        ).hexdigest()
+        cache_key = self._make_cache_key(headline, asset, date)
 
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        entry = self._cache.get(cache_key)
+        if entry is not None and not entry.get("retryable", False):
+            return entry["score"]
 
         # Analyze sentiment
         score = self.analyzer.analyze(headline, asset)
+        retryable = bool(getattr(self.analyzer, "last_analyze_fallback", False))
 
-        # Cache
-        self._cache[cache_key] = score
-        self._save_cache_entry(cache_key, headline, asset, date, score)
+        self._cache[cache_key] = {"score": float(score), "retryable": retryable}
+        if not retryable:
+            self._unsaved_entries += 1
+            self._maybe_save_cache()
 
         return score
+
+    def _make_cache_key(
+        self, headline: str, asset: str, date: pd.Timestamp
+    ) -> str:
+        """Build a cache key that distinguishes everything affecting a score.
+
+        Two different assets sharing a headline must not share a score (the
+        LLM prompt carries the stock), nor may a keyword fallback be replayed
+        under the real model's name, nor may a prompt change silently reuse
+        answers computed under the old instructions.
+        """
+        payload = {
+            "headline": headline,
+            "asset": str(asset),
+            "analyzer": type(self.analyzer).__name__,
+            "model": self.model,
+            "prompt": self._prompt_fingerprint(),
+            "date": pd.Timestamp(date).date().isoformat(),
+        }
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _prompt_fingerprint(self) -> str:
+        """Version the analysis instructions, not just their presence."""
+        prompt = getattr(self.analyzer, "SYSTEM_PROMPT", "") or ""
+        if not prompt:
+            # Keyword scoring has no prompt; its keyword lists are the rule
+            # set. Fingerprint them so edits invalidate stored answers too.
+            keywords = []
+            for attr in ("BULLISH_KEYWORDS", "BEARISH_KEYWORDS"):
+                values = getattr(self.analyzer, attr, None)
+                if isinstance(values, (list, tuple)):
+                    keywords.extend(str(v) for v in values)
+            prompt = "|".join(keywords)
+        return hashlib.sha256(str(prompt).encode("utf-8")).hexdigest()[:16]
 
     # ------------------------------------------------------------------
     # Cache persistence
     # ------------------------------------------------------------------
 
-    def _load_cache(self) -> None:
-        """Load persisted cache from disk."""
-        cache_file = self.cache_dir / "sentiment_cache.json"
-        if cache_file.exists():
-            try:
-                with open(cache_file, encoding="utf-8") as f:
-                    data = json.load(f)
-                self._cache = data
-                logger.debug("Loaded %d cached sentiment scores", len(data))
-            except Exception:
-                self._cache = {}
+    @property
+    def _cache_file(self) -> Path:
+        return self.cache_dir / self._CACHE_FILENAME
 
-    def _save_cache_entry(
-        self, key: str, headline: str, asset: str,
-        date: pd.Timestamp, score: float,
-    ) -> None:
-        """Append a single cache entry to disk (batched by session)."""
-        # Save every 100th entry to reduce I/O
-        if len(self._cache) % 100 == 0:
+    @staticmethod
+    def _normalise_entry(value: object) -> dict | None:
+        """Accept only a well-formed persisted entry."""
+        if isinstance(value, dict) and isinstance(value.get("score"), (int, float)):
+            return {"score": float(value["score"]), "retryable": False}
+        return None
+
+    def _load_cache(self) -> None:
+        """Load persisted cache from disk.
+
+        A corrupt or outdated file must never wipe the in-memory cache: it is
+        warned about and left untouched for inspection, and the session simply
+        starts from what it already holds.
+        """
+        cache_file = self._cache_file
+        if not cache_file.exists():
+            return
+        try:
+            with open(cache_file, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning(
+                "Sentiment cache %s is unreadable (%s); keeping the in-memory "
+                "cache and leaving the file in place",
+                cache_file, e,
+            )
+            return
+
+        if (
+            not isinstance(data, dict)
+            or data.get("version") != self._CACHE_VERSION
+            or not isinstance(data.get("entries"), dict)
+        ):
+            logger.warning(
+                "Sentiment cache %s has version/layout %r, expected %d; "
+                "ignoring it (in-memory cache kept)",
+                cache_file,
+                data.get("version") if isinstance(data, dict) else type(data).__name__,
+                self._CACHE_VERSION,
+            )
+            return
+
+        loaded = {}
+        for key, value in data["entries"].items():
+            entry = self._normalise_entry(value)
+            if entry is not None:
+                loaded[key] = entry
+        self._cache = loaded
+        logger.debug("Loaded %d cached sentiment scores", len(loaded))
+
+    def _maybe_save_cache(self) -> None:
+        """Flush every 100 new entries to reduce I/O."""
+        if self._unsaved_entries >= 100:
             self._save_cache()
 
     def _save_cache(self) -> None:
-        """Persist full cache to disk."""
-        cache_file = self.cache_dir / "sentiment_cache.json"
+        """Persist the cache atomically (temp file + ``os.replace``).
+
+        Writing JSON in place left a truncated file if the process died
+        mid-dump, and the old loader then wiped every score. Retryable
+        (fallback) entries are deliberately not written.
+        """
+        entries = {
+            key: {"score": float(entry["score"])}
+            for key, entry in self._cache.items()
+            if not entry.get("retryable", False)
+        }
+        payload = {"version": self._CACHE_VERSION, "entries": entries}
+        cache_file = self._cache_file
+
+        tmp_name = None
         try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(self._cache, f, ensure_ascii=False, indent=2)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f"{cache_file.name}.", suffix=".tmp", dir=self.cache_dir,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, cache_file)
+            tmp_name = None
+            self._unsaved_entries = 0
         except Exception as e:
-            logger.debug("Failed to save cache: %s", e)
+            logger.warning("Failed to save sentiment cache: %s", e)
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
 
 
 # ======================================================================
@@ -316,6 +436,11 @@ class LLMSentimentFactor(BaseFactor):
 
 class SentimentAnalyzer:
     """Abstract sentiment analyzer."""
+
+    # Set by an analyzer whose last call silently degraded (e.g. the LLM API
+    # failed and a keyword score stood in for it). The factor uses this to keep
+    # fallback scores out of the persistent cache.
+    last_analyze_fallback: bool = False
 
     def analyze(self, headline: str, asset: str = "") -> float:
         """Return sentiment score: -1 (bearish) to +1 (bullish)."""
@@ -394,6 +519,8 @@ Output format: just the number, e.g. "0.6" or "-0.3". Nothing else."""
 
     def analyze(self, headline: str, asset: str = "") -> float:
         """Call DeepSeek API for sentiment analysis."""
+        self.last_analyze_fallback = False
+
         # Rate limiting: max 50 requests per second
         elapsed = time.monotonic() - self._last_request_time
         if elapsed < 0.02:  # 50 req/s
@@ -424,4 +551,5 @@ Output format: just the number, e.g. "0.6" or "-0.3". Nothing else."""
 
         except Exception as e:
             logger.warning("OpenAI API call failed: %s, falling back to keyword analyzer", e)
+            self.last_analyze_fallback = True
             return KeywordSentimentAnalyzer().analyze(headline, asset)

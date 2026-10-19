@@ -27,25 +27,47 @@ from quant_platform.config.schema import Config, FactorsConfig
 
 
 def _parse_factors(raw_factors: dict | None) -> FactorsConfig:
-    """Parse factors config from YAML, extracting enabled factor names."""
+    """Parse factors config from YAML.
+
+    A section that is absent falls back to the schema defaults; a section
+    that is present but empty (or with every factor disabled) yields no
+    factors. The old `tuple(enabled) or default` made an explicitly empty
+    section silently enable the full default list.
+    """
     if raw_factors is None:
         return FactorsConfig()
 
-    enabled_technicals = []
-    tech_config = raw_factors.get("technical", {})
-    for name, cfg in tech_config.items():
-        if isinstance(cfg, dict) and cfg.get("enabled", True):
-            enabled_technicals.append(name)
+    def _enabled_names(section_key: str) -> tuple[str, ...] | None:
+        if section_key not in raw_factors:
+            return None
+        section = raw_factors.get(section_key) or {}
+        return tuple(
+            name for name, cfg in section.items()
+            if isinstance(cfg, dict) and cfg.get("enabled", True)
+        )
 
-    enabled_fundamentals = []
-    fund_config = raw_factors.get("fundamental", {})
-    for name, cfg in fund_config.items():
-        if isinstance(cfg, dict) and cfg.get("enabled", True):
-            enabled_fundamentals.append(name)
+    enabled_technicals = _enabled_names("technical")
+    enabled_fundamentals = _enabled_names("fundamental")
+
+    params: dict[str, dict] = {}
+    for section_key in ("technical", "fundamental"):
+        for name, cfg in (raw_factors.get(section_key) or {}).items():
+            if isinstance(cfg, dict) and cfg.get("params"):
+                params[name] = dict(cfg["params"])
+
+    processing = dict(raw_factors.get("processing") or {})
 
     return FactorsConfig(
-        enabled_technicals=tuple(enabled_technicals) or FactorsConfig.enabled_technicals,
-        enabled_fundamentals=tuple(enabled_fundamentals) or FactorsConfig.enabled_fundamentals,
+        enabled_technicals=(
+            enabled_technicals if enabled_technicals is not None
+            else FactorsConfig.enabled_technicals
+        ),
+        enabled_fundamentals=(
+            enabled_fundamentals if enabled_fundamentals is not None
+            else FactorsConfig.enabled_fundamentals
+        ),
+        params=params,
+        processing=processing,
     )
 
 

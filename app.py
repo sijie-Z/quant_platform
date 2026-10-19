@@ -112,6 +112,11 @@ def create_app(serve_frontend: bool = True) -> FastAPI:
         allow_headers=["*"],
     )
     app.add_middleware(APITokenMiddleware)
+    # Prometheus request counters/latency. The Grafana dashboard queried
+    # api_requests_total/api_duration_seconds, but nothing ever recorded them.
+    from quant_platform.utils.metrics import install_http_middleware
+
+    install_http_middleware(app)
 
     # API routes
     app.include_router(api_router)

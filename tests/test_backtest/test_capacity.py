@@ -117,8 +117,9 @@ class TestCapacityEstimator:
 
     def test_capacity_found(self, sample_data):
         """Should find a capacity AUM with low enough threshold."""
-        # Use a very low threshold since random data has ~0 Sharpe
-        estimator = CapacityEstimator(sharpe_threshold=-1.0)
+        # The project-wide Sharpe subtracts the 3% risk-free rate, so random
+        # data sits below zero; use a threshold below that.
+        estimator = CapacityEstimator(sharpe_threshold=-2.0)
         curve = estimator.estimate(
             weights_history=sample_data["weights_history"],
             prices=sample_data["prices"],
@@ -189,3 +190,30 @@ class TestCapacityEstimator:
         )
 
         assert len(curve.results) == 1
+
+
+def test_costs_and_participation_caps_actually_change_the_result(sample_data):
+    """The AUM curve was identical at every level.
+
+    Costs were deducted only from the internal sizing capital, the reported
+    series stayed gross, and an over-participation trade was never reduced.
+    """
+    estimator = CapacityEstimator()
+
+    def _run(aum):
+        return estimator.estimate(
+            weights_history=sample_data["weights_history"],
+            prices=sample_data["prices"],
+            volumes=sample_data["volumes"],
+            returns=sample_data["returns"],
+            aum_range=[aum],
+        ).results[0]
+
+    low = _run(1e6)
+    high = _run(1e12)
+
+    assert high.n_capped_days > 0
+    assert high.total_impact_cost > 0
+    # Capped trades execute less than the target, so realized turnover falls.
+    assert high.turnover < low.turnover
+    assert high.annualized_return != low.annualized_return

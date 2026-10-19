@@ -1,6 +1,7 @@
 """Configuration schema validation using dataclasses."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -176,6 +177,11 @@ class FactorsConfig:
     enabled_fundamentals: tuple[str, ...] = (
         "log_market_cap", "pb_ratio", "pe_ratio", "roe", "asset_growth",
     )
+    # Per-factor constructor parameters (`momentum_1m: {params: {period: 10}}`).
+    # They used to be dropped during parsing, so editing them changed nothing.
+    params: dict[str, dict] = field(default_factory=dict)
+    # `factors.processing`: winsorize / standardize / neutralize settings.
+    processing: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

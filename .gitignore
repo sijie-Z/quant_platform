@@ -33,6 +33,10 @@ results/*.png
 results/*.pdf
 results/
 
+# SQLite runtime sidecars (WAL mode leaves these next to the database)
+*.db-wal
+*.db-shm
+
 # Coverage
 .coverage
 htmlcov/

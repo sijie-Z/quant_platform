@@ -795,11 +795,24 @@ class QMTBroker(BrokerInterface):
 
     # ── Order lifecycle ──
 
+    #: Statuses after which no further broker callback may change the order.
+    _TERMINAL_STATUSES = frozenset({
+        OrderStatus.FILLED,
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
+        OrderStatus.EXPIRED,
+    })
+
     def place_order(self, order: Order) -> Order:
         """Submit an order to QMT.
 
         Converts internal Order to xtquant params, submits, and tracks.
         The order status will be updated asynchronously via callbacks.
+
+        ``order_stock`` returns a broker order id, or an error code <= 0 on
+        failure. A non-positive result is a rejection: storing it as
+        ``broker_order_id`` marked the order SUBMITTED even though QMT never
+        accepted it, and no callback could ever arrive for it.
         """
         if not self._connected:
             order.status = OrderStatus.REJECTED
@@ -828,6 +841,21 @@ class QMTBroker(BrokerInterface):
                 price_type=xt_price_type,
                 price=price,
             )
+
+            try:
+                accepted = broker_id is not None and int(broker_id) > 0
+            except (TypeError, ValueError):
+                accepted = False
+
+            if not accepted:
+                order.status = OrderStatus.REJECTED
+                order.error_msg = f"QMT order_stock rejected (broker_id={broker_id!r})"
+                order.updated_at = datetime.now().isoformat()
+                self._orders.append(order)
+                logger.error("QMT order_stock rejected: %s %s %d@%.2f (broker_id=%r)",
+                             order.side.value, order.code, order.quantity,
+                             order.price, broker_id)
+                return order
 
             order.broker_order_id = str(broker_id)
             order.status = OrderStatus.SUBMITTED
@@ -861,7 +889,19 @@ class QMTBroker(BrokerInterface):
                 if o.status not in (OrderStatus.SUBMITTED, OrderStatus.PARTIAL):
                     return False
                 try:
-                    self._trader.cancel_order_stock(self._account, int(o.broker_order_id))
+                    result = self._trader.cancel_order_stock(
+                        self._account, int(o.broker_order_id),
+                    )
+                    # xtquant returns 0 on success and a non-zero error code
+                    # when the exchange/broker refuses the cancellation. The
+                    # old code never looked at the return value and reported
+                    # every request as success.
+                    if result != 0:
+                        logger.error(
+                            "QMT cancel rejected: %s (qmt_id=%s, result=%s)",
+                            order_id, o.broker_order_id, result,
+                        )
+                        return False
                     logger.info("QMT cancel requested: %s (qmt_id=%s)", order_id, o.broker_order_id)
                     return True
                 except Exception as e:
@@ -976,7 +1016,14 @@ class QMTBroker(BrokerInterface):
             self._publish_event("qmt.order_ack", {"order_id": str(order_id)})
 
     def _on_order_update(self, xt_order: Any) -> None:
-        """Apply an XtOrder status update to the tracked order."""
+        """Apply an XtOrder status update to the tracked order.
+
+        Callbacks can arrive out of order: a late ``ORDER_PART_SUCC`` snapshot
+        after ``ORDER_SUCCEEDED``, or a stale ``ORDER_REPORTED`` after a
+        partial fill. Terminal states must never be downgraded, partial fills
+        must never fall back to PENDING/SUBMITTED, and the cumulative traded
+        volume must not shrink.
+        """
         from quant_platform.trading.qmt_utils import qmt_status_to_internal
 
         broker_order_id = str(getattr(xt_order, "order_id", ""))
@@ -989,9 +1036,24 @@ class QMTBroker(BrokerInterface):
 
         for order in self._orders:
             if str(order.broker_order_id) == broker_order_id:
+                if order.status in self._TERMINAL_STATUSES:
+                    logger.debug(
+                        "Ignoring stale QMT update %s for terminal order %s (%s)",
+                        status.value, order.order_id, order.status.value,
+                    )
+                    break
+                if (order.status == OrderStatus.PARTIAL
+                        and status in (OrderStatus.PENDING, OrderStatus.SUBMITTED)):
+                    logger.debug(
+                        "Ignoring stale QMT update %s for partially filled order %s",
+                        status.value, order.order_id,
+                    )
+                    break
                 order.status = status
                 if traded > 0:
-                    order.filled_quantity = traded
+                    order.filled_quantity = max(
+                        int(order.filled_quantity or 0), traded,
+                    )
                     if traded_price > 0:
                         order.filled_price = traded_price
                 order.updated_at = datetime.now().isoformat()

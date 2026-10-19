@@ -334,3 +334,56 @@ class TestExecutionTiming:
         assert engine.daily_returns.loc[signal_date] == pytest.approx(0.0)
         # One-sided turnover 0.5 -> two-way 1.0 -> 0.001 of capital.
         assert engine.daily_returns.loc[exec_date] == pytest.approx(-0.001)
+
+
+class TestStampTaxDirection:
+    """Stamp tax is a sell-side tax; the engine used to charge it on buys.
+
+    `_simulate_pnl` passed the total two-way traded value with `is_sell=None`,
+    so `CostModel` assumed exactly half of it was sells: a 100%-cash portfolio
+    building its initial position paid 0.05% stamp tax on buys it never owed,
+    and a full liquidation paid only half of the 0.1% it did owe.
+    """
+
+    @staticmethod
+    def _engine() -> BacktestEngine:
+        return BacktestEngine(
+            initial_capital=1_000_000,
+            rebalance_frequency="monthly",
+            cost_model=CostModel(commission=0.0, stamp_tax=0.001, slippage=0.0),
+            # Disable the turnover cap so the liquidation below is complete.
+            constraints=PortfolioConstraints(max_turnover=1.0),
+        )
+
+    @staticmethod
+    def _flat_returns():
+        dates = pd.date_range("2024-01-01", periods=5, freq="D")
+        return pd.DataFrame(0.0, index=dates, columns=["A", "B"]), dates
+
+    def test_building_from_cash_pays_no_stamp_tax(self):
+        returns, dates = self._flat_returns()
+        engine = self._engine()
+        engine.weights_history = {dates[1]: pd.Series({"A": 0.5, "B": 0.5})}
+
+        engine._simulate_pnl(returns)
+
+        # The initial deployment is 100% buys: no stamp tax is due, so the
+        # day's return is exactly flat.
+        assert engine.daily_returns.loc[dates[2]] == pytest.approx(0.0)
+        assert engine.portfolio_values.iloc[-1] == pytest.approx(1_000_000.0)
+
+    def test_full_liquidation_pays_the_full_sell_side_stamp_tax(self):
+        returns, dates = self._flat_returns()
+        engine = self._engine()
+        engine.weights_history = {
+            dates[1]: pd.Series({"A": 0.5, "B": 0.5}),
+            dates[3]: pd.Series({"A": 0.0, "B": 0.0}),
+        }
+
+        engine._simulate_pnl(returns)
+
+        # Selling 100% of the portfolio is charged the full 0.1% stamp tax.
+        # The old code passed the two-way value with is_sell=None and charged
+        # only half of it (-0.0005).
+        assert engine.daily_returns.loc[dates[4]] == pytest.approx(-0.001)
+        assert engine.portfolio_values.iloc[-1] == pytest.approx(999_000.0)

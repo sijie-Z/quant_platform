@@ -109,14 +109,15 @@ const emit = defineEmits(['toast'])
 const loading = ref(false)
 const status = ref(null)
 
+// Keys as returned by RiskMonitor.get_status(); the old map expected
+// `max_position_pct`-style names the backend never sends, so every label fell
+// through to an English fallback and leverage/order rows never appeared.
 const limitNameMap = {
-  max_position_pct: { en: 'Position', zh: '仓位' },
-  max_drawdown_pct: { en: 'Drawdown', zh: '回撤' },
-  max_kill_drawdown_pct: { en: 'Kill Drawdown', zh: '熔断回撤' },
-  max_daily_loss_pct: { en: 'Daily Loss', zh: '日亏损' },
-  max_leverage: { en: 'Leverage', zh: '杠杆' },
-  max_sector_pct: { en: 'Sector', zh: '行业集中度' },
-  max_order_freq: { en: 'Order Freq', zh: '订单频率' },
+  max_single_position: { en: 'Position', zh: '仓位' },
+  max_sector: { en: 'Sector', zh: '行业集中度' },
+  max_daily_loss: { en: 'Daily Loss', zh: '日亏损' },
+  max_drawdown: { en: 'Drawdown', zh: '回撤' },
+  kill_drawdown: { en: 'Kill Drawdown', zh: '熔断回撤' },
 }
 
 function formatNum(v) {
@@ -135,8 +136,9 @@ function formatLimitName(key) {
 function getLimitFill(key, val) {
   const current = status.value?.current_drawdown || 0
   const dailyLoss = status.value?.daily_pnl_pct || 0
-  if (key.includes('drawdown') && !key.includes('kill')) return Math.min(current / val * 100, 100)
-  if (key.includes('daily')) return Math.min(Math.abs(dailyLoss) / val * 100, 100)
+  if (key === 'kill_drawdown') return Math.min(current / val * 100, 100)
+  if (key === 'max_drawdown') return Math.min(current / val * 100, 100)
+  if (key === 'max_daily_loss') return Math.min(Math.abs(dailyLoss) / val * 100, 100)
   return 0
 }
 
