@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 # Ensure the parent directory is importable
@@ -47,12 +48,31 @@ class APITokenMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Run the event bus for the lifetime of the application.
+
+    The bus is a process-wide singleton, but nothing ever started it. Without
+    consumer loops every publish fell back to inline synchronous delivery,
+    async handlers were skipped, and dead-letter retry never ran.
+    """
+    from quant_platform.core.events import get_event_bus
+
+    bus = get_event_bus()
+    await bus.start()
+    try:
+        yield
+    finally:
+        await bus.stop()
+
+
 def create_app(serve_frontend: bool = True) -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(
         title="A-Share Multi-Factor Quant Platform",
         description="Multi-factor quantitative research platform with LLM-enhanced stock selection",
         version="1.0.0",
+        lifespan=_lifespan,
         docs_url="/api/docs" if serve_frontend else "/docs",
         redoc_url="/api/redoc" if serve_frontend else "/redoc",
     )
