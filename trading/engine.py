@@ -158,6 +158,10 @@ class LiveTradingEngine:
         self._started_at = ""
         self._last_update = ""
         self._last_prices_update = ""
+        # One provider per engine: constructing a fresh RealTimeMarket every
+        # cycle threw away its 10-second quote cache and forced a full market
+        # scrape on every fetch.
+        self._rt_market = None
         self._cycle_log: list[CycleResult] = []
         self._session_id = ""
         # Serialises the daemon loop against manual run-once triggers.
@@ -667,7 +671,9 @@ class LiveTradingEngine:
     def _fetch_prices(self):
         try:
             from quant_platform.trading.realtime import RealTimeMarket
-            rt = RealTimeMarket()
+            if self._rt_market is None:
+                self._rt_market = RealTimeMarket()
+            rt = self._rt_market
             quotes = rt.get_quotes(self._universe)
             updated = 0
             for q in quotes:
