@@ -190,6 +190,12 @@ class LiveRunner:
         self._bus = get_event_bus()
         self._audit = AuditLog(self._store, self._bus)
         self._sm = PortfolioStateMachine()
+        if getattr(self._sm, "_on_transition", None) is None:
+            self._sm.set_transition_callback(
+                lambda record: self._audit.log_state_change(
+                    record.from_state, record.to_state, record.reason,
+                )
+            )
         # Same singleton the API kill switch mutates. A private instance made
         # the dashboard's kill switch invisible to this runner. Tests inject a
         # fresh monitor so one module's order-rate window cannot leak into the

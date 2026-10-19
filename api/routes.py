@@ -2512,6 +2512,11 @@ _core_store = Store()
 _core_bus = get_event_bus()
 _core_sm = PortfolioStateMachine()
 _core_audit = AuditLog(_core_store, _core_bus)
+_core_sm.set_transition_callback(
+    lambda record: _core_audit.log_state_change(
+        record.from_state, record.to_state, record.reason,
+    )
+)
 _core_risk = get_risk_monitor()
 
 # Subscribe EventBus → WebSocket bridge for real-time push
@@ -2585,6 +2590,12 @@ def trading_start(req: dict):
     # risk.circuit_breaker.get_risk_monitor().
     _core_sm = PortfolioStateMachine()
     _core_audit = AuditLog(_core_store, _core_bus)
+    # Audit state transitions: the callback is optional and was never wired.
+    _core_sm.set_transition_callback(
+        lambda record: _core_audit.log_state_change(
+            record.from_state, record.to_state, record.reason,
+        )
+    )
     _core_risk = get_risk_monitor()
 
     engine = LiveTradingEngine(

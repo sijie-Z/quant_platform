@@ -136,3 +136,9 @@ class TestTheKillSwitchReachesTheStateMachine:
         engine._execute_cycle()
 
         assert engine._sm.state != PortfolioState.HALTED
+
+
+def test_state_transitions_are_written_to_the_audit_log(engine):
+    """`AuditLog.log_state_change` existed but nothing called it."""
+    events = engine._store.get_events(topic="audit.state_change")
+    assert events, "engine state transitions were not audited"

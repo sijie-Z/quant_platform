@@ -130,6 +130,14 @@ class LiveTradingEngine:
         self._audit = audit or AuditLog(
             self._store, self._bus, tenant_id=tenant_id,
         )
+        # State changes were never audited: the machine's callback is
+        # optional and no production caller registered one.
+        if getattr(self._sm, "_on_transition", None) is None:
+            self._sm.set_transition_callback(
+                lambda record: self._audit.log_state_change(
+                    record.from_state, record.to_state, record.reason,
+                )
+            )
         self._risk = risk_monitor or RealTimeRiskEngine(
             max_daily_loss=0.03,
             max_drawdown=0.15,
