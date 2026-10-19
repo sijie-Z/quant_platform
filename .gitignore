@@ -72,3 +72,6 @@ baostock_run_err.log
 
 # Generated data
 frontend/data/
+
+# local market-data cache for the first real research run
+data/cache/
