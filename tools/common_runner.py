@@ -47,7 +47,7 @@ from quant_platform.lab.reports import generate_report  # noqa: E402
 
 def _factor_momentum_12m(prices, rets):
     """过去 252 个交易日的累计收益,跳过最近 21 天"""
-    factor = (1 + rets).rolling(252).apply(lambda x: x.prod() - 1).shift(-21)
+    factor = (1 + rets).rolling(252).apply(lambda x: x.prod() - 1).shift(21)
     return factor
 
 def _factor_volatility_60d(prices, rets):

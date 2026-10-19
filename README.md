@@ -4,7 +4,7 @@
   <a href="https://github.com/sijie-Z/quant_platform/actions/workflows/ci.yml"><img src="https://github.com/sijie-Z/quant_platform/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/sijie-Z/quant_platform/actions/workflows/codeql.yml"><img src="https://github.com/sijie-Z/quant_platform/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
   <img src="https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/API-97%20endpoints-brightgreen" alt="API">
+  <img src="https://img.shields.io/badge/API-98%20endpoints-brightgreen" alt="API">
   <img src="https://img.shields.io/badge/CLI-18%20commands-blueviolet" alt="CLI">
   <img src="https://img.shields.io/badge/前端-Vue%203%20%2B%20ECharts-orange" alt="Frontend">
   <img src="https://img.shields.io/badge/实盘-Paper%20%2F%20QMT-yellow" alt="Live Trading">
@@ -66,7 +66,7 @@
 
 ### 🖥️ Web 平台
 
-- **FastAPI 97 端点**：pipeline / 分析 / 风控 / OMS / 实盘 / 监控 全覆盖
+- **FastAPI 98 端点**：pipeline / 分析 / 风控 / OMS / 实盘 / 监控 全覆盖
 - **WebSocket 实时推送**：EventBus → WS 桥接，交易事件实时到达前端
 - **Vue 3 + ECharts 仪表盘**：Bloomberg 风格 11 行面板（净值曲线/因子热力图/风险仪表/持仓/归因）
 - **监控**：Prometheus 指标 + Grafana 16 面板模板 + 合规审计导出
@@ -79,8 +79,14 @@
 # 1. 环境
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
+# core/store.py re-exports the local quant_core package; the editable
+# installs are required (CI and the Dockerfile do the same).
+.venv\Scripts\pip install -e ./packages/quant_core
+.venv\Scripts\pip install -e .
 
 # 2. 跑完整流水线（默认合成数据，无需联网）
+#    注意：默认 config 的合成数据启用了 embedded_alpha（演示用的人造信号）。
+#    做研究/回测结论时请把 data.synthetic.embedded_alpha 设为 false。
 .venv\Scripts\python main.py run
 
 # 3. 启动 Web 平台（FastAPI + Vue）
@@ -91,7 +97,7 @@ python -m venv .venv
 .venv\Scripts\python -m pytest tests/ -q
 ```
 
-### CLI 命令（18 个）
+### CLI 命令（20 个）
 
 ```bash
 python main.py run                 # 完整流水线（数据→因子→信号→回测→报告）
@@ -136,7 +142,7 @@ quant_platform/
 ├── trading/                # 实盘：实时行情 / Paper / QMT / LiveEngine / SignalGenerator
 ├── strategy/               # 多策略管理
 ├── agent/                  # LLM：情绪因子 + RAG 研究 Agent
-├── api/                    # FastAPI 路由（97 端点）
+├── api/                    # FastAPI 路由（98 端点）
 ├── frontend/               # Vue 3 仪表盘（35 组件）
 ├── reporting/              # 报告：文本/图表/自包含 HTML
 ├── operations/             # 基金运营：NAV / 投资者门户

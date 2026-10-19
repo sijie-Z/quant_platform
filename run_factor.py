@@ -61,7 +61,7 @@ FACTORS["reversal"] = {
 
 def _factor_momentum_12m(prices, rets):
     """12-month momentum skipping the most recent month."""
-    return (1 + rets).rolling(252).apply(lambda x: x.prod() - 1).shift(-21)
+    return (1 + rets).rolling(252).apply(lambda x: x.prod() - 1).shift(21)
 
 FACTORS["momentum_12m"] = {
     "name": "momentum_12m",
@@ -101,7 +101,7 @@ def _factor_roe(prices, rets):
     Uses the inverse of cumulative return as value proxy — high past return
     means expensive, low past return means cheap (value play).
     """
-    return -rets.rolling(252).apply(lambda x: (1 + x).prod() - 1).shift(-21)
+    return -rets.rolling(252).apply(lambda x: (1 + x).prod() - 1).shift(21)
 
 FACTORS["roe_proxy"] = {
     "name": "roe_proxy",

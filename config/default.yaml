@@ -56,8 +56,9 @@ factors:
 
 # --- Alpha Model ---
 alpha:
-  method: "icir_weighted"  # equal_weight, ic_weighted, icir_weighted
-  # Ablation #001: Top 8 vs All 26 差距 1.24 Sharpe -> 等权融合所有因子会显著稀释 Alpha
+  method: "equal_weight"  # equal_weight (default, no full-sample weight fitting), ic_weighted, icir_weighted
+  # Ablation #001 found ICIR weighting over all 26 factors diluted alpha; the
+  # research baseline therefore uses equal weights and treats ICIR as opt-in.
   lookback: 252            # Days for IC/ICIR estimation
   min_icir: 0.0            # Minimum ICIR to include factor
   tradability_gate: false  # Per-stock profile-based signal filtering

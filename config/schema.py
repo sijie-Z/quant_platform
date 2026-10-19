@@ -40,7 +40,7 @@ class FactorProcessingConfig:
 
 @dataclass
 class AlphaConfig:
-    method: str = "icir_weighted"
+    method: str = "equal_weight"
     lookback: int = 252
     min_icir: float = 0.0
     tradability_gate: bool = False

@@ -325,11 +325,16 @@ def run_rq3(cs, prices, returns, benchmark, sector_map, label=""):
                 btr = bt.get("daily_returns", pd.Series(dtype=float))
                 regime_bt = btr[btr.index.isin(regime_dates)]
                 if len(regime_bt) >= 5:
-                    rm = all_metrics(regime_bt, returns)
+                    bench = bt.get("benchmark_returns")
+                    rm = all_metrics(
+                        regime_bt,
+                        bench if isinstance(bench, pd.Series) else None,
+                    )
                     sharpe = rm.get("sharpe_ratio", 0)
                 else:
                     sharpe = 0
-            except Exception:
+            except Exception as exc:
+                logger.warning("Regime metrics failed: %s", exc)
                 sharpe = 0
             pct = len(common_dates) / total_days * 100
             regime_records.append({"Cluster": sn, "Regime": regime_name, "IC": ic_s.get("mean_ic", 0),
