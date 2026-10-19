@@ -85,6 +85,7 @@ class SyntheticDataProvider(DataProvider):
         self._dates: pd.DatetimeIndex | None = None
         self._assets: list[str] | None = None
         self._sector_map: dict[str, str] | None = None
+        self._industry_changes_cache: pd.DataFrame | None = None
 
     # ------------------------------------------------------------------
     # Public interface (DataProvider contract)
@@ -683,6 +684,16 @@ class SyntheticDataProvider(DataProvider):
         Returns:
             DataFrame with columns: asset, industry, effective_date
         """
+        if self._industry_changes_cache is not None:
+            return self._industry_changes_cache.copy()
+        if self._sector_map is None:
+            self._generate_all()
+
+        # A dedicated RNG: industry changes must not depend on how many times
+        # this method is called or on other draws from the shared generator,
+        # otherwise two `DataPipeline.run()` calls on the same provider saw
+        # different classifications (and different PIT neutralization).
+        rng = np.random.default_rng(self.seed + 101)
         records = []
         all_dates = pd.DatetimeIndex(self._dates)
         # Industry changes happen at semi-annual boundaries
@@ -699,8 +710,8 @@ class SyntheticDataProvider(DataProvider):
 
             # ~5% chance of reclassification per semi-annual period
             for change_date in semi_annual:
-                if self.rng.random() < 0.05:
-                    new_industry = self.rng.choice(
+                if rng.random() < 0.05:
+                    new_industry = rng.choice(
                         [s for s in SECTORS if s != current_industry]
                     )
                     records.append({
@@ -710,4 +721,6 @@ class SyntheticDataProvider(DataProvider):
                     })
                     current_industry = new_industry
 
-        return pd.DataFrame(records)
+        frame = pd.DataFrame(records)
+        self._industry_changes_cache = frame
+        return frame.copy()

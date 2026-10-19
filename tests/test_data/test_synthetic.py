@@ -180,3 +180,17 @@ class TestReportsPublishedOnNonTradingDays:
         visible = pd.to_datetime(reports["date"])
         published = pd.to_datetime(reports["publish_date"])
         assert (visible >= published).all()
+
+
+def test_industry_changes_are_stable_across_calls_and_instances():
+    """`get_industry_changes()` used the shared RNG, so each call (and each
+    pipeline run) produced a different classification history."""
+    kwargs = dict(n_stocks=30, start_date="2023-01-01", end_date="2024-12-31", seed=5)
+
+    first = SyntheticDataProvider(**kwargs).get_industry_changes()
+    provider = SyntheticDataProvider(**kwargs)
+    again = provider.get_industry_changes()
+    twice = provider.get_industry_changes()
+
+    pd.testing.assert_frame_equal(first, again)
+    pd.testing.assert_frame_equal(again, twice)
