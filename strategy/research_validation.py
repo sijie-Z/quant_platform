@@ -379,7 +379,11 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            from quant_platform.factors.evaluation import ic_summary, rank_ic
+            from quant_platform.factors.evaluation import (
+                ic_summary,
+                pearson_ic,
+                rank_ic,
+            )
             from quant_platform.factors.processing import process_factor
             from quant_platform.factors.registry import get_registry
 
@@ -423,11 +427,28 @@ class ResearchValidator:
                 try:
                     ic = rank_ic(factor, returns)
                     summary = ic_summary(ic)
+                    # `ic_summary` only sees the IC series; pearson IC and
+                    # coverage need the factor panel. The old code read keys
+                    # ic_summary never returns, so every saved evaluation row
+                    # carried pearson_ic=0 and coverage=0.
+                    try:
+                        p_ic = pearson_ic(factor, returns)
+                        pearson_mean = (
+                            float(p_ic.mean()) if len(p_ic) else 0.0
+                        )
+                    except Exception:
+                        pearson_mean = 0.0
+                    coverage = (
+                        float(factor.notna().mean().mean())
+                        if factor.size else 0.0
+                    )
                     ic_results[name] = {
                         "mean_ic": summary["mean_ic"],
+                        "std_ic": summary.get("std_ic", 0.0),
                         "icir": summary["icir"],
-                        "pearson_ic": summary.get("pearson_ic", 0),
-                        "coverage": summary.get("coverage", 0),
+                        "pearson_ic": pearson_mean,
+                        "coverage": coverage,
+                        "n_assets": int(factor.notna().any().sum()),
                     }
                 except Exception as e:
                     step.warnings.append(f"IC evaluation failed for {name}: {e}")
@@ -465,6 +486,12 @@ class ResearchValidator:
                 ic_results.items(), key=lambda x: abs(x[1].get("icir", 0)), reverse=True
             )
             top_factors = [f[0] for f in sorted_factors[:min(2, len(sorted_factors))]]
+            if top_factors:
+                step.warnings.append(
+                    "walk-forward factors were selected by full-sample ICIR "
+                    f"({', '.join(top_factors)}); their OOS metrics are "
+                    "selection-biased"
+                )
 
             if not top_factors:
                 step.status = "skipped"
@@ -523,20 +550,47 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            from quant_platform.factors.store import FactorEvalRecord, FactorResearchStore
+            from quant_platform.factors.store import (
+                FactorEvalRecord,
+                FactorResearchStore,
+                FactorStabilityRecord,
+            )
 
             store = FactorResearchStore()
             saved = 0
+            run_id = f"research_validation_{self.end_date}"
             for fname, summary in ic_results.items():
+                mean_ic = summary.get("mean_ic", 0) or 0
+                std_ic = summary.get("std_ic", 0) or 0
+                icir = summary.get("icir", 0) or 0
+                coverage = summary.get("coverage", 0) or 0
+
                 store.save_evaluation(FactorEvalRecord(
                     factor_name=fname,
                     signal_date=self.end_date,
-                    rank_ic=summary.get("mean_ic", 0),
+                    rank_ic=mean_ic,
                     pearson_ic=summary.get("pearson_ic", 0),
-                    icir=summary.get("icir", 0),
-                    coverage=summary.get("coverage", 0),
-                    n_assets=0,
-                    run_id=f"research_validation_{self.end_date}",
+                    icir=icir,
+                    coverage=coverage,
+                    n_assets=summary.get("n_assets", 0),
+                    run_id=run_id,
+                ))
+                # Ranking reads `factor_stability_history`; nothing ever
+                # wrote it, so `_step_factor_ranking` always returned [].
+                # Walk-forward Sharpe statistics are not known at this point
+                # and stay 0; ICIR and coverage are real.
+                store.save_stability(FactorStabilityRecord(
+                    factor_name=fname,
+                    ic_mean=mean_ic,
+                    ic_std=std_ic,
+                    icir=icir,
+                    sharpe_mean=0.0,
+                    sharpe_std=0.0,
+                    sharpe_consistency=0.0,
+                    positive_folds=0,
+                    total_folds=0,
+                    coverage=coverage,
+                    run_id=run_id,
                 ))
                 saved += 1
 

@@ -168,10 +168,13 @@ def quantile_returns(
         if len(common) < n_quantiles * 5:
             continue
 
-        # Assign quantile labels (Q1 = highest factor, Q5 = lowest)
+        # Assign quantile labels (Q1 = highest factor, Q5 = lowest).
+        # `pd.qcut(..., labels=False)` numbers the lowest values 0, so the
+        # labels have to be reversed to match the documented orientation.
         labels = pd.qcut(f[common], n_quantiles, labels=False, duplicates="drop")
         if labels.nunique() < n_quantiles:
             continue
+        labels = n_quantiles - 1 - labels
 
         dates_list.append(date)
         for qi in range(n_quantiles):

@@ -554,7 +554,9 @@ class LiveTradingEngine:
             self._bus.publish("risk.kill_switch", {"active": True}, source="risk")
             self._audit.log_risk_breach("kill_switch", {"active": True}, severity="critical")
 
-        for sig in signals:
+        for sig in sorted(
+            signals, key=lambda s: 0 if s.side == OrderSide.SELL else 1,
+        ):
             order = self._signal_to_order(sig, total_equity)
             if not order:
                 continue

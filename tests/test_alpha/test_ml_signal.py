@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 from quant_platform.alpha.ml_signal import (
     HAS_LGB,
+    HAS_SHAP,
     HAS_XGB,
     MLSignalConfig,
     MLSignalGenerator,
@@ -439,3 +440,19 @@ class TestPredictReturnsOnlyOutOfSampleSignals:
 
         with pytest.raises(RuntimeError):
             gen.predict(sample_factors)
+
+
+@pytest.mark.skipif(not (HAS_LGB and HAS_SHAP), reason="lightgbm/shap not installed")
+def test_shap_values_do_not_require_forward_returns(
+    sample_factors, sample_forward_returns,
+):
+    """`get_shap_values` passed an empty forward-returns frame to
+    `_prepare_dataset`, so it always answered {"error": "no data"}."""
+    gen = MLSignalGenerator(config=MLSignalConfig(model_type="lightgbm", n_splits=2))
+    gen.train(sample_factors, sample_forward_returns)
+
+    result = gen.get_shap_values(sample_factors, n_samples=50)
+
+    assert "error" not in result, result
+    assert result["mean_abs_shap"]
+    assert set(result["feature_names"]) <= set(sample_factors)

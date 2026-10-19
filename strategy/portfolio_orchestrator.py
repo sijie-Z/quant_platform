@@ -75,6 +75,7 @@ class PortfolioOrchestrator:
         self._last_prices: dict[str, float] = {}
         self._cash_locked: float = 0.0  # Cash reserved for pending buys
         self._date: str = ""
+        self._day_start_equity: float | None = None
 
     @property
     def cash_available(self) -> float:
@@ -163,6 +164,8 @@ class PortfolioOrchestrator:
         """
         orders_created = []
 
+        self._update_risk_monitor()
+
         for strategy_id, targets in self._targets.items():
             # Only this strategy's own holdings, not the shared book.
             current_positions = {
@@ -173,8 +176,14 @@ class PortfolioOrchestrator:
 
             # Determine buys and sells
             all_tickers = set(targets.keys()) | set(current_positions.keys())
+            # Sells first: the cash and exposure they free is what funds the
+            # buys in the same rebalance.
+            ordered_tickers = sorted(
+                all_tickers,
+                key=lambda t: 0 if targets.get(t, 0) < current_positions.get(t, 0) else 1,
+            )
 
-            for ticker in sorted(all_tickers):
+            for ticker in ordered_tickers:
                 target_qty = targets.get(ticker, 0)
                 current_qty = current_positions.get(ticker, 0)
 
@@ -216,6 +225,13 @@ class PortfolioOrchestrator:
                             continue
                     self.exec_engine.submit_order(order)
                     self._cash_locked += order.quantity * price
+                    if hasattr(self.risk_monitor, "project_order"):
+                        self.risk_monitor.project_order({
+                            "ticker": ticker,
+                            "side": "buy",
+                            "quantity": order.quantity,
+                            "price": price,
+                        })
 
                     orders_created.append({
                         "order_id": order.order_id,
@@ -237,6 +253,13 @@ class PortfolioOrchestrator:
                         strategy=strategy_id,
                     )
                     self.exec_engine.submit_order(order)
+                    if hasattr(self.risk_monitor, "project_order"):
+                        self.risk_monitor.project_order({
+                            "ticker": ticker,
+                            "side": "sell",
+                            "quantity": order.quantity,
+                            "price": self._last_prices.get(ticker, 0.0),
+                        })
 
                     orders_created.append({
                         "order_id": order.order_id,
@@ -376,6 +399,46 @@ class PortfolioOrchestrator:
             self.multi_strategy.update_strategy_pnl(
                 sid, (total_pnl - previous) / state.capital_allocated,
             )
+
+    def _update_risk_monitor(self) -> None:
+        """Feed the shared risk monitor the consolidated book.
+
+        The orchestrator accepted a `risk_monitor` but never called
+        `update_portfolio_state`, so position, sector, daily-loss and
+        drawdown checks ran against a zero-value, empty book.
+        """
+        if self.risk_monitor is None or not hasattr(
+            self.risk_monitor, "update_portfolio_state"
+        ):
+            return
+
+        positions_value = sum(p.market_value for p in self.exec_engine.positions)
+        equity = self.cash_available + positions_value
+        if equity <= 0:
+            return
+        if self._day_start_equity is None:
+            self._day_start_equity = equity
+
+        state = {}
+        sector_weights: dict[str, float] = {}
+        for pos in self.exec_engine.positions:
+            if pos.quantity <= 0:
+                continue
+            weight = pos.market_value / equity
+            sector = getattr(pos, "sector", "") or "Unknown"
+            state[pos.ticker] = {
+                "value": pos.market_value,
+                "weight": weight,
+                "sector": sector,
+            }
+            sector_weights[sector] = sector_weights.get(sector, 0.0) + weight
+
+        self.risk_monitor.update_portfolio_state(
+            portfolio_value=equity,
+            daily_pnl=equity - self._day_start_equity,
+            positions=state,
+            sector_weights=sector_weights,
+        )
 
     # ------------------------------------------------------------------
     # Position inquiry

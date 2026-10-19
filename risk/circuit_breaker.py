@@ -68,9 +68,10 @@ class RiskLimits:
     max_drawdown_pct: float = 0.15               # 15% max drawdown from peak
     kill_drawdown_pct: float = 0.25              # 25% kill switch
 
-    # Order rate
+    # Order rate. A rebalance legitimately submits the whole basket in one
+    # burst, so the per-second cap must not be below the per-minute budget.
     max_orders_per_minute: int = 50
-    max_orders_per_second: int = 10
+    max_orders_per_second: int = 50
 
     # Leverage
     max_gross_exposure: float = 1.0              # No leverage (1.0 = 100%)
@@ -185,7 +186,10 @@ class RiskMonitor:
         if sector_breach:
             breaches.append(sector_breach)
 
-        # 4. Daily loss check. A sell that reduces exposure is how the book
+        # 4. Position-count and gross/net exposure limits
+        breaches.extend(self._check_exposure_limits(order))
+
+        # 5. Daily loss check. A sell that reduces exposure is how the book
         # recovers from a breach; blocking it turns a bad day into a trap.
         loss_breach = self._check_daily_loss()
         if loss_breach:
@@ -193,7 +197,7 @@ class RiskMonitor:
                 loss_breach.auto_action = "warn"
             breaches.append(loss_breach)
 
-        # 5. Drawdown check
+        # 6. Drawdown check
         dd_breach = self._check_drawdown()
         if dd_breach:
             if is_reducing:
@@ -232,6 +236,20 @@ class RiskMonitor:
         # Clean old timestamps
         self.order_timestamps = [t for t in self.order_timestamps if now - t < 60]
 
+        recent_second = [t for t in self.order_timestamps if now - t < 1.0]
+        if len(recent_second) > self.limits.max_orders_per_second:
+            return RiskBreach(
+                breach_type=BreachType.ORDER_RATE,
+                severity=RiskLevel.ORANGE,
+                message=(
+                    f"Order rate {len(recent_second)}/s exceeds limit "
+                    f"{self.limits.max_orders_per_second}"
+                ),
+                current_value=len(recent_second),
+                limit_value=self.limits.max_orders_per_second,
+                auto_action="block",
+            )
+
         if len(self.order_timestamps) > self.limits.max_orders_per_minute:
             return RiskBreach(
                 breach_type=BreachType.ORDER_RATE,
@@ -242,6 +260,76 @@ class RiskMonitor:
                 auto_action="block",
             )
         return None
+
+    def _check_exposure_limits(self, order: dict) -> list[RiskBreach]:
+        """Check position count and gross/net exposure.
+
+        `RiskLimits` declared `max_total_positions`, `max_gross_exposure`
+        and `max_net_exposure`, but no check read them.
+        """
+        breaches: list[RiskBreach] = []
+        if self.portfolio_value <= 0:
+            return breaches
+
+        ticker = str(order.get("ticker", ""))
+        side = str(order.get("side", "buy")).lower()
+        price = float(order.get("price", 0) or 0)
+        quantity = float(order.get("quantity", 0) or 0)
+        delta = price * quantity / self.portfolio_value
+        if side not in ("buy", "b"):
+            delta = -delta
+
+        if side in ("buy", "b") and ticker not in self.positions:
+            n_positions = sum(
+                1 for p in self.positions.values()
+                if float(p.get("value", 0) or 0) > 0
+            )
+            if n_positions >= self.limits.max_total_positions:
+                breaches.append(RiskBreach(
+                    breach_type=BreachType.CONCENTRATION,
+                    severity=RiskLevel.ORANGE,
+                    message=(
+                        f"Position count {n_positions} already at limit "
+                        f"{self.limits.max_total_positions}"
+                    ),
+                    current_value=n_positions,
+                    limit_value=self.limits.max_total_positions,
+                    auto_action="block",
+                ))
+
+        weights = [
+            float(p.get("weight", 0) or 0) for p in self.positions.values()
+        ]
+        gross = sum(abs(w) for w in weights)
+        net = sum(weights)
+        projected_gross = max(0.0, gross + delta)
+        projected_net = net + delta
+
+        if projected_gross > self.limits.max_gross_exposure + 1e-9:
+            breaches.append(RiskBreach(
+                breach_type=BreachType.LEVERAGE,
+                severity=RiskLevel.ORANGE,
+                message=(
+                    f"Gross exposure {projected_gross:.1%} would exceed limit "
+                    f"{self.limits.max_gross_exposure:.0%}"
+                ),
+                current_value=projected_gross,
+                limit_value=self.limits.max_gross_exposure,
+                auto_action="block",
+            ))
+        if abs(projected_net) > self.limits.max_net_exposure + 1e-9:
+            breaches.append(RiskBreach(
+                breach_type=BreachType.LEVERAGE,
+                severity=RiskLevel.ORANGE,
+                message=(
+                    f"Net exposure {projected_net:.1%} would exceed limit "
+                    f"{self.limits.max_net_exposure:.0%}"
+                ),
+                current_value=projected_net,
+                limit_value=self.limits.max_net_exposure,
+                auto_action="block",
+            ))
+        return breaches
 
     def _check_position_limit(self, order: dict) -> RiskBreach | None:
         """Check single position size limit, direction-aware.
@@ -415,23 +503,44 @@ class RiskMonitor:
         book.
         """
         side = str(order.get("side", "buy")).lower()
-        if side not in ("buy", "b") or self.portfolio_value <= 0:
-            return
-        ticker = order.get("ticker") or order.get("symbol") or order.get("code")
-        if not ticker:
+        ticker_value = order.get("ticker") or order.get("symbol") or order.get("code")
+        if not ticker_value:
             return
         price = float(order.get("price", 0) or 0)
         quantity = float(order.get("quantity", 0) or 0)
         notional = price * quantity
-        if notional <= 0:
+        if notional <= 0 or self.portfolio_value <= 0:
+            return
+        ticker = str(ticker_value)
+
+        if side in ("sell", "s"):
+            # Project a reducing order so a sells-first batch frees exposure
+            # before the buys are checked.
+            pos = self.positions.get(ticker)
+            if pos is None:
+                return
+            sector = self._resolve_sector(ticker, order)
+            reduce_value = min(float(pos.get("value", 0.0)), notional)
+            reduce_weight = min(
+                float(pos.get("weight", 0.0)), notional / self.portfolio_value,
+            )
+            pos["value"] = float(pos.get("value", 0.0)) - reduce_value
+            pos["weight"] = float(pos.get("weight", 0.0)) - reduce_weight
+            if sector in self.sector_weights:
+                self.sector_weights[sector] = max(
+                    0.0, self.sector_weights[sector] - reduce_weight,
+                )
             return
 
-        sector = self._resolve_sector(str(ticker), order)
+        if side not in ("buy", "b"):
+            return
+
+        sector = self._resolve_sector(ticker, order)
         weight = notional / self.portfolio_value
-        pos = self.positions.get(str(ticker))
+        pos = self.positions.get(ticker)
         if pos is None:
             pos = {"value": 0.0, "weight": 0.0, "sector": sector}
-            self.positions[str(ticker)] = pos
+            self.positions[ticker] = pos
         pos["value"] = float(pos.get("value", 0.0)) + notional
         pos["weight"] = float(pos.get("weight", 0.0)) + weight
         pos["sector"] = sector

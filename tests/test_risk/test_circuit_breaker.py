@@ -4,6 +4,7 @@ import pytest
 from quant_platform.risk.circuit_breaker import (
     BreachType,
     RiskLevel,
+    RiskLimits,
     RiskMonitor,
 )
 
@@ -280,3 +281,58 @@ class TestPendingOrdersShareTheSectorBudget:
 
         assert monitor._resolve_sector("600519") == "食品饮料"
         assert monitor._resolve_sector("000001") == "Unknown"
+
+
+class TestDeclaredLimitsAreEnforced:
+    """`RiskLimits` declared these limits but no check read them."""
+
+    def test_total_position_count(self):
+        monitor = RiskMonitor(RiskLimits(max_total_positions=3))
+        monitor.update_portfolio_state(
+            portfolio_value=1_000_000, daily_pnl=0,
+            positions={
+                f"S{i}": {"value": 10_000, "weight": 0.01, "sector": "X"}
+                for i in range(3)
+            },
+            sector_weights={"X": 0.03},
+        )
+
+        approved, breaches = monitor.check_pre_trade({
+            "ticker": "NEW", "side": "buy", "quantity": 100, "price": 1.0,
+        })
+
+        assert approved is False
+        assert any(b.breach_type == BreachType.CONCENTRATION for b in breaches)
+
+    def test_gross_exposure(self):
+        monitor = RiskMonitor(RiskLimits(
+            max_gross_exposure=1.0, max_single_position_pct=0.20,
+        ))
+        monitor.update_portfolio_state(
+            portfolio_value=1_000_000, daily_pnl=0,
+            positions={"A": {"value": 950_000, "weight": 0.95, "sector": "X"}},
+            sector_weights={"X": 0.95},
+        )
+
+        approved, breaches = monitor.check_pre_trade({
+            "ticker": "B", "side": "buy", "quantity": 1_000, "price": 100.0,
+        })
+
+        assert approved is False
+        assert any(b.breach_type == BreachType.LEVERAGE for b in breaches)
+
+    def test_per_second_order_rate(self):
+        monitor = RiskMonitor(RiskLimits(
+            max_orders_per_second=2, max_orders_per_minute=1_000,
+        ))
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+
+        approvals = [
+            monitor.check_pre_trade({
+                "ticker": "A", "side": "buy", "quantity": 100, "price": 1.0,
+            })[0]
+            for _ in range(3)
+        ]
+
+        assert approvals[:2] == [True, True]
+        assert approvals[2] is False

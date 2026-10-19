@@ -351,7 +351,7 @@ class MLSignalGenerator:
         forward_returns: pd.DataFrame,
         start_idx: int,
         end_idx: int,
-    ) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    ) -> tuple[np.ndarray, np.ndarray, list[str], pd.Index]:
         """Prepare training dataset from factor cross-sections.
 
         Flattens all dates and assets into a single feature matrix.
@@ -656,12 +656,40 @@ class MLSignalGenerator:
         if self.model is None:
             return {"error": "model not trained"}
 
-        first_factor = list(factors.values())[0]
-        n_dates = len(first_factor.index)
-        X, _, feature_names, _ = self._prepare_dataset(factors, pd.DataFrame(), 0, n_dates)
+        feature_names = (
+            list(self._feature_names)
+            if self._feature_names
+            else sorted(factors.keys())[:self.config.top_n_features]
+        )
+        missing = [name for name in feature_names if name not in factors]
+        if missing:
+            return {"error": f"missing factors: {missing}"}
 
-        if len(X) == 0:
+        first_factor = factors[feature_names[0]]
+        dates = first_factor.index
+        assets = first_factor.columns
+
+        # Feature-only matrix. `_prepare_dataset` needs forward returns and
+        # was called with an empty frame, so it always returned no rows and
+        # this function always answered {"error": "no data"}.
+        rows = []
+        for date in dates:
+            features = []
+            valid_mask = np.ones(len(assets), dtype=bool)
+            for name in feature_names:
+                df = factors[name]
+                row = (
+                    df.loc[date].values
+                    if date in df.index else np.full(len(assets), np.nan)
+                )
+                features.append(row)
+                valid_mask = valid_mask & ~np.isnan(row)
+            if valid_mask.any():
+                rows.append(np.column_stack(features)[valid_mask])
+
+        if not rows:
             return {"error": "no data"}
+        X = np.vstack(rows)
 
         # Subsample for efficiency
         if len(X) > n_samples:

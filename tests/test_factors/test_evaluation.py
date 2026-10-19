@@ -65,6 +65,24 @@ def test_quantile_returns():
             assert f"Q{qi}" in qr.columns
 
 
+def test_q1_is_the_highest_factor_group():
+    """`pd.qcut(labels=False)` numbers the lowest values 0; using it directly
+    labeled the bottom quintile Q1, opposite to the documented convention."""
+    dates = pd.bdate_range("2024-01-02", periods=30)
+    assets = [f"S{i:02d}" for i in range(50)]
+    rank = np.tile(np.arange(50, dtype=float), (30, 1))
+    factor = pd.DataFrame(rank, index=dates, columns=assets)
+    # Forward returns increase with the factor: the top group earns the most.
+    fwd = pd.DataFrame(
+        rank + np.random.default_rng(0).normal(0, 1, rank.shape),
+        index=dates, columns=assets,
+    )
+
+    qr = quantile_returns(factor, fwd, n_quantiles=5)
+
+    assert qr["Q1"].mean() > qr["Q5"].mean()
+
+
 def test_factor_correlation():
     factor, fwd_ret = _make_factor_and_returns()
     factors = {"f1": factor, "f2": factor.shift(1).fillna(0)}

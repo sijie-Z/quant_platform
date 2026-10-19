@@ -299,7 +299,8 @@
 | Registry/门禁 | `is_trusted` 只看 validity，`begin_run` 默认 `status=failed, validity=valid`，失败/未完成的 run 也算可信；验证报告的 `overall` 只看步骤是否崩溃，门禁 FAIL/REJECTED 与跳过的 walk-forward 仍报 `pass` 并退出 0。现在可信要求 `status=success`，overall 由门禁与必需步骤共同决定 |
 | IC 监控 | ICIR 与"IC 为正比例"在 63 日移动平均序列上计算（真实 0.19 被报成 1.34、56% 报成 92%）；现在离散度统计使用原始逐日 IC，平滑序列只用于展示与趋势 |
 | 实盘/API | `POST /api/risk/kill-switch` 不在无 token 时的回环白名单内（docker-compose 默认无 token 且端口公开），远程可解除熔断；`GET /api/risk/status` 会用 OMS 账本覆盖实盘风控状态（下一次引擎周期看到 90% 回撤并触发熔断）；回撤/日亏只在有订单时检查；扇区检查对新股票一律 "Unknown" 且同批订单不累计；熔断后引擎直接跳过周期、从不执行其声称的"flatten"；盘前持仓同步检查从不比较任何东西；6 个交易端点用 `async def` 执行阻塞 RPC。均已修正：`/api/risk` 纳入敏感前缀、GET 不再改状态、组合更新即评估权益熔断、扇区映射与在途订单投影、熔断时卖出可用份额、持仓同步真实比较并在收盘后清理幽灵持仓、阻塞端点改同步、风险概览返回 `available/reason` 而不是 200 + GREEN |
+| 其他 | 分位数收益的 Q1 方向与文档相反（`qcut` 的 0 是最低组）；`factor_stability_history` 从未写入导致因子排名永远为空，且保存的 `pearson_ic/coverage` 恒为 0；SHAP 永远返回 "no data"；`max_total_positions` / `max_gross_exposure` / `max_net_exposure` / `max_orders_per_second` 声明但从未检查；orchestrator 接收了 `risk_monitor` 却从不喂组合状态。均已修复，先卖后买的执行顺序保证同一批调仓的卖出释放敞口 |
 
-验证：全量测试 **1808 passed / 4 skipped / 0 failed**（4m09s），ruff 全绿。
+验证：全量测试 **1813 passed / 4 skipped / 0 failed**（3m10s），ruff 全绿。
 
 已知仍未处理：多租户隔离（#75 产品定位未定）；`framework/contracts/`、`kernel/` 等零导入目录的去留（#70/#77）仍是显式决策项。

@@ -447,7 +447,9 @@ class LiveRunner:
         total_tax = 0.0
         total_slippage = 0.0
 
-        for sig in signals:
+        for sig in sorted(
+            signals, key=lambda s: 0 if s["side"] == "sell" else 1,
+        ):
             result = self._execute_signal(sig)
             if result:
                 orders.append(result)
