@@ -217,7 +217,16 @@ class PaperBroker:
                 exchange = inst.exchange
         latency = self._latency.sample(exchange)
         self._latency_samples.append(latency)
+        if len(self._latency_samples) > 5_000:
+            self._latency_samples = self._latency_samples[-2_500:]
         return latency
+
+    def _record_fill(self, record: FillRecord) -> FillRecord:
+        """Append a fill record, keeping the in-memory list bounded."""
+        self._fill_records.append(record)
+        if len(self._fill_records) > 5_000:
+            self._fill_records = self._fill_records[-2_500:]
+        return record
 
     def _wait_latency(self, symbol: str, actual_wait: bool = False):
         """Simulate network/exchange latency.
@@ -457,7 +466,7 @@ class PaperBroker:
                 requested_qty=qty, filled_qty=0, fill_price=0,
                 latency_ms=latency_ms,
             )
-            self._fill_records.append(record)
+            self._record_fill(record)
             self._metrics.total_orders += 1
             return record
 
@@ -514,7 +523,7 @@ class PaperBroker:
             partial=total_filled < qty and total_filled > 0,
             timestamp_ns=time.time_ns(),
         )
-        self._fill_records.append(record)
+        self._record_fill(record)
         return record
 
     # ── Cancel Order ──
@@ -553,7 +562,7 @@ class PaperBroker:
                 cancel_succeeded=False,
                 timestamp_ns=time.time_ns(),
             )
-            self._fill_records.append(record)
+            self._record_fill(record)
             return record
 
         # Perform cancel
@@ -570,7 +579,7 @@ class PaperBroker:
             cancel_succeeded=True,
             timestamp_ns=time.time_ns(),
         )
-        self._fill_records.append(record)
+        self._record_fill(record)
         return record
 
     # ── Metrics ──

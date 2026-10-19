@@ -33,6 +33,14 @@ router = APIRouter(prefix="/api/monitor")
 
 class RiskOverviewResponse(BaseModel):
     factor_exposures: dict[str, float] = Field(default_factory=dict, description="Barra 10 factor exposures")
+    factor_exposures_available: bool = Field(
+        False,
+        description="Whether factor_exposures contains a real decomposition",
+    )
+    factor_exposures_reason: str = Field(
+        "",
+        description="Why factor exposures are unavailable, when they are",
+    )
     sector_concentration: dict[str, float] = Field(default_factory=dict, description="Top sector weights")
     current_drawdown: float = Field(0.0, description="Current drawdown %")
     volatility: float = Field(0.0, description="Annualized volatility")
@@ -45,6 +53,8 @@ class RiskOverviewResponse(BaseModel):
 
 
 class TCASummaryResponse(BaseModel):
+    available: bool = Field(False, description="Whether the TCA metrics below are populated")
+    reason: str = Field("", description="Why TCA is unavailable, when it is")
     n_orders: int = 0
     mean_is_bps: float = 0.0
     mean_delay_bps: float = 0.0
@@ -58,6 +68,8 @@ class TCASummaryResponse(BaseModel):
 
 
 class FactorStatusResponse(BaseModel):
+    available: bool = Field(False, description="Whether rolling IC data is populated")
+    reason: str = Field("", description="Why factor status is unavailable, when it is")
     factors: list[dict] = Field(default_factory=list, description="Factor IC stats [{name, ic, icir, trend, alert}]")
     rolling_ic: dict[str, list[float]] = Field(default_factory=dict, description="Rolling IC series per factor")
     ic_dates: list[str] = Field(default_factory=list, description="Dates for rolling IC")
@@ -67,6 +79,8 @@ class FactorStatusResponse(BaseModel):
 
 
 class CapacityGaugeResponse(BaseModel):
+    available: bool = Field(False, description="Whether the capacity curve is populated")
+    reason: str = Field("", description="Why capacity is unavailable, when it is")
     current_aum: float = 0.0
     capacity_aum: float = 0.0
     usage_pct: float = 0.0
@@ -145,6 +159,10 @@ def _get_bus():
 async def get_risk_overview():
     """Aggregate risk data: factor exposures, concentration, drawdown, VaR."""
     result = RiskOverviewResponse()
+    result.factor_exposures_reason = (
+        "no Barra decomposition is cached for the live book; "
+        "POST /api/barra/decompose with portfolio weights to compute one"
+    )
 
     # Get risk status from RiskMonitor
     risk = _get_risk()
@@ -202,6 +220,7 @@ async def get_risk_overview():
 async def get_tca_summary():
     """Aggregate TCA data from recent trades."""
     result = TCASummaryResponse()
+    result.reason = "no trades recorded"
 
     store = _get_store()
     if not store:
@@ -221,6 +240,11 @@ async def get_tca_summary():
                 daily.setdefault(date, []).append(t)
 
         result.n_orders = len(trades)
+        result.available = False
+        result.reason = (
+            "stored trades carry no arrival price, so implementation shortfall "
+            "cannot be computed; execution/tca.py needs quote data"
+        )
 
     except Exception as e:
         logger.debug("TCA summary partial: %s", e)
@@ -235,6 +259,10 @@ async def get_tca_summary():
 async def get_factor_status():
     """Factor IC monitoring, attribution, and decay alerts."""
     result = FactorStatusResponse()
+    result.reason = (
+        "no rolling IC series is cached; POST /api/ic-monitor/compute to "
+        "compute factor statistics"
+    )
 
     # Try to get IC monitor data
     try:
@@ -280,6 +308,10 @@ async def get_factor_status():
 async def get_capacity_gauge():
     """Strategy capacity estimation and usage."""
     result = CapacityGaugeResponse()
+    result.reason = (
+        "capacity curve is not precomputed; run the backtest capacity "
+        "analysis to populate aum_curve/capacity_aum"
+    )
 
     store = _get_store()
     if not store:

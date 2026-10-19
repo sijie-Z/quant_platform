@@ -296,6 +296,10 @@ class OrderManager:
             positions=list(self.positions.values()),
         )
         self.snapshots.append(snapshot)
+        # `/api/oms/positions` and `/api/risk/status` call this on every poll;
+        # without a cap the list grew for the life of the process.
+        if len(self.snapshots) > 1_000:
+            self.snapshots = self.snapshots[-500:]
         return snapshot
 
     def get_order_blotter(self, tenant_id: str = "") -> list[dict]:

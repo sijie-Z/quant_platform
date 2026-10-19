@@ -402,3 +402,28 @@ class TestCodeToSector:
         assert _code_to_sector("300001") == "创业板"
         assert _code_to_sector("999999") == "其他"
         assert _code_to_sector("") == "Unknown"
+
+
+class TestUnavailableMetricsAreExplicit:
+    """An uncomputed metric must say so instead of returning zeros."""
+
+    def test_tca_is_marked_unavailable_without_trade_data(self, client):
+        data = client.get("/api/monitor/tca-summary").json()
+        assert data["available"] is False
+        assert data["reason"]
+
+    def test_factor_status_is_marked_unavailable(self, client):
+        data = client.get("/api/monitor/factor-status").json()
+        assert data["available"] is False
+        assert data["reason"]
+
+    def test_capacity_is_marked_unavailable(self, client):
+        data = client.get("/api/monitor/capacity-gauge").json()
+        assert data["available"] is False
+        assert data["reason"]
+
+    def test_risk_overview_explains_empty_factor_exposures(self, client):
+        data = client.get("/api/monitor/risk-overview").json()
+        assert data["factor_exposures"] == {}
+        assert data["factor_exposures_available"] is False
+        assert data["factor_exposures_reason"]

@@ -1494,6 +1494,22 @@ def _get_oms() -> OrderManager:
     return _oms_instance
 
 
+_rt_market_instance = None
+
+
+def _get_rt_market():
+    """Shared RealTimeMarket.
+
+    Each request used to construct a fresh instance, so its 10-second quote
+    cache was always cold and every call triggered a full market scrape.
+    """
+    global _rt_market_instance
+    if _rt_market_instance is None:
+        from quant_platform.trading.realtime import RealTimeMarket
+        _rt_market_instance = RealTimeMarket()
+    return _rt_market_instance
+
+
 @router.post("/oms/order")
 async def create_order(order_req: dict):
     """Create a new order."""
@@ -2505,7 +2521,7 @@ async def trading_start(req: dict):
     # Set default universe: top stocks by market cap
     try:
         from quant_platform.trading.realtime import RealTimeMarket
-        rt = RealTimeMarket()
+        rt = _get_rt_market()
         snapshot = rt.get_market_snapshot()
         # Top N by market cap, filter out ST and new stocks
         snapshot = snapshot[~snapshot['名称'].str.contains('ST|退', na=False)]
@@ -2609,7 +2625,7 @@ def market_snapshot():
     """Get real-time A-share market snapshot."""
     try:
         from quant_platform.trading.realtime import RealTimeMarket
-        rt = RealTimeMarket()
+        rt = _get_rt_market()
         df = rt.get_market_snapshot()
         # Return top 50 by amount for performance
         top = df.nlargest(50, '成交额')
@@ -2624,7 +2640,7 @@ def market_gainers():
     """Get top gainers."""
     try:
         from quant_platform.trading.realtime import RealTimeMarket
-        rt = RealTimeMarket()
+        rt = _get_rt_market()
         df = rt.get_top_gainers(20)
         return {"stocks": df.to_dict('records')}
     except Exception as e:
@@ -2636,7 +2652,7 @@ def market_losers():
     """Get top losers."""
     try:
         from quant_platform.trading.realtime import RealTimeMarket
-        rt = RealTimeMarket()
+        rt = _get_rt_market()
         df = rt.get_top_losers(20)
         return {"stocks": df.to_dict('records')}
     except Exception as e:
@@ -2648,7 +2664,7 @@ def market_sectors():
     """Get sector data."""
     try:
         from quant_platform.trading.realtime import RealTimeMarket
-        rt = RealTimeMarket()
+        rt = _get_rt_market()
         df = rt.get_sector_data()
         records = df.head(30).to_dict('records')
         return {"sectors": records}
