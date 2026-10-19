@@ -407,9 +407,13 @@ class SyntheticDataProvider(DataProvider):
         )
         df = df.set_index(["date", "asset"]).sort_index()
 
-        # Apply suspension: ~2% of stock-days are suspended (NaN prices)
+        # Apply suspension: ~2% of tradable stock-days are suspended (NaN
+        # prices). Only rows that actually have a price are eligible -- marking
+        # a pre-listing NaN row as "suspended" would have no stale close to
+        # forward-fill from.
         n_total = n_dates * n_assets
-        suspended = self.rng.choice(n_total, size=int(n_total * 0.02), replace=False)
+        eligible = np.flatnonzero(df["close"].notna().to_numpy())
+        suspended = self.rng.choice(eligible, size=int(n_total * 0.02), replace=False)
         # We do this via the underlying arrays for efficiency
         flat_idx = np.array(suspended)
         for col in ["open", "high", "low", "close", "volume", "turnover", "vwap"]:
@@ -417,6 +421,13 @@ class SyntheticDataProvider(DataProvider):
 
         # Forward-fill suspension gaps (max 30 days)
         df = df.groupby("asset").ffill(limit=30)
+
+        # Mark the stale rows. Forward-filling keeps the price path realistic,
+        # but downstream return computation must not difference across the
+        # fill: doing so fabricates a zero return followed by a multi-day move
+        # -- a fake reversal signal (issue #58).
+        df["is_suspended"] = False
+        df.iloc[flat_idx, df.columns.get_loc("is_suspended")] = True
 
         return df
 

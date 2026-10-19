@@ -7,6 +7,7 @@ that -- otherwise "which results does this fix invalidate?" can only be
 answered by reading commit messages.
 """
 
+import json
 import sqlite3
 
 import pytest
@@ -88,8 +89,6 @@ class TestMarkValidity:
         store.mark_validity(run_id, "affected", "BUG-03")  # duplicate
         store.mark_validity(run_id, "affected", "BUG-22")
 
-        import json
-
         causes = json.loads(store.get_run(run_id)["affected_by"])
         assert causes == ["BUG-03", "BUG-22"]
 
@@ -125,3 +124,74 @@ class TestListAffected:
         store.mark_validity(two_runs[0]["run_id"], "superseded", "BUG-03")
         store.mark_validity(two_runs[1]["run_id"], "invalidated", "BUG-22")
         assert len(store.list_affected()) == 2
+
+
+class TestPublicReadApi:
+    def test_invalidated_row_is_machine_readable(self, store, two_runs):
+        run_id = two_runs[0]["run_id"]
+        store.mark_validity(run_id, "invalidated", "BUG-03")
+
+        assert store.is_trusted(run_id) is False
+        rows = {r["run_id"]: r for r in store.list_runs()}
+        assert rows[run_id]["validity"] == "invalidated"
+        assert json.loads(rows[run_id]["affected_by"]) == ["BUG-03"]
+        assert [r["run_id"] for r in store.list_runs(validity="invalidated")] == [run_id]
+        assert any(r["run_id"] != run_id for r in store.list_runs(validity="valid"))
+
+    def test_mark_survives_reopen(self, store, two_runs, tmp_path):
+        run_id = two_runs[0]["run_id"]
+        store.mark_validity(run_id, "invalidated", "BUG-03")
+
+        reopened = RunStore(str(tmp_path / "registry.db"))
+        assert reopened.get_run(run_id)["validity"] == "invalidated"
+
+
+class TestSnapshotBridge:
+    def test_export_import_round_trip(self, store, two_runs, tmp_path):
+        run_id = two_runs[0]["run_id"]
+        store.mark_validity(run_id, "affected", "BUG-03")
+        snapshot = tmp_path / "registry.json"
+        assert store.export_runs(str(snapshot)) == 2
+
+        other = RunStore(str(tmp_path / "other.db"))
+        assert other.import_runs(str(snapshot)) == 2
+        row = other.get_run(run_id)
+        assert row["validity"] == "affected"
+        assert json.loads(row["affected_by"]) == ["BUG-03"]
+
+    def test_import_does_not_overwrite_local_marks(self, store, two_runs, tmp_path):
+        run_id = two_runs[0]["run_id"]
+        store.mark_validity(run_id, "invalidated", "BUG-03")
+        snapshot = tmp_path / "registry.json"
+        store.export_runs(str(snapshot))
+
+        # A stale snapshot says "valid"; importing it must not undo the mark.
+        payload = json.loads(snapshot.read_text(encoding="utf-8"))
+        for row in payload:
+            row["validity"] = "valid"
+            row["affected_by"] = []
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert store.import_runs(str(snapshot)) == 0
+        assert store.get_run(run_id)["validity"] == "invalidated"
+
+    def test_cli_import_and_mark(self, store, two_runs, tmp_path):
+        from types import SimpleNamespace
+
+        from quant_platform.main import cmd_runs
+
+        snapshot = tmp_path / "registry.json"
+        store.export_runs(str(snapshot))
+        target_db = str(tmp_path / "cli.db")
+
+        assert cmd_runs(SimpleNamespace(
+            db=target_db, subcommand="import", path=str(snapshot),
+        )) == 0
+
+        run_id = two_runs[0]["run_id"]
+        assert cmd_runs(SimpleNamespace(
+            db=target_db, subcommand="mark", run_id=run_id,
+            state="invalidated", reason="BUG-03",
+        )) == 0
+
+        assert RunStore(target_db).get_run(run_id)["validity"] == "invalidated"

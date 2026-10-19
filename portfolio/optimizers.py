@@ -17,11 +17,62 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _limit_turnover(
+    weights: pd.Series,
+    prev_weights: pd.Series | None,
+    max_turnover: float,
+    universe: pd.Index | None = None,
+) -> pd.Series:
+    """Blend a target portfolio toward the previous one until turnover fits.
+
+    Turnover is measured over the *union* of both indices with zero fill, so
+    names entering or leaving the portfolio count. The old implementation
+    aligned on the intersection, which understated exactly the component an
+    equal-weight fallback creates, and then renormalized after blending --
+    which could push turnover straight back over the cap.
+    """
+    if prev_weights is None or max_turnover >= 1.0:
+        return weights
+
+    index = weights.index.union(prev_weights.index)
+    current = weights.reindex(index, fill_value=0.0)
+    previous = prev_weights.reindex(index, fill_value=0.0)
+    turnover = float((current - previous).abs().sum() / 2)
+    if turnover <= max_turnover:
+        return weights
+
+    scale = max_turnover / turnover
+    blended = previous + scale * (current - previous)
+    if universe is not None:
+        blended = blended.reindex(universe, fill_value=0.0)
+    return blended
+
+
 class PortfolioOptimizer(ABC):
     """Abstract portfolio optimizer."""
 
     def __init__(self, constraints: PortfolioConstraints):
         self.constraints = constraints
+        # Fallback accounting: a silent switch to equal weight changes what
+        # the backtest actually held, so the engine must be able to report it.
+        self.fallback_count = 0
+        self.last_fallback_reason: str | None = None
+
+    def _equal_weight_fallback(
+        self,
+        signal: pd.Series,
+        cov_matrix: pd.DataFrame | None,
+        prices: pd.Series | None,
+        prev_weights: pd.Series | None,
+        sector_map: pd.Series | None,
+        reason: str,
+    ) -> pd.Series:
+        self.fallback_count += 1
+        self.last_fallback_reason = reason
+        logger.warning("Optimizer fallback to equal weight: %s", reason)
+        return EqualWeightOptimizer(self.constraints).optimize(
+            signal, cov_matrix, prices, prev_weights, sector_map,
+        )
 
     @abstractmethod
     def optimize(
@@ -90,22 +141,16 @@ class EqualWeightOptimizer(PortfolioOptimizer):
                         scale = self.constraints.max_sector_exposure / sector_weight
                         weights[sector_assets] *= scale
 
-        # Normalize
+        # Normalize DOWN only. Scaling up used to push single names back above
+        # max_weight and sectors back above their cap whenever the candidate
+        # set was too narrow; a total below 1 is simply cash.
         total = weights.sum()
-        if total > 0:
+        if total > 1.0:
             weights = weights / total
-        else:
-            weights[:] = 0.0
 
-        # Turnover constraint
-        if prev_weights is not None and self.constraints.max_turnover < 1.0:
-            turnover = (weights - prev_weights).abs().sum() / 2
-            if turnover > self.constraints.max_turnover:
-                scale = self.constraints.max_turnover / turnover
-                weights = prev_weights + scale * (weights - prev_weights)
-                weights = weights / weights.sum()
-
-        return weights
+        return _limit_turnover(
+            weights, prev_weights, self.constraints.max_turnover, signal.index,
+        )
 
 
 class MeanVarianceOptimizer(PortfolioOptimizer):
@@ -125,7 +170,13 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
     ) -> pd.Series:
         import math
 
-        import cvxpy as cp
+        try:
+            import cvxpy as cp
+        except ImportError:
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                "cvxpy is not installed",
+            )
         # Pre-filter: only optimize top-N stocks by signal for numerical stability
         # Must select enough to satisfy sum(w) == 1 with max_weight cap
         min_needed = int(math.ceil(1.0 / max(self.constraints.max_weight, 0.01)))
@@ -139,14 +190,19 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
             top_assets = top_assets.intersection(cov_matrix.index)
 
         if len(top_assets) < 2:
-            return EqualWeightOptimizer(self.constraints).optimize(
-                signal, cov_matrix, prices, prev_weights, sector_map
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                "fewer than two optimizable assets",
             )
 
         assets = top_assets.sort_values()
         n = len(assets)
 
-        alpha_vec = signal[assets].values
+        # A single inf signal makes the QP unbounded and drives both solvers
+        # into the fallback path; treat non-finite alpha as neutral instead.
+        alpha_vec = np.nan_to_num(
+            signal[assets].values, nan=0.0, posinf=0.0, neginf=0.0,
+        )
         if cov_matrix is not None:
             cov = cov_matrix.loc[assets, assets].values
         else:
@@ -174,11 +230,18 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
                 if mask.sum() > 0:
                     constraints_list.append(mask @ w <= self.constraints.max_sector_exposure)
 
-        # Turnover constraint
+        # Turnover constraint. Holdings dropped from the top-N candidate set
+        # are still sold, so their weight belongs on the left-hand side too;
+        # reindexing previous weights onto `assets` alone understated it.
         if prev_weights is not None and self.constraints.max_turnover < 1.0:
             prev_w = prev_weights.reindex(assets, fill_value=0.0).values
+            dropped = float(
+                prev_weights.reindex(
+                    prev_weights.index.difference(assets)
+                ).abs().sum()
+            )
             constraints_list.append(
-                cp.sum(cp.abs(w - prev_w)) <= 2 * self.constraints.max_turnover
+                cp.sum(cp.abs(w - prev_w)) + dropped <= 2 * self.constraints.max_turnover
             )
 
         solved = False
@@ -188,7 +251,12 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
             try:
                 problem = cp.Problem(objective, constraints_list)
                 problem.solve(solver=solver, verbose=False)
-                if w.value is not None:
+                solution = w.value
+                if (
+                    problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                    and solution is not None
+                    and np.all(np.isfinite(solution))
+                ):
                     solved = True
                     used_solver = str(solver)
                     break
@@ -198,10 +266,9 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
 
         if not solved:
             status = problem.status if problem is not None else "N/A"
-            logger.warning("MVO FAILED — fallback to equal weight (solver=%s, n=%d, status=%s)",
-                           used_solver, n, status)
-            return EqualWeightOptimizer(self.constraints).optimize(
-                signal, cov_matrix, prices, prev_weights, sector_map
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                f"MVO solver failed (solver={used_solver}, n={n}, status={status})",
             )
 
         logger.info("MVO SUCCESS: solver=%s n=%d status=%s w_min=%.4f w_max=%.4f",
@@ -210,10 +277,12 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
         weights = pd.Series(w.value, index=assets)
         weights = weights.clip(lower=0)
         total = weights.sum()
-        if total > 1e-10:
-            weights = weights / total
-        else:
-            weights = pd.Series(0.0, index=signal.index)
+        if total <= 1e-10:
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                "MVO returned an all-zero portfolio",
+            )
+        weights = weights / total
 
         # Volatility targeting: scale weights down if portfolio vol exceeds target
         if self.constraints.target_volatility > 0 and cov_matrix is not None:
@@ -223,7 +292,13 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
                 weights = weights * scale
                 # sum(weights) < 1 means remaining weight is cash (0% return)
 
-        return weights.reindex(signal.index, fill_value=0.0)
+        weights = weights.reindex(signal.index, fill_value=0.0)
+
+        # The target-level turnover cap is a hard constraint, so it is applied
+        # last (the solver's version is approximate).
+        return _limit_turnover(
+            weights, prev_weights, self.constraints.max_turnover, signal.index,
+        )
 
 
 class RiskParityOptimizer(PortfolioOptimizer):
@@ -244,8 +319,9 @@ class RiskParityOptimizer(PortfolioOptimizer):
         import cvxpy as cp
 
         if cov_matrix is None:
-            return EqualWeightOptimizer(self.constraints).optimize(
-                signal, cov_matrix, prices, prev_weights, sector_map
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                "risk parity needs a covariance matrix",
             )
 
         # Use top assets by signal to narrow universe
@@ -255,8 +331,9 @@ class RiskParityOptimizer(PortfolioOptimizer):
         selected = selected.sort_values()
 
         if len(selected) < 2:
-            return EqualWeightOptimizer(self.constraints).optimize(
-                signal, None, prices, prev_weights, sector_map
+            return self._equal_weight_fallback(
+                signal, None, prices, prev_weights, sector_map,
+                "fewer than two optimizable assets",
             )
 
         cov = cov_matrix.loc[selected, selected].values
@@ -282,20 +359,31 @@ class RiskParityOptimizer(PortfolioOptimizer):
         try:
             problem = cp.Problem(objective, constraints_list)
             problem.solve(solver=cp.ECOS, verbose=False)
-        except Exception:
-            return EqualWeightOptimizer(self.constraints).optimize(
-                signal, cov_matrix, prices, prev_weights, sector_map
+        except Exception as exc:
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                f"risk parity solver failed: {exc}",
             )
 
-        if w.value is None:
-            return EqualWeightOptimizer(self.constraints).optimize(
-                signal, cov_matrix, prices, prev_weights, sector_map
+        if w.value is None or not np.all(np.isfinite(w.value)):
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                "risk parity solver returned no finite solution",
             )
 
         weights = pd.Series(w.value, index=selected)
         weights = weights.clip(lower=0)
-        weights = weights / weights.sum()
-        return weights.reindex(signal.index, fill_value=0.0)
+        total = weights.sum()
+        if total <= 1e-10:
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                "risk parity returned an all-zero portfolio",
+            )
+        weights = weights / total
+        weights = weights.reindex(signal.index, fill_value=0.0)
+        return _limit_turnover(
+            weights, prev_weights, self.constraints.max_turnover, signal.index,
+        )
 
 
 def _ensure_psd(cov: np.ndarray) -> np.ndarray:

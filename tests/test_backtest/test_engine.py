@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 from quant_platform.backtest.cost_model import CostModel
 from quant_platform.backtest.engine import BacktestEngine
+from quant_platform.portfolio.constraints import PortfolioConstraints
 
 
 class TestRebalanceDates:
@@ -50,6 +51,67 @@ class TestSimulatePnl:
         # The recorded turnover stays one-sided: it is a metric, not the base
         # the cost model is fed.
         assert engine.turnover_history.iloc[0] == pytest.approx(0.5)
+
+    def test_execution_clamps_turnover_to_the_configured_cap(self):
+        dates = pd.date_range("2024-01-01", periods=5, freq="D")
+        returns = pd.DataFrame(0.0, index=dates, columns=["A", "B"])
+        engine = BacktestEngine(
+            rebalance_frequency="monthly",
+            constraints=PortfolioConstraints(max_turnover=0.30),
+        )
+        # First rebalance deploys from cash (exempt from the cap); the second
+        # swaps half the portfolio, which must be clamped to 30%.
+        engine.weights_history = {
+            dates[1]: pd.Series({"A": 0.5, "B": 0.5}),
+            dates[3]: pd.Series({"A": 1.0, "B": 0.0}),
+        }
+
+        engine._simulate_pnl(returns)
+
+        assert engine.turnover_history is not None
+        assert engine.turnover_history.iloc[0] == pytest.approx(0.5)
+        assert engine.turnover_history.iloc[-1] == pytest.approx(0.30)
+
+
+class TestSummaryReportsOptimizerFallbacks:
+    def test_fallback_count_and_effective_optimizer_are_exposed(self):
+        rng = np.random.default_rng(3)
+        dates = pd.bdate_range("2023-01-02", periods=120)
+        assets = [f"S{i:02d}" for i in range(30)]
+        prices = pd.DataFrame(
+            100 * np.exp(np.cumsum(rng.normal(0, 0.01, (120, 30)), axis=0)),
+            index=dates, columns=assets,
+        )
+        returns = prices.pct_change(fill_method=None).shift(-1)
+        signal = pd.DataFrame(
+            rng.normal(size=(120, 30)), index=dates, columns=assets,
+        )
+        sector_map = pd.Series("Tech", index=assets)
+
+        class FallbackOptimizer:
+            fallback_count = 0
+            last_fallback_reason = None
+
+            def optimize(self, signal=None, **_kwargs):
+                self.fallback_count += 1
+                self.last_fallback_reason = "stub infeasible"
+                return pd.Series(1.0 / len(signal), index=signal.index)
+
+        engine = BacktestEngine(rebalance_frequency="monthly")
+        stub = FallbackOptimizer()
+        engine._get_optimizer = lambda: stub
+
+        result = engine.run(
+            signal=signal, prices=prices, returns=returns,
+            benchmark_returns=None, sector_map=sector_map,
+        )
+        summary = result["summary"]
+
+        assert summary["n_rebalances"] > 0
+        assert summary["n_optimizer_fallbacks"] == summary["n_rebalances"]
+        assert summary["optimizer_fallback_rate"] == pytest.approx(1.0)
+        assert summary["effective_optimizer"].endswith("+equal_weight_fallback")
+        assert len(engine.optimizer_outcomes) == summary["n_rebalances"]
 
 
 class TestCovarianceWindowSeesNoFuture:
