@@ -246,3 +246,17 @@ class TestLiveRunnerState:
         s = runner.get_state()
         assert s["cycles"] == 3
         assert s["universe_size"] == 1
+
+
+@pytest.fixture(autouse=True)
+def _fresh_risk_monitor(monkeypatch):
+    """Isolate the order-rate window between test modules.
+
+    LiveRunner shares the process-wide RiskMonitor in production so the
+    dashboard kill switch reaches it; in tests a module that places >50
+    orders in one second must not block the next module's first orders.
+    """
+    import quant_platform.trading.live_runner as live_runner_mod
+    from quant_platform.risk.circuit_breaker import RiskMonitor
+
+    monkeypatch.setattr(live_runner_mod, "get_risk_monitor", lambda: RiskMonitor())

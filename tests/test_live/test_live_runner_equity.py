@@ -118,3 +118,13 @@ class TestRebalanceDoesNotReBuy:
             assert weight < 0.10, (
                 f"{pos.code} is {weight:.1%} of the book; the target is 4%"
             )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_risk_monitor(monkeypatch):
+    """See tests/test_trading/test_live_runner.py: per-module isolation of
+    the shared monitor's order-rate window."""
+    import quant_platform.trading.live_runner as live_runner_mod
+    from quant_platform.risk.circuit_breaker import RiskMonitor
+
+    monkeypatch.setattr(live_runner_mod, "get_risk_monitor", lambda: RiskMonitor())

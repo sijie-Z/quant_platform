@@ -355,8 +355,11 @@ def _execute_pipeline(run_id: str, req: RunRequest):
 
         # Stage 1: Data
         _update_status(run_id, 10, "data")
-        prices, returns, benchmark, metadata, financials, turnover = _load_data(
-            config, use_tushare=req.use_tushare, use_baostock=req.use_baostock)
+        from quant_platform.utils.metrics import pipeline_stage
+
+        with pipeline_stage("data"):
+            prices, returns, benchmark, metadata, financials, turnover = _load_data(
+                config, use_tushare=req.use_tushare, use_baostock=req.use_baostock)
 
         # Compute the quality report while the price panel exists, and keep
         # the small summary with the run. The run record does not retain the
@@ -374,19 +377,22 @@ def _execute_pipeline(run_id: str, req: RunRequest):
 
         # Stage 2: Factors
         _update_status(run_id, 30, "factors")
-        processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
-            prices, returns, financials, metadata, turnover, config=config)
+        with pipeline_stage("factors"):
+            processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+                prices, returns, financials, metadata, turnover, config=config)
 
         # Stage 3: Alpha
         _update_status(run_id, 50, "alpha")
-        signal = _generate_signal(config, processed_factors, returns)
+        with pipeline_stage("alpha"):
+            signal = _generate_signal(config, processed_factors, returns)
 
         # Stage 4-5: Backtest
         _update_status(run_id, 70, "backtest")
-        bt_results = _run_backtest(
-            config, signal, prices, returns, benchmark,
-            sector_map, fin_unstacked,
-        )
+        with pipeline_stage("backtest"):
+            bt_results = _run_backtest(
+                config, signal, prices, returns, benchmark,
+                sector_map, fin_unstacked,
+            )
 
         # Stage 6: Build response
         _update_status(run_id, 90, "report")

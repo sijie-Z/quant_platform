@@ -88,6 +88,9 @@ class DailyReport:
             "total_slippage": round(self.total_slippage, 4),
             "risk_level": self.risk_level,
             "drawdown_pct": round(self.drawdown_pct, 4),
+            # The dual-track PaperBroker metrics were computed every cycle
+            # and then dropped here, so the TCA comparison never surfaced.
+            "paper_metrics": self.paper_metrics,
         }
 
 
@@ -151,6 +154,7 @@ class LiveRunner:
         broker_type: str = "simulated",
         initial_cash: float = 10_000_000,
         dual_track: bool = True,
+        risk_monitor: RiskMonitor | None = None,
         **broker_kwargs,
     ):
         self._initial_cash = initial_cash
@@ -187,8 +191,10 @@ class LiveRunner:
         self._audit = AuditLog(self._store, self._bus)
         self._sm = PortfolioStateMachine()
         # Same singleton the API kill switch mutates. A private instance made
-        # the dashboard's kill switch invisible to this runner.
-        self._risk = get_risk_monitor()
+        # the dashboard's kill switch invisible to this runner. Tests inject a
+        # fresh monitor so one module's order-rate window cannot leak into the
+        # next.
+        self._risk = risk_monitor or get_risk_monitor()
 
         # Universe
         self._universe: list[str] = []
@@ -501,8 +507,13 @@ class LiveRunner:
             daily_pnl=daily_pnl,
             daily_return_pct=daily_return,
             n_positions=self._get_n_positions(),
-            n_orders=len(signals),
-            n_fills=len(orders),
+            # `n_orders` used to be the signal count and `n_fills` every
+            # returned order including rejected/unfilled ones.
+            n_orders=len(orders),
+            n_fills=sum(
+                1 for order in orders
+                if order.get("status") in ("filled", "partial")
+            ),
             total_commission=total_commission,
             total_tax=total_tax,
             total_slippage=total_slippage,

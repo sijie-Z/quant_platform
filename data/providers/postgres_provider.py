@@ -243,6 +243,52 @@ class PostgresStore:
                 if hasattr(TradeRow, k)
             }))
 
+    def save_order_with_trade(self, order: dict, trade: dict):
+        """Write an order and its trade in one transaction."""
+        if self._fallback_store:
+            return self._fallback_store.save_order_with_trade(order, trade)
+
+        with self._lock, self._session() as session:
+            row = session.get(OrderRow, order.get("order_id"))
+            if row:
+                for key, value in order.items():
+                    if hasattr(row, key):
+                        setattr(row, key, value)
+            else:
+                session.add(OrderRow(**{
+                    k: v for k, v in order.items() if hasattr(OrderRow, k)
+                }))
+            session.add(TradeRow(**{
+                k: v for k, v in trade.items() if hasattr(TradeRow, k)
+            }))
+
+    def _state_store(self):
+        """Local metadata store for engine state / EOD markers.
+
+        These are process-local runtime records; keeping them on the local
+        SQLite file avoids adding lifecycle tables to the market-data schema
+        and matches the default deployment.
+        """
+        if self._fallback_store is not None:
+            return self._fallback_store
+        if not hasattr(self, "_local_state_store"):
+            from quant_core.store import Store
+
+            self._local_state_store = Store()
+        return self._local_state_store
+
+    def save_engine_state(self, state: dict, strategy_id: str):
+        return self._state_store().save_engine_state(state, strategy_id)
+
+    def get_engine_state(self, strategy_id: str):
+        return self._state_store().get_engine_state(strategy_id)
+
+    def has_eod_reconciliation(self, date: str) -> bool:
+        return self._state_store().has_eod_reconciliation(date)
+
+    def mark_eod_reconciliation(self, date: str) -> None:
+        return self._state_store().mark_eod_reconciliation(date)
+
     def save_position(self, position: dict):
         """Save or update a position."""
         if self._fallback_store:

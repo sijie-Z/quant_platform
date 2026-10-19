@@ -381,6 +381,7 @@ def cmd_run(args) -> int:
     import yaml
 
     from quant_platform.utils.cache import PipelineCache
+    from quant_platform.utils.metrics import pipeline_stage
 
     config_path = _resolve_config_path(args.config)
 
@@ -450,8 +451,9 @@ def cmd_run(args) -> int:
     # 2. Factors
     # ------------------------------------------------------------------
     logger.info("[2/6] Computing factors...")
-    processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
-        prices, returns, financials, metadata, turnover, config=config)
+    with pipeline_stage("factors"):
+        processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+            prices, returns, financials, metadata, turnover, config=config)
 
     for name, summary in ic_results.items():
         logger.info("  %-20s Rank IC=%.4f  ICIR=%.2f", name, summary["mean_ic"], summary["icir"])
@@ -521,16 +523,18 @@ def cmd_run(args) -> int:
                     signal.loc[date, asset] = w
     else:
         logger.info("[3/6] Generating alpha signal...")
-        signal = _generate_signal(config, processed_factors, returns,
-                                  prices=prices, volume=turnover)
+        with pipeline_stage("alpha"):
+            signal = _generate_signal(config, processed_factors, returns,
+                                      prices=prices, volume=turnover)
 
     # ------------------------------------------------------------------
     # 4-5. Portfolio + Backtest
     # ------------------------------------------------------------------
     logger.info("[4/6] Portfolio optimization (integrated in backtest)...")
     logger.info("[5/6] Running backtest...")
-    results = _run_backtest(config, signal, prices, returns, benchmark,
-                            sector_map, fin_unstacked)
+    with pipeline_stage("backtest"):
+        results = _run_backtest(config, signal, prices, returns, benchmark,
+                                sector_map, fin_unstacked)
 
     # ------------------------------------------------------------------
     # 6. Report

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -398,3 +399,31 @@ def install_http_middleware(app):
         add_middleware(HTTPMetricsMiddleware)
         return app
     return HTTPMetricsMiddleware(app)
+
+
+@contextmanager
+def pipeline_stage(stage_name: str):
+    """Instrument one pipeline stage with the Grafana metric names.
+
+    ``pipeline_stage_total`` / ``pipeline_stage_duration_seconds`` /
+    ``pipeline_stage_errors_total`` are what the shipped dashboard queries;
+    without a caller they were permanently empty.
+    """
+    m = get_metrics()
+    start = time.perf_counter()
+    m.counter("pipeline_stage_total", labels={"stage": stage_name}).inc()
+    try:
+        yield
+        m.counter(
+            "pipeline_stage_success_total", labels={"stage": stage_name},
+        ).inc()
+    except Exception as exc:
+        m.counter(
+            "pipeline_stage_errors_total",
+            labels={"stage": stage_name, "error": type(exc).__name__},
+        ).inc()
+        raise
+    finally:
+        m.histogram(
+            "pipeline_stage_duration_seconds", labels={"stage": stage_name},
+        ).observe(time.perf_counter() - start)

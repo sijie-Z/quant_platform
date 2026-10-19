@@ -19,3 +19,15 @@ def test_api_requests_are_exported():
     assert "api_requests_total" in text
     assert "api_duration_seconds" in text
     assert "/api/health" in text
+
+
+def test_pipeline_stages_are_instrumented():
+    from quant_platform.utils.metrics import get_metrics, pipeline_stage
+
+    with pipeline_stage("unit_test_stage"):
+        pass
+
+    text = get_metrics().export_text()
+    assert "pipeline_stage_total" in text
+    assert 'stage="unit_test_stage"' in text
+    assert "pipeline_stage_duration_seconds" in text
