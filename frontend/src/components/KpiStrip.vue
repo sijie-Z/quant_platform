@@ -33,9 +33,9 @@ const metrics = computed(() => {
     { key: 'ann',    label: $t('kpi.annualizedReturn'), display: pct(p.annual_return),     tone: p.annual_return >= 0 ? 'pos' : 'neg' },
     { key: 'vol',    label: $t('kpi.volatility'), display: pct(p.annual_volatility), tone: 'neu' },
     { key: 'sharpe', label: $t('kpi.sharpe'),      display: num(p.sharpe_ratio),      tone: p.sharpe_ratio >= 1 ? 'pos' : p.sharpe_ratio >= 0 ? 'neu' : 'neg' },
-    { key: 'sort',   label: $t('kpi.calmar'), display: num(p.sortino_ratio),     tone: p.sortino_ratio >= 0 ? 'pos' : 'neg' },
+    { key: 'sort',   label: $t('kpi.sortino'), display: num(p.sortino_ratio),     tone: p.sortino_ratio >= 0 ? 'pos' : 'neg' },
     { key: 'dd',     label: $t('kpi.maxDrawdown'),      display: pct(p.max_drawdown),      tone: 'neg' },
-    { key: 'var',    label: $t('kpi.volatility'),     display: r.historical_var != null ? pct(r.historical_var) : '--', tone: 'neg' },
+    { key: 'var',    label: $t('kpi.var'),     display: r.historical_var != null ? pct(r.historical_var) : '--', tone: 'neg' },
     { key: 'win',    label: $t('kpi.winRate'),    display: pct(p.win_rate),          tone: p.win_rate >= 0.5 ? 'pos' : 'neu', sub: `${p.n_rebalances || 0} ${$t('common.month')}` },
   ]
 })

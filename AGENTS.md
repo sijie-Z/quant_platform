@@ -223,7 +223,7 @@ quant_platform/
 │   └── research_agent.py       # RAG研究Agent: 研报信号提取+因子假设生成+归因分析+风险叙述
 │
 ├── api/                        # Web API层
-│   ├── routes.py               # FastAPI路由: 97端点 (2,159行)
+│   ├── routes.py               # FastAPI路由: 98端点 (2,159行)
 │   ├── monitor.py              # 监控聚合API: 6端点 (风控/TCA/因子/容量/配置/Kill Switch)
 │   └── schemas.py              # Pydantic请求/响应模型
 │
@@ -277,7 +277,7 @@ quant_platform/
 │   ├── package.json
 │   └── vite.config.js
 │
-├── tests/                      # 1077个单元测试
+├── tests/                      # 1,859个测试函数（约1,984条用例）
 │   ├── conftest.py             # 共享fixtures
 │   ├── test_data/              # 合成数据(9) + pipeline(5) + 质量(7) + 连接池(11) + PostgreSQL(10) + WebSocket(18) + Level2(22) + 基本面(23) = 105
 │   ├── test_factors/           # 技术(6) + 基本面(5) + 处理(5) + 评估(7) + IC监控(12) + 网络(17) + 正交化(18) + 择时(25) = 95
@@ -1065,10 +1065,10 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 29. **事件驱动核心架构** — EventBus/Store/StateMachine/AuditLog/Scheduler 五大组件，解耦+持久化+状态管理+合规审计
 30. **实时风控熔断** — RiskMonitor集成到交易引擎，下单前自动检查，Kill Switch一键熔断
 31. **WebSocket实时推送** — EventBus→WebSocket桥接，交易事件实时推送到前端
-32. **FastAPI + Vue 3 Web 界面** — REST API 97端点 + Bloomberg Terminal风格暗色仪表盘 + 9个视图
+32. **FastAPI + Vue 3 Web 界面** — REST API 98端点 + Bloomberg Terminal风格暗色仪表盘 + 9个视图
 33. **ABC抽象接口** — DataProvider / BaseFactor / PortfolioOptimizer 全部可插拔，注册表模式
 34. **配置驱动** — YAML参数化，零硬编码，类型化dataclass验证
-35. **1077个单元测试** — 覆盖全模块：数据/因子/Alpha/组合/回测/风险/LLM/报告/工具/核心架构/执行/交易/策略/ML/IC/Barra/指标/并行/Agent/连接池/图因子/PostgreSQL/WebSocket/Level2/基本面/合规导出/基金运营/监控API/跨资产/Paper Broker/XTP Broker/Live Runner/QMT Broker
+35. **1,859个测试函数（约1,984条用例）** — 覆盖全模块：数据/因子/Alpha/组合/回测/风险/LLM/报告/工具/核心架构/执行/交易/策略/ML/IC/Barra/指标/并行/Agent/连接池/图因子/PostgreSQL/WebSocket/Level2/基本面/合规导出/基金运营/监控API/跨资产/Paper Broker/XTP Broker/Live Runner/QMT Broker
 36. **Pipeline 缓存** — 基于 config hash 的自动缓存，支持 `--force` `--no-cache`
 
 ---
@@ -1090,7 +1090,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 | **实时风控** | RiskMonitor集成到交易引擎，下单前自动检查，Kill Switch一键熔断，前端实时风险面板 | A |
 | **多因子信号** | 4因子等权复合(动量+低波+RSI反转+MACD)，替代单一动量，15因子引擎可扩展接入 | A |
 | **实时推送** | EventBus→WebSocket桥接，交易事件(order/fill/risk/portfolio)实时推送到前端 | A |
-| **可测试性** | 1077个单元测试，fixture共享，覆盖全模块 | A |
+| **可测试性** | 1,859个测试函数（约1,984条用例），fixture共享，覆盖全模块 | A |
 | **可扩展性** | ABC抽象接口，注册表模式，Strategy模式，插件式因子/优化器/数据源 | A |
 | **配置管理** | YAML驱动，零硬编码，类型化dataclass验证，环境变量覆盖 | A- |
 | **性能优化** | 6个Numba JIT内核，prange并行化，Pipeline缓存，向量化回测 | A- |
@@ -1098,7 +1098,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 | **文档** | AGENTS.md完整架构文档，BEGINNER_GUIDE.md，ASHARE_PITFALLS.md，README.md | A |
 | **A股实盘处理** | 10大陷阱全处理：前复权/停牌/幸存者偏差/涨跌停/ST/T+1/成本/手数/除权/行业漂移 | A |
 | **回测保真度** | 佣金0.03%双边+印花税0.1%单边+滑点+手数约束+T+1执行 | A- |
-| **Web服务化** | FastAPI 97端点 + Vue 3 前端 + WebSocket实时推送 + 9个视图 | A |
+| **Web服务化** | FastAPI 98端点 + Vue 3 前端 + WebSocket实时推送 + 9个视图 | A |
 | **订单管理** | OMS + SimulatedExchange + TCA分析 + A股成本模型 | A- |
 | **执行算法** | TWAP/VWAP/Iceberg + SmartRouter自动路由 | B+ |
 | **数据质量** | 8项检查 + 严重性分级 + API端点 | B+ |

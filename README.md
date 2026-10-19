@@ -24,7 +24,7 @@
 - **研究层**：20+ 因子引擎、IC/ICIR 评估、因子合成、Walk-Forward 验证、组合优化
 - **验证层**：Oracle IC / Known Alpha / MVO Audit 六项系统性验证；No-Lookahead 契约 8 条中 4 条已验证成立、3 条未接线（见「研究验证」一节）
 - **实盘层**：实时行情、Paper Trading 模拟盘、QMT 实盘接口、实时风控熔断、执行算法
-- **展示层**：FastAPI 97 个 REST 端点 + WebSocket 实时推送 + Vue 3 Bloomberg 风格仪表盘
+- **展示层**：FastAPI 98 个 REST 端点 + WebSocket 实时推送 + Vue 3 Bloomberg 风格仪表盘
 
 > 设计原则：**先验证，后交易；先诚实，后优化。** 所有研究记录都携带 Trust Metadata（数据源、复权方式、PIT 状态、偏差警告），不做粉饰。
 

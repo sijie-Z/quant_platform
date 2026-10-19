@@ -7,7 +7,8 @@ export default {
   kpi: {
     totalReturn: '总收益', annualizedReturn: '年化收益', volatility: '波动率', sharpe: '夏普比',
     maxDrawdown: '最大回撤', calmar: '卡玛比', winRate: '胜率', profitLossRatio: '盈亏比',
-    turnover: '换手率', alpha: 'Alpha', beta: 'Beta', informationRatio: '信息比'
+    turnover: '换手率', alpha: 'Alpha', beta: 'Beta', informationRatio: '信息比',
+    sortino: '索提诺比', var: '风险价值(VaR)'
   },
   // 终端仪表盘
   terminal: {
