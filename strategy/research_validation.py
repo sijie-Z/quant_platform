@@ -236,7 +236,7 @@ class ResearchValidator:
         # Step 6: Run Strategy Gates
         wf_result = step4.details.get("wf_result")
         step6 = self._step_run_gates(
-            ic_results, wf_result, len(processed_factors),
+            ic_results, wf_result, len(processed_factors), prices=prices,
         )
         steps.append(step6)
         report.gate_result = step6.details.get("gate_report")
@@ -538,6 +538,7 @@ class ResearchValidator:
 
     def _step_run_gates(
         self, ic_results: dict, wf_result: dict | None, n_factors: int,
+        prices=None,
     ) -> ValidationStep:
         """Run Strategy Gates on validation results."""
         step = ValidationStep(
@@ -546,8 +547,12 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            from quant_platform.strategy.gates import GateConfig, GateRunner
+            from quant_platform.strategy.gates import (
+                GateRunner,
+                count_assets_with_data,
+            )
 
+            n_assets_total, n_assets_with_data = count_assets_with_data(prices)
             runner = GateRunner()
             report = runner.run(
                 strategy_name="research_validation",
@@ -555,8 +560,8 @@ class ResearchValidator:
                 wf_results=wf_result,
                 n_factors=n_factors,
                 n_params=n_factors,
-                n_assets_total=100,
-                n_assets_with_data=100,
+                n_assets_total=n_assets_total,
+                n_assets_with_data=n_assets_with_data,
             )
 
             step.status = "completed"

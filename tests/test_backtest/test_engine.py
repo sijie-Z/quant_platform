@@ -180,7 +180,7 @@ class TestCovarianceWindowSeesNoFuture:
 
         windows = []
 
-        def capture(ret_window, method, lookback):
+        def capture(ret_window, method, lookback, ewma_half_life=63):
             windows.append(ret_window)
             return None
 

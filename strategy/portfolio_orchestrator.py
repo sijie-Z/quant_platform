@@ -64,6 +64,14 @@ class PortfolioOrchestrator:
 
         # Track positions per strategy (strategy_id -> {ticker: target_qty})
         self._targets: dict[str, dict[str, int]] = {}
+        # Per-strategy position ledger. `ExecutionEngine.positions` is one
+        # shared book with no strategy attribution, so comparing each
+        # strategy's target against it made every strategy act on the whole
+        # book: with two strategies each targeting 100 shares, the first fill
+        # satisfied both, and the next rebalance made both sell the other's
+        # shares. The ledger is updated from fills, which carry `order.strategy`.
+        self._books: dict[str, dict[str, dict[str, float]]] = {}
+        self._last_strategy_pnl: dict[str, float] = {}
         self._last_prices: dict[str, float] = {}
         self._cash_locked: float = 0.0  # Cash reserved for pending buys
         self._date: str = ""
@@ -156,9 +164,11 @@ class PortfolioOrchestrator:
         orders_created = []
 
         for strategy_id, targets in self._targets.items():
+            # Only this strategy's own holdings, not the shared book.
             current_positions = {
-                p.ticker: p.quantity
-                for p in self.exec_engine.positions
+                ticker: int(pos["qty"])
+                for ticker, pos in self._books.get(strategy_id, {}).items()
+                if pos["qty"] > 0
             }
 
             # Determine buys and sells
@@ -292,39 +302,80 @@ class PortfolioOrchestrator:
                 tax=tax,
                 slippage=abs(fill_price - price) * order.quantity,
             )
+            self._record_strategy_fill(
+                order, fill_price, order.quantity, commission, tax,
+            )
 
             if order.side == OrderSide.BUY:
                 self._cash_locked -= fill_price * order.quantity
 
         # Update strategy P&L
-        self._update_strategy_pnl()
+        self._update_strategy_pnl(prices)
 
-    def _update_strategy_pnl(self) -> None:
-        """Per-strategy P&L is not reported, because it cannot be attributed.
+    def _record_strategy_fill(
+        self,
+        order,
+        fill_price: float,
+        quantity: int,
+        commission: float = 0.0,
+        tax: float = 0.0,
+    ) -> None:
+        """Attribute a fill to the order's strategy.
 
-        This used to compute
-
-            total_pnl = sum(p.unrealized_pnl + p.realized_pnl
-                            for p in self.exec_engine.positions)
-            daily_return = total_pnl / state.current_value
-            self.multi_strategy.update_strategy_pnl(sid, daily_return)
-
-        -- the *whole shared book's* P&L, divided by one strategy's capital and
-        handed back as that strategy's own daily return. With N strategies the
-        same book P&L is credited N times, and `get_aggregate_metrics()` sums
-        it. `ExecutionEngine.positions` carries no strategy attribution
-        (`execution/models.py:Position` has no such field; orders are tagged
-        with a strategy at `create_order` but the resulting position is not),
-        so there is no per-strategy number to report.
-
-        The `if state.current_value > 0` guard used to make this a no-op in
-        practice. Fixing BUG-06 -- a funded strategy now starts at its
-        allocation -- made it pass, which is what brought this into reach.
-        Reporting a figure that belongs to every strategy as if it belonged to
-        one is worse than reporting none, so the push is skipped until
-        positions are attributed. See BUG-08.
+        The shared book nets the positions; this ledger records who owns what.
+        Buy commission is capitalised into the average cost, sell commission
+        and stamp tax reduce realised P&L, and the fill price already carries
+        slippage.
         """
-        return
+        sid = order.strategy or "default"
+        book = self._books.setdefault(sid, {})
+        pos = book.setdefault(
+            order.ticker, {"qty": 0.0, "avg_cost": 0.0, "realized_pnl": 0.0},
+        )
+
+        if order.side == OrderSide.BUY:
+            new_qty = pos["qty"] + quantity
+            pos["avg_cost"] = (
+                pos["qty"] * pos["avg_cost"] + quantity * fill_price + commission
+            ) / new_qty
+            pos["qty"] = new_qty
+        else:
+            sold = min(quantity, int(pos["qty"]))
+            pos["realized_pnl"] += (
+                sold * (fill_price - pos["avg_cost"]) - commission - tax
+            )
+            pos["qty"] -= sold
+
+    def _update_strategy_pnl(self, prices: dict[str, float] | None = None) -> None:
+        """Push each strategy's own P&L into MultiStrategyManager.
+
+        Before the per-strategy ledger existed, this credited the whole shared
+        book's P&L to every strategy, which `get_aggregate_metrics()` then
+        summed. Each strategy's P&L is now realised P&L plus the mark-to-market
+        of only its own lots; the daily return handed to
+        `update_strategy_pnl` is the change in that P&L over its allocated
+        capital (the manager adds daily_pnl to current_value rather than
+        compounding).
+        """
+        marks = prices or self._last_prices
+
+        for sid, book in self._books.items():
+            state = self.multi_strategy.states.get(sid)
+            if state is None or state.capital_allocated <= 0:
+                continue
+
+            total_pnl = 0.0
+            for ticker, pos in book.items():
+                price = marks.get(ticker, pos["avg_cost"])
+                total_pnl += pos["realized_pnl"] + pos["qty"] * (
+                    price - pos["avg_cost"]
+                )
+
+            previous = self._last_strategy_pnl.get(sid, 0.0)
+            self._last_strategy_pnl[sid] = total_pnl
+            self.multi_strategy.update_strategy_pnl(
+                sid, (total_pnl - previous) / state.capital_allocated,
+            )
 
     # ------------------------------------------------------------------
     # Position inquiry

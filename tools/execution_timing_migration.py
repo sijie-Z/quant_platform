@@ -58,6 +58,7 @@ def _run(config, signal, prices, returns, benchmark, sector_map, financials, tim
         max_sector_exposure=config.portfolio.constraints.max_sector_exposure,
         max_turnover=config.portfolio.constraints.max_turnover,
         lot_size=config.portfolio.constraints.lot_size,
+        risk_aversion=config.portfolio.risk_aversion,
     )
     cost_model = CostModel(
         commission=config.costs.commission,
@@ -74,6 +75,7 @@ def _run(config, signal, prices, returns, benchmark, sector_map, financials, tim
         benchmark=config.backtest.benchmark,
         covariance_method=config.portfolio.covariance.method,
         covariance_lookback=config.portfolio.covariance.lookback,
+        covariance_ewma_half_life=config.portfolio.covariance.ewma_half_life,
         execution_timing=timing,
     )
     return engine.run(

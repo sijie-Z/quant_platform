@@ -122,6 +122,37 @@ class TestDashboard:
             assert "RISK" in report
             assert "STRESS TESTS" in report
 
+    def test_var_config_is_forwarded(self, monkeypatch):
+        """`risk.var.confidence` / `risk.var.horizon` were declared in the
+        config schema but every caller used the function defaults."""
+        import quant_platform.reporting.dashboard as dashboard_mod
+
+        captured = {}
+
+        def fake_var_summary(returns, confidence=0.95, horizon=1):
+            captured["confidence"] = confidence
+            captured["horizon"] = horizon
+            return {
+                "historical_var": 0, "parametric_var": 0,
+                "monte_carlo_var": 0, "historical_cvar": 0,
+                "confidence": confidence, "horizon_days": horizon,
+            }
+
+        monkeypatch.setattr(dashboard_mod, "var_summary", fake_var_summary)
+
+        dates = pd.bdate_range("2023-01-01", periods=300)
+        rng = np.random.default_rng(42)
+        strategy = pd.Series(rng.normal(0.0005, 0.015, 300), index=dates)
+        results = {"daily_returns": strategy, "benchmark_returns": None}
+
+        with tempfile.TemporaryDirectory() as d:
+            generate_dashboard(
+                results, output_dir=d, save_plots=False,
+                var_confidence=0.99, var_horizon=5,
+            )
+
+        assert captured == {"confidence": 0.99, "horizon": 5}
+
     def test_generate_with_weights(self):
         dates = pd.bdate_range("2023-01-01", periods=300)
         rng = np.random.default_rng(42)

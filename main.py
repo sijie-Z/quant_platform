@@ -203,6 +203,7 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
         max_sector_exposure=config.portfolio.constraints.max_sector_exposure,
         max_turnover=config.portfolio.constraints.max_turnover,
         lot_size=config.portfolio.constraints.lot_size,
+        risk_aversion=config.portfolio.risk_aversion,
     )
 
     cost_model = CostModel(
@@ -221,6 +222,7 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
         benchmark=config.backtest.benchmark,
         covariance_method=config.portfolio.covariance.method,
         covariance_lookback=config.portfolio.covariance.lookback,
+        covariance_ewma_half_life=config.portfolio.covariance.ewma_half_life,
     )
 
     return engine.run(
@@ -399,6 +401,8 @@ def cmd_run(args) -> int:
         save_plots=config.output.save_plots,
         plot_format=config.output.plot_format,
         ic_results=ic_results,
+        var_confidence=config.risk.var.confidence,
+        var_horizon=config.risk.var.horizon,
     )
 
     print(report)
@@ -1339,7 +1343,11 @@ def cmd_gate(args) -> int:
     Integrates IC results, walk-forward, backtest metrics, and data coverage
     into a unified PASS/WARNING/FAIL/REJECTED gate report.
     """
-    from quant_platform.strategy.gates import GateConfig, GateRunner
+    from quant_platform.strategy.gates import (
+        GateConfig,
+        GateRunner,
+        count_assets_with_data,
+    )
 
     config = load_config(_resolve_config_path(args.config))
 
@@ -1352,7 +1360,9 @@ def cmd_gate(args) -> int:
 
     # Load data
     prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
-    n_assets_total = len(prices.columns)
+    # Coverage is measured from the panel, not assumed: passing the same
+    # number for both sides made the coverage gate compare a value with itself.
+    n_assets_total, n_assets_with_data = count_assets_with_data(prices)
 
     # Compute factors and IC results
     processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
@@ -1395,7 +1405,7 @@ def cmd_gate(args) -> int:
         n_factors=n_factors,
         n_params=n_params,
         n_assets_total=n_assets_total,
-        n_assets_with_data=n_assets_total,
+        n_assets_with_data=n_assets_with_data,
     )
 
     print(report.print_report())

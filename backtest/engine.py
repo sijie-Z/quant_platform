@@ -42,6 +42,7 @@ class BacktestEngine:
         benchmark: str = "equal_weight",
         covariance_method: str = "ledoit_wolf",
         covariance_lookback: int = 252,
+        covariance_ewma_half_life: int = 63,
         execution_timing: str = "next_close",
     ):
         self.initial_capital = initial_capital
@@ -52,6 +53,7 @@ class BacktestEngine:
         self.benchmark_type = benchmark
         self.covariance_method = covariance_method
         self.covariance_lookback = covariance_lookback
+        self.covariance_ewma_half_life = covariance_ewma_half_life
 
         # `next_close` (default): the signal is computed from rdate's close and
         # executed at the *next* trading day's close, which is what the module
@@ -73,6 +75,9 @@ class BacktestEngine:
         self.optimizer_outcomes: dict[pd.Timestamp, dict] = {}
         self.optimizer_fallback_count = 0
         self.skipped_rebalances = 0
+        # Sum of per-rebalance costs in return units. Reported in the summary
+        # so the strategy gates can evaluate the configured cost-drag limit.
+        self.total_cost_drag = 0.0
 
     @staticmethod
     def _compute_equal_weight_benchmark(returns: pd.DataFrame) -> pd.Series:
@@ -181,6 +186,7 @@ class BacktestEngine:
                     ret_window,
                     method=self.covariance_method,
                     lookback=min(self.covariance_lookback, len(ret_window)),
+                    ewma_half_life=self.covariance_ewma_half_life,
                 )
             except Exception:
                 cov = None
@@ -233,6 +239,17 @@ class BacktestEngine:
             else f"{self.optimizer_name}+equal_weight_fallback"
         )
         summary["n_skipped_rebalances"] = self.skipped_rebalances
+
+        years = len(self.daily_returns) / 252.0
+        summary["annual_turnover"] = (
+            float(self.turnover_history.sum()) / years
+            if years > 0 and self.turnover_history is not None
+            and len(self.turnover_history) else 0.0
+        )
+        summary["total_cost_drag"] = float(self.total_cost_drag)
+        summary["annual_cost_drag"] = (
+            float(self.total_cost_drag) / years if years > 0 else 0.0
+        )
 
         logger.info("Backtest complete: total_return=%.2f%%, sharpe=%.2f",
                      summary.get("total_return", 0) * 100,
@@ -318,6 +335,7 @@ class BacktestEngine:
         all_dates = returns.index.sort_values()
         schedule = self._execution_schedule(returns)
 
+        self.total_cost_drag = 0.0
         capital = self.initial_capital
         current_weights = pd.Series(0.0, index=returns.columns)
         daily_ret_list = []
@@ -360,6 +378,7 @@ class BacktestEngine:
                     # sells -- which only holds for the *two-way* traded value.
                     # Passing one-sided turnover halved every component.
                     rebalance_cost = self.cost_model.compute_costs(turnover * 2)
+                    self.total_cost_drag += rebalance_cost
                 turnover_records.append((exec_date, turnover))
 
                 # Record what was actually executed. Reporting, exposure and

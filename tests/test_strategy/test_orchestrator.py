@@ -46,7 +46,7 @@ class TestPortfolioOrchestrator:
         o.process_fills({"A0001": 100.0})
 
         # Now signal changes — exit A0001
-        o._targets["test"] = {}
+        o._targets[sid] = {}
         orders = o.rebalance()
         sells = [o for o in orders if o["side"] == "sell"]
         assert len(sells) > 0
@@ -74,17 +74,16 @@ class TestPortfolioOrchestrator:
         assert "cash_available" in summary
 
 
-class TestPerStrategyPnlIsNotMisattributed:
-    """`_update_strategy_pnl` credited every strategy with the whole book.
+class TestPerStrategyPositionAttribution:
+    """The orchestrator used to compare each strategy's target with the whole
+    shared book.
 
-    It computed `total_pnl` over `self.exec_engine.positions` -- one shared
-    book with no strategy attribution -- divided by a single strategy's
-    capital, and pushed that as the strategy's own daily return. With N
-    strategies the same book P&L is counted N times.
-
-    An `if state.current_value > 0` guard made it a no-op, until the fix for
-    BUG-06 made a funded strategy start at its allocation and the guard began
-    to pass.
+    `ExecutionEngine.positions` is one book with no strategy attribution.
+    With two strategies each targeting 150 shares, the first strategy's buy
+    made the second believe it already held the shares; the next rebalance
+    then saw 300 shares against a 150-share target and made *both* strategies
+    sell 150, oscillating the book. Fills now update a per-strategy ledger
+    keyed by `order.strategy`, and P&L follows the lots a strategy owns.
     """
 
     @pytest.fixture
@@ -98,21 +97,30 @@ class TestPerStrategyPnlIsNotMisattributed:
             orch.on_signal("2025-01-01", pd.Series({"A0001": 0.5}), strategy_id=sid)
         orch.rebalance()
         orch.process_fills({"A0001": 100.0})
-        # `ExecutionEngine.positions` is a property returning a *copy*, so a
-        # test cannot populate the book through it -- the first draft appended
-        # to a throwaway list and asserted nothing. Reach the real dict.
-        assert orch.exec_engine._positions, "fixture produced no shared position"
-        for position in orch.exec_engine._positions.values():
-            position.unrealized_pnl = 50_000.0
         return orch, ms, a, b
 
-    def test_the_shared_book_pnl_is_not_credited_to_each_strategy(self, two_strategies):
+    def test_each_strategy_owns_its_own_lots(self, two_strategies):
+        orch, _, a, b = two_strategies
+
+        # 500k allocation / 50 positions x 1.5 signal / 100 per share,
+        # rounded down to one lot: 100 shares per strategy.
+        assert orch.exec_engine.get_position("A0001").quantity == 200
+        assert orch._books[a]["A0001"]["qty"] == 100
+        assert orch._books[b]["A0001"]["qty"] == 100
+
+    def test_rebalance_does_not_react_to_the_other_strategys_position(
+        self, two_strategies,
+    ):
+        orch, _, _, _ = two_strategies
+
+        assert orch.rebalance() == []
+
+    def test_pnl_follows_the_lots_a_strategy_owns(self, two_strategies):
         orch, ms, a, b = two_strategies
 
-        before = {sid: ms.states[sid].total_pnl for sid in (a, b)}
-        orch._update_strategy_pnl()
-        after = {sid: ms.states[sid].total_pnl for sid in (a, b)}
+        orch._update_strategy_pnl({"A0001": 110.0})
 
-        assert after == before, (
-            "a strategy was credited with the whole shared book's P&L"
-        )
+        # Identical allocations and fills: the two strategies must report the
+        # same number, and it must be positive, not the double-credited book.
+        assert ms.states[a].total_pnl == pytest.approx(ms.states[b].total_pnl)
+        assert ms.states[a].total_pnl > 0

@@ -129,6 +129,25 @@ class TestExportTradeLog:
         )
         assert result.n_records <= 4
 
+    def test_timezone_aware_records_are_not_dropped(self, exporter, store):
+        """A timestamp with a UTC offset used to raise TypeError when compared
+        with the naive export window; the except clause treated it as
+        unparseable and silently omitted the record from every export."""
+        store.save_trade({
+            "trade_id": "aware", "order_id": "o1", "code": "600519",
+            "side": "buy", "quantity": 100, "price": 100,
+            "executed_at": "2024-07-15T10:00:00+08:00",
+        })
+        store.save_trade({
+            "trade_id": "naive", "order_id": "o2", "code": "000001",
+            "side": "buy", "quantity": 100, "price": 10,
+            "executed_at": "2024-07-15T10:00:00",
+        })
+
+        result = exporter.export_trade_log(start="2024-07-01", end="2024-07-31")
+
+        assert result.n_records == 2
+
     def test_export_empty(self, exporter, store):
         result = exporter.export_trade_log(
             start="2024-01-01", end="2024-12-31",

@@ -24,13 +24,16 @@
       </div>
       <div class="metric-card">
         <div class="metric-label">{{ locale === 'zh-CN' ? '容量使用率' : 'Capacity Use' }}</div>
-        <div class="metric-value" :class="capacityGauge.usage_pct > 80 ? 'text-red' : 'text-green'">
-          {{ capacityGauge.usage_pct.toFixed(1) }}%
+        <div class="metric-value" :class="capacityGauge.available === false ? '' : (capacityGauge.usage_pct > 80 ? 'text-red' : 'text-green')">
+          {{ capacityGauge.available === false ? '—' : capacityGauge.usage_pct.toFixed(1) + '%' }}
         </div>
       </div>
       <div class="metric-card">
         <div class="metric-label">{{ locale === 'zh-CN' ? '平均IS成本' : 'Avg IS Cost' }}</div>
-        <div class="metric-value text-purple">{{ tcaSummary.mean_is_bps.toFixed(1) }} <span class="metric-unit">bps</span></div>
+        <div class="metric-value text-purple">
+          <template v-if="tcaSummary.available === false">—</template>
+          <template v-else>{{ tcaSummary.mean_is_bps.toFixed(1) }} <span class="metric-unit">bps</span></template>
+        </div>
       </div>
     </div>
 
@@ -47,7 +50,11 @@
         <div class="card-body">
           <!-- Factor Exposure Radar -->
           <div class="chart-title">{{ locale === 'zh-CN' ? 'Barra因子暴露' : 'Barra Factor Exposures' }}</div>
-          <div ref="riskRadarRef" class="chart-container-sm"></div>
+          <div
+            v-if="riskOverview.factor_exposures_available === false"
+            class="chart-unavailable"
+          >{{ riskOverview.factor_exposures_reason || (locale === 'zh-CN' ? '暂无因子暴露数据' : 'No factor exposures available') }}</div>
+          <div v-show="riskOverview.factor_exposures_available !== false" ref="riskRadarRef" class="chart-container-sm"></div>
           <!-- Sector Concentration -->
           <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '行业集中度' : 'Sector Concentration' }}</div>
           <div ref="sectorBarRef" class="chart-container-sm"></div>
@@ -61,10 +68,15 @@
           <span class="tag tag-orange">{{ tcaSummary.n_orders }} {{ locale === 'zh-CN' ? '笔订单' : 'orders' }}</span>
         </div>
         <div class="card-body">
-          <div class="chart-title">{{ locale === 'zh-CN' ? '实现缺口趋势' : 'Implementation Shortfall Trend' }}</div>
-          <div ref="tcaLineRef" class="chart-container-sm"></div>
-          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '成本分解' : 'Cost Decomposition' }}</div>
-          <div ref="tcaBarRef" class="chart-container-sm"></div>
+          <div v-if="tcaSummary.available === false" class="chart-unavailable">
+            {{ tcaSummary.reason || (locale === 'zh-CN' ? '暂无成交记录，无法计算 TCA' : 'No trades recorded; TCA unavailable') }}
+          </div>
+          <div v-show="tcaSummary.available !== false">
+            <div class="chart-title">{{ locale === 'zh-CN' ? '实现缺口趋势' : 'Implementation Shortfall Trend' }}</div>
+            <div ref="tcaLineRef" class="chart-container-sm"></div>
+            <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '成本分解' : 'Cost Decomposition' }}</div>
+            <div ref="tcaBarRef" class="chart-container-sm"></div>
+          </div>
         </div>
       </div>
 
@@ -77,10 +89,15 @@
           </span>
         </div>
         <div class="card-body">
-          <div class="chart-title">{{ locale === 'zh-CN' ? '滚动IC（60天）' : 'Rolling IC (60d)' }}</div>
-          <div ref="factorICRef" class="chart-container-sm"></div>
-          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '因子归因（bps）' : 'Factor Attribution (bps)' }}</div>
-          <div ref="factorAttrRef" class="chart-container-sm"></div>
+          <div v-if="factorStatus.available === false" class="chart-unavailable">
+            {{ factorStatus.reason || (locale === 'zh-CN' ? '暂无因子 IC 数据' : 'No factor IC data available') }}
+          </div>
+          <div v-show="factorStatus.available !== false">
+            <div class="chart-title">{{ locale === 'zh-CN' ? '滚动IC（60天）' : 'Rolling IC (60d)' }}</div>
+            <div ref="factorICRef" class="chart-container-sm"></div>
+            <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '因子归因（bps）' : 'Factor Attribution (bps)' }}</div>
+            <div ref="factorAttrRef" class="chart-container-sm"></div>
+          </div>
         </div>
       </div>
 
@@ -91,10 +108,15 @@
           <span class="tag tag-green">{{ formatNum(capacityGauge.current_aum, 0) }} {{ locale === 'zh-CN' ? '管理规模' : 'AUM' }}</span>
         </div>
         <div class="card-body">
-          <div class="chart-title">{{ locale === 'zh-CN' ? '容量使用率' : 'Capacity Usage' }}</div>
-          <div ref="capacityGaugeRef" class="chart-container-sm"></div>
-          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '规模 vs 夏普衰减' : 'AUM vs Sharpe Decay' }}</div>
-          <div ref="capacityCurveRef" class="chart-container-sm"></div>
+          <div v-if="capacityGauge.available === false" class="chart-unavailable">
+            {{ capacityGauge.reason || (locale === 'zh-CN' ? '暂无持仓数据，无法估算容量' : 'No positions; capacity unavailable') }}
+          </div>
+          <div v-show="capacityGauge.available !== false">
+            <div class="chart-title">{{ locale === 'zh-CN' ? '容量使用率' : 'Capacity Usage' }}</div>
+            <div ref="capacityGaugeRef" class="chart-container-sm"></div>
+            <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '规模 vs 夏普衰减' : 'AUM vs Sharpe Decay' }}</div>
+            <div ref="capacityCurveRef" class="chart-container-sm"></div>
+          </div>
         </div>
       </div>
 
@@ -239,20 +261,24 @@ const riskOverview = reactive({
   factor_exposures: {}, sector_concentration: {}, current_drawdown: 0,
   volatility: 0, var_95: 0, cvar_95: 0, risk_level: 'GREEN',
   portfolio_value: 0, daily_pnl: 0, n_positions: 0,
+  factor_exposures_available: null, factor_exposures_reason: '',
 })
 
 const tcaSummary = reactive({
+  available: null, reason: '',
   n_orders: 0, mean_is_bps: 0, mean_delay_bps: 0, mean_impact_bps: 0,
   mean_timing_bps: 0, mean_arrival_bps: 0, median_is_bps: 0,
   daily_trend: [], cost_breakdown: [], by_ticker: {},
 })
 
 const factorStatus = reactive({
+  available: null, reason: '',
   factors: [], rolling_ic: {}, ic_dates: [], attribution: [],
   decay_alerts: [], disabled_factors: [],
 })
 
 const capacityGauge = reactive({
+  available: null, reason: '',
   current_aum: 0, capacity_aum: 0, usage_pct: 0,
   participation_rate: 0, sharpe_at_capacity: 0, aum_curve: [],
 })
@@ -279,6 +305,7 @@ const capacityGaugeRef = ref(null)
 const capacityCurveRef = ref(null)
 
 let chartInstances = []
+const chartsByEl = new Map()
 let resizeObservers = []
 let pollTimer = null
 
@@ -294,7 +321,17 @@ const colors = ['#4da6ff', '#34d399', '#f87171', '#fb923c', '#a78bfa', '#22d3ee'
 
 function initChart(refEl, opts = {}) {
   if (!refEl) return null
+  // The dashboard polls every 15s, and every render used to call
+  // `echarts.init` again on the same DOM node. Each call leaves the previous
+  // instance alive and un-disposed, so one open tab accumulated a new set of
+  // eight charts (and their canvases) every poll. Reuse the instance for the
+  // element; the DOM ref changes only when v-if recreates the subtree.
+  const cached = chartsByEl.get(refEl)
+  if (cached && !cached.isDisposed() && cached.getDom() === refEl) {
+    return cached
+  }
   const chart = echarts.init(refEl, null, { renderer: 'canvas' })
+  chartsByEl.set(refEl, chart)
   chartInstances.push(chart)
   if (window.ResizeObserver) {
     const ro = new ResizeObserver(() => chart.resize())
@@ -337,11 +374,11 @@ function renderAllCharts() {
 }
 
 function renderRiskRadar() {
-  const chart = initChart(riskRadarRef.value)
-  if (!chart) return
   const factors = Object.keys(riskOverview.factor_exposures)
   const values = Object.values(riskOverview.factor_exposures)
-  if (!factors.length) return
+  if (riskOverview.factor_exposures_available === false || !factors.length) return
+  const chart = initChart(riskRadarRef.value)
+  if (!chart) return
   chart.setOption({
     tooltip: { ...tooltipBase },
     radar: {
@@ -367,10 +404,10 @@ function renderRiskRadar() {
 }
 
 function renderSectorBar() {
-  const chart = initChart(sectorBarRef.value)
-  if (!chart) return
   const sectors = Object.entries(riskOverview.sector_concentration)
   if (!sectors.length) return
+  const chart = initChart(sectorBarRef.value)
+  if (!chart) return
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis', axisPointer: { type: 'shadow' } },
     grid: { ...gridBase, left: 80 },
@@ -387,10 +424,10 @@ function renderSectorBar() {
 }
 
 function renderTCALine() {
+  const trend = tcaSummary.daily_trend
+  if (tcaSummary.available === false || !trend.length) return
   const chart = initChart(tcaLineRef.value)
   if (!chart) return
-  const trend = tcaSummary.daily_trend
-  if (!trend.length) return
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis' },
     grid: gridBase,
@@ -409,10 +446,10 @@ function renderTCALine() {
 }
 
 function renderTCABar() {
+  const cb = tcaSummary.cost_breakdown
+  if (tcaSummary.available === false || !cb.length) return
   const chart = initChart(tcaBarRef.value)
   if (!chart) return
-  const cb = tcaSummary.cost_breakdown
-  if (!cb.length) return
   const last10 = cb.slice(-10)
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis', axisPointer: { type: 'shadow' } },
@@ -429,11 +466,11 @@ function renderTCABar() {
 }
 
 function renderFactorIC() {
-  const chart = initChart(factorICRef.value)
-  if (!chart) return
   const dates = factorStatus.ic_dates.map(d => d.slice(5))
   const factors = Object.keys(factorStatus.rolling_ic)
-  if (!factors.length || !dates.length) return
+  if (factorStatus.available === false || !factors.length || !dates.length) return
+  const chart = initChart(factorICRef.value)
+  if (!chart) return
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis' },
     grid: gridBase,
@@ -448,10 +485,10 @@ function renderFactorIC() {
 }
 
 function renderFactorAttr() {
+  const attr = factorStatus.attribution
+  if (factorStatus.available === false || !attr.length) return
   const chart = initChart(factorAttrRef.value)
   if (!chart) return
-  const attr = factorStatus.attribution
-  if (!attr.length) return
   const sorted = [...attr].sort((a, b) => b.contribution_bps - a.contribution_bps)
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis', axisPointer: { type: 'shadow' } },
@@ -471,6 +508,7 @@ function renderFactorAttr() {
 }
 
 function renderCapacityGauge() {
+  if (capacityGauge.available === false) return
   const chart = initChart(capacityGaugeRef.value)
   if (!chart) return
   chart.setOption({
@@ -498,10 +536,10 @@ function renderCapacityGauge() {
 }
 
 function renderCapacityCurve() {
+  const curve = capacityGauge.aum_curve
+  if (capacityGauge.available === false || !curve.length) return
   const chart = initChart(capacityCurveRef.value)
   if (!chart) return
-  const curve = capacityGauge.aum_curve
-  if (!curve.length) return
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis' },
     grid: gridBase,
@@ -594,6 +632,7 @@ onBeforeUnmount(() => {
   if (pollTimer) clearInterval(pollTimer)
   chartInstances.forEach(c => { try { c.dispose() } catch (_) {} })
   chartInstances = []
+  chartsByEl.clear()
   resizeObservers.forEach(o => { try { o.disconnect() } catch (_) {} })
   resizeObservers = []
 })
@@ -632,6 +671,18 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 160px;
   flex-shrink: 0;
+}
+
+.chart-unavailable {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+  padding: var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-align: center;
 }
 
 .chart-title {

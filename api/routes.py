@@ -382,7 +382,11 @@ def _execute_pipeline(run_id: str, req: RunRequest):
         # Risk
         from quant_platform.risk.stress import run_all_stress_tests
         from quant_platform.risk.var import var_summary
-        risk = var_summary(strategy_returns)
+        risk = var_summary(
+            strategy_returns,
+            confidence=config.risk.var.confidence,
+            horizon=config.risk.var.horizon,
+        )
         stress_df = run_all_stress_tests(strategy_returns)
         stress_tests = [
             StressTestItem(
@@ -973,12 +977,12 @@ async def get_demo():
         equity.append(round(price, 4))
         d += dt.timedelta(days=1)
 
-    # Drawdown
+    # Drawdown (fraction, matching /api/run; the UI multiplies by 100)
     dd = []
     peak = 0
     for v in equity:
         peak = max(peak, v)
-        dd.append(round((v / peak - 1) * 100, 2))
+        dd.append(round(v / peak - 1, 6))
 
     # Rolling sharpe (last 252 entries)
     rs_dates = dates[252:]
@@ -1111,11 +1115,14 @@ async def get_demo():
                 "years": ["2021", "2022", "2023", "2024", "2025"],
                 "months": list(range(1, 13)),
                 "data": [
-                    [3.2, -1.5, 2.8, 0.9, -2.1, 1.4, 3.5, -0.8, 2.1, 1.7, -1.2, 2.9],
-                    [-4.1, 1.2, -0.8, 2.3, -1.7, 3.1, -2.5, 0.6, 1.9, -3.2, 2.4, 0.5],
-                    [1.8, -0.4, 2.5, 1.1, -0.9, 2.7, 0.3, -1.6, 3.4, 0.8, -2.1, 1.5],
-                    [2.1, 1.5, -1.2, 3.8, 0.4, -0.7, 2.9, 1.3, -0.5, 4.1, 0.2, -1.8],
-                    [1.2, -0.6, 2.4, None, None, None, None, None, None, None, None, None],
+                    [value / 100 if value is not None else None for value in row]
+                    for row in (
+                        [3.2, -1.5, 2.8, 0.9, -2.1, 1.4, 3.5, -0.8, 2.1, 1.7, -1.2, 2.9],
+                        [-4.1, 1.2, -0.8, 2.3, -1.7, 3.1, -2.5, 0.6, 1.9, -3.2, 2.4, 0.5],
+                        [1.8, -0.4, 2.5, 1.1, -0.9, 2.7, 0.3, -1.6, 3.4, 0.8, -2.1, 1.5],
+                        [2.1, 1.5, -1.2, 3.8, 0.4, -0.7, 2.9, 1.3, -0.5, 4.1, 0.2, -1.8],
+                        [1.2, -0.6, 2.4, None, None, None, None, None, None, None, None, None],
+                    )
                 ],
             },
             "return_distribution": distribution,
@@ -1822,6 +1829,11 @@ def _run_monte_carlo(result: dict, params: dict) -> dict:
         mc_result = simulator.bootstrap_simulation(daily_returns, block_size=21)
 
     # Convert numpy types for JSON serialization
+    terminal_values = np.asarray(mc_result.get("terminal_values", []), dtype=float)
+    if terminal_values.size > 2_000:
+        step = int(np.ceil(terminal_values.size / 2_000))
+        terminal_values = terminal_values[::step]
+
     return {
         "method": mc_result["method"],
         "n_simulations": mc_result["n_simulations"],
@@ -1831,6 +1843,7 @@ def _run_monte_carlo(result: dict, params: dict) -> dict:
         "max_drawdown": mc_result["max_drawdown"],
         "sharpe": mc_result.get("sharpe", {}),
         "fitted_distribution": mc_result.get("fitted_distribution"),
+        "terminal_values": terminal_values.tolist(),
         "paths": mc_result.get("paths", [])[:30],
     }
 

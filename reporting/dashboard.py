@@ -37,6 +37,8 @@ def generate_dashboard(
     save_plots: bool = True,
     plot_format: str = "png",
     ic_results: dict[str, dict] | None = None,
+    var_confidence: float = 0.95,
+    var_horizon: int = 1,
 ) -> str:
     """Generate comprehensive backtest dashboard.
 
@@ -69,7 +71,9 @@ def generate_dashboard(
     rolling_stats = _compute_rolling_stats(strategy_returns)
 
     # Risk metrics
-    risk = var_summary(strategy_returns)
+    risk = var_summary(
+        strategy_returns, confidence=var_confidence, horizon=var_horizon,
+    )
     stress = run_all_stress_tests(strategy_returns)
 
     # Exposure (latest weights)

@@ -239,10 +239,18 @@ class ComplianceExporter:
                 continue
             try:
                 dt = datetime.fromisoformat(str(raw))
-                if start_dt <= dt <= end_dt:
-                    filtered.append(r)
             except (ValueError, TypeError):
                 continue
+            # Timezone-aware timestamps (QMT callbacks, externally imported
+            # records) cannot be compared with the naive local window: the
+            # comparison raises TypeError, which the old code caught as
+            # "unparseable" and silently dropped the record from every export.
+            # Convert to local wall-clock time, which is what the export
+            # window is expressed in.
+            if dt.tzinfo is not None:
+                dt = dt.astimezone().replace(tzinfo=None)
+            if start_dt <= dt <= end_dt:
+                filtered.append(r)
         return filtered
 
     def _write_xlsx(

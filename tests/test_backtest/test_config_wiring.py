@@ -1,0 +1,82 @@
+"""The portfolio config knobs must reach the objects that use them.
+
+`portfolio.risk_aversion`, `portfolio.covariance.ewma_half_life` and
+`risk.var.confidence` were declared in `config/schema.py` and
+`config/default.yaml` but no caller read them: changing them in YAML produced
+an identical backtest.
+"""
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from quant_platform.main import _run_backtest
+from quant_platform.utils.config import load_config
+
+DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "default.yaml"
+
+
+def test_run_backtest_forwards_portfolio_config(monkeypatch):
+    import quant_platform.backtest.engine as engine_mod
+
+    config = load_config(str(DEFAULT_CONFIG))
+    config.portfolio.risk_aversion = 3.5
+    config.portfolio.covariance.method = "ewma"
+    config.portfolio.covariance.ewma_half_life = 21
+
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, **kwargs):
+            return {"summary": {}, "daily_returns": None, "weights_history": {}}
+
+    monkeypatch.setattr(engine_mod, "BacktestEngine", FakeEngine)
+
+    _run_backtest(config, None, None, None, None, None, None)
+
+    assert captured["constraints"].risk_aversion == 3.5
+    assert captured["covariance_method"] == "ewma"
+    assert captured["covariance_ewma_half_life"] == 21
+
+
+def test_engine_forwards_ewma_half_life_to_covariance(monkeypatch):
+    import quant_platform.backtest.engine as engine_mod
+    from quant_platform.backtest.engine import BacktestEngine
+
+    captured = {}
+
+    def fake_estimate(ret, method="sample", lookback=252, ewma_half_life=63):
+        captured["method"] = method
+        captured["ewma_half_life"] = ewma_half_life
+        return None
+
+    monkeypatch.setattr(engine_mod, "estimate_covariance", fake_estimate)
+
+    dates = pd.bdate_range("2023-01-02", periods=90)
+    assets = [f"S{i:02d}" for i in range(12)]
+    rng = np.random.default_rng(0)
+    returns = pd.DataFrame(
+        rng.normal(0, 0.01, (len(dates), len(assets))),
+        index=dates, columns=assets,
+    )
+    prices = 100 * (1 + returns).cumprod()
+    signal = pd.DataFrame(1.0, index=dates, columns=assets)
+
+    engine = BacktestEngine(
+        initial_capital=1_000_000,
+        rebalance_frequency="monthly",
+        optimizer="equal_weight",
+        covariance_method="ewma",
+        covariance_lookback=20,
+        covariance_ewma_half_life=17,
+    )
+    engine.run(
+        signal=signal, prices=prices, returns=returns,
+        benchmark_returns=returns.mean(axis=1), sector_map=None,
+    )
+
+    assert captured["method"] == "ewma"
+    assert captured["ewma_half_life"] == 17
