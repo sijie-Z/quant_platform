@@ -18,9 +18,19 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import StrEnum
 from typing import Any
 
+from quant_platform.execution.models import (
+    Fill as ExecutionFill,
+)
+from quant_platform.execution.models import (
+    Order as ExecutionOrder,
+)
+from quant_platform.execution.models import (
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from quant_platform.execution.order_book import (
     BookOrder,
     OrderBook,
@@ -36,28 +46,15 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-class OrderSide(StrEnum):
-    BUY = "buy"
-    SELL = "sell"
-
-
-class OrderType(StrEnum):
-    LIMIT = "limit"
-    MARKET = "market"
-
-
-class OrderStatus(StrEnum):
-    PENDING = "pending"
-    SUBMITTED = "submitted"
-    PARTIAL = "partial"
-    FILLED = "filled"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
-
-
 @dataclass
-class Order:
-    """A trade order."""
+class BrokerOrder:
+    """Broker-layer order DTO.
+
+    This is the wire shape used by SimulatedBroker/QMTBroker. The canonical
+    domain model is `quant_platform.execution.models.Order`. Both used to be
+    called `Order`, so a function signature could not say which contract it
+    expected; use the conversion methods at the layer boundary (issue #74).
+    """
     order_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     code: str = ""               # e.g. '600519'
     side: OrderSide = OrderSide.BUY
@@ -75,6 +72,58 @@ class Order:
     broker_order_id: str = ""
     error_msg: str = ""
 
+    def to_execution_order(self) -> ExecutionOrder:
+        """Convert this broker DTO to the canonical OMS model."""
+        order = ExecutionOrder(
+            order_id=self.order_id,
+            ticker=self.code,
+            side=OrderSide(self.side.value),
+            order_type=OrderType(self.order_type.value),
+            quantity=self.quantity,
+            limit_price=self.price if self.price > 0 else None,
+            status=OrderStatus(self.status.value),
+            created_at=self.created_at,
+            notes=self.error_msg,
+        )
+        if self.filled_quantity > 0:
+            order.fills.append(ExecutionFill(
+                timestamp=self.updated_at,
+                price=self.filled_price,
+                quantity=self.filled_quantity,
+                commission=self.commission,
+                tax=self.tax,
+                slippage=self.slippage,
+            ))
+        return order
+
+    @classmethod
+    def from_execution_order(
+        cls, order: ExecutionOrder, **overrides: Any,
+    ) -> BrokerOrder:
+        """Build a broker DTO from the canonical OMS model."""
+        broker_order = cls(
+            order_id=order.order_id,
+            code=order.ticker,
+            side=OrderSide(order.side.value),
+            order_type=OrderType(order.order_type.value),
+            quantity=order.quantity,
+            price=order.limit_price or 0.0,
+            filled_quantity=order.filled_quantity,
+            filled_price=order.avg_fill_price,
+            status=OrderStatus(order.status.value),
+            commission=order.total_commission,
+            tax=order.total_tax,
+            slippage=order.total_slippage,
+            created_at=order.created_at or datetime.now().isoformat(),
+            updated_at=(
+                order.filled_at or order.submitted_at or datetime.now().isoformat()
+            ),
+            error_msg=order.notes,
+        )
+        for key, value in overrides.items():
+            setattr(broker_order, key, value)
+        return broker_order
+
     def to_dict(self) -> dict:
         return {
             "order_id": self.order_id, "code": self.code,
@@ -86,6 +135,11 @@ class Order:
             "created_at": self.created_at, "updated_at": self.updated_at,
             "error_msg": self.error_msg,
         }
+
+
+# Backward-compatible name. New code should use `BrokerOrder` so the layer is
+# explicit and `execution.models.Order` stays the single domain model.
+Order = BrokerOrder
 
 
 @dataclass

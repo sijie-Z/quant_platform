@@ -79,3 +79,64 @@ def test_optimizer_with_prev_weights():
 
     weights = optimizer.optimize(signal, cov, prev_weights=prev)
     assert weights.sum() > 0
+
+
+def test_turnover_counts_names_entering_and_leaving_the_portfolio():
+    """The old clamp aligned on the intersection, so a complete swap of the
+    portfolio looked like zero turnover."""
+    assets = [f"S{i:02d}" for i in range(20)]
+    signal = pd.Series(1.0, index=assets)
+    constraints = PortfolioConstraints(max_weight=0.10, max_turnover=0.20)
+    prev = pd.Series(0.0, index=assets)
+    prev.iloc[10:] = 0.10  # hold exactly the names the optimizer will drop
+
+    weights = EqualWeightOptimizer(constraints).optimize(signal, prev_weights=prev)
+
+    index = weights.index.union(prev.index)
+    turnover = (
+        weights.reindex(index, fill_value=0.0) - prev.reindex(index, fill_value=0.0)
+    ).abs().sum() / 2
+    assert turnover <= 0.20 + 1e-9, f"turnover {turnover:.3f} exceeded the cap"
+
+
+def test_equal_weight_never_scales_above_max_weight():
+    """Renormalizing a too-narrow candidate set used to undo the cap."""
+    assets = [f"S{i}" for i in range(5)]
+    signal = pd.Series(1.0, index=assets)
+    constraints = PortfolioConstraints(max_weight=0.10)
+
+    weights = EqualWeightOptimizer(constraints).optimize(signal)
+
+    assert weights.max() <= 0.10 + 1e-12
+    # Five names cannot fill 100% under a 10% cap; the rest is cash.
+    assert weights.sum() <= 0.5 + 1e-12
+
+
+def test_fallback_is_counted_and_reason_is_recorded():
+    signal = pd.Series([1.0], index=["ONLY"])
+    optimizer = MeanVarianceOptimizer(PortfolioConstraints(max_weight=1.0))
+
+    weights = optimizer.optimize(signal)
+
+    assert weights.sum() > 0
+    assert optimizer.fallback_count == 1
+    assert "fewer than two" in (optimizer.last_fallback_reason or "")
+
+
+def test_solver_failure_is_counted(monkeypatch):
+    import cvxpy as cp
+
+    signal, cov = _make_signal_and_cov(20)
+    constraints = PortfolioConstraints(max_weight=0.10, max_turnover=0.30)
+    optimizer = MeanVarianceOptimizer(constraints)
+
+    def explode(self, *args, **kwargs):
+        raise RuntimeError("solver exploded")
+
+    monkeypatch.setattr(cp.Problem, "solve", explode)
+
+    weights = optimizer.optimize(signal, cov)
+
+    assert weights.sum() > 0
+    assert optimizer.fallback_count == 1
+    assert "solver" in (optimizer.last_fallback_reason or "")

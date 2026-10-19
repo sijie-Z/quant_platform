@@ -24,7 +24,7 @@
 
 | 编号 | 名称 | 核心发现 | 状态 |
 |------|------|---------|------|
-| #001 | [Factor Selection](ABLATION_001_FACTOR_SELECTION.md) | 等权融合所有因子会显著稀释 Alpha。Top 8 vs All 26 差距 **1.24 Sharpe** | ✅ |
+| #001 | [Factor Selection](ABLATION_001_FACTOR_SELECTION.md) | 等权融合所有因子会显著稀释 Alpha。Top 8 vs All 26 差距 **1.24 Sharpe** | ⚠️ **数字作废（#60）** — 产出于空信号缺陷修复前 |
 | #002 | [Correlation Clustering](ABLATION_002_CORRELATION_CLUSTERING.md) | 8 个因子 = **4 个独立 Alpha 信号簇**：短期反转、中期趋势、长期趋势、流动性 | ✅ |
 | #003 | [Cluster Representatives](ABLATION_003_CLUSTER_REPRESENTATIVES.md) | 4 个代表因子解释 Top 8 的 **82% 收益**（Sharpe 0.381 vs 0.464） | ✅ |
 

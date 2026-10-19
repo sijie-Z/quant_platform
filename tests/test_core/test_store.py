@@ -341,3 +341,23 @@ class TestThePrimaryKeyMigration:
         reopened = Store(db)
 
         assert len(reopened.get_positions()) == 2
+
+
+class TestEngineState:
+    def test_round_trip(self, store):
+        state = {"version": 1, "cash": 1.0, "positions": [{"asset": "A"}]}
+        store.save_engine_state(state, "strategy-a")
+        assert store.get_engine_state("strategy-a") == state
+
+    def test_missing_returns_none(self, store):
+        assert store.get_engine_state("does-not-exist") is None
+
+    def test_overwrite_keeps_one_row(self, store):
+        store.save_engine_state({"v": 1}, "s")
+        store.save_engine_state({"v": 2}, "s")
+        assert store.get_engine_state("s") == {"v": 2}
+
+    def test_survives_reopen(self, tmp_path):
+        db = str(tmp_path / "state.db")
+        Store(db).save_engine_state({"v": 3}, "s")
+        assert Store(db).get_engine_state("s") == {"v": 3}

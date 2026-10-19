@@ -198,7 +198,7 @@ def classify_regimes(benchmark_returns):
     if benchmark_returns is None or len(benchmark_returns) == 0:
         return pd.Series("Sideways", index=pd.date_range(START_DATE, END_DATE, freq="ME"))
 
-    monthly = benchmark_returns.resample("M").apply(lambda x: (1 + x).prod() - 1)
+    monthly = benchmark_returns.resample(pd.offsets.MonthEnd()).apply(lambda x: (1 + x).prod() - 1)
     regimes = {}
     for date, ret in monthly.items():
         if ret > REGIME_THRESHOLDS["Bull"]:

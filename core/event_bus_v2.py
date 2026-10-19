@@ -486,9 +486,15 @@ class AsyncEventBus:
 
         # Event loop reference (set on first async operation)
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._started = False
 
         # DLQ retry task
         self._dlq_task: asyncio.Task | None = None
+
+    @property
+    def is_started(self) -> bool:
+        """Whether the consumer loops and DLQ retry loop are running."""
+        return self._started
 
     # ── Subscription ──
 
@@ -520,6 +526,7 @@ class AsyncEventBus:
                 self._handlers[topic].append((handler, queue, stats, 'async'))
             logger.debug("Subscribed async handler '%s' to '%s' (queue=%d)",
                         handler_name, topic, q_size)
+            self._ensure_consumer(topic, handler, queue, stats, 'async')
         else:
             # Sync handler — delegate to subscribe_sync
             self.subscribe_sync(topic, handler, queue_size=queue_size, name=name)
@@ -543,6 +550,46 @@ class AsyncEventBus:
 
         logger.debug("Subscribed sync handler '%s' to '%s' (queue=%d)",
                     handler_name, topic, q_size)
+        self._ensure_consumer(topic, handler, queue, stats, 'sync')
+
+    def _start_consumer_task(self, topic, handler, queue, stats, handler_type):
+        """Create the consumer task for one handler. Loop thread only."""
+        key = f"{topic}:{stats.handler_name}"
+        if key in self._consumer_tasks:
+            return
+        if handler_type == 'async':
+            self._consumer_tasks[key] = self._loop.create_task(
+                self._async_consumer_loop(handler, queue, stats)
+            )
+        else:
+            self._consumer_tasks[key] = self._loop.create_task(
+                self._sync_consumer_loop(handler, queue, stats)
+            )
+
+    def _ensure_consumer(self, topic, handler, queue, stats, handler_type):
+        """Attach a consumer loop to a handler subscribed after start().
+
+        Engines and other components are created on demand, long after the
+        application startup hook started the bus. Without this their handlers
+        would sit in the registry with no task draining the queue.
+        """
+        if not self._started or self._loop is None or not self._loop.is_running():
+            return
+        key = f"{topic}:{stats.handler_name}"
+        if key in self._consumer_tasks:
+            return
+
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if running is self._loop:
+            self._start_consumer_task(topic, handler, queue, stats, handler_type)
+        else:
+            self._loop.call_soon_threadsafe(
+                self._start_consumer_task, topic, handler, queue, stats, handler_type,
+            )
 
     def unsubscribe(self, topic: str, handler: SyncHandler | AsyncHandler):
         """Remove a handler subscription."""
@@ -707,22 +754,20 @@ class AsyncEventBus:
 
     async def start(self):
         """Start all consumer loops. Call once at application startup."""
-        self._loop = asyncio.get_event_loop()
+        if self._started:
+            return
+
+        self._loop = asyncio.get_running_loop()
+        self._started = True
 
         with self._lock:
-            for topic, handlers in self._handlers.items():
-                for handler, queue, stats, handler_type in handlers:
-                    key = f"{topic}:{stats.handler_name}"
-                    if key not in self._consumer_tasks:
-                        if handler_type == 'async':
-                            task = asyncio.create_task(
-                                self._async_consumer_loop(handler, queue, stats)
-                            )
-                        else:
-                            task = asyncio.create_task(
-                                self._sync_consumer_loop(handler, queue, stats)
-                            )
-                        self._consumer_tasks[key] = task
+            registered = [
+                (topic, handler, queue, stats, handler_type)
+                for topic, handlers in self._handlers.items()
+                for handler, queue, stats, handler_type in handlers
+            ]
+        for topic, handler, queue, stats, handler_type in registered:
+            self._start_consumer_task(topic, handler, queue, stats, handler_type)
 
         # Start DLQ retry loop
         self._dlq_task = asyncio.create_task(self._dlq_retry_loop())
@@ -732,6 +777,9 @@ class AsyncEventBus:
 
     async def stop(self):
         """Gracefully stop all consumers. Flush WAL."""
+        if not self._started:
+            return
+
         # Cancel all consumer tasks
         for task in self._consumer_tasks.values():
             task.cancel()
@@ -753,6 +801,7 @@ class AsyncEventBus:
         self._consumer_tasks.clear()
         self._dlq_task = None
         self._loop = None
+        self._started = False
 
         # Close event store
         self._event_store.close()

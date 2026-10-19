@@ -218,3 +218,130 @@ class TestBarraModel:
         rd = model.decompose_risk(portfolio_weights, factor_exposures, date=str(date))
         assert isinstance(rd, BarraRiskDecomposition)
         assert rd.total_risk > 0
+
+
+class TestBarraExposureBuilder:
+    """The production endpoint used to pass the platform's factor panel
+    straight into `fit()`. None of its names (`momentum_12m`,
+    `log_market_cap`, ...) matched the Barra names (`momentum`, `size`, ...),
+    so all ten exposures fell back to zero and the decomposition reported
+    zero factor risk for every portfolio. These tests pin the translation."""
+
+    @pytest.fixture
+    def market_data(self):
+        rng = np.random.default_rng(7)
+        dates = pd.bdate_range("2023-01-02", periods=80)
+        assets = [f"S{i:02d}" for i in range(40)]
+
+        returns = pd.DataFrame(
+            rng.normal(0.0, 0.01, (len(dates), len(assets))),
+            index=dates, columns=assets,
+        )
+        prices = 10.0 * (1.0 + returns).cumprod()
+        benchmark = returns.mean(axis=1)
+
+        platform_factors = {}
+        for name in (
+            "log_market_cap", "pb_ratio", "momentum_12m", "volatility_60d",
+            "roe", "asset_growth", "turnover_20d",
+        ):
+            platform_factors[name] = pd.DataFrame(
+                rng.normal(size=(len(dates), len(assets))),
+                index=dates, columns=assets,
+            )
+
+        index = pd.MultiIndex.from_product(
+            [dates, assets], names=["date", "asset"],
+        )
+        financials = pd.DataFrame({
+            "total_assets": rng.uniform(1e9, 5e9, len(index)),
+            "net_assets": rng.uniform(1e8, 1e9, len(index)),
+        }, index=index)
+
+        return prices, returns, benchmark, financials, platform_factors
+
+    def test_builds_non_zero_panel_for_every_factor(self, market_data):
+        prices, returns, benchmark, financials, platform_factors = market_data
+        model = BarraModel()
+
+        exposures = model.build_exposures(
+            prices, returns,
+            benchmark=benchmark,
+            financials=financials,
+            platform_factors=platform_factors,
+        )
+
+        assert set(exposures) == set(BARRA_FACTORS)
+        for name in BARRA_FACTORS:
+            panel = exposures[name]
+            assert panel.shape == returns.shape
+            assert np.isfinite(panel.to_numpy()).all()
+            assert panel.abs().to_numpy().sum() > 0, f"{name} exposure is all zero"
+
+    def test_value_proxy_is_negated_price_to_book(self, market_data):
+        prices, returns, benchmark, financials, platform_factors = market_data
+        model = BarraModel()
+
+        exposures = model.build_exposures(
+            prices, returns,
+            benchmark=benchmark,
+            financials=financials,
+            platform_factors=platform_factors,
+        )
+
+        correlation = exposures["value"].stack().corr(platform_factors["pb_ratio"].stack())
+        assert correlation < 0, "Barra value is book-to-price, pb_ratio is price-to-book"
+
+    def test_fitted_model_reports_non_zero_factor_risk(self, market_data):
+        prices, returns, benchmark, financials, platform_factors = market_data
+        model = BarraModel()
+        exposures = model.build_exposures(
+            prices, returns,
+            benchmark=benchmark,
+            financials=financials,
+            platform_factors=platform_factors,
+        )
+        model.fit(exposures, returns)
+
+        # A concentrated portfolio: equal weight over the whole universe has
+        # zero net exposure to every cross-sectionally standardized factor.
+        weights = pd.Series(0.0, index=returns.columns)
+        weights.iloc[:10] = 0.1
+        decomposition = model.decompose_risk(weights, exposures)
+
+        assert decomposition.factor_risk > 0
+        assert decomposition.r_squared > 0
+        assert sum(abs(v) for v in decomposition.factor_exposures.values()) > 0
+
+    def test_universe_equal_weight_has_no_net_factor_exposure(self, market_data):
+        """Documents why a whole-universe equal-weight portfolio decomposes
+        to zero factor risk: every exposure is cross-sectionally z-scored to
+        zero mean, so the portfolio average is zero by construction."""
+        prices, returns, benchmark, financials, platform_factors = market_data
+        model = BarraModel()
+        exposures = model.build_exposures(
+            prices, returns,
+            benchmark=benchmark,
+            financials=financials,
+            platform_factors=platform_factors,
+        )
+        model.fit(exposures, returns)
+
+        weights = pd.Series(1.0 / returns.shape[1], index=returns.columns)
+        decomposition = model.decompose_risk(weights, exposures)
+        assert decomposition.factor_risk == pytest.approx(0.0, abs=1e-12)
+
+    def test_specific_risk_is_per_asset(self, market_data):
+        prices, returns, benchmark, financials, platform_factors = market_data
+        model = BarraModel()
+        exposures = model.build_exposures(
+            prices, returns,
+            benchmark=benchmark,
+            financials=financials,
+            platform_factors=platform_factors,
+        )
+        model.fit(exposures, returns)
+
+        specific = model.specific_risk.reindex(returns.columns)
+        assert specific.notna().all()
+        assert specific.std() > 0, "every asset got the same specific risk"

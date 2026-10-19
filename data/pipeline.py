@@ -423,6 +423,13 @@ class DataPipeline:
         # Handle price limits: stocks at limit ( ±10%) are untradable
         close = df["close_adj"].unstack("asset")
         change = close.pct_change(fill_method=None)
+        # A resume-day jump is a multi-day move, not a limit move: do not
+        # label rows whose price spans a forward-filled suspension.
+        if "is_suspended" in df.columns:
+            suspended = (
+                df["is_suspended"].unstack("asset").fillna(False).astype(bool)
+            )
+            change = change.mask(suspended | suspended.shift(1))
         limit_thresholds = pd.DataFrame(0.10, index=close.index, columns=close.columns)
         for col in close.columns:
             code = str(col)
@@ -468,8 +475,20 @@ class DataPipeline:
         return the strategy could have earned.
         """
         close = self.prices["close_adj"].unstack("asset")
-        self.returns = close.pct_change(fill_method=None).shift(-1)
+        returns = close.pct_change(fill_method=None).shift(-1)
         # shift(-1): return from today's close to tomorrow's close
+
+        # A suspension leaves a stale (forward-filled) close. `returns[s-1]`
+        # then becomes a fake zero and `returns[s]` the compounded multi-day
+        # move -- adjacent contaminated observations that produce a spurious
+        # reversal signal. Neither is a one-day return, so drop both.
+        if "is_suspended" in self.prices.columns:
+            suspended = (
+                self.prices["is_suspended"].unstack("asset").fillna(False).astype(bool)
+            )
+            returns = returns.mask(suspended | suspended.shift(-1))
+
+        self.returns = returns
 
     # ------------------------------------------------------------------
     # Alignment
@@ -495,6 +514,23 @@ class DataPipeline:
     def get_close(self) -> pd.DataFrame:
         """Return close prices (unstacked: date x asset)."""
         return self.prices["close_adj"].unstack("asset")
+
+    def get_factor_prices(self) -> pd.DataFrame:
+        """Close prices with forward-filled suspension rows blanked.
+
+        `get_close()` keeps the stale mark, which is what valuation wants on a
+        day a stock could not trade. Research inputs are different: a factor
+        that differences across the fill sees a fake zero followed by a
+        multi-day move. Blanking those rows makes pandas propagate NaN across
+        both boundaries instead of fabricating a reversal.
+        """
+        close = self.prices["close_adj"].unstack("asset")
+        if "is_suspended" in self.prices.columns:
+            suspended = (
+                self.prices["is_suspended"].unstack("asset").fillna(False).astype(bool)
+            )
+            close = close.mask(suspended)
+        return close
 
     def get_volume(self) -> pd.DataFrame:
         """Return volume (unstacked: date x asset)."""

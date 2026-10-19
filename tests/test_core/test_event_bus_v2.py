@@ -364,3 +364,39 @@ class TestTheBusCanBeRestarted:
 
         assert len(received) == 2, "the restarted bus never delivered the event"
         assert received[1].data["n"] == 2
+
+
+class TestProductionStart:
+    """The global bus used to be created and never started: every publish
+    fell back to inline synchronous delivery, async handlers were skipped,
+    and the DLQ retry loop never ran. `start()` is now called from the app
+    lifespan, and handlers registered afterwards get a consumer task."""
+
+    @pytest.mark.asyncio
+    async def test_is_started_reflects_the_lifecycle(self):
+        bus = AsyncEventBus(default_queue_size=100)
+        assert bus.is_started is False
+
+        await bus.start()
+        assert bus.is_started is True
+
+        await bus.stop()
+        assert bus.is_started is False
+
+    @pytest.mark.asyncio
+    async def test_handler_subscribed_after_start_is_consumed(self):
+        bus = AsyncEventBus(default_queue_size=100)
+        received = []
+
+        async def handler(event: Event):
+            received.append(event)
+
+        await bus.start()
+        bus.subscribe("late.topic", handler)
+        await asyncio.sleep(0)  # let the consumer task be scheduled
+
+        await bus.publish_async("late.topic", {"n": 1})
+        await asyncio.sleep(0.05)
+        await bus.stop()
+
+        assert len(received) == 1, "a handler subscribed after start() was never drained"

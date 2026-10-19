@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -59,6 +59,7 @@ class State:
     last_rebalance: str = ""
     next_rebalance: str = ""
     vol_series: list[float] = field(default_factory=list)
+    last_processed_date: str = ""
     status: str = "init"
 
 
@@ -90,6 +91,56 @@ class LiveEngine:
         self.state.next_rebalance = str(self._rebalance_dates[0])[:10] if self._rebalance_dates else ""
         logger.info("History loaded: %d days, %d rebalance dates", len(returns), len(self._rebalance_dates))
 
+    # ── 状态持久化 ──
+
+    SNAPSHOT_VERSION = 1
+
+    def to_snapshot(self) -> dict[str, Any]:
+        """Serialize all runtime state for persistence across processes."""
+        return {
+            "version": self.SNAPSHOT_VERSION,
+            "cash": self.state.cash,
+            "positions": [asdict(p) for p in self.state.positions],
+            "equity_peak": self.state.equity_peak,
+            "current_equity": self.state.current_equity,
+            "total_trades": self.state.total_trades,
+            "last_rebalance": self.state.last_rebalance,
+            "next_rebalance": self.state.next_rebalance,
+            "vol_series": list(self.state.vol_series),
+            "status": self.state.status,
+            "last_processed_date": self.state.last_processed_date,
+            "day_count": self._day_count,
+        }
+
+    def restore_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Rehydrate state from :meth:`to_snapshot`.
+
+        Call this AFTER ``load_history``: loading history recomputes
+        ``next_rebalance`` and would otherwise overwrite the persisted value.
+
+        Raises:
+            ValueError: if the snapshot version is unsupported.
+        """
+        version = snapshot.get("version")
+        if version != self.SNAPSHOT_VERSION:
+            raise ValueError(
+                f"Unsupported LiveEngine snapshot version: {version!r}"
+            )
+
+        self.state.cash = float(snapshot.get("cash", INITIAL_CAPITAL))
+        self.state.positions = [
+            Position(**position) for position in snapshot.get("positions", [])
+        ]
+        self.state.equity_peak = float(snapshot.get("equity_peak", INITIAL_CAPITAL))
+        self.state.current_equity = float(snapshot.get("current_equity", INITIAL_CAPITAL))
+        self.state.total_trades = int(snapshot.get("total_trades", 0))
+        self.state.last_rebalance = snapshot.get("last_rebalance", "")
+        self.state.next_rebalance = snapshot.get("next_rebalance", "")
+        self.state.vol_series = list(snapshot.get("vol_series", []))
+        self.state.status = snapshot.get("status", "init")
+        self.state.last_processed_date = snapshot.get("last_processed_date", "")
+        self._day_count = int(snapshot.get("day_count", 0))
+
     # ── 核心循环 ──
 
     def run_once(self, date: pd.Timestamp) -> dict[str, Any]:
@@ -101,6 +152,21 @@ class LiveEngine:
             return {"status": "no_data"}
 
         date_str = str(date)[:10]
+
+        # A killed engine stays killed until an operator explicitly restores
+        # or clears it; and a date already processed must not be replayed
+        # (a daemon restart used to double-apply a day).
+        if self.state.status == "killed":
+            return {
+                "date": date_str, "action": "killed", "status": "killed",
+                "equity": self.state.current_equity, "cash": self.state.cash,
+            }
+        if self.state.last_processed_date and date_str <= self.state.last_processed_date:
+            return {
+                "date": date_str, "action": "none", "status": "already_processed",
+                "equity": self.state.current_equity, "cash": self.state.cash,
+            }
+
         self._day_count += 1
         result: dict[str, Any] = {"date": date_str, "action": "none"}
 
@@ -131,6 +197,7 @@ class LiveEngine:
         result["drawdown"] = drawdown
         result["n_positions"] = len(self.state.positions)
 
+        self.state.last_processed_date = date_str
         return result
 
     def run(self, start: str | None = None, end: str | None = None):

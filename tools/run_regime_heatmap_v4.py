@@ -50,7 +50,7 @@ def compound(x):
 
 
 def classify_regimes(benchmark_returns):
-    monthly = benchmark_returns.resample("M").apply(lambda x: (1 + x).prod() - 1)
+    monthly = benchmark_returns.resample(pd.offsets.MonthEnd()).apply(lambda x: (1 + x).prod() - 1)
     regimes = {}
     for date, ret in monthly.items():
         if ret > 0.02:
@@ -69,7 +69,7 @@ def classify_regimes(benchmark_returns):
 
 
 def classify_volatility(returns):
-    monthly_vol = returns.mean(axis=1).resample("M").std()
+    monthly_vol = returns.mean(axis=1).resample(pd.offsets.MonthEnd()).std()
     thirds = monthly_vol.quantile([1/3, 2/3])
     regimes = {}
     for date, vol in monthly_vol.items():
