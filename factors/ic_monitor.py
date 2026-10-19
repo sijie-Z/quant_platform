@@ -22,6 +22,7 @@ import warnings
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -94,35 +95,35 @@ class FactorICMonitor:
         if len(common_dates) < window:
             return pd.Series(dtype=float)
 
-        ic_values = []
-        ic_dates = []
+        # Cross-sectional IC is a per-date quantity: compute it once for each
+        # date, then take the rolling mean. The old nested loop recomputed the
+        # same date's IC `window` times (14,931 Spearman calls for 237 output
+        # dates on a 300-day panel), which made this function O(n * window)
+        # and dominated the whole test suite (issue #62).
+        daily_ic: dict[Any, float] = {}
+        for date in common_dates:
+            f_vals = factor.loc[date].dropna()
+            r_vals = forward_returns.loc[date].dropna()
+            common = f_vals.index.intersection(r_vals.index)
+            if len(common) > 10:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    ic = f_vals[common].corr(r_vals[common], method="spearman")
+                if not np.isnan(ic):
+                    daily_ic[date] = float(ic)
 
-        for i in range(window, len(common_dates)):
-            date = common_dates[i]
-            window_dates = common_dates[i - window:i]
-
-            # Get factor values and returns for the window
-            factor.loc[window_dates]
-            returns_window = forward_returns.loc[window_dates]
-
-            # Compute cross-sectional rank IC for each date, then average
-            daily_ics = []
-            for d in window_dates:
-                f_vals = factor.loc[d].dropna()
-                r_vals = returns_window.loc[d].dropna()
-                common = f_vals.index.intersection(r_vals.index)
-                if len(common) > 10:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        ic = f_vals[common].corr(r_vals[common], method="spearman")
-                    if not np.isnan(ic):
-                        daily_ics.append(ic)
-
-            if daily_ics:
-                ic_values.append(float(np.mean(daily_ics)))
-                ic_dates.append(date)
-
-        return pd.Series(ic_values, index=ic_dates, name="ic")
+        # ic[t] = mean of daily ICs over the `window` dates before t, i.e. the
+        # same window the old loop used (current date excluded).
+        ic_series = pd.Series(daily_ic, dtype=float).reindex(common_dates)
+        ic_series = (
+            ic_series.rolling(window, min_periods=1)
+            .mean()
+            .shift(1)
+            .iloc[window:]
+            .dropna()
+        )
+        ic_series.name = "ic"
+        return ic_series
 
     def compute_factor_stats(
         self,

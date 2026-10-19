@@ -1,5 +1,10 @@
 # Trading System Runtime Kernel — alpha-v1.0 控制平面
 
+> **STATUS: PARTIAL PROPOSAL — not wired into the runtime. See #78 / #77.**
+> `kernel/kernel.py` exists but has zero runtime importers; `daemon/runner.py`
+> still runs `LiveEngine` + `SafetySystem` directly. Sections 2–4 describe the
+> intended design, not the current system.
+
 > 把零件装成机器。从 "collection of components" 变成 "autonomous trading organism"。
 
 ---

@@ -58,14 +58,22 @@ classifiers = [
 ]
 
 [project.scripts]
-quant = "main:main"
+quant = "quant_platform.main:main"
 
-[tool.setuptools.packages.find]
-# The repo root IS the quant_platform package; subpackages (core, data, ...)
-# are discovered directly. Using include=["*"] because find_packages returns
-# subpackage names (core, data) without the "quant_platform." prefix, so
-# "quant_platform*" would match nothing.
-include = ["*"]
+[tool.setuptools]
+# The repo root IS the `quant_platform` package. Package it under that name
+# instead of installing its 46 subdirectories as top-level packages: the old
+# `packages.find include=["*"]` installed `data`, `core`, ... directly, which
+# created a second module identity (`data.x` vs `quant_platform.data.x`) and
+# split every module-level singleton in two (issue #69).
+#
+# This mapping is designed for editable installs (`pip install -e .`), which
+# is what CI and the Dockerfile use. A non-editable wheel would contain only
+# `quant_platform/__init__.py`; enumerate subpackages here if that is needed.
+packages = ["quant_platform"]
+
+[tool.setuptools.package-dir]
+quant_platform = "."
 
 # ---------------------------------------------------------------------------
 # ruff — fast Python linter (replaces flake8 + isort + autoflake)
