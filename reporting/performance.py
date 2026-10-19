@@ -108,7 +108,8 @@ def plot_monthly_returns_heatmap(
     save_path: str | None = None,
 ) -> plt.Figure:
     """Plot monthly returns heatmap."""
-    monthly = strategy_returns.resample("M").apply(lambda x: (1 + x).prod() - 1)
+    # `"M"` was removed in pandas 3; MonthEnd works on 2.x and 3.x.
+    monthly = strategy_returns.resample(pd.offsets.MonthEnd()).apply(lambda x: (1 + x).prod() - 1)
 
     # Build pivot: year x month
     df = monthly.to_frame(name="return")

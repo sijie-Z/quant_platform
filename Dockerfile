@@ -46,12 +46,6 @@ RUN pip install -e . --no-deps
 # Prebuilt dashboard from stage 1
 COPY --from=frontend /frontend/dist ./frontend/dist
 
-# Symlink so `import quant_platform` resolves in any context:
-# WORKDIR=/app, but the package is named quant_platform, so we make
-# /quant_platform → /app available via PYTHONPATH=/.
-RUN ln -sf /app /quant_platform
-ENV PYTHONPATH=/:/app
-
 # ---------------------------------------------------------------------------
 # Drop privileges. Only the paths the application actually writes to are
 # handed to the runtime user; the code itself stays root-owned and read-only
@@ -81,4 +75,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"
 
-CMD ["python", "main.py", "web"]
+CMD ["python", "-m", "quant_platform.main", "web"]

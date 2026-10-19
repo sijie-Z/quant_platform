@@ -70,6 +70,9 @@ class BacktestEngine:
         self.benchmark_returns: pd.Series | None = None
         self.weights_history: dict[pd.Timestamp, pd.Series] = {}
         self.turnover_history: pd.Series | None = None
+        self.optimizer_outcomes: dict[pd.Timestamp, dict] = {}
+        self.optimizer_fallback_count = 0
+        self.skipped_rebalances = 0
 
     def run(
         self,
@@ -112,20 +115,28 @@ class BacktestEngine:
                      self.rebalance_frequency)
 
         self.weights_history = {}
+        self.optimizer_outcomes = {}
+        self.optimizer_fallback_count = 0
+        self.skipped_rebalances = 0
         prev_weights = None
+        # One optimizer instance for the whole run, so its fallback counter
+        # accumulates; a fresh instance per rebalance hid every fallback.
+        optimizer = self._get_optimizer()
 
         for i, rdate in enumerate(rebalance_dates):
             logger.debug("Rebalance %d/%d: %s", i + 1, len(rebalance_dates), str(rdate)[:10])
 
             sig = signal.loc[rdate].dropna()
             if len(sig) < 10:
-                logger.debug("Rebalance %s: only %d signals — using equal weight fallback",
+                logger.debug("Rebalance %s: only %d signals — using equal-weight signal "
+                             "(the configured optimizer still applies)",
                               str(rdate)[:10], len(sig))
                 if rdate in prices.index:
                     valid_assets = prices.loc[rdate].dropna().index
                     if len(valid_assets) >= 10:
                         sig = pd.Series(1.0, index=valid_assets)
                 if len(sig) < 10:
+                    self.skipped_rebalances += 1
                     continue
 
             # Estimate covariance matrix.
@@ -139,6 +150,7 @@ class BacktestEngine:
             # future. It was also one row too long (253 for a 252 lookback).
             prior_dates = returns.index[returns.index < rdate]
             if len(prior_dates) == 0:
+                self.skipped_rebalances += 1
                 continue
             lookback_end = returns.index.get_loc(prior_dates[-1])
             lookback_start = max(0, lookback_end + 1 - self.covariance_lookback)
@@ -150,6 +162,7 @@ class BacktestEngine:
             sig = sig[valid_assets]
 
             if len(sig) < 10:
+                self.skipped_rebalances += 1
                 continue
 
             ret_window = ret_window[valid_assets]
@@ -163,7 +176,7 @@ class BacktestEngine:
                 cov = None
 
             # Optimize
-            optimizer = self._get_optimizer()
+            fallbacks_before = optimizer.fallback_count
             weights = optimizer.optimize(
                 signal=sig,
                 cov_matrix=cov,
@@ -171,6 +184,22 @@ class BacktestEngine:
                 prev_weights=prev_weights,
                 sector_map=sector_map.reindex(sig.index) if sector_map is not None else None,
             )
+            fell_back = optimizer.fallback_count > fallbacks_before
+            fallback_reason = optimizer.last_fallback_reason if fell_back else None
+            if fell_back:
+                self.optimizer_fallback_count += 1
+                logger.warning(
+                    "Rebalance %s: optimizer fallback #%d — %s",
+                    str(rdate)[:10], self.optimizer_fallback_count, fallback_reason,
+                )
+
+            self.optimizer_outcomes[rdate] = {
+                "optimizer": self.optimizer_name,
+                "fallback": fell_back,
+                "reason": fallback_reason,
+                "n_assets": int((weights > 0).sum()),
+                "gross_exposure": float(weights.sum()),
+            }
 
             self.weights_history[rdate] = weights
             prev_weights = weights
@@ -180,9 +209,20 @@ class BacktestEngine:
 
         # Compute metrics
         summary = all_metrics(self.daily_returns, self.benchmark_returns)
-        summary["n_rebalances"] = len(self.weights_history)
+        n_rebalances = len(self.weights_history)
+        summary["n_rebalances"] = n_rebalances
         summary["optimizer"] = self.optimizer_name
         summary["initial_capital"] = self.initial_capital
+        summary["n_optimizer_fallbacks"] = self.optimizer_fallback_count
+        summary["optimizer_fallback_rate"] = (
+            self.optimizer_fallback_count / n_rebalances if n_rebalances else 0.0
+        )
+        summary["effective_optimizer"] = (
+            self.optimizer_name
+            if self.optimizer_fallback_count == 0
+            else f"{self.optimizer_name}+equal_weight_fallback"
+        )
+        summary["n_skipped_rebalances"] = self.skipped_rebalances
 
         logger.info("Backtest complete: total_return=%.2f%%, sharpe=%.2f",
                      summary.get("total_return", 0) * 100,
@@ -283,6 +323,25 @@ class BacktestEngine:
                 target_weights = target_weights.reindex(returns.columns, fill_value=0.0)
 
                 turnover = (target_weights - current_weights).abs().sum() / 2
+                # Enforce the turnover cap at execution time too. Optimizer
+                # constraints only see target-level turnover, while realized
+                # turnover also includes weight drift and candidate-set
+                # changes; without this clamp the reported 0.44 could exceed
+                # the configured 0.30 even when the optimizer "succeeded".
+                # Initial deployment from cash is exempt: the cap governs
+                # rebalancing an existing portfolio, and clamping the first
+                # purchase would make a fully-invested mandate unreachable.
+                if (
+                    float(current_weights.sum()) > 1e-12
+                    and self.constraints.max_turnover < 1.0
+                    and turnover > self.constraints.max_turnover
+                ):
+                    scale = self.constraints.max_turnover / turnover
+                    target_weights = (
+                        current_weights + scale * (target_weights - current_weights)
+                    )
+                    turnover = (target_weights - current_weights).abs().sum() / 2
+
                 if turnover > 0:
                     # `turnover` is one-sided (the convention documented in
                     # portfolio/constraints.py), but CostModel.compute_costs

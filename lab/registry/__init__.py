@@ -165,12 +165,34 @@ class RunStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def list_runs(self, limit: int = 50) -> list[dict]:
+    def list_runs(self, limit: int = 50, validity: str | None = None) -> list[dict]:
+        """Recent runs, optionally filtered by validity state.
+
+        A validity filter makes "show me everything that is not trustworthy"
+        a query rather than a Python loop over all rows.
+        """
+        query = "SELECT * FROM research_runs"
+        params: list[Any] = []
+        if validity is not None:
+            if validity not in self.VALIDITY_STATES:
+                raise ValueError(
+                    f"validity must be one of {self.VALIDITY_STATES}, got {validity!r}"
+                )
+            query += " WHERE COALESCE(validity, 'valid')=?"
+            params.append(validity)
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM research_runs ORDER BY timestamp DESC LIMIT ?", (limit,)
-            ).fetchall()
+            rows = conn.execute(query, tuple(params)).fetchall()
         return [dict(r) for r in rows]
+
+    def is_trusted(self, run_id: str) -> bool:
+        """Whether a run's result is still plain 'valid'."""
+        run = self.get_run(run_id)
+        if run is None:
+            return False
+        return (run.get("validity") or "valid") in self.TRUSTED_STATES
 
     # ── Result validity ─────────────────────────────────────────────────
     #
@@ -186,6 +208,13 @@ class RunStore:
     # reading commit messages.
 
     VALIDITY_STATES = ("valid", "affected", "invalidated", "superseded")
+    VALIDITY_MEANINGS = {
+        "valid": "trusted as-is",
+        "affected": "a fixed defect may change the numbers; treat as suspect",
+        "invalidated": "known wrong; do not use",
+        "superseded": "replaced by a newer run",
+    }
+    TRUSTED_STATES = ("valid",)
 
     def mark_validity(self, run_id: str, validity: str, reason: str = "") -> bool:
         """Record whether a run's result can still be trusted.
@@ -254,3 +283,71 @@ class RunStore:
                     filtered.append(r)
             out = filtered
         return out
+
+    # ── Snapshot bridge ─────────────────────────────────────────────────
+    #
+    # The runtime database is gitignored; the committed JSON export is the
+    # only copy of the historical corpus. These two methods make that corpus
+    # importable (so its validity can be marked) and re-exportable.
+
+    _COLUMNS = (
+        "run_id", "timestamp", "status", "reason", "slice", "data_source",
+        "data_meta", "universe_provider", "universe_meta", "factor",
+        "factor_params", "evaluation", "input_hash", "report_path",
+        "warnings", "validity", "affected_by",
+    )
+    _JSON_FIELDS = (
+        "data_meta", "universe_meta", "factor_params", "evaluation",
+        "warnings", "affected_by",
+    )
+
+    def import_runs(self, path: str) -> int:
+        """Load a JSON export into this registry. Returns rows inserted.
+
+        ``INSERT OR IGNORE`` leaves an existing local row untouched, so
+        importing the committed snapshot never overwrites a validity mark
+        that was made locally.
+        """
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("registry export must be a JSON list")
+
+        imported = 0
+        with self._conn() as conn:
+            for record in payload:
+                if not isinstance(record, dict):
+                    raise ValueError("every registry row must be a JSON object")
+                missing = {"run_id", "timestamp", "status", "slice"} - set(record)
+                if missing:
+                    raise ValueError(f"registry row missing {sorted(missing)}: {record!r}")
+
+                values = dict(record)
+                if not values.get("validity"):
+                    values["validity"] = "valid"
+                for field in self._JSON_FIELDS:
+                    value = values.get(field)
+                    if value is None:
+                        values[field] = "[]" if field in ("warnings", "affected_by") else "{}"
+                    elif not isinstance(value, str):
+                        values[field] = json.dumps(value, default=str)
+
+                placeholders = ",".join("?" for _ in self._COLUMNS)
+                cursor = conn.execute(
+                    f"INSERT OR IGNORE INTO research_runs ({','.join(self._COLUMNS)}) "
+                    f"VALUES ({placeholders})",
+                    tuple(values.get(column) for column in self._COLUMNS),
+                )
+                imported += cursor.rowcount
+            conn.commit()
+        return imported
+
+    def export_runs(self, path: str, validity: str | None = None) -> int:
+        """Write runs to a JSON snapshot, newest first. Returns the row count."""
+        rows = self.list_runs(limit=1_000_000, validity=validity)
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(rows, indent=2, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+        return len(rows)

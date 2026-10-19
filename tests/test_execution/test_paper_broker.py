@@ -3,6 +3,8 @@
 import numpy as np
 import pytest
 
+from quant_platform.execution.models import Order as ExecutionOrder
+from quant_platform.execution.models import OrderSide as ExecutionSide
 from quant_platform.execution.order_book import (
     BookOrder,
     OrderBook,
@@ -301,6 +303,70 @@ class TestL2Replay:
         depth = book.get_depth_snapshot(levels=5)
         assert len(depth["bids"]) > 0
         assert len(depth["asks"]) > 0
+
+
+class TestSnapshotSeedingDoesNotSelfMatch:
+    """Regression for #61 (same class as BUG-13).
+
+    Seeding pushed both ladders through the matching engine, so on a locked
+    snapshot (best bid == best ask) the first seeded ask immediately traded
+    against the seeded bid: depth was destroyed and a print fabricated before
+    any participant order arrived.
+    """
+
+    def _seed(self, bids, asks):
+        pb = PaperBroker(latency=LatencyModel.ZERO, partial_fill_rate=0.0)
+        pb.seed_book_from_snapshot("600519", {
+            "timestamp": 1000, "bids": bids, "asks": asks,
+        })
+        return pb, pb._books["600519"]
+
+    def test_locked_snapshot_does_not_self_match(self):
+        _, book = self._seed(
+            bids=[[1800.0, 500], [1799.5, 300]],
+            asks=[[1800.0, 400], [1800.5, 200]],
+        )
+
+        assert book._total_trades == 0
+        assert book._total_volume == 0
+        assert book.best_bid == 1800.0
+        assert book.best_ask == 1800.0
+        assert book._bid_levels[1800.0].total_quantity == 500
+        assert book._ask_levels[1800.0].total_quantity == 400
+        depth = book.get_depth_snapshot(levels=5)
+        assert len(depth["bids"]) == 2
+        assert len(depth["asks"]) == 2
+
+    def test_crossed_snapshot_is_preserved_not_matched(self):
+        _, book = self._seed(bids=[[1800.5, 500]], asks=[[1800.0, 400]])
+
+        assert book._total_trades == 0
+        assert book._total_volume == 0
+        assert book.best_bid == 1800.5
+        assert book.best_ask == 1800.0
+        assert book._bid_levels[1800.5].total_quantity == 500
+        assert book._ask_levels[1800.0].total_quantity == 400
+
+    def test_incoming_orders_still_fill_against_seeded_levels(self):
+        pb, book = self._seed(
+            bids=[[1800.0, 500]],
+            asks=[[1800.0, 400]],
+        )
+
+        buy = pb.place_order(ExecutionOrder(
+            ticker="600519", side=ExecutionSide.BUY,
+            quantity=100, limit_price=1800.0,
+        ))
+        sell = pb.place_order(ExecutionOrder(
+            ticker="600519", side=ExecutionSide.SELL,
+            quantity=100, limit_price=1800.0,
+        ))
+
+        assert buy.filled_qty == 100
+        assert buy.fill_price == 1800.0
+        assert sell.filled_qty == 100
+        assert sell.fill_price == 1800.0
+        assert book._total_trades == 2
 
 
 # ── Latency Arbitrage Detection ──

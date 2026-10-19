@@ -217,3 +217,27 @@
 | 该次提交的 git 历史 | | `CLAUDE.md` 的计数（实测 1631 测试 / 101 端点 / 20 命令，文档写的是 1077 / 97 / 18） |
 
 完整的研究产物分档在 #72。
+
+---
+
+## 十一、2026-10-19 修复记录
+
+这一轮处理的是交接时仍列在 Issues 上、且能用测试表达的问题。每项都有回归测试守护：
+
+| Issue | 修复 | 位置 |
+|---|---|---|
+| #58 | 合成数据停牌前向填充不再伪造反转信号：provider 标记 `is_suspended`，收益与因子价格在填充边界置 NaN，涨跌停标记跳过复牌跳空 | `data/providers/synthetic.py`、`data/pipeline.py`、`main.py` |
+| #59 | MVO 回退等权不再静默：记录回退次数/原因并写入 summary 与 API；等权不再把权重放大到 `max_weight` 之上；换手按索引并集计算并真正钳制（首次建仓豁免）；RiskParity 同样受换手约束 | `portfolio/optimizers.py`、`backtest/engine.py`、`api/schemas.py` |
+| #71 | Registry validity 机制启用：`list_runs(validity=...)`、`is_trusted()`、JSON 导入/导出、`runs import/export` CLI；43 条历史记录可导入并标记 | `lab/registry/__init__.py`、`main.py` |
+| #3/#4 | 实盘状态持久化：Store 新增 `engine_state` 表；`LiveEngine` 快照/恢复 + 已处理日期水位；daemon 每次运行恢复并落盘，日盈亏不再硬编码 0，损坏快照拒绝覆盖 | `packages/quant_core/src/quant_core/store.py`、`trading/live_engine.py`、`daemon/runner.py` |
+| #60 | 历史产物作废标注：`ABLATION_001` 顶部加 SUPERSEDED 说明，`results/backtest_report.html` 加可见 VOID 横幅，新增 `results/README.md` 说明整目录不可引用 | `docs/research/`、`results/` |
+| #61 | 纸面交易快照播种不再自成交：L2 快照档位以 passive 挂单进入订单簿，锁价/交叉快照保留原始深度；后续真实订单仍可成交 | `execution/paper_broker.py` |
+| #67/#68/#73/#78 | 文档状态标注：`framework/__init__.py` 去掉不存在的 CONSTITUTION/ARCHITECTURE/import-linter 引用与 `registry`/`trust` 导出；4 份架构文档加 STATUS 横幅，修正 import-linter 表述、风险阈值与 README 中的错误路径 | `framework/__init__.py`、`docs/*.md`、`README.md` |
+| #62 | IC 监控滚动计算从 O(n·window) 改为“每日 IC 只算一次 + 滚动平均”；测试耗时 233s → 7s，Spearman 调用 14,931 → 237 | `factors/ic_monitor.py` |
+| #69 | 双导入身份：`pyproject.toml` 改为把仓库根目录安装为 `quant_platform`（不再把 46 个子目录装成顶层包）；移除 flat 别名 sys.path 与导入；CI/Docker 去掉 PYTHONPATH 垫片；新增 `tests/test_architecture/test_import_identity.py` 守卫 | `pyproject.toml`、`.github/workflows/ci.yml`、`Dockerfile`、`tests/conftest.py` 及多处导入 |
+
+另外修掉了三处 pandas 3.x 兼容问题（`resample("M")`、`rolling(axis=1)`、零价格 `pct_change`），它们在本机全局 pandas 3.0.6 下会让 17 个测试失败；在仓库锁定的 2.1.3 下同样成立。
+
+验证：全量测试 **1678 passed / 3 skipped / 0 failed**（3m58s；#62 修复前同一套件 6m53s），ruff 全绿。
+
+仍未处理的交接项：#63（第一个真实研究）、#74（两份 Order）、#70/#77（契约与死代码）。

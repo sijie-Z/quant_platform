@@ -17,8 +17,7 @@ import numpy as np
 import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
-
-from trading.reversal_paper_trader import ReversalPaperTrader
+from quant_platform.trading.reversal_paper_trader import ReversalPaperTrader
 
 logging.basicConfig(
     level=logging.INFO,
