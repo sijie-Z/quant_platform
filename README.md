@@ -223,10 +223,10 @@ quant_platform/
 |------|------|
 | `docs/NO_LOOKAHEAD_CONTRACT.md` | 前视偏差零容忍契约（8 条铁规） |
 | `docs/VALIDATION_REPORT.md` | 六项系统性验证报告 |
-| `docs/KERNEL_ARCHITECTURE.md` | 实盘运行内核（控制平面）设计 |
-| `docs/PRODUCTION_PLAYBOOK.md` | 从回测到实盘的完整操作手册 |
-| `docs/PRODUCTION_ARCHITECTURE_V1.md` | 生产架构 v1（80d 反转 + Vol Filter） |
-| `docs/ASHARE_PITFALLS.md` | 10 大 A 股实盘陷阱及处理 |
+| `docs/KERNEL_ARCHITECTURE.md` | 实盘运行内核（控制平面）设计（提案，未接入运行路径） |
+| `PRODUCTION_PLAYBOOK.md` | 从回测到实盘的完整操作手册 |
+| `docs/PRODUCTION_ARCHITECTURE_V1.md` | 生产架构 v1（目标设计，未实现） |
+| `data/ASHARE_PITFALLS.md` | 10 大 A 股实盘陷阱及处理 |
 | `docs/OPS_RUNBOOK.md` | 运维手册 |
 | `docs/research/` | 系统研究报告（Alpha Discovery / 市场结构 / Regime） |
 

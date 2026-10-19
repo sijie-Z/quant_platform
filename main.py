@@ -123,7 +123,7 @@ def _load_data(config, use_tushare: bool = True, use_baostock: bool = False):
     pipeline.run()
 
     return (
-        pipeline.get_close(),
+        pipeline.get_factor_prices(),
         pipeline.returns,
         pipeline.benchmark,
         pipeline.metadata,
@@ -654,11 +654,24 @@ def cmd_runs(args) -> int:
         )
         return 0
 
+    if sub == "import":
+        inserted = store.import_runs(args.path)
+        print(f"Imported {inserted} new run(s) from {args.path}")
+        return 0
+
+    if sub == "export":
+        count = store.export_runs(args.path, validity=getattr(args, "validity", None))
+        print(f"Exported {count} run(s) to {args.path}")
+        return 0
+
     if sub == "affected":
         rows = store.list_affected(args.reason)
         title = "Runs affected" + (f" by {args.reason}" if args.reason else "")
     else:
-        rows = store.list_runs(getattr(args, "limit", 50))
+        rows = store.list_runs(
+            getattr(args, "limit", 50),
+            validity=getattr(args, "validity", None),
+        )
         title = "Recent runs"
 
     if not rows:
@@ -1221,7 +1234,7 @@ def cmd_factor(args) -> int:
                 n_days=getattr(args, "n_days", 500),
             )
         else:
-            from run_factor import run_factor_report
+            from quant_platform.run_factor import run_factor_report
             run_factor_report(args.factor)
     except Exception as e:
         logger.error("Factor run failed: %s", e)
@@ -1756,6 +1769,9 @@ def main() -> int:
     runs_sub = runs_parser.add_subparsers(dest="subcommand", help="Runs action")
     runs_list = runs_sub.add_parser("list", help="List recent runs with validity")
     runs_list.add_argument("--limit", type=int, default=50, help="How many runs")
+    runs_list.add_argument("--validity", type=str, default=None,
+                           choices=["valid", "affected", "invalidated", "superseded"],
+                           help="Only list runs in this validity state")
     runs_list.add_argument("--db", type=str, default=None, help="Registry path")
     runs_aff = runs_sub.add_parser(
         "affected", help="Runs marked affected/invalidated rather than valid"
@@ -1771,6 +1787,19 @@ def main() -> int:
     runs_mark.add_argument("--reason", type=str, default="",
                            help="Cause, e.g. BUG-03")
     runs_mark.add_argument("--db", type=str, default=None, help="Registry path")
+    runs_import = runs_sub.add_parser(
+        "import", help="Import runs from a JSON snapshot into the registry"
+    )
+    runs_import.add_argument("path", type=str, help="JSON snapshot path")
+    runs_import.add_argument("--db", type=str, default=None, help="Registry path")
+    runs_export = runs_sub.add_parser(
+        "export", help="Export the registry to a JSON snapshot"
+    )
+    runs_export.add_argument("path", type=str, help="JSON snapshot path")
+    runs_export.add_argument("--validity", type=str, default=None,
+                             choices=["valid", "affected", "invalidated", "superseded"],
+                             help="Only export runs in this validity state")
+    runs_export.add_argument("--db", type=str, default=None, help="Registry path")
 
     # ml
     ml_parser = subparsers.add_parser("ml", help="ML alpha signal operations")

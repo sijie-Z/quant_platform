@@ -361,7 +361,15 @@ class PaperBroker:
         return None
 
     def seed_book_from_snapshot(self, symbol: str, snapshot: dict):
-        """Seed an order book from an L2 snapshot."""
+        """Seed an order book from an L2 snapshot.
+
+        Seeded levels are passive: they rest and never aggress. Without this,
+        the ask ladder is added *into* the bid ladder through the matching
+        engine, so a locked snapshot (best bid == best ask) trades against
+        itself before any participant order arrives -- destroying depth and
+        fabricating a print. Incoming broker orders still fill against the
+        seeded levels.
+        """
         book = OrderBook(symbol)
         bids = snapshot.get("bids", [])
         asks = snapshot.get("asks", [])
@@ -376,6 +384,7 @@ class PaperBroker:
                 price=float(price),
                 quantity=int(qty),
                 source="l2_replay",
+                passive=True,
             )
             book.add_order(order)
 
@@ -388,6 +397,7 @@ class PaperBroker:
                 price=float(price),
                 quantity=int(qty),
                 source="l2_replay",
+                passive=True,
             )
             book.add_order(order)
 

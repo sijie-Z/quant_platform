@@ -188,6 +188,12 @@ class Store:
                     cumulative_return REAL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS engine_state (
+                    strategy_id TEXT PRIMARY KEY,
+                    state_json  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);
                 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
                 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
@@ -633,6 +639,35 @@ class Store:
                 "SELECT * FROM nav_history ORDER BY date DESC LIMIT 1"
             ).fetchone()
             return dict(row) if row else None
+
+    # ── Engine State ──
+
+    def save_engine_state(self, state: dict, strategy_id: str = "default") -> None:
+        """Persist an engine snapshot atomically (one row, one transaction).
+
+        Used by the daemon so positions, cash and the processed-date watermark
+        survive a process restart. The watermark lives in the same row, so a
+        crash cannot leave "cash updated but date not advanced" behind.
+        """
+        payload = json.dumps(state, default=str)
+        updated_at = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO engine_state
+                   (strategy_id, state_json, updated_at) VALUES (?, ?, ?)""",
+                (strategy_id, payload, updated_at),
+            )
+
+    def get_engine_state(self, strategy_id: str = "default") -> dict | None:
+        """Load a persisted engine snapshot, or None if none exists."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT state_json FROM engine_state WHERE strategy_id=?",
+                (strategy_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["state_json"])
 
     # ── Stats ──
 

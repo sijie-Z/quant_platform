@@ -160,7 +160,8 @@ class InvestorPortal:
         if "nav_per_unit" not in df.columns:
             return pd.DataFrame()
 
-        monthly = df["nav_per_unit"].resample("M").last()
+        # `"M"` was removed in pandas 3; MonthEnd works on 2.x and 3.x.
+        monthly = df["nav_per_unit"].resample(pd.offsets.MonthEnd()).last()
         monthly_ret = monthly.pct_change().dropna()
 
         if len(monthly_ret) == 0:

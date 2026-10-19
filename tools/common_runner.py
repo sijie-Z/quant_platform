@@ -20,9 +20,8 @@ import time
 import traceback
 from pathlib import Path
 
-# Flat-layout requires D:/Desktop on sys.path before importing quant_platform
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # D:/Desktop
-sys.path.insert(0, "D:/Desktop")
+# Put the repo's parent on sys.path so `quant_platform` resolves to this tree.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import akshare as ak  # noqa: E402
 import numpy as np

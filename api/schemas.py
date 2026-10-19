@@ -84,6 +84,10 @@ class PerformanceMetrics(BaseModel):
     n_rebalances: int
     optimizer: str
     initial_capital: float
+    n_optimizer_fallbacks: int = 0
+    optimizer_fallback_rate: float = 0.0
+    effective_optimizer: str | None = None
+    n_skipped_rebalances: int = 0
 
 
 class FactorICItem(BaseModel):
@@ -282,6 +286,15 @@ class BarraDecomposeRequest(BaseModel):
     date: str | None = Field(default=None, description="Date for decomposition (YYYY-MM-DD)")
     half_life: int = Field(default=252, ge=63, le=504, description="Covariance half-life")
     shrinkage_target: str = Field(default="identity", description="Shrinkage target")
+    weights: dict[str, float] | None = Field(
+        default=None,
+        description=(
+            "Portfolio weights by ticker. Defaults to current OMS positions, "
+            "then to equal weight across the universe. Note that an equal-weight "
+            "whole-universe portfolio has zero net exposure to every "
+            "cross-sectionally standardized factor by construction."
+        ),
+    )
 
 
 class BarraRiskResponse(BaseModel):

@@ -124,7 +124,11 @@ class DataQualityMonitor:
 
     def _check_price_anomalies(self, prices: pd.DataFrame):
         """Check for anomalous price movements."""
-        pct_changes = prices.pct_change().abs()
+        # Zero is a missing quote, not an infinite return: pandas 3 raises on
+        # the division instead of returning inf. Only numeric columns are
+        # price series (the panel also carries boolean mask columns).
+        numeric = prices.select_dtypes(include=[np.number])
+        pct_changes = numeric.mask(numeric == 0).pct_change(fill_method=None).abs()
         anomalies = pct_changes > self.max_daily_move
 
         n_anomalies = anomalies.sum().sum()

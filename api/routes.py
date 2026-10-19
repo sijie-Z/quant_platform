@@ -469,6 +469,10 @@ def _execute_pipeline(run_id: str, req: RunRequest):
                 n_rebalances=summary.get("n_rebalances", 0),
                 optimizer=summary.get("optimizer", ""),
                 initial_capital=summary.get("initial_capital", 0),
+                n_optimizer_fallbacks=summary.get("n_optimizer_fallbacks", 0),
+                optimizer_fallback_rate=summary.get("optimizer_fallback_rate", 0.0),
+                effective_optimizer=summary.get("effective_optimizer"),
+                n_skipped_rebalances=summary.get("n_skipped_rebalances", 0),
             ).model_dump(),
             "risk": RiskMetrics(
                 historical_var=risk.get("historical_var", 0),
@@ -825,7 +829,8 @@ def _build_chart_data(
 
     monthly = None
     if len(sr) >= 21:
-        monthly_ret = sr.resample("M").apply(lambda x: (1 + x).prod() - 1)
+        # `"M"` was removed in pandas 3; MonthEnd works on 2.x and 3.x.
+        monthly_ret = sr.resample(pd.offsets.MonthEnd()).apply(lambda x: (1 + x).prod() - 1)
         monthly_ret.index = monthly_ret.index.to_period("M")
         mdf = monthly_ret.groupby([monthly_ret.index.year, monthly_ret.index.month]).first().unstack()
         if not mdf.empty:
@@ -2092,8 +2097,14 @@ async def check_order_risk(order: dict):
 
 @router.post("/execution/smart-route")
 async def smart_route_order(req: dict):
-    """Create execution plan using smart order routing."""
-    from quant_platform.execution.algorithms import SmartRouter
+    """Create an execution plan, and optionally send it to the OMS.
+
+    Set ``execute`` to true to turn every slice into a real OMS order
+    (create -> submit -> fill), so positions and cash move with the parent
+    order. ``price`` sets the execution price; when omitted the last close
+    from the configured data feed is used.
+    """
+    from quant_platform.execution.algorithms import PlanExecutor, SmartRouter
     from quant_platform.execution.models import Order, OrderSide
 
     ticker = req.get("ticker", "")
@@ -2105,7 +2116,7 @@ async def smart_route_order(req: dict):
     order = Order(ticker=ticker, side=OrderSide(side), quantity=quantity)
     plan = SmartRouter.execute(order, avg_daily_volume=adv, urgency=urgency)
 
-    return {
+    response = {
         "plan_id": plan.plan_id,
         "algorithm": plan.algorithm,
         "ticker": plan.ticker,
@@ -2124,6 +2135,24 @@ async def smart_route_order(req: dict):
             for s in plan.slices
         ],
     }
+
+    if req.get("execute", False):
+        price = req.get("price")
+        if price is None:
+            try:
+                config = load_config()
+                prices, *_rest = _load_data(config)
+                price = float(prices[ticker].dropna().iloc[-1])
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"execute=true needs a price and none could be derived for {ticker}: {e}",
+                ) from e
+
+        report = PlanExecutor(_get_oms()).execute_plan(plan, price=float(price))
+        response["execution"] = report.to_dict()
+
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -2793,6 +2822,35 @@ async def ic_monitor_alerts():
 # Barra Risk Model endpoints
 # ────────────────────────────────────────────────────────────────
 
+def _resolve_portfolio_weights(requested: dict[str, float] | None, prices: pd.DataFrame) -> pd.Series:
+    """Pick the portfolio to decompose.
+
+    Explicit weights win; otherwise the current OMS positions are marked to
+    the latest close; otherwise the universe is equal-weighted. Equal weight
+    over the whole universe has zero net exposure to every cross-sectionally
+    standardized factor by construction, so that fallback is only a safe
+    default, not a meaningful risk decomposition.
+    """
+    if requested:
+        raw = pd.Series(requested, dtype=float)
+    else:
+        marks: dict[str, float] = {}
+        for ticker, position in getattr(_get_oms(), "positions", {}).items():
+            if ticker not in prices.columns:
+                continue
+            series = prices[ticker].dropna()
+            if series.empty:
+                continue
+            marks[ticker] = float(position.quantity) * float(series.iloc[-1])
+        raw = pd.Series(marks, dtype=float) if marks else pd.Series(1.0, index=prices.columns)
+
+    weights = raw.reindex(prices.columns).fillna(0.0)
+    total = float(weights.sum())
+    if total <= 0:
+        raise HTTPException(status_code=400, detail="Portfolio weights must sum to a positive value")
+    return weights / total
+
+
 @router.post("/barra/decompose", response_model=BarraRiskResponse)
 async def barra_decompose(req: BarraDecomposeRequest):
     """Decompose portfolio risk using Barra 10-factor model."""
@@ -2804,19 +2862,24 @@ async def barra_decompose(req: BarraDecomposeRequest):
         processed_factors, _ic_results, sector_map, fin_unstacked = _compute_factors(
             prices, returns, financials, metadata, turnover, config=config)
 
-        # Use equal weight portfolio as default
-        assets = list(prices.columns)
-        n = len(assets)
-        weights = pd.Series(1.0 / n, index=assets)
+        weights = _resolve_portfolio_weights(req.weights, prices)
 
         model = BarraModel(
             half_life=req.half_life,
             shrinkage_target=req.shrinkage_target,
         )
-        model.fit(processed_factors, returns)
 
-        # Build factor_exposures dict for decompose_risk
-        factor_exposures = processed_factors
+        # Translate the platform factor panel into Barra's ten exposures.
+        # Passing `processed_factors` straight through used to name-match
+        # nothing, so every exposure and the whole factor-risk term were 0.
+        factor_exposures = model.build_exposures(
+            prices,
+            returns,
+            benchmark=benchmark,
+            financials=financials,
+            platform_factors=processed_factors,
+        )
+        model.fit(factor_exposures, returns)
 
         result = model.decompose_risk(weights, factor_exposures, date=req.date)
 
@@ -2848,7 +2911,14 @@ async def barra_covariance(req: BarraDecomposeRequest):
             half_life=req.half_life,
             shrinkage_target=req.shrinkage_target,
         )
-        model.fit(processed_factors, returns)
+        factor_exposures = model.build_exposures(
+            prices,
+            returns,
+            benchmark=benchmark,
+            financials=financials,
+            platform_factors=processed_factors,
+        )
+        model.fit(factor_exposures, returns)
 
         cov_df = model.get_factor_covariance_df()
         return BarraCovarianceResponse(

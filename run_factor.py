@@ -20,7 +20,6 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, "D:/Desktop")
 import akshare as ak
 import numpy as np
 import pandas as pd
