@@ -27,7 +27,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from quant_platform.data.providers.base import DataFetchIncompleteError, DataProvider
+from quant_platform.data.providers.base import (
+    DataFetchIncompleteError,
+    DataProvider,
+    cache_manifest_matches,
+    read_cache_manifest,
+    write_cache_manifest,
+)
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -35,6 +41,12 @@ logger = get_logger(__name__)
 # Cache directory
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+
+# Cache format/semantics version. Combined with DATA_SCHEMA_VERSION and the
+# adjustment convention in the sidecar manifest, so a schema bump (or a change
+# in what the HDF5 file means) refetches instead of replaying stale data (D13).
+_PROVIDER_CACHE_VERSION = "v3"
+_PRICE_ADJUSTMENT = "hfq"
 
 # Tushare unit conventions (see https://tushare.pro/document/2):
 #   vol is in 手 (lots, 100 shares), amount in 千元 (thousand CNY),
@@ -60,6 +72,8 @@ class TushareProvider(DataProvider):
     all-False ``is_st`` column.  Callers must treat ST screening as
     unavailable (fail closed or label the result).
     """
+
+    price_adjustment = _PRICE_ADJUSTMENT
 
     def __init__(
         self,
@@ -88,6 +102,10 @@ class TushareProvider(DataProvider):
 
         # No point-in-time ST history is available from this source.
         self.st_available = False
+        # Where get_benchmark() data came from: "index_daily" or
+        # "equal_weight_fallback". Recorded in the cache manifest and pipeline
+        # provenance so a degraded benchmark is not mistaken for CSI 300.
+        self.benchmark_source = "unknown"
         # True only when *date-stamped* index membership (index_weight)
         # succeeded; the fallbacks are a single end-date snapshot.
         self.universe_history_available = False
@@ -266,33 +284,163 @@ class TushareProvider(DataProvider):
         return self.get_index_membership_mask(start_date, end_date)
 
     # ------------------------------------------------------------------
+    # Cache identity / versioning (D12/D13)
+    # ------------------------------------------------------------------
+
+    def _cache_file(self) -> Path:
+        return self.cache_dir / (
+            f"tushare_{self.index_code}_{self.start_date}_{self.end_date}.h5"
+        )
+
+    def _cache_manifest_valid(self, cache_file: Path) -> bool:
+        """Whether the HDF5 file was written under the current semantics."""
+        if not cache_manifest_matches(
+            cache_file,
+            adjustment=_PRICE_ADJUSTMENT,
+            cache_version=_PROVIDER_CACHE_VERSION,
+        ):
+            return False
+        # A file copied/renamed from another index or date range must not be
+        # served: the sidecar records the selection it was fetched for.
+        manifest = read_cache_manifest(cache_file) or {}
+        return (
+            str(manifest.get("index_code")) == str(self.index_code)
+            and str(manifest.get("start_date")) == str(self.start_date)
+            and str(manifest.get("end_date")) == str(self.end_date)
+        )
+
+    def _write_cache_manifest(self, cache_file: Path) -> None:
+        write_cache_manifest(
+            cache_file,
+            provider="tushare",
+            adjustment=_PRICE_ADJUSTMENT,
+            cache_version=_PROVIDER_CACHE_VERSION,
+            extra={
+                "index_code": self.index_code,
+                "start_date": self.start_date,
+                "end_date": self.end_date,
+                "benchmark_source": self.benchmark_source,
+            },
+        )
+
+    def _discard_cache(self, cache_file: Path) -> None:
+        for path in (cache_file, cache_file.with_name(
+                f"{cache_file.name}.manifest.json")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not delete stale cache %s: %s", path, exc)
+
+    def cache_identity(self) -> dict:
+        """Selection inputs that change the fetched panel (used in the key)."""
+        return {
+            "provider": "tushare",
+            "adjustment": _PRICE_ADJUSTMENT,
+            "cache_version": _PROVIDER_CACHE_VERSION,
+            "index_code": self.index_code,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "synthetic": False,
+        }
+
+    def cache_universe(
+        self,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        n_symbols: int | None = None,
+    ) -> list[str] | None:
+        """Constituent code set, loaded without deserializing the price panel.
+
+        Reads only the ``/constituents`` table from an existing, version-valid
+        HDF5 file; otherwise fetches the constituent history (the same data
+        the full fetch needs, so it is cached in memory for reuse). Returns
+        ``None`` when unavailable.
+        """
+        if self._constituent_history is None:
+            cache_file = self._cache_file()
+            if cache_file.exists() and self._cache_manifest_valid(cache_file):
+                try:
+                    with pd.HDFStore(cache_file, mode="r") as store:
+                        if "/constituents" in set(store.keys()):
+                            history = store["constituents"]
+                            history["trade_date"] = pd.to_datetime(
+                                history["trade_date"], errors="coerce"
+                            )
+                            self._constituent_history = history
+                            self.universe_history_available = bool(
+                                len(history) > 0
+                            )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Could not read constituents from %s: %s",
+                        cache_file, exc,
+                    )
+            if self._constituent_history is None:
+                api = self.ts_api
+                if api is None:
+                    return None
+                try:
+                    self._constituent_history = self._fetch_constituents(api)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not fetch the constituent universe for the "
+                        "cache identity: %s", exc,
+                    )
+                    return None
+        history = self._constituent_history
+        if history is None or history.empty or "ts_code" not in history.columns:
+            return None
+        return sorted(history["ts_code"].dropna().astype(str).unique())
+
+    # ------------------------------------------------------------------
     # Main data loading with caching
     # ------------------------------------------------------------------
 
     def _load_or_fetch_all(self) -> None:
         """Load from HDF5 cache or fetch from Tushare API.
 
-        A cache file that cannot be read (corrupt/truncated/incompatible) is
-        deleted and refetched.  The cache is written only after *every*
-        fetch completed; a :class:`DataFetchIncompleteError` therefore never
-        leaves a partial panel behind.
+        A cache whose sidecar manifest is missing or records a different
+        schema/cache/adjustment version is not trusted: it is deleted and
+        refetched (D13). A cache file that cannot be read is likewise deleted
+        and refetched. The cache is written only after *every* fetch
+        completed; a :class:`DataFetchIncompleteError` therefore never leaves a
+        partial panel behind.
         """
-        cache_file = self.cache_dir / f"tushare_{self.index_code}_{self.start_date}_{self.end_date}.h5"
+        cache_file = self._cache_file()
 
-        if cache_file.exists():
+        cache_usable = cache_file.exists() and self._cache_manifest_valid(cache_file)
+        if cache_file.exists() and not cache_usable:
+            logger.warning(
+                "Cache %s has a missing/mismatched version manifest "
+                "(schema or adjustment changed); refetching", cache_file,
+            )
+            self._discard_cache(cache_file)
+            cache_usable = False
+
+        if cache_usable:
             logger.info("Loading from cache: %s", cache_file)
             try:
                 self._load_from_cache(cache_file)
                 return
-            except Exception as exc:  # noqa: BLE001 - any unreadable cache is corrupt
+            except MemoryError:
+                # Not evidence of corruption: preserve the file and let the
+                # failure surface (D34 applies to provider caches too).
+                raise
+            except OSError as exc:
+                # Sharing/permission/transient IO: keep the file; refetching
+                # is cheaper than losing a valid cache permanently.
+                logger.warning(
+                    "Cache %s could not be read (%s); keeping it and refetching",
+                    cache_file, exc,
+                )
+            except Exception as exc:  # noqa: BLE001 - unreadable => corrupt
                 logger.warning(
                     "Cache %s is corrupt/unreadable (%s); deleting and refetching",
                     cache_file, exc,
                 )
-                try:
-                    cache_file.unlink()
-                except OSError as unlink_exc:
-                    logger.warning("Could not delete corrupt cache: %s", unlink_exc)
+                self._discard_cache(cache_file)
+                if cache_file.exists():
                     raise
 
         if not self._has_token:
@@ -307,11 +455,37 @@ class TushareProvider(DataProvider):
 
         logger.info("Fetching real data from Tushare (this takes ~30s first time)...")
         self._fetch_all_from_tushare()
-        self._save_to_cache(cache_file)
-        logger.info("Data cached to: %s", cache_file)
+        try:
+            self._save_to_cache(cache_file)
+        except Exception as exc:  # a cache failure must not fail the research run
+            logger.warning(
+                "Data fetched but could not be cached to %s: %s",
+                cache_file, exc,
+            )
+        else:
+            logger.info("Data cached to: %s", cache_file)
 
     def _load_from_cache(self, cache_file: Path) -> None:
-        """Reload all data from HDF5 cache."""
+        """Reload all data from HDF5 cache.
+
+        Refuses a file whose version manifest is missing or stale, so direct
+        callers get the same protection as :meth:`_load_or_fetch_all` (D13).
+        """
+        if not self._cache_manifest_valid(cache_file):
+            raise ValueError(
+                "cache version manifest missing or does not match the current "
+                "schema/adjustment versions"
+            )
+        manifest = read_cache_manifest(cache_file) or {}
+        self.benchmark_source = str(
+            manifest.get("benchmark_source", "unknown")
+        )
+        if self.benchmark_source == "equal_weight_fallback":
+            logger.warning(
+                "Cached Tushare benchmark is an equal-weight fallback, not "
+                "the CSI 300 index; metrics compare against a constructed "
+                "benchmark"
+            )
         with pd.HDFStore(cache_file, mode="r") as store:
             keys = set(store.keys())
             if "/prices" not in keys:
@@ -341,7 +515,12 @@ class TushareProvider(DataProvider):
                      len(self._metadata), len(self._prices))
 
     def _save_to_cache(self, cache_file: Path) -> None:
-        """Persist all data to HDF5 atomically (temp file + ``os.replace``)."""
+        """Persist all data to HDF5 atomically (temp file + ``os.replace``).
+
+        The version manifest is written right after the data file. A crash
+        between the two leaves a cache without a valid manifest, which the
+        loader treats as stale and refetches -- never as current data.
+        """
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = cache_file.with_name(
             f"{cache_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
@@ -355,6 +534,13 @@ class TushareProvider(DataProvider):
                 if self._constituent_history is not None:
                     store["constituents"] = self._constituent_history
             os.replace(tmp_file, cache_file)
+            try:
+                self._write_cache_manifest(cache_file)
+            except Exception as exc:  # cache metadata is best effort
+                logger.warning(
+                    "Could not write cache version manifest for %s: %s",
+                    cache_file, exc,
+                )
         finally:
             if tmp_file.exists():
                 try:
@@ -378,9 +564,16 @@ class TushareProvider(DataProvider):
             raise RuntimeError("Tushare API not available")
 
         # 1. Get CSI 300 constituents over time
-        logger.info("  Fetching CSI 300 constituent history...")
-        constituents = self._fetch_constituents(api)
-        self._constituent_history = constituents
+        if self._constituent_history is None or self._constituent_history.empty:
+            logger.info("  Fetching CSI 300 constituent history...")
+            self._constituent_history = self._fetch_constituents(api)
+        else:
+            # Already resolved for the cache key; reuse instead of re-fetching.
+            logger.info("  Reusing pre-resolved CSI 300 constituent history...")
+            self.universe_history_available = bool(
+                len(self._constituent_history) > 0
+            )
+        constituents = self._constituent_history
         all_codes = list(constituents["ts_code"].unique())
         logger.info("  Got %d unique constituent stocks", len(all_codes))
 
@@ -897,12 +1090,14 @@ class TushareProvider(DataProvider):
                 df = df.set_index("trade_date").sort_index()
                 returns = pd.to_numeric(df["pct_chg"], errors="coerce") / 100.0
                 returns.name = "benchmark"
+                self.benchmark_source = "index_daily"
                 return returns.dropna()
         except Exception as e:
             logger.warning("Failed to fetch CSI 300 index: %s", e)
 
         # Fallback: compute equal-weight benchmark from prices
         logger.info("Using equal-weight benchmark as fallback")
+        self.benchmark_source = "equal_weight_fallback"
         if self._prices is None or self._prices.empty:
             return pd.Series(dtype=float, name="benchmark")
         close = self._prices["close"].unstack("asset")

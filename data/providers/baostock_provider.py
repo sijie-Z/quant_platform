@@ -27,13 +27,19 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import random
 import time
 from pathlib import Path
 
 import pandas as pd
 
-from quant_platform.data.providers.base import DataFetchIncompleteError, DataProvider
+from quant_platform.data.providers.base import (
+    DataFetchIncompleteError,
+    DataProvider,
+    cache_manifest_matches,
+    write_cache_manifest,
+)
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -41,8 +47,12 @@ logger = get_logger(__name__)
 CACHE_DIR = Path(__file__).parent.parent.parent / ".cache" / "baostock"
 
 # Bump these when cache semantics change; every cache key carries the version
-# so a format/unit change can never silently replay old data.
+# so a format/unit change can never silently replay old data. The schema
+# generation (DATA_SCHEMA_VERSION) is mixed into `_cache_version()` at call
+# time, so one bump invalidates the pipeline pickle *and* these provider
+# caches (D13).
 _CACHE_VERSION = "v2"
+_PRICE_ADJUSTMENT = "hfq"
 _UNIVERSE_CACHE_VERSION = 2
 _UNIVERSE_CACHE_TTL_DAYS = 7
 
@@ -259,6 +269,8 @@ class BaostockDataProvider(DataProvider):
     the listing status, not an ST flag), so no ``is_st`` column is fabricated.
     """
 
+    price_adjustment = _PRICE_ADJUSTMENT
+
     def __init__(self, cache_enabled: bool = True, max_retries: int = 2,
                  retry_backoff: float = 0.5):
         self._cache_enabled = cache_enabled
@@ -268,6 +280,89 @@ class BaostockDataProvider(DataProvider):
         self._bs = None
         # No point-in-time ST history is supplied by this source.
         self.st_available = False
+        # Universe sample pinned by `cache_universe()` so the pipeline cache
+        # key and the actual fetch use the *same* symbols even if the
+        # underlying stock list changes between resolution and fetch.
+        self._pinned_range: tuple[str, str] | None = None
+        self._pinned_price_codes: list[str] | None = None
+        self._pinned_financial_codes: list[str] | None = None
+
+    # ------------------------------------------------------------------
+    # Cache identity / versioning (D12/D13)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cache_version() -> str:
+        """Cache format version including the global data-schema generation."""
+        from quant_platform.data.providers.base import schema_version
+
+        return f"{_CACHE_VERSION}-s{schema_version()}"
+
+    def cache_identity(self) -> dict:
+        return {
+            "provider": "baostock",
+            "adjustment": _PRICE_ADJUSTMENT,
+            "cache_version": self._cache_version(),
+            "cache_enabled": bool(self._cache_enabled),
+            "synthetic": False,
+        }
+
+    @staticmethod
+    def _normalise_range(
+        start_date, end_date,
+    ) -> tuple[str, str]:
+        """Canonical YYYY-MM-DD pair for pin matching (accepts compact ISO)."""
+
+        def _one(value) -> str:
+            if value is None:
+                return ""
+            try:
+                return pd.Timestamp(value).date().isoformat()
+            except (TypeError, ValueError):
+                return str(value)
+
+        return _one(start_date), _one(end_date)
+
+    def cache_universe(
+        self,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        n_symbols: int | None = None,
+    ) -> list[str] | None:
+        """The exact symbol set ``get_prices``/``get_financials`` will fetch.
+
+        ``get_prices`` always samples ``_MAJOR_LIST_SIZE`` stocks (it does not
+        consult ``universe.n_stocks``) and ``get_financials`` samples 100;
+        both are pinned here so the pipeline cache key describes the panel
+        that is actually fetched. Returns ``None`` when the real universe is
+        unavailable: a fallback-pool sample cannot be attested, so the caller
+        must not cache the run.
+        """
+        records = self._get_universe_records()
+        if records is None:
+            logger.warning(
+                "Stock universe unavailable; the baostock data stage cannot "
+                "be cached for this run"
+            )
+            return None
+        universe = self._records_for_range(records, start_date, end_date)
+        price_codes = _stratified_sample(universe, _MAJOR_LIST_SIZE)
+        financial_codes = _stratified_sample(universe, 100)
+        self._pinned_range = self._normalise_range(start_date, end_date)
+        self._pinned_price_codes = price_codes
+        self._pinned_financial_codes = financial_codes
+        return sorted(set(price_codes) | set(financial_codes))
+
+    def _pinned_codes(
+        self, start_date: str, end_date: str, *, financial: bool,
+    ) -> list[str] | None:
+        """Codes pinned for this exact range (see :meth:`cache_universe`)."""
+        if self._pinned_range != self._normalise_range(start_date, end_date):
+            return None
+        if financial:
+            return self._pinned_financial_codes
+        return self._pinned_price_codes
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -313,34 +408,111 @@ class BaostockDataProvider(DataProvider):
     def _cache_path(self, key: str) -> Path:
         return CACHE_DIR / f"{key}.parquet"
 
+    @staticmethod
+    def _key_adjustment(key: str) -> str:
+        if "_adj1" in key:
+            return _PRICE_ADJUSTMENT
+        if "_adj3" in key:
+            return "raw"
+        return "n/a"
+
+    def _manifest_valid(self, key: str) -> bool:
+        expected_adjustment = self._key_adjustment(key)
+        return cache_manifest_matches(
+            self._cache_path(key),
+            adjustment=(
+                None if expected_adjustment == "n/a" else expected_adjustment
+            ),
+            cache_version=self._cache_version(),
+            key=key,
+        )
+
+    def _write_manifest(self, key: str) -> None:
+        write_cache_manifest(
+            self._cache_path(key),
+            provider="baostock",
+            adjustment=self._key_adjustment(key),
+            cache_version=self._cache_version(),
+            extra={"key": key},
+        )
+
+    def _discard_cache(self, key: str) -> None:
+        base = self._cache_path(key)
+        for path in (
+            base,
+            base.with_suffix(".csv"),
+            base.with_name(f"{base.name}.manifest.json"),
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def _load_cache(self, key: str) -> pd.DataFrame | None:
         if not self._cache_enabled:
             return None
-        # Try parquet first
         path = self._cache_path(key)
-        if path.exists():
-            try:
-                return pd.read_parquet(path)
-            except Exception:
-                pass
-        # Fallback to CSV
         csv_path = path.with_suffix(".csv")
-        if csv_path.exists():
+        if not path.exists() and not csv_path.exists():
+            return None
+        if not self._manifest_valid(key):
+            logger.info(
+                "Ignoring cache %s: missing/stale version manifest "
+                "(schema or adjustment changed); refetching", key,
+            )
+            self._discard_cache(key)
+            return None
+        # Usually exactly one format exists (writes remove the twin). If a
+        # Windows sharing violation prevented removing the old parquet after
+        # a CSV fallback write, serve the *newer* file rather than the stale
+        # parquet. Never fall back to the older twin on a read error.
+        source = path if path.exists() else csv_path
+        if path.exists() and csv_path.exists():
             try:
-                return pd.read_csv(csv_path, index_col=[0, 1], parse_dates=[0])
-            except Exception:
-                pass
-        return None
+                if csv_path.stat().st_mtime > path.stat().st_mtime:
+                    source = csv_path
+            except OSError:
+                source = path
+        try:
+            if source == csv_path:
+                return pd.read_csv(source, index_col=[0, 1], parse_dates=[0])
+            return pd.read_parquet(source)
+        except Exception:
+            return None
 
     def _save_cache(self, key: str, df: pd.DataFrame):
         if not self._cache_enabled:
             return
+        base = self._cache_path(key)
+        csv_path = base.with_suffix(".csv")
+        tmp = base.with_name(f"{base.name}.tmp.{os.getpid()}")
         try:
-            df.to_parquet(self._cache_path(key), index=True)
-        except Exception:
-            # Fallback to CSV if parquet fails
-            csv_path = self._cache_path(key).with_suffix(".csv")
-            df.to_csv(csv_path, index=True)
+            try:
+                df.to_parquet(tmp, index=True)
+                os.replace(tmp, base)
+                # The parquet file is authoritative; drop a stale CSV twin so
+                # a later parquet failure cannot resurrect older values.
+                csv_path.unlink(missing_ok=True)
+            except Exception:
+                # Fallback to CSV if parquet fails. Write atomically too, and
+                # remove the stale parquet (see MINOR 7 / reviewer finding).
+                tmp.unlink(missing_ok=True)
+                csv_tmp = csv_path.with_name(
+                    f"{csv_path.name}.tmp.{os.getpid()}"
+                )
+                df.to_csv(csv_tmp, index=True)
+                os.replace(csv_tmp, csv_path)
+                base.unlink(missing_ok=True)
+            self._write_manifest(key)
+        except Exception as exc:  # a cache failure must not fail the research run
+            logger.warning(
+                "Could not cache baostock panel %s: %s", key, exc,
+            )
+            for leftover in (tmp,):
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # Daily prices
@@ -396,7 +568,7 @@ class BaostockDataProvider(DataProvider):
             ",".join(sorted(str(code).zfill(6) for code in codes)).encode()
         ).hexdigest()[:8]
         cache_key = (
-            f"daily_{_CACHE_VERSION}_{start_date}_{end_date}_"
+            f"daily_{self._cache_version()}_{start_date}_{end_date}_"
             f"{len(codes)}_{codes_digest}_adj{adjustflag}"
         )
         cached = self._load_cache(cache_key)
@@ -504,6 +676,12 @@ class BaostockDataProvider(DataProvider):
         path = self._universe_cache_path()
         if not path.exists():
             return None
+        if not cache_manifest_matches(path, cache_version=self._cache_version()):
+            logger.info(
+                "Ignoring stock universe cache %s: missing/stale version "
+                "manifest (schema changed); refetching", path.name,
+            )
+            return None
         if _UNIVERSE_CACHE_TTL_DAYS > 0:
             age_seconds = time.time() - path.stat().st_mtime
             if age_seconds > _UNIVERSE_CACHE_TTL_DAYS * 86400:
@@ -520,9 +698,20 @@ class BaostockDataProvider(DataProvider):
             return
         try:
             path = self._universe_cache_path()
-            path.write_text(json.dumps(records), encoding="utf-8")
+            tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+            tmp.write_text(json.dumps(records), encoding="utf-8")
+            os.replace(tmp, path)
+            write_cache_manifest(
+                path,
+                provider="baostock",
+                adjustment="n/a",
+                cache_version=self._cache_version(),
+                extra={"universe_cache_version": _UNIVERSE_CACHE_VERSION},
+            )
         except OSError as exc:
             logger.warning("could not cache stock universe: %s", exc)
+        except Exception as exc:  # manifest failure must not break the fetch
+            logger.warning("could not cache stock universe manifest: %s", exc)
 
     def _fetch_stock_basic_universe(self) -> list[dict] | None:
         """All type=1 A-share records (listed, paused and delisted).
@@ -645,7 +834,7 @@ class BaostockDataProvider(DataProvider):
         source has no ST history and an all-False column would silently
         disable ST screening.
         """
-        cache_key = f"metadata_{_CACHE_VERSION}"
+        cache_key = f"metadata_{self._cache_version()}"
         cached = self._load_cache(cache_key)
         if cached is not None:
             cached.attrs["st_available"] = False
@@ -703,7 +892,7 @@ class BaostockDataProvider(DataProvider):
 
     def _get_industry_map(self) -> dict[str, str]:
         """Get industry classification for all stocks."""
-        cache_key = f"industry_map_{_CACHE_VERSION}"
+        cache_key = f"industry_map_{self._cache_version()}"
         cached = self._load_cache(cache_key)
         if cached is not None:
             return dict(zip(cached.index, cached["industry"], strict=False))
@@ -750,9 +939,13 @@ class BaostockDataProvider(DataProvider):
         fields: list[str] | None = None,
     ) -> pd.DataFrame:
         """Get daily price data for a range-overlapping stock sample."""
-        codes = self._get_major_stocks_list(
-            start_date=start_date, end_date=end_date,
+        codes = self._pinned_codes(
+            start_date, end_date, financial=False,
         )
+        if codes is None:
+            codes = self._get_major_stocks_list(
+                start_date=start_date, end_date=end_date,
+            )
         df = self._fetch_daily_data(codes, start_date, end_date)
         if df.empty:
             return self._project_price_fields(df, fields)
@@ -847,9 +1040,13 @@ class BaostockDataProvider(DataProvider):
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
 
-        codes = self._get_major_stocks_list(
-            n=100, start_date=start_date, end_date=end_date,
+        codes = self._pinned_codes(
+            start_date, end_date, financial=True,
         )
+        if codes is None:
+            codes = self._get_major_stocks_list(
+                n=100, start_date=start_date, end_date=end_date,
+            )
         if not codes:
             return _empty_financials()
 
@@ -857,8 +1054,8 @@ class BaostockDataProvider(DataProvider):
             ",".join(sorted(codes)).encode()
         ).hexdigest()[:8]
         cache_key = (
-            f"fin_{_CACHE_VERSION}_{start_date}_{end_date}_"
-            f"{len(codes)}_{codes_digest}"
+            f"fin_{self._cache_version()}_{start_date}_{end_date}_"
+            f"{len(codes)}_{codes_digest}_adj3"
         )
         cached = self._load_cache(cache_key)
         if cached is not None and len(cached) > 0:
@@ -1027,7 +1224,9 @@ class BaostockDataProvider(DataProvider):
         end_date: str,
     ) -> pd.Series:
         """Get CSI 300 daily trailing returns (pctChg / 100)."""
-        cache_key = f"bench_{_CACHE_VERSION}_{start_date}_{end_date}"
+        cache_key = (
+            f"bench_{self._cache_version()}_{start_date}_{end_date}_adj1"
+        )
         cached = self._load_cache(cache_key)
         if cached is not None and not cached.empty:
             series = cached.iloc[:, 0]

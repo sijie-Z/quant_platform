@@ -22,9 +22,10 @@ from quant_platform.utils.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
-# Effective provider used by the most recent `_load_data()` call. The cache
-# key is computed before loading, so the caller compares this afterwards and
-# refuses to cache a silent fallback under the requested provider's key.
+# Effective provider used by the most recent `_load_data()` call, including a
+# ValidatedProvider wrapper chain (e.g. "validated(baostock+adata)"). The data
+# cache key is computed *after* provider resolution from this identity, so a
+# silent fallback can never land in the requested provider's slot.
 _LAST_DATA_PROVIDER = ""
 
 # Provenance of the most recent `_load_data()` call, recorded in metrics.json
@@ -103,21 +104,22 @@ def _sector_panel_is_usable(panel, has_history: bool) -> bool:
     return has_history or bool(panel.notna().to_numpy().any())
 
 
-def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
-    """Load and clean data. Returns (prices, returns, benchmark, metadata, financials, turnover).
+def _resolve_provider(
+    config,
+    use_tushare: bool = False,
+    use_baostock: bool = False,
+    *,
+    with_universe: bool = True,
+) -> dict:
+    """Select the effective provider and describe its data identity (D12).
 
-    Respects the config.data.provider setting:
-    - "baostock":  Baostock free A-share data
-    - "tushare":   Tushare Pro (requires TUSHARE_TOKEN env var)
-    - "postgres":  PostgreSQL stored data
-    - "synthetic": Synthetic data (for testing only)
-
-    `use_tushare`/`use_baostock` are explicit CLI overrides. They default to
-    False so the config decides; the old `use_tushare=True` default silently
-    replaced a configured synthetic/postgres provider whenever a Tushare
-    token happened to be present in the environment.
+    Provider resolution happens *before* the pipeline cache key is computed:
+    a silent fallback to synthetic, a ``ValidatedProvider`` wrapper, or a
+    changed secondary source all alter the produced data while leaving the
+    YAML untouched. The returned dict carries the provider instance plus the
+    identity inputs (requested/effective names, wrapper chain, sampled symbol
+    set, adjustment basis) used by :func:`_data_cache_key`.
     """
-    from quant_platform.data.pipeline import DataPipeline
     from quant_platform.data.providers.baostock_provider import BaostockDataProvider
     from quant_platform.data.providers.synthetic import SyntheticDataProvider
     from quant_platform.data.providers.tushare_loader import TushareProvider
@@ -226,6 +228,309 @@ def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
         except Exception:
             logger.info("Secondary provider (adata) unavailable — running without validation")
 
+    from quant_platform.data.providers.base import provider_identity, sampled_universe
+
+    identity = provider_identity(provider)
+    if not isinstance(identity.get("sources"), dict) and provider_name:
+        # The selection code is authoritative for the effective provider name
+        # (test doubles and custom providers may not have a known class name).
+        identity["provider"] = provider_name
+        identity["synthetic"] = provider_name == "synthetic"
+    effective_provider = str(
+        identity.get("provider") or provider_name or requested_provider
+    )
+    universe = None
+    if with_universe:
+        universe = sampled_universe(
+            provider,
+            start_date=str(config.data.start_date),
+            end_date=str(config.data.end_date),
+            n_symbols=getattr(
+                getattr(config, "universe", None), "n_stocks", None,
+            ),
+        )
+    return {
+        "provider": provider,
+        "provider_name": provider_name,
+        "requested_provider": requested_provider,
+        "effective_provider": effective_provider,
+        "identity": identity,
+        "universe": universe,
+        "allow_fallback": allow_fallback,
+        "failures": failures,
+        "validated": isinstance(identity.get("sources"), dict),
+    }
+
+
+def _effective_provider_attr(provider, attribute: str):
+    """Read a provider attribute through a ValidatedProvider wrapper."""
+    providers = getattr(provider, "providers", None)
+    if isinstance(providers, dict) and providers:
+        primary = providers.get(getattr(provider, "primary", None))
+        if primary is None:
+            primary = next(iter(providers.values()))
+        return _effective_provider_attr(primary, attribute)
+    return getattr(provider, attribute, None)
+
+
+def _build_data_manifest(
+    resolution: dict,
+    config,
+    data_date: str = "",
+    payload_assets=None,
+) -> dict:
+    """Provenance record stored alongside a cached data stage (D35).
+
+    Fields: requested/effective provider, synthetic flag, source, date range,
+    symbol-set hash, adjustment basis, data date, schema version, creation
+    time and app version. A cache hit serves this record, not the current
+    run's requested provider, so a synthetic fallback can never masquerade as
+    a real-provider result.
+    """
+    from datetime import UTC, datetime
+
+    from quant_platform.utils.cache import (
+        CACHE_KEY_VERSION,
+        DATA_SCHEMA_VERSION,
+        PipelineCache,
+        app_version,
+    )
+
+    identity = resolution.get("identity") or {}
+    universe = resolution.get("universe")
+    assets = sorted({str(asset) for asset in (payload_assets or [])})
+    sources = identity.get("sources")
+    if isinstance(sources, dict):
+        validation = {
+            "wrapper": identity.get("wrapper"),
+            "primary": identity.get("primary"),
+            "sources": sorted(str(name) for name in sources),
+        }
+    else:
+        validation = {"wrapper": None}
+    return {
+        "requested_provider": resolution.get("requested_provider"),
+        "effective_provider": resolution.get("effective_provider"),
+        "synthetic": bool(identity.get("synthetic")),
+        "source": resolution.get("effective_provider"),
+        "start_date": str(config.data.start_date),
+        "end_date": str(config.data.end_date),
+        "data_date": data_date,
+        "symbol_hash": PipelineCache.hash_symbols(universe),
+        "symbol_count": None if universe is None else len(set(universe)),
+        "payload_asset_hash": PipelineCache.hash_symbols(assets) if assets else None,
+        "payload_asset_count": len(assets),
+        "adjustment": identity.get("adjustment"),
+        "benchmark_source": _effective_provider_attr(
+            resolution.get("provider"), "benchmark_source",
+        ),
+        "schema_version": DATA_SCHEMA_VERSION,
+        "cache_key_version": CACHE_KEY_VERSION,
+        "created_at": datetime.now(UTC).isoformat(),
+        "app_version": app_version(),
+        "fallback_allowed": bool(resolution.get("allow_fallback")),
+        "failures": list(resolution.get("failures") or []),
+        "validation": validation,
+    }
+
+
+def _data_cache_key(
+    config,
+    resolution: dict,
+    *,
+    use_baostock: bool = False,
+    use_tushare: bool = False,
+) -> str:
+    """Pipeline data-stage key: materialized config + effective provider (D12)."""
+    from quant_platform.utils.cache import PipelineCache
+
+    return PipelineCache.make_data_cache_key(
+        config=config,
+        provider_identity=resolution.get("identity") or {},
+        symbols=resolution.get("universe"),
+        overrides={
+            "use_baostock": bool(use_baostock),
+            "use_tushare": bool(use_tushare),
+        },
+        start_date=str(config.data.start_date),
+        end_date=str(config.data.end_date),
+    )
+
+
+def _manifest_is_compatible(manifest: dict | None, resolution: dict) -> bool:
+    """Whether a stored data manifest describes the current resolved run."""
+    from quant_platform.utils.cache import DATA_SCHEMA_VERSION, PipelineCache
+
+    if not isinstance(manifest, dict) or not manifest:
+        return False
+    if manifest.get("schema_version") != DATA_SCHEMA_VERSION:
+        return False
+    if manifest.get("requested_provider") != resolution.get("requested_provider"):
+        return False
+    if manifest.get("effective_provider") != resolution.get("effective_provider"):
+        return False
+    identity = resolution.get("identity") or {}
+    if manifest.get("adjustment") != identity.get("adjustment"):
+        return False
+    if bool(manifest.get("synthetic")) != bool(identity.get("synthetic")):
+        return False
+    expected_symbols = PipelineCache.hash_symbols(resolution.get("universe"))
+    return expected_symbols is None or manifest.get("symbol_hash") == expected_symbols
+
+
+DATA_STAGE = "data_v4"
+
+
+def _payload_manifest_coherent(payload, manifest: dict | None) -> bool:
+    """Whether the payload's embedded provenance matches its sidecar manifest.
+
+    Saves write the pickle and the sidecar under the lock, but a reader can
+    still pair an old payload with a newer sidecar (or vice versa) when a
+    writer replaces both between the two reads. The manifest is built from
+    the payload provenance, so a coherent pair matches on every identity
+    field -- including ``created_at``.
+    """
+    if not isinstance(manifest, dict) or not manifest:
+        return False
+    provenance = payload.get("provenance") if isinstance(payload, dict) else None
+    if not isinstance(provenance, dict):
+        return False
+    fields = (
+        "requested_provider", "effective_provider", "synthetic", "source",
+        "start_date", "end_date", "data_date", "symbol_hash",
+        "payload_asset_hash", "adjustment", "benchmark_source",
+        "schema_version", "created_at",
+    )
+    return all(provenance.get(field) == manifest.get(field) for field in fields)
+
+
+def _load_data_stage(
+    cache,
+    cache_key: str,
+    config,
+    resolution: dict,
+    *,
+    read_cache: bool,
+    write_cache: bool,
+    use_tushare: bool = False,
+    use_baostock: bool = False,
+):
+    """Load the data stage from cache or recompute and (over)write it.
+
+    ``--force`` is ``read_cache=False, write_cache=True``: the stale entry is
+    atomically replaced instead of being left behind (D33). ``--no-cache`` is
+    both False. A provider whose universe cannot be determined cheaply is not
+    cached at all (a key without the symbol-set hash could serve stale data).
+
+    Returns ``(data_tuple, provenance, cache_hit)``.
+    """
+    stage = DATA_STAGE
+    validated = bool(resolution.get("validated"))
+    # A validated multi-source run may silently drop a configured source at
+    # fetch time (e.g. adata returns empty). The key records the configured
+    # chain, not which sources actually contributed, so caching such a run
+    # could serve primary-only data under a "validated" entry. Skip caching
+    # until the wrapper can attest the observed sources.
+    can_cache = resolution.get("universe") is not None and not validated
+
+    if read_cache and can_cache:
+        payload, manifest = cache.load_stage_with_manifest(stage, cache_key)
+        if isinstance(payload, dict) and payload.get("data") is not None:
+            compatible = _manifest_is_compatible(manifest, resolution)
+            coherent = _payload_manifest_coherent(payload, manifest)
+            if compatible and coherent:
+                data_tuple = payload["data"]
+                provenance = dict(manifest or payload.get("provenance") or {})
+                provenance["cache"] = {
+                    "hit": True, "stage": stage, "key": cache_key,
+                }
+                logger.info("Data loaded from cache (key %s)", cache_key)
+                return data_tuple, provenance, True
+            if not compatible:
+                logger.warning(
+                    "Cache entry %s failed provenance validation; recomputing",
+                    cache_key,
+                )
+                cache.evict_stage(stage, cache_key)
+            else:
+                # A concurrent writer is replacing this entry: do not evict
+                # the fresh file, just recompute and let the last save win.
+                logger.warning(
+                    "Cache entry %s has mismatched payload/manifest "
+                    "provenance (concurrent writer?); recomputing without "
+                    "evicting", cache_key,
+                )
+    elif read_cache and not can_cache:
+        logger.info(
+            "Pipeline cache disabled for this run: %s",
+            "validated multi-source runs cannot attest which sources "
+            "contributed" if validated
+            else "the provider universe cannot be determined before loading",
+        )
+
+    prices, returns, benchmark, metadata, financials, turnover = _load_data(
+        config,
+        use_tushare=use_tushare,
+        use_baostock=use_baostock,
+        resolution=resolution,
+    )
+    data_tuple = (
+        prices, returns, benchmark, metadata, financials, turnover,
+    )
+    provenance = dict(_LAST_DATA_PROVENANCE)
+    provenance["cache"] = {"hit": False, "stage": stage, "key": cache_key}
+
+    if write_cache and can_cache:
+        manifest = {
+            key: value for key, value in provenance.items() if key != "cache"
+        }
+        cache.save_stage(
+            stage, cache_key,
+            {"data": data_tuple, "provenance": provenance},
+            manifest=manifest,
+        )
+    elif write_cache:
+        logger.info(
+            "Not caching data: the effective provider's symbol set is unknown"
+        )
+    return data_tuple, provenance, False
+
+
+def _load_data(
+    config,
+    use_tushare: bool = False,
+    use_baostock: bool = False,
+    resolution: dict | None = None,
+):
+    """Load and clean data. Returns (prices, returns, benchmark, metadata, financials, turnover).
+
+    Respects the config.data.provider setting:
+    - "baostock":  Baostock free A-share data
+    - "tushare":   Tushare Pro (requires TUSHARE_TOKEN env var)
+    - "postgres":  PostgreSQL stored data
+    - "synthetic": Synthetic data (for testing only)
+
+    `use_tushare`/`use_baostock` are explicit CLI overrides. They default to
+    False so the config decides; the old `use_tushare=True` default silently
+    replaced a configured synthetic/postgres provider whenever a Tushare
+    token happened to be present in the environment.
+
+    ``resolution`` may be passed by callers that resolved the provider
+    earlier to compute the pipeline cache key (D12); otherwise the provider is
+    resolved here.
+    """
+    from quant_platform.data.pipeline import DataPipeline
+    from quant_platform.utils.metrics import get_metrics
+
+    if resolution is None:
+        resolution = _resolve_provider(
+            config, use_tushare=use_tushare, use_baostock=use_baostock,
+        )
+    provider = resolution["provider"]
+    provider_name = resolution.get("provider_name") or ""
+    requested_provider = resolution.get("requested_provider", "")
+    metrics = get_metrics()
+
     pipeline = DataPipeline(
         provider=provider,
         start_date=config.data.start_date,
@@ -304,22 +609,20 @@ def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
             metadata.attrs["factor_ohlc"] = ohlc
 
     global _LAST_DATA_PROVIDER, _LAST_DATA_PROVENANCE
-    _LAST_DATA_PROVIDER = provider_name or configured_provider
+    _LAST_DATA_PROVIDER = resolution.get("effective_provider") or provider_name
 
     factor_prices = pipeline.get_factor_prices()
     data_date = ""
+    payload_assets: list[str] = []
     if factor_prices is not None and len(factor_prices.index) > 0:
         data_date = str(factor_prices.index[-1])[:10]
-    _LAST_DATA_PROVENANCE = {
-        "requested_provider": requested_provider,
-        "effective_provider": _LAST_DATA_PROVIDER,
-        "synthetic": _LAST_DATA_PROVIDER == "synthetic",
-        "start_date": str(config.data.start_date),
-        "end_date": str(config.data.end_date),
-        "data_date": data_date,
-        "fallback_allowed": allow_fallback,
-        "failures": failures,
-    }
+        try:
+            payload_assets = [str(asset) for asset in factor_prices.columns]
+        except Exception:  # defensive: provenance must not kill the run
+            payload_assets = []
+    _LAST_DATA_PROVENANCE = _build_data_manifest(
+        resolution, config, data_date=data_date, payload_assets=payload_assets,
+    )
 
     return (
         factor_prices,
@@ -838,18 +1141,28 @@ def cmd_run(args) -> int:
 
     run_id = uuid.uuid4().hex[:12]
     use_baostock = bool(getattr(args, "use_baostock", False))
-    requested_provider = (
-        "baostock" if use_baostock
-        else getattr(config.data, "provider", "synthetic")
+    use_tushare = bool(getattr(args, "use_tushare", False))
+    # D12: resolve the provider *before* computing the key, so a silent
+    # fallback, a ValidatedProvider wrapper or a changed secondary source
+    # cannot reuse another run's entry. The universe (sampled symbols) is
+    # needed only when the cache is used at all.
+    resolution = _resolve_provider(
+        config,
+        use_tushare=use_tushare,
+        use_baostock=use_baostock,
+        with_universe=not args.no_cache,
     )
-    config_hash = PipelineCache.make_config_hash(
-        raw_config,
-        provider=requested_provider,
-        overrides={"use_baostock": use_baostock},
+    cache_key = _data_cache_key(
+        config, resolution,
+        use_baostock=use_baostock, use_tushare=use_tushare,
     )
-    cache_key = config_hash
+    config_hash = cache_key
     cache = PipelineCache(args.cache_dir)
-    use_cache = not args.force and not args.no_cache
+    # D33: --force skips the *read* but still writes: a forced recomputation
+    # must replace the stale entry, otherwise the next normal run serves the
+    # old payload again. --no-cache disables both.
+    read_cache = not args.force and not args.no_cache
+    write_cache = not args.no_cache
 
     def _save_config_version() -> None:
         """Persist the config snapshot only for successful runs (issue S11)."""
@@ -868,52 +1181,23 @@ def cmd_run(args) -> int:
 
     logger.info("=" * 60)
     logger.info("Quant Platform: Starting full pipeline run")
-    logger.info("  Config: %s  Cache key: %s  Use cache: %s",
-                 config_path, cache_key, use_cache)
+    logger.info("  Config: %s  Cache key: %s  Read cache: %s  Write cache: %s",
+                 config_path, cache_key, read_cache, write_cache)
     logger.info("=" * 60)
 
     # ------------------------------------------------------------------
     # 1. Data
     # ------------------------------------------------------------------
     logger.info("[1/6] Loading data...")
-    data_tuple = None
-    provenance: dict = {}
-    # Stage name carries a version. This entry used to be a 5-tuple without
-    # `turnover`, and on a cache hit the code set `turnover = None` -- which
-    # made TurnoverFactor fall back to a price SMA. Identical inputs therefore
-    # produced a different `turnover_20d` depending on whether the cache was
-    # warm. Reading old entries back is what caused that, so a new stage name
-    # retires them rather than trying to detect the shape.
-    #
-    # data_v3 also carries the data provenance (requested/effective provider,
-    # synthetic flag, dates) so a cache hit can still write it to the report.
-    if use_cache:
-        cached_payload = cache.load_stage("data_v3", cache_key)
-        if isinstance(cached_payload, dict):
-            data_tuple = cached_payload.get("data")
-            provenance = cached_payload.get("provenance") or {}
-
-    if data_tuple is not None:
-        prices, returns, benchmark, metadata, financials, turnover = data_tuple
-        logger.info("Data loaded from cache")
-    else:
-        prices, returns, benchmark, metadata, financials, turnover = _load_data(
-            config, use_baostock=use_baostock,
+    (prices, returns, benchmark, metadata, financials, turnover), provenance, cache_hit = (
+        _load_data_stage(
+            cache, cache_key, config, resolution,
+            read_cache=read_cache, write_cache=write_cache,
+            use_tushare=use_tushare, use_baostock=use_baostock,
         )
-        provenance = dict(_LAST_DATA_PROVENANCE)
-        # A silent fallback (e.g. Tushare configured but unreachable) must not
-        # be stored under the requested provider's key: after credentials are
-        # fixed that entry would keep serving synthetic data.
-        if use_cache and requested_provider == _LAST_DATA_PROVIDER:
-            cache.save_stage("data_v3", cache_key, {
-                "data": (prices, returns, benchmark, metadata, financials, turnover),
-                "provenance": provenance,
-            })
-        elif use_cache:
-            logger.warning(
-                "Not caching data: requested provider '%s' fell back to '%s'",
-                requested_provider, _LAST_DATA_PROVIDER,
-            )
+    )
+    if cache_hit:
+        logger.info("Data loaded from cache")
 
     if provenance:
         logger.info(
@@ -1306,6 +1590,63 @@ def cmd_sweep(args) -> int:
     return 0
 
 
+def _cmd_cache_refresh(args) -> int:
+    """Recompute the current config's data stage and overwrite its entry (D33).
+
+    Unlike ``run --force`` this stops after the data stage: no factors,
+    backtest or reports. Useful right after a provider/data fix to make sure
+    the next normal run cannot replay the pre-fix payload.
+    """
+    import yaml
+
+    from quant_platform.utils.cache import PipelineCache
+
+    config_path = _resolve_config_path(getattr(args, "config", None))
+    if not Path(config_path).exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path, encoding="utf-8") as f:
+        raw_config = yaml.safe_load(f)
+    config = load_config(raw=raw_config)
+    if getattr(args, "allow_synthetic_fallback", False):
+        config.data.allow_synthetic_fallback = True
+
+    use_baostock = bool(getattr(args, "use_baostock", False))
+    resolution = _resolve_provider(config, use_baostock=use_baostock)
+    if resolution.get("universe") is None or resolution.get("validated"):
+        print(
+            "Error: this run's data stage is not cacheable "
+            + (
+                "(validated multi-source runs cannot attest which sources "
+                "contributed)."
+                if resolution.get("validated")
+                else "(the effective provider's symbol set is unknown)."
+            )
+            + " There is nothing to refresh.",
+            file=sys.stderr,
+        )
+        return 1
+    cache_key = _data_cache_key(config, resolution, use_baostock=use_baostock)
+    cache = PipelineCache(getattr(args, "cache_dir", None) or ".quant_cache")
+    _data_tuple, provenance, _hit = _load_data_stage(
+        cache, cache_key, config, resolution,
+        read_cache=False, write_cache=True, use_baostock=use_baostock,
+    )
+    print(
+        f"Refreshed cache entry {DATA_STAGE} {cache_key}: "
+        f"provider={provenance.get('effective_provider')} "
+        f"symbols={provenance.get('symbol_count')} "
+        f"data_date={provenance.get('data_date')}"
+    )
+    if cache.save_failures:
+        print(
+            f"Warning: {cache.save_failures} cache save failure(s); "
+            "the previous entry may still be in place. See logs.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def cmd_cache(args) -> int:
     """Manage pipeline cache."""
     from quant_platform.utils.cache import PipelineCache
@@ -1315,8 +1656,14 @@ def cmd_cache(args) -> int:
     if subcommand is None:
         # argparse `required=True` normally prevents this; keep a defensive
         # nonzero exit so a programmatic caller cannot get a false success.
-        print("Error: a cache subcommand is required (list, clear, prune).", file=sys.stderr)
+        print(
+            "Error: a cache subcommand is required "
+            "(list, clear, prune, refresh).",
+            file=sys.stderr,
+        )
         return 2
+    if subcommand == "refresh":
+        return _cmd_cache_refresh(args)
 
     cache = PipelineCache(cache_dir)
 
@@ -2717,9 +3064,11 @@ def main() -> int:
     run_parser.add_argument("--use-baostock", action="store_true",
                             help="Use Baostock real A-share data instead of synthetic")
     run_parser.add_argument("--force", "-f", action="store_true",
-                            help="Force recomputation, bypass cache")
+                            help="Force recomputation and overwrite the pipeline "
+                                 "cache entry (provider data caches are unaffected)")
     run_parser.add_argument("--no-cache", action="store_true",
-                            help="Disable caching entirely")
+                            help="Disable the pipeline result cache, read and "
+                                 "write (provider data caches are unaffected)")
     run_parser.add_argument("--cache-dir", type=str, default=".quant_cache",
                             help="Cache directory path")
     run_parser.add_argument("--allow-synthetic-fallback", action="store_true",
@@ -2851,6 +3200,21 @@ def main() -> int:
                              help="Delete entries older than this (default: 30)")
     cache_prune.add_argument("--max-entries", type=int, default=None,
                              help="Keep at most this many entries (default: 64)")
+    cache_refresh = cache_sub.add_parser(
+        "refresh",
+        help="Recompute the data stage for the current config and overwrite "
+             "its pipeline cache entry (no factors/backtest; provider data "
+             "caches are range-immutable and still used)",
+    )
+    cache_refresh.add_argument("--config", "-c", type=str, default=None,
+                               help="Path to config YAML file")
+    cache_refresh.add_argument("--use-baostock", action="store_true",
+                               help="Use Baostock real A-share data")
+    cache_refresh.add_argument("--allow-synthetic-fallback", action="store_true",
+                               help="Development only: allow a real provider to "
+                                    "fall back to synthetic data")
+    cache_refresh.add_argument("--cache-dir", type=str, default=argparse.SUPPRESS,
+                               help="Cache directory path")
     # Kept for backward compatibility with `cache --cache-dir X list`; the
     # subparser copies (SUPPRESS default) win when given after the subcommand.
     cache_parser.add_argument("--cache-dir", type=str, default=".quant_cache",
