@@ -1,57 +1,77 @@
-# Ops Runbook — alpha-v1.0 系统运维手册
+# Ops Runbook — 系统运维手册
 
 > 系统挂了怎么办、数据断了怎么办、调仓失败怎么办。
 > 不做优化，只做"活下来"。
+
+> 入口说明：日常交易与 Web 服务分别用 `python main.py trade` 和
+> `python main.py web`。`trading/live_engine.py` 与
+> `trading/reversal_paper_trader.py` 是库模块（没有 `__main__`），直接
+> `python trading/live_engine.py` 只会导入类，不会启动任何东西。
 
 ---
 
 ## 1. 系统启动
 
 ```bash
-# 日常运行
-python trading/live_engine.py
+# 实盘/纸面交易（单进程；券商连接失败会直接退出，不会回退模拟盘）
+python main.py trade --broker paper --days 30        # Paper Trading
+python main.py trade --broker qmt --days 1           # QMT 实盘（需 miniQMT + xtquant；真实券商每次 1 个交易所日）
+python main.py trade --broker qmt_live --days 1      # 显式 live 模式
 
-# 每日监控检查
+# Web/API（必须单 worker，见第 11 节）
+python main.py web
+
+# 每日监控检查（脚本自带 __main__）
 python monitoring/run_monitor.py
-
-# Paper trading 回放
-python trading/reversal_paper_trader.py
 ```
+
+QMT 密码优先读环境变量 `QMT_PASSWORD`，账户/服务器/模式见
+`config/default.yaml` 的 `execution.qmt` 段。`--broker qmt` 不再静默等价于模拟盘。
+真实券商只在**交易所交易日**执行（非交易日直接拒绝），每次运行只支持 **1 个交易所日**，
+且必须提供真实行情 feed（拒绝合成价格）。
 
 ## 2. 系统停止
 
 ```bash
-# Ctrl+C 正常停止
-# 如果进程卡死:
-pkill -f live_engine.py
+# Ctrl+C 正常停止；CLI LiveRunner 会结束会话并 checkpoint SQLite WAL；
+# Web API 的 LiveTradingEngine 与 daemon 的 LiveEngine 还会落盘/恢复 engine_state
+# （CLI LiveRunner 不落盘/不恢复）
+# 如果进程卡死（POSIX）:
+pkill -f "main.py trade"
+
+# Docker（QUANT_API_TOKEN 需在 .env 中，否则 compose 插值会报错）
+docker compose stop        # stop_grace_period: 30s
 ```
 
 ## 3. 故障处理
 
 | 故障 | 现象 | 处理 |
 |------|------|------|
-| 数据源断开 | log 显示 connection error | 检查网络/切换备用数据源 |
-| 调仓失败 | 部分股票未成交 | 手动补单，记录偏差 |
+| 数据源断开 | log 显示 connection error / `DataFetchIncomplete` | 检查网络/切换备用数据源；真实源默认 fail closed，不要用 `--allow-synthetic-fallback` 掩盖 |
+| 调仓失败 | 部分股票未成交 | 回测中未成交目标会顺延到下一个可交易日（`tradable_mask`）；实盘 LiveRunner 每周期重算信号，未成交余量按券商/模拟盘撤单规则处理（SimulatedBroker 会撤销未成交余量），必要时手动补单并记录偏差 |
 | 净值异常下跌 | 单日跌幅 > 10% | 触发 kill switch，检查行情数据 |
-| 系统崩溃 | 进程退出 | 重启，检查 log，确认状态一致 |
-| 对账不一致 | 期望持仓 ≠ 实际持仓 | 以实际持仓为准，记录偏差原因 |
+| 系统崩溃 | 进程退出 | 重启，检查 log；Web API 的 `LiveTradingEngine` / daemon 的 `LiveEngine` 从 `engine_state` 恢复持仓/现金/Kill Switch；CLI `main.py trade` 每次新建 broker 账本，**不会恢复上一次会话**，必须与券商/Store 实际持仓对账 |
+| 对账不一致 | 期望持仓 ≠ 实际持仓 | 以实际持仓为准，记录偏差原因；Web API 的 `LiveTradingEngine.start()` 会运行 HealthCheck（含持仓同步）；daemon 只做 SafetySystem 检查（不对比持仓）；CLI runner 不运行 healthcheck |
+| 券商连接失败 | `Broker ... failed to connect`，退出码 1 | 检查 miniQMT/xtquant/账户；系统不会自动转模拟盘 |
+| API 401/403 | `Invalid or missing API token` / `loopback-only` | 设置 `QUANT_API_TOKEN` 并在 UI Settings 填入同一 token |
 
 ## 4. 重启流程
 
 ```
 1. 检查上次运行 log → 确认最后状态
-2. 检查当前持仓 (与实际券商对账)
+2. 检查当前持仓 (与实际券商对账；Web API 的 LiveTradingEngine 或 daemon 的
+   LiveEngine 会从 data/trading.db 的 engine_state 恢复，CLI `main.py trade` 不恢复)
 3. 检查现金余额
-4. 启动 live_engine
-5. 确认系统输出正常
+4. 启动 python main.py web（由 API/daemon 管理引擎）或 python main.py trade（单次会话）
+5. 确认系统输出正常；/api/health 返回 200
 ```
 
 ## 5. 调仓日操作流程
 
 ```
-1. 开盘前: 确认数据源正常
+1. 开盘前: 确认数据源正常（healthcheck）
 2. 盘中: 确认信号计算无异常
-3. 收盘后: 检查成交情况
+3. 收盘后: 检查成交情况（涨跌停/停牌导致的未成交会顺延）
 4. 对账: 期望 vs 实际
 5. 记录: 调仓日志
 ```
@@ -60,7 +80,7 @@ pkill -f live_engine.py
 
 | 场景 | 动作 |
 |------|------|
-| 系统失控 | 手动 kill switch → 全部平仓 |
+| 系统失控 | 手动 kill switch（`POST /api/risk/kill-switch` 或 Monitor 面板）→ 全部平仓 |
 | 券商 API 异常 | 暂停交易，转为手动模式 |
 | 重大市场事件 | 暂停系统，等待市场稳定 |
 
@@ -71,3 +91,148 @@ pkill -f live_engine.py
 - [ ] 净值未异常下跌
 - [ ] 下次调仓日在预期范围内
 - [ ] 系统 log 无异常报错
+- [ ] `GET /api/health` 返回 200；`GET /api/readiness` 返回 200（503 时按返回的 checks 排查）
+- [ ] 备份任务成功（见第 8 节）
+
+## 8. 备份与恢复
+
+### 需要备份的状态
+
+| 路径 | 内容 | 可否重建 |
+|------|------|----------|
+| `data/trading.db` | 订单/持仓/成交/P&L/信号/会话/事件/配置快照/NAV/引擎状态/EOD 标记（11 张表） | 否 |
+| `data/reports/` | 研究 Registry 生成的报告 | 部分 |
+| `results/` | 回测输出（HTML/CSV/PNG/metrics.json） | 可重跑，但历史 run 不保证复现 |
+| `.quant_versions/` | 配置版本快照 | 否（若未纳入外部版本管理） |
+| `config/` | 当前配置 | 否 |
+| `.quant_cache/`、`.cache/`、`.agent_cache/`、`.sentiment_cache/` | 缓存 | 可重建，可不备份 |
+
+### 热备份（服务运行中）
+
+SQLite 处于 WAL 模式，直接拷贝主文件可能拿到不一致快照。先 checkpoint，再用
+SQLite 的在线备份接口（或短暂停服拷贝）：
+
+```bash
+# 1) 尽量让 WAL 落盘（服务运行中也可执行）
+python -c "import sqlite3; c=sqlite3.connect('data/trading.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()"
+
+# 2) 用 sqlite3 .backup 生成一致性副本（先确保目标目录存在；需安装 sqlite3 CLI）
+mkdir -p backups
+sqlite3 data/trading.db ".backup 'backups/trading-20261020.db'"
+```
+
+没有 `sqlite3` CLI 时，最稳妥的做法是**停止写入进程**后拷走
+`data/trading.db` 连同 `data/trading.db-wal`、`data/trading.db-shm`。
+
+### 完整备份示例
+
+```bash
+mkdir -p backups/20261020
+sqlite3 data/trading.db ".backup 'backups/20261020/trading.db'"
+cp -r .quant_versions config results data/reports backups/20261020/
+```
+
+### 恢复
+
+```bash
+# 1) 停止服务（确保没有进程持有数据库）
+# 2) 删除旧的 -wal/-shm，避免与新副本混用
+rm -f data/trading.db-wal data/trading.db-shm
+# 3) 拷回备份
+cp backups/20261020/trading.db data/trading.db
+cp -r backups/20261020/.quant_versions .quant_versions
+# 4) 启动并验证
+python main.py web
+curl http://127.0.0.1:8000/api/health
+```
+
+建议在每个交易日收盘后（EOD 之后）做一次备份；至少保留最近 5 个交易日与 1 个周备份。
+
+## 9. 升级与迁移
+
+```bash
+# 1) 先备份（第 8 节）
+# 2) 更新依赖并重装本地包
+pip install -r requirements.txt
+pip install -e ./packages/quant_core
+pip install -e .
+# 3) 前端产物不随仓库分发，升级后重新构建
+cd frontend && npm ci && npm run build && cd ..
+# 4) 启动并验证
+python main.py web
+```
+
+- **缓存 schema**：`utils/cache.py` 的 `DATA_SCHEMA_VERSION` 当前为 **5**。版本变化时旧缓存条目会被自动淘汰；也可以直接删除 `.quant_cache/`。
+- **数据库 schema**：Store 使用 `CREATE TABLE IF NOT EXISTS` 与增量迁移（例如新增 `tenant_id`、`engine_state`、`eod_reconciliation` 列/表）。升级前必须备份；没有自动降级路径。
+- **配置版本**：`python main.py config list`（另有 `show` / `diff` / `rollback` 子命令）；版本快照在 `.quant_versions/`。
+- **CLI/API 兼容**：升级后先跑 `python main.py --help` 与 `pytest tests/ -q`。
+
+## 10. 数据来源与 provenance
+
+`python main.py run` 会在结果目录写出 `metrics.json`（`schema_version: 1`），其中：
+
+| 字段 | 含义 |
+|------|------|
+| `provenance.requested_provider` | 配置请求的数据源 |
+| `provenance.effective_provider` | 实际使用的数据源（回退时不同） |
+| `provenance.synthetic` | 是否合成数据 |
+| `provenance.start_date` / `end_date` | 请求区间 |
+| `provenance.data_date` | 数据截止交易日 |
+| `provenance.fallback_allowed` | 是否允许显式回退合成数据 |
+| `provenance.failures` | 数据源初始化/加载失败列表 |
+| `performance` / `risk` / `factors` / `stress_tests` | 回测指标、风险、因子 IC、压力测试 |
+| `daily_returns` / `daily_return_dates` | 日收益序列 |
+
+同样的 provenance 会写入 HTML 报告；控制台也会打印一行
+`Data provenance: requested=... effective=... synthetic=... data_date=...`。
+研究 run 的 validity 用 `python main.py runs list`（另有 `affected` / `mark` 子命令）管理。
+
+## 11. 部署约束：单 worker
+
+运行注册表、pipeline 并发上限、实盘引擎句柄、Kill Switch、OMS 账本和 WebSocket
+客户端集合都是**进程内状态**。必须单 uvicorn worker 运行：不要加 `--workers N`
+或 `--reload`。多 worker 会导致 run 404、重复下单、Kill Switch 只对一个 worker
+生效、WS 事件只推给部分客户端、多个进程写同一个 SQLite。横向扩展需要先把这些
+状态外置到 Redis/数据库（未实现）。详见 README「部署约束：单 worker」。
+
+## 12. 告警与数据保留
+
+### 告警
+
+- 日志 sink 常开；设置 `ALERT_WEBHOOK_URL` 后会额外把告警以 JSON POST 到该地址
+  （`ALERT_WEBHOOK_TIMEOUT` 默认 3 秒）。相同告警 5 分钟内去重；投递失败只记日志
+  并增加 `alerts_webhook_failures_total`，不会阻断引擎周期。
+- 告警来源：盘前 healthcheck 失败、调度器 EOD 异常、引擎/数据源严重事件。
+- Prometheus `/api/metrics` + Grafana 16 面板模板（`monitoring/grafana_dashboard.json`）。
+- `monitoring/run_monitor.py` 有告警时非零退出，适合 cron / 任务计划调用。
+
+### 健康与就绪探针
+
+| 端点 | 用途 |
+|------|------|
+| `GET /api/health` | liveness；休市不会失败，Docker healthcheck 用它 |
+| `GET /api/readiness` | dead-man switch；200 ready / 503 degraded |
+
+`/api/readiness` 的判断逻辑：引擎预期运行但超过 max(2×rebalance interval, 60 秒) 没有
+cycle、引擎在跑但没有活着的 scheduler（或盘中 scheduler tick 超过 90 秒）、或行情数据
+超过 2 个交易日未成功更新时返回 503；休市期间不要求数据更新。研究-only 部署
+（未启动引擎）不会被判为不健康。
+
+### 数据保留（retention）
+
+```bash
+# 归档并删除超过保留期的行（删除前写 dated CSV 到 archive 目录）
+python main.py data retention --archive-dir ./archive
+
+# 按表覆盖保留期（0 = 禁用该表）；CLI 参数优先于内置默认值
+python main.py data retention --events-days 90 --signals-days 365 --trades-days 1825
+```
+
+注意：环境变量 `QUANT_RETENTION_*_DAYS`（ORDERS/TRADES/PNL/SIGNALS/SESSIONS/EVENTS/NAV）
+**只被 scheduler 的每日 retention hook 读取**（`RetentionPolicy.from_env()`）；
+`main.py data retention` 使用 CLI 参数，不读取这些环境变量。未知/非法值回退默认。
+
+默认保留期：orders/trades/pnl 5 年，signals/sessions 1 年，events 180 天，NAV 10 年。
+删除 `orders` 时还会检查是否仍有被保留的 `trades` 引用该订单，避免留下孤儿成交。
+删除后默认 `PRAGMA wal_checkpoint(TRUNCATE)` + `VACUUM`（`--no-vacuum` 跳过）。
+建议在 EOD 之后、备份之前运行 retention。

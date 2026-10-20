@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import sys
 import time
 import traceback
@@ -31,10 +32,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from quant_platform.core.events import get_event_bus
 from quant_platform.core.exchange_calendar import is_trading_day
 from quant_platform.core.store import Store
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
+from quant_platform.risk.healthcheck import emit_alert, install_alert_handler
 from quant_platform.risk.safety import SafetyLimits, SafetySystem
 from quant_platform.trading.live_engine import LiveEngine
 
@@ -84,6 +87,12 @@ class Daemon:
         self.last_run_date: str = str(
             self._load_state().get("last_run_date", "") or ""
         )
+        # S4: an unattended daemon must have the production alert handler
+        # wired, so health-check/system failures reach the sink.
+        try:
+            install_alert_handler(get_event_bus())
+        except Exception:
+            logger.warning("Could not install the alert handler", exc_info=True)
 
     # ── Persisted watermark ──
 
@@ -143,12 +152,20 @@ class Daemon:
         except Exception as e:
             # A daily data failure is an operational alert, not a debug line.
             logger.error("ALERT: daily data load failed: %s", e)
+            emit_alert(
+                "critical", f"daily data load failed: {e}", source="daemon",
+                details={"error": type(e).__name__},
+            )
             result["status"] = "data_failed"
             result["alerts"].append(f"Data load failed: {e}")
             return result
 
         if pipeline.returns is None or len(pipeline.returns.index) == 0:
             logger.error("ALERT: data pipeline returned an empty panel")
+            emit_alert(
+                "critical", "data pipeline returned an empty panel",
+                source="daemon",
+            )
             result["status"] = "data_failed"
             result["alerts"].append("Data pipeline returned an empty panel")
             return result
@@ -235,6 +252,11 @@ class Daemon:
                             "ALERT: safety check failed [%s]: %s",
                             check.name, check.message,
                         )
+                        emit_alert(
+                            "error",
+                            f"safety check failed [{check.name}]: {check.message}",
+                            source="daemon",
+                        )
                     result["alerts"].extend(
                         f"{c.name}: {c.message}" for c in failed
                     )
@@ -283,29 +305,65 @@ class Daemon:
             return list(index[-1:])
         return [day for day in index if str(day)[:10] > last_processed]
 
+    def close(self) -> None:
+        """Persist state, flush the WAL and close the store (S16).
+
+        Best-effort and idempotent: called from ``run_forever``'s finally and
+        from the CLI shutdown path, so a SIGTERM leaves a complete snapshot
+        and a checkpointed database.
+        """
+        if self.engine is not None:
+            try:
+                snapshot = self.engine.to_snapshot()
+                snapshot["safety"] = {
+                    "kill_switch_triggered": self.safety.kill_switch_triggered,
+                }
+                self.store.save_engine_state(snapshot, self.strategy_id)
+            except Exception:
+                logger.error(
+                    "Shutdown engine snapshot failed: %s", traceback.format_exc(),
+                )
+        try:
+            self._save_state()
+        except Exception:
+            logger.error("Shutdown daemon state save failed: %s", traceback.format_exc())
+        try:
+            self.store.checkpoint()
+        except Exception as exc:
+            logger.error("Shutdown WAL checkpoint failed: %s", exc)
+        try:
+            self.store.close()
+        except Exception as exc:
+            logger.error("Shutdown store close failed: %s", exc)
+
     def run_forever(self, interval_seconds: int = 3600):
         """持续运行."""
         logger.info("Daemon started. Interval: %ds", interval_seconds)
-        while True:
-            try:
-                if self.should_run_today():
-                    result = self.run_once()
-                    if result["status"] == "killed":
-                        logger.warning("Kill switch triggered. Waiting for manual recovery.")
-                        break
-                    if result["status"] == "ok":
-                        # A successful run resets the crash budget; otherwise
-                        # three crashes spread over months would still exit.
-                        self.restart_count = 0
-                else:
-                    logger.debug("Not time to run yet")
-                time.sleep(interval_seconds)
-            except KeyboardInterrupt:
-                logger.info("Daemon stopped by user")
-                break
-            except Exception:
-                logger.error("Daemon crashed: %s", traceback.format_exc())
-                self._handle_crash()
+        try:
+            while True:
+                try:
+                    if self.should_run_today():
+                        result = self.run_once()
+                        if result["status"] == "killed":
+                            logger.warning("Kill switch triggered. Waiting for manual recovery.")
+                            break
+                        if result["status"] == "ok":
+                            # A successful run resets the crash budget; otherwise
+                            # three crashes spread over months would still exit.
+                            self.restart_count = 0
+                    else:
+                        logger.debug("Not time to run yet")
+                    time.sleep(interval_seconds)
+                except KeyboardInterrupt:
+                    logger.info("Daemon stopped by user")
+                    break
+                except Exception:
+                    logger.error("Daemon crashed: %s", traceback.format_exc())
+                    self._handle_crash()
+        finally:
+            # S16: SIGTERM/SIGINT or a normal exit must not abandon the
+            # snapshot and the WAL.
+            self.close()
 
     def _handle_crash(self):
         """崩溃恢复 (restart budget scoped to RESTART_WINDOW_HOURS)."""
@@ -328,6 +386,13 @@ class Daemon:
 
 if __name__ == "__main__":
     from quant_platform.utils.logging import setup_logging
+
+    # S16: docker stop sends SIGTERM. Convert it into KeyboardInterrupt so
+    # the run loop unwinds and run_forever's finally persists and closes.
+    def _handle_sigterm(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     # Rotating file handler: an unattended daemon must not grow one log file
     # without bound.

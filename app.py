@@ -107,6 +107,7 @@ async def _lifespan(_app: FastAPI):
     """
     from quant_platform.api import routes as api_routes
     from quant_platform.core.events import get_event_bus
+    from quant_platform.risk.healthcheck import install_alert_handler
 
     # Executors were shut down by a previous lifespan exit; recreate them and
     # pre-build the critical singletons before any request can race them.
@@ -114,6 +115,9 @@ async def _lifespan(_app: FastAPI):
     api_routes.initialize_singletons()
 
     bus = get_event_bus()
+    # S4: health-check failures and system alerts get a production handler
+    # that logs and forwards them to the alert sink (idempotent per bus).
+    install_alert_handler(bus)
     await bus.start()
     try:
         yield

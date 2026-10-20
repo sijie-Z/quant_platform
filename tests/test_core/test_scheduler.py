@@ -128,6 +128,13 @@ class TestClosingAuctionAndEodTiming:
         store = Store(str(tmp_path / "eod_timing.db"))
         sm = PortfolioStateMachine()
         scheduler = TradingScheduler(state_machine=sm, store=store, bus=EventBus())
+        # S2: EOD no longer fabricates a 1,000,000 equity. Seed a persisted
+        # engine snapshot (the same row the live engine writes) so these
+        # timing tests exercise the state machine, not the equity fallback.
+        store.save_engine_state(
+            {"portfolio_value": 1_000_000.0, "cash": 1_000_000.0, "positions": []},
+            "live_engine:test",
+        )
         sm.transition(PortfolioState.READY, "test")
         sm.transition(PortfolioState.TRADING, "test")
         return scheduler, store
@@ -173,6 +180,13 @@ class TestEodReconciliationIsIdempotent:
         store = Store(str(tmp_path / "eod.db"))
         scheduler = TradingScheduler(
             state_machine=PortfolioStateMachine(), store=store, bus=EventBus()
+        )
+        # S2: EOD requires a real equity source. Persist an engine snapshot so
+        # the assertions below stay about idempotency, not the (tested
+        # separately) skip-when-unavailable path.
+        store.save_engine_state(
+            {"portfolio_value": 1_000_000.0, "cash": 1_000_000.0, "positions": []},
+            "live_engine:test",
         )
         return scheduler, store
 

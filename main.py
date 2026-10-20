@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 from pathlib import Path
 
@@ -33,6 +34,42 @@ _LAST_DATA_PROVENANCE: dict = {}
 
 class DataProviderUnavailableError(RuntimeError):
     """A configured real data provider could not be used (fail closed)."""
+
+
+def _install_shutdown_handlers(cleanup):
+    """Install SIGTERM/SIGINT/atexit shutdown for a CLI entry point (S16).
+
+    Called only from CLI command functions, never from library import paths.
+    The signal handler raises ``SystemExit`` so an in-flight run unwinds
+    through its normal ``finally`` blocks (the LiveRunner session is closed
+    there); ``cleanup`` runs from the caller's finally/atexit exactly once.
+    """
+    import atexit
+
+    state = {"done": False}
+
+    def _cleanup_once():
+        if state["done"]:
+            return
+        state["done"] = True
+        try:
+            cleanup()
+        except Exception:
+            logger.exception("Shutdown cleanup failed")
+
+    def _handler(signum, _frame):
+        raise SystemExit(128 + int(signum))
+
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError) as exc:  # not the main thread / unsupported
+            logger.warning("Could not install %s handler: %s", name, exc)
+    atexit.register(_cleanup_once)
+    return _cleanup_once
 
 
 # ---------------------------------------------------------------------------
@@ -2017,11 +2054,31 @@ def cmd_trade(args) -> int:
         return 1
     runner.set_universe(universe)
 
+    def _cleanup_runner():
+        """Flush and close the runner's store on normal exit or SIGTERM."""
+        store = getattr(runner, "_store", None)
+        if store is None:
+            return
+        try:
+            store.checkpoint()
+        except Exception as exc:
+            logger.warning("Store checkpoint on shutdown failed: %s", exc)
+        try:
+            store.close()
+        except Exception as exc:
+            logger.warning("Store close on shutdown failed: %s", exc)
+
+    # S16: SIGTERM/SIGINT unwinds through LiveRunner.run()'s finally block
+    # (which completes the session row), then this cleanup flushes the WAL
+    # and closes the store. Installed only from this CLI entry point.
+    cleanup_once = _install_shutdown_handlers(_cleanup_runner)
     try:
         report = runner.run(days=days, seed=args.seed)
     except (RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        cleanup_once()
     d = report.to_dict()
 
     print(f"\nSession: {d['session_id']}")
@@ -2061,6 +2118,54 @@ def cmd_trade(args) -> int:
             file=sys.stderr,
         )
         return 1
+    return 0
+
+
+def cmd_data(args) -> int:
+    """Data maintenance commands (S10)."""
+    if getattr(args, "subcommand", "") != "retention":
+        print("Error: unknown data subcommand", file=sys.stderr)
+        return 2
+
+    from quant_platform.core.store import RetentionPolicy, Store
+
+    policy = RetentionPolicy(
+        orders_days=args.orders_days,
+        trades_days=args.trades_days,
+        pnl_days=args.pnl_days,
+        signals_days=args.signals_days,
+        sessions_days=args.sessions_days,
+        events_days=args.events_days,
+        nav_days=args.nav_days,
+    )
+    store = Store(args.db)
+    try:
+        result = store.run_retention(
+            policy=policy,
+            archive_dir=args.archive_dir,
+            vacuum=not args.no_vacuum,
+        )
+    except Exception as exc:
+        print(f"Error: retention failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+
+    print("Retention complete")
+    for table, entry in result["tables"].items():
+        if not entry.get("enabled"):
+            print(f"  {table:<14} disabled")
+            continue
+        print(
+            f"  {table:<14} archived={entry['archived']:<6} "
+            f"deleted={entry['deleted']:<6} cutoff={entry['cutoff']}"
+        )
+        if entry.get("archive_path"):
+            print(f"                 archive: {entry['archive_path']}")
+    print(
+        f"  db size: {result['db_size_bytes']:,} bytes; "
+        f"checkpointed={result['checkpointed']} vacuumed={result['vacuumed']}"
+    )
     return 0
 
 
@@ -2643,6 +2748,55 @@ def main() -> int:
     trade_parser.add_argument("--no-dual-track", action="store_true",
                             help="Disable PaperBroker parallel tracking")
 
+    # data (retention / maintenance)
+    data_parser = subparsers.add_parser("data", help="Data maintenance (retention)")
+    data_sub = data_parser.add_subparsers(
+        dest="subcommand", required=True, help="Data action",
+    )
+    retention_parser = data_sub.add_parser(
+        "retention",
+        help="Archive and delete rows older than each table's max age",
+    )
+    retention_parser.add_argument(
+        "--db", type=str, default="data/trading.db", help="SQLite database path",
+    )
+    retention_parser.add_argument(
+        "--archive-dir", type=str, default="data/archive",
+        help="Directory for dated CSV archives written before deletion",
+    )
+    retention_parser.add_argument(
+        "--orders-days", type=int, default=5 * 365,
+        help="Order retention in days (0 disables)",
+    )
+    retention_parser.add_argument(
+        "--trades-days", type=int, default=5 * 365,
+        help="Trade retention in days (0 disables)",
+    )
+    retention_parser.add_argument(
+        "--pnl-days", type=int, default=5 * 365,
+        help="P&L snapshot retention in days (0 disables)",
+    )
+    retention_parser.add_argument(
+        "--signals-days", type=int, default=365,
+        help="Signal retention in days (0 disables)",
+    )
+    retention_parser.add_argument(
+        "--sessions-days", type=int, default=365,
+        help="Session retention in days (0 disables)",
+    )
+    retention_parser.add_argument(
+        "--events-days", type=int, default=180,
+        help="Event/audit retention in days (0 disables)",
+    )
+    retention_parser.add_argument(
+        "--nav-days", type=int, default=10 * 365,
+        help="NAV history retention in days (0 disables)",
+    )
+    retention_parser.add_argument(
+        "--no-vacuum", action="store_true",
+        help="Skip the VACUUM after deletion",
+    )
+
     # analyze
     analyze_parser = subparsers.add_parser("analyze", help="Analyze existing results")
     analyze_parser.add_argument("--results-dir", "-r", type=str, default="./results",
@@ -2941,6 +3095,8 @@ def _dispatch(parser, args) -> int:
         return cmd_run(args)
     elif args.command == "trade":
         return cmd_trade(args)
+    elif args.command == "data":
+        return cmd_data(args)
     elif args.command == "analyze":
         return cmd_analyze(args)
     elif args.command == "compare":

@@ -36,7 +36,12 @@ from quant_platform.core.state_machine import PortfolioState, PortfolioStateMach
 from quant_platform.core.store import Store
 from quant_platform.execution.models import OrderType
 from quant_platform.risk.circuit_breaker import RiskMonitor, get_risk_monitor
-from quant_platform.risk.healthcheck import HealthCheck, SystemBlockError
+from quant_platform.risk.healthcheck import (
+    HealthCheck,
+    SystemBlockError,
+    emit_alert,
+    install_alert_handler,
+)
 from quant_platform.risk.realtime_engine import RealTimeRiskEngine
 from quant_platform.trading.broker import (
     BrokerInterface,
@@ -47,6 +52,7 @@ from quant_platform.trading.broker import (
 )
 from quant_platform.trading.signal_generator import LiveSignalGenerator
 from quant_platform.utils.logging import get_logger
+from quant_platform.utils.metrics import get_metrics
 
 try:
     from quant_platform.core.context import TenantContext
@@ -168,6 +174,18 @@ class LiveTradingEngine:
         # object implementing check_pre_trade/update_portfolio_state/
         # get_status (tests inject a fresh RiskMonitor for isolation).
         self._risk = risk_monitor or get_risk_monitor()
+        # S21: risk level, breaches and the kill switch are durable. Attaching
+        # the store here restores a manually armed kill switch from a previous
+        # process before any health check or order can run.
+        attach_risk_state = getattr(self._risk, "attach_persistence", None)
+        if callable(attach_risk_state):
+            try:
+                attach_risk_state(
+                    self._store, tenant_id=tenant_id, audit=self._audit,
+                    restore=True,
+                )
+            except Exception as exc:
+                logger.error("Risk-state persistence setup failed: %s", exc)
         self._signal_generator = signal_generator or LiveSignalGenerator()
         self._rebalance_interval = rebalance_interval
         self._n_stocks = n_stocks
@@ -180,6 +198,9 @@ class LiveTradingEngine:
             TenantContext.set_current(TenantContext(tenant_id=tenant_id))
 
         self._running = False
+        # Distinguishes an intentional stop from a rolled-back failed start,
+        # so stop() does not rewrite a "failed" session as "stopped".
+        self._start_failed = False
         self._thread: threading.Thread | None = None
         # D14: created fresh in `start()` for every run; the loop receives its
         # own Event by argument. The old shared event was cleared by start(),
@@ -233,8 +254,19 @@ class LiveTradingEngine:
         if NAVCalculator is not None:
             self._nav_calc = NAVCalculator(self._store)
 
-        # Scheduler
-        self._scheduler = TradingScheduler(self._sm, self._store, self._bus, rebalance_interval)
+        # Scheduler. It receives the broker and the tenant-scoped engine-state
+        # key so EOD reconciliation can read real equity instead of inventing
+        # one (S2), and reuses this engine's session id (S20).
+        self._scheduler = TradingScheduler(
+            self._sm, self._store, self._bus, rebalance_interval,
+            broker=broker,
+            engine_state_key=self._engine_state_key,
+            tenant_id=tenant_id,
+        )
+        # Use the scheduler's validated/coerced integer. A numeric string
+        # passed here would otherwise reach `event.wait(timeout=...)` and
+        # raise outside the loop's try block.
+        self._rebalance_interval = self._scheduler._rebalance_interval
 
     def set_universe(self, codes: list[str]):
         self._universe = codes
@@ -264,6 +296,10 @@ class LiveTradingEngine:
                 raise RuntimeError(message)
         self._thread = None
         self._stop_event = threading.Event()
+        # True until the loop thread is actually running: failures before the
+        # rollback block (broker connect, state restore, health check) must
+        # still leave a "failed" session when the API rolls back with stop().
+        self._start_failed = True
 
         self._session_id = uuid.uuid4().hex[:12]
         # A failed QMT/XTP connection used to be ignored: the engine reported
@@ -308,43 +344,121 @@ class LiveTradingEngine:
             self._risk.peak_value = max(self._risk.peak_value, equity)
             if self._risk.portfolio_value <= 0:
                 self._risk.portfolio_value = equity
-        self._running = True
-        self._started_at = datetime.now().isoformat()
+        self._started_at = self._exchange_now().replace(tzinfo=None).isoformat()
 
-        # Transition state machine
+        # S1: only enter TRADING when the exchange is actually open. The old
+        # unconditional READY -> TRADING meant a 09:00 start looked like a
+        # closed market with a trading portfolio, which made the scheduler run
+        # EOD reconciliation before the session existed.
         self._sm.transition(PortfolioState.READY, "engine started")
-        self._sm.transition(PortfolioState.TRADING, "auto-transition to trading")
+        market = self._scheduler.get_market_session()
+        if self._scheduler.is_market_open():
+            self._sm.transition(PortfolioState.TRADING, "market open")
+        elif market.status == "pre_market":
+            self._sm.transition(PortfolioState.PRE_MARKET, "market pre-open")
+        # Otherwise the engine stays READY and the scheduler performs the
+        # PRE_MARKET/TRADING transition when the exchange session begins.
 
-        # Record session
-        self._store.save_session({
-            "session_id": self._session_id,
-            "broker": type(self._broker).__name__,
-            "status": "active",
-            "started_at": self._started_at,
-        })
-
-        # Start scheduler
-        self._scheduler.start()
-
-        # Start engine loop with its own stop Event (D14). Embedded/test
-        # overrides of `_run_loop` may still take zero arguments, so only pass
-        # the per-run event when the callable accepts it.
-        loop_target = getattr(self._run_loop, "__func__", self._run_loop)
-        accepts_event = False
+        # S16/C5: every fallible setup step is inside one rollback. Setting
+        # `_running = True` before a session/scheduler/thread failure left a
+        # zombie engine: get_state() said "running" but no loop existed and
+        # the `if self._running: return` guard blocked every retry.
+        started_scheduler = False
         try:
-            accepts_event = "stop_event" in inspect.signature(loop_target).parameters
-        except (TypeError, ValueError):
-            accepts_event = False
-        if accepts_event:
-            self._thread = threading.Thread(
-                target=self._run_loop, args=(self._stop_event,), daemon=True,
-            )
-        else:
-            self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
+            # Record session
+            self._store.save_session({
+                "session_id": self._session_id,
+                "broker": type(self._broker).__name__,
+                "status": "active",
+                "started_at": self._started_at,
+            })
 
-        # Audit + Event
-        self._audit.log(AuditAction.ENGINE_START, "engine", reason=f"session={self._session_id}")
+            # S4: make sure a sink handler exists for health-check/engine
+            # alerts even when embedded without the API lifespan.
+            try:
+                install_alert_handler(self._bus)
+            except Exception as exc:
+                logger.error("Alert handler install failed: %s", exc)
+
+            # Start scheduler (reusing this engine's session id, S20). Mark
+            # it before the call so the rollback below always stops it, even
+            # if start() raises after partially entering.
+            started_scheduler = True
+            self._scheduler.start(session_id=self._session_id)
+
+            # S16: write ENGINE_START *before* the loop thread exists.
+            try:
+                self._audit.log(
+                    AuditAction.ENGINE_START, "engine",
+                    reason=f"session={self._session_id}",
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"ENGINE_START audit failed ({exc})"
+                ) from exc
+
+            # Start engine loop with its own stop Event (D14). Embedded/test
+            # overrides of `_run_loop` may still take zero arguments, so only
+            # pass the per-run event when the callable accepts it.
+            loop_target = getattr(self._run_loop, "__func__", self._run_loop)
+            accepts_event = False
+            try:
+                accepts_event = "stop_event" in inspect.signature(
+                    loop_target
+                ).parameters
+            except (TypeError, ValueError):
+                accepts_event = False
+            if accepts_event:
+                target_thread = threading.Thread(
+                    target=self._run_loop, args=(self._stop_event,), daemon=True,
+                )
+            else:
+                target_thread = threading.Thread(
+                    target=self._run_loop, daemon=True,
+                )
+
+            self._running = True
+            self._thread = target_thread
+            self._thread.start()
+            self._start_failed = False
+        except Exception as exc:
+            self._running = False
+            self._start_failed = True
+            self._thread = None
+            # Reset the lifecycle so a retry starts from READY rather than a
+            # half-entered TRADING/PRE_MARKET state.
+            try:
+                self._sm.force_state(PortfolioState.READY, "start rollback")
+            except Exception:
+                pass
+            if started_scheduler:
+                try:
+                    self._scheduler.stop()
+                except Exception as stop_exc:
+                    logger.error("Rollback scheduler stop failed: %s", stop_exc)
+            try:
+                self._store.save_session({
+                    "session_id": self._session_id,
+                    "status": "failed",
+                    "stopped_at": self._exchange_now().replace(
+                        tzinfo=None,
+                    ).isoformat(),
+                })
+            except Exception as session_exc:
+                logger.error("Rollback session write failed: %s", session_exc)
+            try:
+                self._bus.publish("engine.start_blocked", {
+                    "error": str(exc),
+                }, source="engine")
+            except Exception:
+                pass
+            logger.critical("Engine start aborted: %s", exc)
+            raise
+
+        # Start the dead-man heartbeat immediately: readiness allows 2x the
+        # cycle interval before it expects the first loop beat.
+        self._record_cycle_heartbeat(None)
+
         self._bus.publish("engine.started", {
             "session_id": self._session_id,
             "n_stocks": self._n_stocks,
@@ -354,29 +468,56 @@ class LiveTradingEngine:
         logger.info("Engine started. Session: %s, Universe: %d", self._session_id, len(self._universe))
 
     def stop(self):
+        """Stop the engine. Every step is best-effort and independent.
+
+        S16: `scheduler.stop()` used to run before the final snapshot and
+        could raise, skipping the engine_state write, the session completion
+        and the store flush entirely. The final snapshot and WAL checkpoint
+        now always run.
+        """
         self._running = False
         stop_event = self._stop_event
         if stop_event is not None:
             stop_event.set()
-        self._scheduler.stop()
+
+        try:
+            self._scheduler.stop()
+        except Exception as exc:
+            logger.error("Scheduler stop failed during engine stop: %s", exc)
 
         thread = self._thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=self._stop_join_timeout)
+            try:
+                thread.join(timeout=self._stop_join_timeout)
+            except Exception as exc:
+                logger.error("Engine thread join failed: %s", exc)
             if thread.is_alive():
                 logger.critical(
                     "Engine loop thread still alive %.0fs after stop request",
                     self._stop_join_timeout,
                 )
-                self._bus.publish("system.error", {
-                    "error": "engine loop thread did not exit before stop completed",
-                }, source="engine")
+                try:
+                    self._bus.publish("system.error", {
+                        "error": "engine loop thread did not exit before stop completed",
+                    }, source="engine")
+                except Exception:
+                    pass
+                emit_alert(
+                    "critical",
+                    f"engine loop thread still alive after "
+                    f"{self._stop_join_timeout:.0f}s stop timeout",
+                    source="engine",
+                )
 
         # D14: wait for an in-flight manually triggered cycle to release the
         # lock before writing the "final" session/NAV snapshot. Previously the
         # loop thread join did not cover `POST /trading/run-once`, so stop
         # could save a final state while that cycle was still trading.
-        quiesced = self._cycle_lock.acquire(timeout=self._stop_join_timeout)
+        try:
+            quiesced = self._cycle_lock.acquire(timeout=self._stop_join_timeout)
+        except Exception as exc:
+            quiesced = False
+            logger.error("Cycle-lock wait failed during stop: %s", exc)
         if quiesced:
             self._cycle_lock.release()
         else:
@@ -385,23 +526,44 @@ class LiveTradingEngine:
                 "final state may not reflect it",
                 self._stop_join_timeout,
             )
-            self._bus.publish("system.error", {
-                "error": "active cycle did not quiesce before stop completed",
-            }, source="engine")
+            try:
+                self._bus.publish("system.error", {
+                    "error": "active cycle did not quiesce before stop completed",
+                }, source="engine")
+            except Exception:
+                pass
+            emit_alert(
+                "critical",
+                "active trading cycle did not quiesce before engine stop",
+                source="engine",
+            )
 
-        self._sm.transition(PortfolioState.POST_MARKET, "engine stopped")
+        try:
+            if self._sm.state in (
+                PortfolioState.TRADING, PortfolioState.REBALANCING,
+            ):
+                self._sm.transition(PortfolioState.POST_MARKET, "engine stopped")
+            if self._sm.state == PortfolioState.POST_MARKET:
+                self._sm.transition(PortfolioState.READY, "post-market complete")
+        except Exception as exc:
+            logger.error("State transition during stop failed: %s", exc)
 
-        # D5: persist the final snapshot (kill switch, peak equity, day
-        # baseline, trading day, cash/positions) so a restart resumes.
-        self._persist_engine_state()
+        # D5/S16: the final snapshot and the session row always run, even
+        # when scheduler.stop()/the thread join failed above.
+        try:
+            self._persist_engine_state()
+        except Exception as exc:
+            logger.error("Final engine-state persist failed: %s", exc)
 
-        # Save final state
-        self._store.save_session({
-            "session_id": self._session_id,
-            "status": "stopped",
-            "stopped_at": datetime.now().isoformat(),
-            "total_trades": self._trade_count,
-        })
+        try:
+            self._store.save_session({
+                "session_id": self._session_id,
+                "status": "failed" if self._start_failed else "stopped",
+                "stopped_at": self._exchange_now().replace(tzinfo=None).isoformat(),
+                "total_trades": self._trade_count,
+            })
+        except Exception as exc:
+            logger.error("Final session write failed: %s", exc)
 
         # Day-end NAV calculation
         if self._nav_calc is not None:
@@ -410,7 +572,7 @@ class LiveTradingEngine:
                 cash = account.get("cash", 0)
                 market_value = account.get("total_equity", 0) - cash
                 nav = self._nav_calc.update_daily_nav(
-                    date=datetime.now().strftime("%Y-%m-%d"),
+                    date=self._exchange_now().strftime("%Y-%m-%d"),
                     cash=cash,
                     market_value=market_value,
                 )
@@ -418,19 +580,45 @@ class LiveTradingEngine:
             except Exception as e:
                 logger.warning("NAV calculation failed: %s", e)
 
-        self._audit.log(AuditAction.ENGINE_STOP, "engine",
-                        details={"trades": self._trade_count, "cycles": self._cycle_count})
-        self._bus.publish("engine.stopped", {
-            "session_id": self._session_id,
-            "trades": self._trade_count,
-            "cycles": self._cycle_count,
-        }, source="engine")
+        try:
+            self._audit.log(AuditAction.ENGINE_STOP, "engine",
+                            details={"trades": self._trade_count, "cycles": self._cycle_count})
+        except Exception as exc:
+            logger.error("ENGINE_STOP audit failed: %s", exc)
 
-        self._sm.transition(PortfolioState.READY, "post-market complete")
+        try:
+            self._bus.publish("engine.stopped", {
+                "session_id": self._session_id,
+                "trades": self._trade_count,
+                "cycles": self._cycle_count,
+            }, source="engine")
+        except Exception:
+            pass
+
+        try:
+            self._sm.transition(PortfolioState.READY, "post-market complete")
+        except Exception as exc:
+            logger.error("State transition back to READY failed: %s", exc)
+
+        # S16: flush the WAL after the final writes so a subsequent stop/start
+        # (or a container restart) sees a consolidated database file.
+        try:
+            self._store.checkpoint()
+        except Exception as exc:
+            logger.error("Store checkpoint during engine stop failed: %s", exc)
+
         logger.info("Engine stopped. Trades: %d, Cycles: %d", self._trade_count, self._cycle_count)
 
     def run_once(self) -> CycleResult:
         return self._execute_cycle()
+
+    def cycles_outside_session(self) -> bool:
+        """Whether the loop trades outside exchange hours (paper mode).
+
+        Live brokers skip cycles when the market is closed; readiness must not
+        treat that deliberate idle time as a dead engine (S4).
+        """
+        return isinstance(self._broker, SimulatedBroker)
 
     def get_state(self) -> dict:
         account = self._broker.get_account()
@@ -532,6 +720,10 @@ class LiveTradingEngine:
         if event is None:
             event = threading.Event()
         while not event.is_set():
+            # S4 dead-man switch: beat once per loop iteration, before the
+            # market gate. Live brokers correctly idle outside the session,
+            # but a hung/dead loop must still be visible to /api/readiness.
+            self._record_cycle_heartbeat(None)
             try:
                 # Paper trading runs continuously; live brokers only trade in market hours
                 if self._scheduler.is_market_open() or isinstance(self._broker, SimulatedBroker):
@@ -541,7 +733,18 @@ class LiveTradingEngine:
                         self._cycle_log = self._cycle_log[-50:]
             except Exception as e:
                 logger.error("Cycle error: %s", e, exc_info=True)
-                self._bus.publish("system.error", {"error": str(e)}, source="engine")
+                try:
+                    self._bus.publish("system.error", {"error": str(e)}, source="engine")
+                except Exception:
+                    pass
+                # Dedupe by exception type: an error whose message varies
+                # (addresses, ids) would otherwise bypass the sink's
+                # five-minute dedupe and POST a webhook every cycle.
+                emit_alert(
+                    "error",
+                    f"engine cycle error: {type(e).__name__}",
+                    source="engine", details={"error": str(e)},
+                )
 
             event.wait(timeout=self._rebalance_interval)
 
@@ -632,7 +835,13 @@ class LiveTradingEngine:
         REBALANCING for the life of the process while the kill switch was on.
         """
         if self._sm.state != PortfolioState.HALTED:
-            self._sm.transition(PortfolioState.HALTED, reason)
+            if self._sm.transition(PortfolioState.HALTED, reason):
+                # S4: a halted engine is an operational emergency; route it
+                # through the alert sink (deduplicated for five minutes).
+                emit_alert(
+                    "critical", f"engine halted: {reason}", source="engine",
+                    details={"session_id": self._session_id},
+                )
 
     # ── Exchange clock and quote freshness (D11/D12) ──
 
@@ -839,7 +1048,10 @@ class LiveTradingEngine:
             "price": payload.get("filled_price") or payload.get("price") or 0.0,
             "commission": payload.get("commission", 0),
             "tax": payload.get("tax", 0),
-            "executed_at": payload.get("updated_at") or datetime.now().isoformat(),
+            "executed_at": (
+                payload.get("updated_at")
+                or self._exchange_now().replace(tzinfo=None).isoformat()
+            ),
         }
         for attempt in (1, 2):
             try:
@@ -888,6 +1100,17 @@ class LiveTradingEngine:
         except Exception as exc:
             logger.error("Engine-state persist: account query failed: %s", exc)
             account = {}
+        if not isinstance(account, dict):
+            account = {}
+        if account.get("connected") is False:
+            # QMT/XTP return an initial-cash placeholder when disconnected
+            # (trading/broker.py). Persisting it would overwrite the last real
+            # cash/equity and poison the scheduler's EOD equity source (S2).
+            logger.error(
+                "Engine-state persist: broker reports disconnected; keeping "
+                "the prior persisted cash/equity",
+            )
+            account = {}
 
         try:
             prior_state = self._store.get_engine_state(self._engine_state_key) or {}
@@ -931,7 +1154,7 @@ class LiveTradingEngine:
             ),
             "trade_count": self._trade_count,
             "cycle_count": self._cycle_count,
-            "updated_at": self._exchange_now().isoformat(),
+            "updated_at": self._exchange_now().replace(tzinfo=None).isoformat(),
         }
         try:
             self._store.save_engine_state(state, self._engine_state_key)
@@ -1069,10 +1292,41 @@ class LiveTradingEngine:
                 self._risk.portfolio_value,
                 float(state.get("portfolio_value") or 0.0),
             )
-        if state.get("kill_switch_active"):
+        # S21 follow-up: the risk monitor's own persisted state is
+        # authoritative for the kill switch. `engine_state` records the flag
+        # on every cycle, so a dashboard deactivation performed after the
+        # engine stopped would otherwise be undone by the stale engine row on
+        # the next start. Only fall back to the engine row when no risk_state
+        # record was restored and the switch is not already armed.
+        risk_state_authoritative = False
+        risk_updated = ""
+        has_persisted = getattr(self._risk, "has_persisted_state", None)
+        if callable(has_persisted):
+            try:
+                risk_state_authoritative = bool(has_persisted())
+            except Exception:
+                risk_state_authoritative = False
+        try:
+            risk_updated = str(
+                self._risk.get_status().get("persisted_at") or ""
+            )
+        except Exception:
+            risk_updated = ""
+        engine_updated = str(state.get("updated_at") or "")
+        # Fail safe in both directions: if the engine snapshot is newer than
+        # the risk row (e.g. the arm's risk_state write failed but a later
+        # cycle persisted engine_state), honour the engine flag.
+        engine_flag_is_newer = (
+            bool(engine_updated) and engine_updated > risk_updated
+        )
+        if (
+            state.get("kill_switch_active")
+            and (not risk_state_authoritative or engine_flag_is_newer)
+            and not getattr(self._risk, "kill_switch_active", False)
+        ):
             activate = getattr(self._risk, "activate_kill_switch", None)
             if callable(activate):
-                activate("restored persisted kill switch")
+                activate("restored persisted kill switch", actor="engine-restore")
             logger.critical(
                 "Persisted kill switch restored; orders remain blocked until "
                 "explicitly deactivated",
@@ -1093,21 +1347,58 @@ class LiveTradingEngine:
         if not self._cycle_lock.acquire(blocking=False):
             logger.warning("Cycle already running; skipping duplicate trigger")
             account = self._broker.get_account()
-            return CycleResult(
+            cycle = CycleResult(
                 cycle_id=self._cycle_count,
-                timestamp=datetime.now().isoformat(),
+                timestamp=self._exchange_now().replace(tzinfo=None).isoformat(),
                 portfolio_value=account.get("total_equity", 0),
                 cash=account.get("cash", 0),
                 n_positions=account.get("n_positions", 0),
             )
+            self._record_cycle_heartbeat(cycle)
+            return cycle
         try:
-            return self._execute_cycle_body()
+            cycle = self._execute_cycle_body()
+        except Exception:
+            self._record_cycle_heartbeat(None)
+            raise
         finally:
             self._cycle_lock.release()
+        self._record_cycle_heartbeat(cycle)
+        return cycle
+
+    def _record_cycle_heartbeat(self, cycle: CycleResult | None) -> None:
+        """Export the dead-man-switch gauges consumed by /api/readiness (S4).
+
+        Cheap attribute writes into the in-process metrics collector; no
+        threads, no I/O.
+        """
+        try:
+            metrics = get_metrics()
+            metrics.gauge(
+                "last_engine_cycle_timestamp",
+                help="Epoch seconds of the last engine cycle (including skipped)",
+            ).set(time.time())
+            if cycle is not None:
+                metrics.gauge(
+                    "trading_equity",
+                    help="Last cycle portfolio equity",
+                ).set(float(cycle.portfolio_value or 0.0))
+                metrics.gauge(
+                    "trading_positions",
+                    help="Last cycle open position count",
+                ).set(float(cycle.n_positions or 0))
+            metrics.gauge(
+                "risk_kill_switch_active",
+                help="1 when the risk kill switch is armed",
+            ).set(1.0 if getattr(self._risk, "kill_switch_active", False) else 0.0)
+        except Exception:
+            pass
 
     def _execute_cycle_body(self) -> CycleResult:
         self._cycle_count += 1
-        now = datetime.now().isoformat()
+        # S17: P&L/session/event rows use the exchange-local naive basis
+        # shared with the scheduler, not the host clock.
+        now = self._exchange_now().replace(tzinfo=None).isoformat()
         self._last_update = now
 
         # D7/D12: release T+1 locks and reset the daily P&L baseline only
@@ -1460,6 +1751,15 @@ class LiveTradingEngine:
                 self._last_fetch_codes = set(fresh_prices)
                 self._last_prices_update = datetime.now().isoformat()
                 self._last_prices_update_monotonic = time.monotonic()
+                # S4: dead-man-switch heartbeat for /api/readiness. Only a
+                # successful quote fetch counts as "data success".
+                try:
+                    get_metrics().gauge(
+                        "last_data_success_timestamp",
+                        help="Epoch seconds of the last successful market-data fetch",
+                    ).set(time.time())
+                except Exception:
+                    pass
             self._bus.publish("market.snapshot", {"count": updated}, source="realtime")
         except Exception as e:
             logger.warning("Price fetch failed: %s", e)

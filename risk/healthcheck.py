@@ -26,13 +26,22 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import threading
 import time
+import urllib.error
+import urllib.request
+import weakref
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from quant_platform.core.events import EventBus, get_event_bus
 from quant_platform.utils.logging import get_logger
+from quant_platform.utils.metrics import get_metrics
 
 try:
     from quant_platform.core.context import TenantContext
@@ -40,6 +49,261 @@ except ImportError:
     TenantContext = None  # type: ignore[assignment,misc]
 
 logger = get_logger(__name__)
+
+_EXCHANGE_TZ = ZoneInfo("Asia/Shanghai")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Alert sinks (S4)
+#
+# Health-check failures used to be visible only as an EventBus topic with no
+# production subscriber: a dead engine, stalled scheduler or failed data feed
+# left no trace an operator would see. Every alert now goes through a sink;
+# the logging sink is always on and a webhook sink is enabled with
+# ALERT_WEBHOOK_URL. Identical alerts are deduplicated for five minutes so a
+# persistent failure cannot flood the sink every tick.
+# ──────────────────────────────────────────────────────────────────────
+
+
+class AlertSink:
+    """Destination for an operational alert."""
+
+    def emit(self, alert: dict) -> None:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class LoggingAlertSink(AlertSink):
+    """Always-on sink that writes the alert to the platform log."""
+
+    def emit(self, alert: dict) -> None:
+        severity = str(alert.get("severity", "info")).lower()
+        message = alert.get("message", "")
+        source = alert.get("source", "-")
+        if severity in ("critical", "error", "kill"):
+            logger.critical("ALERT [%s] %s: %s", severity, source, message)
+        else:
+            logger.warning("ALERT [%s] %s: %s", severity, source, message)
+
+
+class WebhookAlertSink(AlertSink):
+    """POST alerts as JSON to ``ALERT_WEBHOOK_URL``.
+
+    The timeout is deliberately short: an alert sink must not stall an engine
+    cycle or a health-check gate. Delivery failures are logged and counted.
+    """
+
+    def __init__(self, url: str, timeout: float = 3.0):
+        self._url = url
+        self._timeout = max(0.1, float(timeout))
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    def emit(self, alert: dict) -> None:
+        metrics = get_metrics()
+        payload = json.dumps(alert, default=str, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self._url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "quant-platform-alert/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                response.read(256)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            metrics.counter(
+                "alerts_webhook_failures_total",
+                help="Alert webhook deliveries that failed",
+            ).inc()
+            logger.error("Alert webhook delivery failed (%s): %s", self._url, exc)
+            return
+        metrics.counter(
+            "alerts_webhook_delivered_total",
+            help="Alert webhook deliveries that succeeded",
+        ).inc()
+
+
+class CompositeAlertSink(AlertSink):
+    """Fan an alert out to several sinks; one failure cannot block others."""
+
+    def __init__(self, sinks: list[AlertSink] | None = None):
+        self._sinks = list(sinks or [])
+
+    @property
+    def sinks(self) -> list[AlertSink]:
+        return list(self._sinks)
+
+    def emit(self, alert: dict) -> None:
+        for sink in self._sinks:
+            try:
+                sink.emit(alert)
+            except Exception as exc:  # a bad sink must not break the caller
+                logger.error("Alert sink %s failed: %s", type(sink).__name__, exc)
+
+
+def build_default_alert_sink() -> AlertSink:
+    """Logging sink plus a webhook sink when ``ALERT_WEBHOOK_URL`` is set."""
+    sinks: list[AlertSink] = [LoggingAlertSink()]
+    url = (os.environ.get("ALERT_WEBHOOK_URL") or "").strip()
+    if url:
+        try:
+            timeout = float(os.environ.get("ALERT_WEBHOOK_TIMEOUT") or 3)
+        except ValueError:
+            timeout = 3.0
+        sinks.append(WebhookAlertSink(url, timeout=timeout))
+    return CompositeAlertSink(sinks)
+
+
+_alert_sink: AlertSink | None = None
+_alert_sink_lock = threading.Lock()
+
+
+def get_alert_sink() -> AlertSink:
+    """Process-wide alert sink (built once; restart to change the env)."""
+    global _alert_sink
+    sink = _alert_sink
+    if sink is None:
+        with _alert_sink_lock:
+            if _alert_sink is None:
+                _alert_sink = build_default_alert_sink()
+            sink = _alert_sink
+    return sink
+
+
+def set_alert_sink(sink: AlertSink | None) -> None:
+    """Replace the process-wide sink (tests / embedding). ``None`` resets."""
+    global _alert_sink
+    with _alert_sink_lock:
+        _alert_sink = sink
+
+
+class AlertDeduplicator:
+    """Suppress an identical alert repeated inside ``window_seconds``."""
+
+    def __init__(self, window_seconds: float = 300.0):
+        self._window = float(window_seconds)
+        self._seen: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def should_emit(self, signature: str, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            last = self._seen.get(signature)
+            if last is not None and now - last < self._window:
+                return False
+            self._seen[signature] = now
+            if len(self._seen) > 1000:
+                cutoff = now - self._window
+                self._seen = {
+                    key: stamp for key, stamp in self._seen.items()
+                    if stamp > cutoff
+                }
+            return True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._seen.clear()
+
+
+_alert_dedupe = AlertDeduplicator(window_seconds=300.0)
+
+
+def reset_alert_dedupe() -> None:
+    """Forget dedupe state (tests)."""
+    _alert_dedupe.clear()
+
+
+def emit_alert(
+    severity: str,
+    message: str,
+    source: str = "",
+    details: dict | None = None,
+    sink: AlertSink | None = None,
+    dedupe: bool = True,
+) -> bool:
+    """Send one alert to the process-wide (or given) sink.
+
+    Returns True when the alert was emitted, False when an identical alert
+    was suppressed by the five-minute dedupe window.
+    """
+    signature = f"{severity}|{source}|{message}"
+    if dedupe and not _alert_dedupe.should_emit(signature):
+        return False
+    alert = {
+        "severity": str(severity),
+        "message": str(message),
+        "source": str(source),
+        "details": details or {},
+        "timestamp": datetime.now(_EXCHANGE_TZ).isoformat(),
+    }
+    try:
+        (sink or get_alert_sink()).emit(alert)
+    except Exception as exc:  # the sink contract says it never raises
+        logger.error("Alert sink emission failed: %s", exc)
+    return True
+
+
+_alert_handler_buses: weakref.WeakSet = weakref.WeakSet()
+_alert_handler_lock = threading.Lock()
+
+_HEALTHCHECK_FAIL_TOPIC = "system.healthcheck.fail"
+
+
+def _healthcheck_failure_message(data: dict) -> str:
+    failed = data.get("failed_checks")
+    if not failed:
+        failed = [
+            check.get("name", "?")
+            for check in data.get("checks", [])
+            if str(check.get("status", "")).lower() in ("fail", "error")
+        ]
+    return "healthcheck failed: " + ", ".join(str(name) for name in failed)
+
+
+def install_alert_handler(bus: EventBus | None = None, sink: AlertSink | None = None):
+    """Subscribe a production handler for ``system.healthcheck.*``.
+
+    The handler logs the event and forwards failures to the sink. Installing
+    twice on the same bus is a no-op, so the API lifespan, the engine and the
+    daemon can all call it. Returns the handler (or None when already wired).
+    """
+    bus = bus or get_event_bus()
+    with _alert_handler_lock:
+        if bus in _alert_handler_buses:
+            return None
+        _alert_handler_buses.add(bus)
+
+    def _on_healthcheck(event) -> None:
+        topic = getattr(event, "topic", "")
+        data = getattr(event, "data", {}) or {}
+        if topic.endswith(".pass"):
+            logger.info("Health check passed (%d checks)", len(data.get("checks", [])))
+            return
+        message = _healthcheck_failure_message(data)
+        emit_alert(
+            "critical", message, source="healthcheck",
+            details={"topic": topic, "report": data}, sink=sink,
+        )
+
+    def _on_system_alert(event) -> None:
+        # Core-layer producers (e.g. the scheduler) cannot import risk/; they
+        # publish `system.alert` instead and this handler forwards it.
+        data = getattr(event, "data", {}) or {}
+        emit_alert(
+            str(data.get("severity", "error")),
+            str(data.get("message", "system alert")),
+            source=str(data.get("source", "system")),
+            details=data, sink=sink,
+        )
+
+    bus.subscribe("system.healthcheck.*", _on_healthcheck)
+    bus.subscribe("system.alert", _on_system_alert)
+    return _on_healthcheck
 
 
 class CheckStatus(StrEnum):
@@ -180,6 +444,15 @@ class HealthCheck:
                 "failed_checks": failed,
             }, source="healthcheck")
             logger.critical("Pre-flight health check FAILED: %s", failed)
+            # S4: the event used to have no production subscriber. Emit through
+            # the sink as well (the bus handler emits the same message; the
+            # five-minute dedupe keeps the sink from seeing it twice).
+            emit_alert(
+                "critical",
+                _healthcheck_failure_message({"failed_checks": failed}),
+                source="healthcheck",
+                details={"failed_checks": failed, "report": report.to_dict()},
+            )
             raise SystemBlockError(
                 f"Pre-flight checks failed: {failed}. "
                 f"Trading blocked until issues are resolved."

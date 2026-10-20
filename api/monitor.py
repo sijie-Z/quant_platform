@@ -58,6 +58,9 @@ class RiskOverviewResponse(BaseModel):
     daily_pnl: float = Field(0.0)
     n_positions: int = Field(0)
     kill_switch: bool = Field(False, description="Whether the kill switch is active")
+    persisted: bool = Field(
+        False, description="Whether the risk state is durable across a restart",
+    )
     limits: dict[str, float] = Field(
         default_factory=dict, description="Live RiskMonitor limits",
     )
@@ -122,6 +125,12 @@ class KillSwitchRequest(BaseModel):
 class KillSwitchResponse(BaseModel):
     active: bool
     message: str
+    persisted: bool = Field(
+        False, description="Whether the new state was written to durable storage",
+    )
+    persist_error: bool = Field(
+        False, description="True when the durable write failed; state is memory-only",
+    )
 
 
 # ── Singleton references (lazy, shared with routes.py) ──
@@ -145,12 +154,22 @@ def _get_store():
     if instance is None:
         with _singleton_lock:
             if _core_store is None:
+                # Share the API's store instead of opening a second handle on
+                # the same SQLite file: two Store objects for one DB made the
+                # risk monitor see a "different target" on every dashboard
+                # poll (S21 regression).
                 try:
-                    from quant_platform.core.store import Store
-                    _core_store = Store()
+                    from quant_platform.api import routes as routes_module
+                    _core_store = getattr(routes_module, "_core_store", None)
                 except Exception:
-                    logger.exception("Monitor store construction failed")
-                    return None
+                    _core_store = None
+                if _core_store is None:
+                    try:
+                        from quant_platform.core.store import Store
+                        _core_store = Store()
+                    except Exception:
+                        logger.exception("Monitor store construction failed")
+                        return None
             instance = _core_store
     return instance
 
@@ -168,6 +187,22 @@ def _get_risk():
                     logger.exception("Monitor risk-monitor lookup failed")
                     return None
             instance = _core_risk
+    # S21: attach the dashboard's monitor to the Store once. Re-attaching on
+    # every poll with a different Store object used to reset the in-memory
+    # risk state (including an armed kill switch). The tenant reset rule in
+    # RiskMonitor now only fires on a genuine tenant change; this guard keeps
+    # the monitor bound to its first store.
+    store = _get_store()
+    attach = getattr(instance, "attach_persistence", None)
+    if (
+        store is not None
+        and callable(attach)
+        and getattr(instance, "_store", None) is None
+    ):
+        try:
+            attach(store, tenant_id="default", restore=False)
+        except Exception:
+            logger.exception("Monitor risk-state persistence setup failed")
     return instance
 
 
@@ -224,6 +259,7 @@ def _compute_risk_overview() -> RiskOverviewResponse:
             result.current_drawdown = abs(status.get("current_drawdown", 0))
             result.n_positions = status.get("n_positions", 0)
             result.kill_switch = bool(status.get("kill_switch", False))
+            result.persisted = bool(status.get("persisted", False))
             result.limits = {
                 str(k): float(v)
                 for k, v in (status.get("limits") or {}).items()
@@ -476,11 +512,21 @@ async def monitor_kill_switch(req: KillSwitchRequest):
 
     try:
         if req.activate:
-            risk.activate_kill_switch(reason=req.reason)
+            risk.activate_kill_switch(reason=req.reason, actor="api/monitor")
             msg = f"Kill Switch ACTIVATED: {req.reason}"
         else:
-            risk.deactivate_kill_switch()
+            risk.deactivate_kill_switch(
+                reason=req.reason, actor="api/monitor",
+            )
             msg = "Kill Switch DEACTIVATED"
+
+        # S21: tell the operator whether the emergency action is durable.
+        try:
+            status = risk.get_status()
+            persisted = bool(status.get("persisted", False))
+            persist_error = bool(status.get("persist_error", False))
+        except Exception:
+            persisted, persist_error = False, False
 
         # Broadcast via EventBus
         bus = _get_bus()
@@ -488,9 +534,13 @@ async def monitor_kill_switch(req: KillSwitchRequest):
             bus.publish("risk.kill_switch", {
                 "active": req.activate,
                 "reason": req.reason,
+                "persisted": persisted,
             }, source="monitor")
 
-        return KillSwitchResponse(active=req.activate, message=msg)
+        return KillSwitchResponse(
+            active=req.activate, message=msg, persisted=persisted,
+            persist_error=persist_error,
+        )
 
     except Exception as e:
         logger.exception("Monitor kill-switch update failed")

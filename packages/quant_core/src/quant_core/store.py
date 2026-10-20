@@ -21,17 +21,43 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+#: Time basis for new rows in ``pnl_history``/``sessions``/``events``
+#: (S17): Asia/Shanghai wall clock, stored naive. The scheduler has always
+#: used this basis; the engine and Store defaults used the host clock, so a
+#: UTC container wrote rows eight hours off and a UTC-5 host sixteen. Legacy
+#: rows are NOT migrated (see the ops2 report): only rows written from this
+#: version on use the single documented basis.
+EXCHANGE_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def exchange_now() -> datetime:
+    """Current exchange-local (Asia/Shanghai) wall clock, naive.
+
+    Derived from the epoch clock, never from the host time zone, so changing
+    ``TZ`` or a frozen host clock cannot move the stored timestamp domain.
+    """
+    return datetime.fromtimestamp(time.time(), EXCHANGE_TZ).replace(tzinfo=None)
+
+
+def exchange_now_iso() -> str:
+    """ISO timestamp in the documented store basis (Shanghai naive)."""
+    return exchange_now().isoformat()
 
 
 def _clamp_limit(limit, default: int = 100, maximum: int = 1000) -> int:
@@ -53,6 +79,65 @@ def _clamp_days(days, default: int = 30, maximum: int = 3650) -> int:
     except (TypeError, ValueError, OverflowError):
         return default
     return max(1, min(value, maximum))
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """Per-table maximum age for the retention job (S10).
+
+    A value of ``0`` (or negative) disables retention for that table. Defaults
+    follow the task book: events 180d, signals/sessions 1y, orders/trades/P&L
+    5y, NAV 10y.
+    """
+
+    orders_days: int = 5 * 365
+    trades_days: int = 5 * 365
+    pnl_days: int = 5 * 365
+    signals_days: int = 365
+    sessions_days: int = 365
+    events_days: int = 180
+    nav_days: int = 10 * 365
+
+    @classmethod
+    def from_env(cls) -> RetentionPolicy:
+        """Build a policy from ``QUANT_RETENTION_*_DAYS`` overrides.
+
+        Unknown/unparsable values fall back to the defaults rather than
+        crashing a daemon at startup.
+        """
+        import os
+
+        defaults = cls()
+        fields = {
+            "orders_days": "QUANT_RETENTION_ORDERS_DAYS",
+            "trades_days": "QUANT_RETENTION_TRADES_DAYS",
+            "pnl_days": "QUANT_RETENTION_PNL_DAYS",
+            "signals_days": "QUANT_RETENTION_SIGNALS_DAYS",
+            "sessions_days": "QUANT_RETENTION_SESSIONS_DAYS",
+            "events_days": "QUANT_RETENTION_EVENTS_DAYS",
+            "nav_days": "QUANT_RETENTION_NAV_DAYS",
+        }
+        values = {}
+        for field, env in fields.items():
+            raw = os.environ.get(env)
+            if raw is None or raw == "":
+                values[field] = getattr(defaults, field)
+                continue
+            try:
+                values[field] = int(raw)
+            except ValueError:
+                logger.warning("Ignoring invalid %s=%r; using default", env, raw)
+                values[field] = getattr(defaults, field)
+        return cls(**values)
+
+    def is_enabled(self) -> bool:
+        return any(
+            getattr(self, field) > 0
+            for field in (
+                "orders_days", "trades_days", "pnl_days", "signals_days",
+                "sessions_days", "events_days", "nav_days",
+            )
+        )
 
 
 class Store:
@@ -95,11 +180,42 @@ class Store:
             raise
 
     def close(self):
-        """Close this thread's connection (call before deleting the DB file)."""
+        """Close this thread's connection (call before deleting the DB file).
+
+        The WAL is checkpointed first so the committed rows live in the main
+        database file after shutdown (S16). Checkpoint failure must not stop
+        the connection from closing.
+        """
         conn = getattr(self._local, "conn", None)
         if conn is not None:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error as exc:
+                logger.warning("WAL checkpoint on close failed: %s", exc)
             conn.close()
             self._local.conn = None
+
+    def checkpoint(self) -> None:
+        """Flush the WAL into the main database file (TRUNCATE)."""
+        with self._conn() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def vacuum(self) -> None:
+        """Rebuild the database file to return freed pages to the OS.
+
+        VACUUM cannot run inside a transaction; every write commits through
+        ``_conn`` so the connection is idle here. Failures are logged and
+        reported (a locked database must not abort a retention run).
+        """
+        conn = self._get_connection()
+        conn.execute("VACUUM")
+
+    def size_bytes(self) -> int:
+        """Size of the main database file on disk, in bytes."""
+        try:
+            return Path(self._db_path).stat().st_size
+        except OSError:
+            return 0
 
     def _init_schema(self):
         """Create tables if they don't exist."""
@@ -725,19 +841,48 @@ class Store:
     def save_pnl_snapshot(self, snapshot: dict):
         """Save a P&L snapshot."""
         with self._lock, self._conn() as conn:
-            conn.execute("""
-                    INSERT INTO pnl_history
-                    (timestamp, total_equity, cash, market_value, daily_pnl,
-                     daily_pnl_pct, cumulative_pnl, n_positions, max_drawdown, sharpe_ratio)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                snapshot.get('timestamp', datetime.now().isoformat()),
-                snapshot['total_equity'], snapshot['cash'],
-                snapshot['market_value'], snapshot.get('daily_pnl', 0),
-                snapshot.get('daily_pnl_pct', 0), snapshot.get('cumulative_pnl', 0),
-                snapshot.get('n_positions', 0), snapshot.get('max_drawdown', 0),
-                snapshot.get('sharpe_ratio', 0),
-            ))
+            self._save_pnl(conn, snapshot)
+
+    def _save_pnl(self, conn: sqlite3.Connection, snapshot: dict) -> None:
+        conn.execute("""
+                INSERT INTO pnl_history
+                (timestamp, total_equity, cash, market_value, daily_pnl,
+                 daily_pnl_pct, cumulative_pnl, n_positions, max_drawdown, sharpe_ratio)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+            snapshot.get('timestamp', exchange_now_iso()),
+            snapshot['total_equity'], snapshot['cash'],
+            snapshot['market_value'], snapshot.get('daily_pnl', 0),
+            snapshot.get('daily_pnl_pct', 0), snapshot.get('cumulative_pnl', 0),
+            snapshot.get('n_positions', 0), snapshot.get('max_drawdown', 0),
+            snapshot.get('sharpe_ratio', 0),
+        ))
+
+    def save_pnl_and_mark_eod(
+        self, snapshot: dict, date: str, timestamp: str | None = None,
+    ) -> bool:
+        """Write the EOD snapshot and its marker in one transaction.
+
+        The two writes were separate transactions, so a crash in between left
+        a snapshot with no marker and the next run appended a second snapshot
+        for the same day. One transaction makes the pair all-or-nothing. The
+        marker is inserted with ``OR IGNORE`` first and the snapshot is only
+        written when the insert actually claimed the day, so two racing
+        processes also produce exactly one snapshot.
+
+        Returns True when this call reconciled the day, False when another
+        run had already claimed it.
+        """
+        with self._lock, self._conn() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO eod_reconciliation (date, timestamp) "
+                "VALUES (?, ?)",
+                (date, timestamp or exchange_now_iso()),
+            )
+            if cursor.rowcount == 0:
+                return False
+            self._save_pnl(conn, snapshot)
+            return True
 
     def get_pnl_history(self, days: int = 30,
                         start_date: str = "", end_date: str = "") -> list[dict]:
@@ -755,7 +900,7 @@ class Store:
                 query += " AND timestamp >= ?"
                 params.append(start_date)
             else:
-                cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+                cutoff = (exchange_now() - timedelta(days=days)).isoformat()
                 query += " AND timestamp > ?"
                 params.append(cutoff)
             if end_date:
@@ -786,8 +931,29 @@ class Store:
             conn.execute(
                 "INSERT OR REPLACE INTO eod_reconciliation (date, timestamp) "
                 "VALUES (?, ?)",
-                (date, timestamp or datetime.now().isoformat()),
+                (date, timestamp or exchange_now_iso()),
             )
+
+    def get_last_eod_reconciliation(self) -> str:
+        """Latest exchange date (YYYY-MM-DD) with an EOD marker, or ''.
+
+        Used by the scheduler's startup catch-up scan (S3): a stand-alone
+        scheduler that was down for a few days compares this against the
+        exchange calendar and reconciles the gap.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(date) AS last_date FROM eod_reconciliation"
+            ).fetchone()
+        return str(row["last_date"] or "") if row else ""
+
+    def get_last_pnl_timestamp(self) -> str:
+        """Timestamp of the newest P&L snapshot, or '' when there is none."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(timestamp) AS last_ts FROM pnl_history"
+            ).fetchone()
+        return str(row["last_ts"] or "") if row else ""
 
     # ── Signals ──
 
@@ -860,7 +1026,7 @@ class Store:
             "strategy_id": session.get("strategy_id", ""),
             "broker": session.get("broker", "simulated"),
             "status": session.get("status", "active"),
-            "started_at": session.get("started_at", datetime.now().isoformat()),
+            "started_at": session.get("started_at", exchange_now_iso()),
             "stopped_at": session.get("stopped_at", ""),
             "total_trades": session.get("total_trades", 0),
             "total_pnl": session.get("total_pnl", 0),
@@ -916,7 +1082,7 @@ class Store:
                 event.get('topic', ''),
                 json.dumps(event.get('data', {})),
                 event.get('source', ''), event.get('timestamp', time.time()),
-                datetime.now().isoformat(),
+                exchange_now_iso(),
             ))
 
     def get_events(self, topic: str = "", limit: int = 100,
@@ -1018,7 +1184,7 @@ class Store:
         crash cannot leave "cash updated but date not advanced" behind.
         """
         payload = json.dumps(state, default=str)
-        updated_at = datetime.now().isoformat(timespec="seconds")
+        updated_at = exchange_now_iso()
         with self._lock, self._conn() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO engine_state
@@ -1036,6 +1202,207 @@ class Store:
         if row is None:
             return None
         return json.loads(row["state_json"])
+
+    def get_latest_engine_state(self, tenant_id: str = "") -> tuple[str, dict] | None:
+        """Newest *engine* snapshot as ``(key, state)``, or None.
+
+        The scheduler is not constructed with the engine's tenant-scoped key
+        in every embedding (and a standalone scheduler has no engine at all),
+        so EOD equity lookup (S2) falls back to whichever engine most recently
+        persisted a snapshot. Rows written by other features into the same
+        key/value table (``risk_state:{tenant}``) and daemon replay snapshots
+        (a different schema) are not engine books: accepting them mis-sourced
+        equity. Only snapshots that carry an engine book (cash + positions)
+        are eligible; with ``tenant_id`` only that tenant's engine key is
+        considered. Unreadable JSON is ignored rather than crashing EOD.
+        """
+        query = "SELECT strategy_id, state_json FROM engine_state"
+        params: tuple = ()
+        if tenant_id:
+            query += " WHERE strategy_id = ?"
+            params = (f"live_engine:{tenant_id}",)
+        else:
+            query += " WHERE strategy_id NOT LIKE 'risk_state:%'"
+        query += " ORDER BY updated_at DESC LIMIT 20"
+        with self._conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+        for row in rows:
+            try:
+                state = json.loads(row["state_json"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring unreadable engine_state row %s", row["strategy_id"],
+                )
+                continue
+            if (
+                isinstance(state, dict)
+                and "cash" in state
+                and "positions" in state
+                and ("portfolio_value" in state or "total_equity" in state)
+            ):
+                return str(row["strategy_id"]), state
+        return None
+
+    # ── Retention (S10) ──
+
+    #: ``(table, policy field, timestamp column, date-only, primary key)``.
+    #: Deletion is always by the table's own timestamp; `orders` additionally
+    #: requires that no *retained* trade still references the row, so a policy
+    #: that keeps trades longer than orders cannot orphan fills. Deletes use
+    #: the ids of the rows that were archived, so a concurrent insert with a
+    #: historical timestamp is never deleted without an archive copy.
+    _RETENTION_TABLES = (
+        ("events", "events_days", "created_at", False, "id"),
+        ("pnl_history", "pnl_days", "timestamp", False, "id"),
+        ("signals", "signals_days", "generated_at", False, "signal_id"),
+        ("sessions", "sessions_days", "started_at", False, "session_id"),
+        ("trades", "trades_days", "executed_at", False, "trade_id"),
+        ("orders", "orders_days", "created_at", False, "order_id"),
+        ("nav_history", "nav_days", "date", True, "date"),
+    )
+
+    #: Rows deleted per SQL statement, below SQLite's bound-parameter limit.
+    _RETENTION_DELETE_CHUNK = 500
+
+    def run_retention(
+        self,
+        policy: RetentionPolicy | None = None,
+        archive_dir: str | Path | None = None,
+        vacuum: bool = True,
+        now: datetime | None = None,
+    ) -> dict:
+        """Archive then delete rows older than each table's max age.
+
+        Every eligible batch is written to a dated CSV under ``archive_dir``
+        *before* the DELETE runs (temp file + fsync + os.replace); if the
+        archive cannot be written the rows are kept. Afterwards the WAL is
+        checkpointed and, when anything was deleted, the database is
+        vacuumed. Returns per-table counts, archive paths and the resulting
+        database size (also exported as the ``store_size_bytes`` gauge).
+
+        The job is idempotent: a second run finds no eligible rows and writes
+        no archive.
+        """
+        policy = policy or RetentionPolicy()
+        now = now or exchange_now()
+        archive_root = Path(archive_dir or "data/archive")
+        result: dict = {
+            "tables": {},
+            "checkpointed": False,
+            "vacuumed": False,
+            "db_size_bytes": 0,
+        }
+        deleted_total = 0
+
+        for table, field, column, date_only, id_column in self._RETENTION_TABLES:
+            days = int(getattr(policy, field))
+            entry: dict = {
+                "enabled": days > 0, "archived": 0, "deleted": 0,
+                "archive_path": "", "cutoff": "",
+            }
+            if days <= 0:
+                result["tables"][table] = entry
+                continue
+
+            cutoff = (
+                (now - timedelta(days=days)).strftime("%Y-%m-%d")
+                if date_only
+                else (now - timedelta(days=days)).isoformat()
+            )
+            where = f"{column} < ?"
+            extra = ""
+            if table == "orders":
+                extra = (
+                    " AND NOT EXISTS (SELECT 1 FROM trades "
+                    "WHERE trades.order_id = orders.order_id)"
+                )
+            entry["cutoff"] = cutoff
+
+            with self._conn() as conn:
+                rows = [
+                    dict(row) for row in conn.execute(
+                        f"SELECT * FROM {table} WHERE {where}{extra}", (cutoff,)
+                    ).fetchall()
+                ]
+            if not rows:
+                result["tables"][table] = entry
+                continue
+
+            archive_path = None
+            try:
+                archive_root.mkdir(parents=True, exist_ok=True)
+                stamp = now.strftime("%Y%m%dT%H%M%S%f")
+                archive_path = archive_root / f"{table}_{stamp}.csv"
+                tmp_path = archive_path.with_name(archive_path.name + ".tmp")
+                with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
+                    writer = csv.DictWriter(
+                        fh, fieldnames=list(rows[0].keys()),
+                    )
+                    writer.writeheader()
+                    writer.writerows(rows)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, archive_path)
+            except OSError as exc:
+                logger.critical(
+                    "Retention: archiving %s failed (%s); rows kept", table, exc,
+                )
+                entry["error"] = str(exc)
+                result["tables"][table] = entry
+                continue
+
+            entry["archive_path"] = str(archive_path)
+            entry["archived"] = len(rows)
+            ids = [row[id_column] for row in rows]
+            # SQLite's bound-variable limit (32,766 on CPython 3.12) is easily
+            # exceeded by a real backlog; one giant IN-list archived 40k rows
+            # and then failed the DELETE, so retention could never drain.
+            deleted = 0
+            chunk_size = self._RETENTION_DELETE_CHUNK
+            with self._lock, self._conn() as conn:
+                for offset in range(0, len(ids), chunk_size):
+                    chunk = ids[offset:offset + chunk_size]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    delete_where = f"{id_column} IN ({placeholders})"
+                    if extra:
+                        delete_where += extra
+                    cursor = conn.execute(
+                        f"DELETE FROM {table} WHERE {delete_where}",
+                        tuple(chunk),
+                    )
+                    if cursor.rowcount > 0:
+                        deleted += cursor.rowcount
+            entry["deleted"] = deleted
+            deleted_total += deleted
+            result["tables"][table] = entry
+            logger.info(
+                "Retention: archived and deleted %d %s row(s) older than %s",
+                deleted, table, cutoff,
+            )
+
+        try:
+            self.checkpoint()
+            result["checkpointed"] = True
+        except sqlite3.Error as exc:
+            logger.error("Retention: WAL checkpoint failed: %s", exc)
+        if vacuum and deleted_total > 0:
+            try:
+                self.vacuum()
+                result["vacuumed"] = True
+            except sqlite3.Error as exc:
+                logger.error("Retention: VACUUM failed: %s", exc)
+
+        result["db_size_bytes"] = self.size_bytes()
+        try:
+            from quant_platform.utils.metrics import get_metrics
+
+            get_metrics().gauge(
+                "store_size_bytes",
+                help="SQLite trading database file size in bytes",
+            ).set(result["db_size_bytes"])
+        except Exception:  # metrics must never break retention
+            pass
+        return result
 
     # ── Stats ──
 
@@ -1055,4 +1422,5 @@ class Store:
                 "sessions": conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
                 "events": conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
                 "db_path": self._db_path,
+                "db_size_bytes": self.size_bytes(),
             }

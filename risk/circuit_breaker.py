@@ -13,11 +13,15 @@ These run on every order submission and every portfolio update.
 
 from __future__ import annotations
 
+import json
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
+from quant_platform.core.audit import AuditAction, AuditLog
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -85,7 +89,13 @@ class RiskMonitor:
     on every fill. Maintains risk state and generates alerts.
     """
 
-    def __init__(self, limits: RiskLimits | None = None):
+    def __init__(
+        self,
+        limits: RiskLimits | None = None,
+        store: Any = None,
+        tenant_id: str = "default",
+        audit: AuditLog | None = None,
+    ):
         self.limits = limits or RiskLimits()
         self.risk_level = RiskLevel.GREEN
         self.breaches: list[RiskBreach] = []
@@ -108,9 +118,274 @@ class RiskMonitor:
         # Kill switch
         self.kill_switch_active = False
 
+        # S21: durable risk state. Level, breaches and the kill switch lived
+        # only in memory, so a restart cleared a manually armed switch and all
+        # breach history. `attach_persistence` wires the store/audit lazily so
+        # every construction path (singleton, engine, tests) can opt in.
+        self._store: Any = None
+        self._tenant_id = tenant_id or "default"
+        self._audit: AuditLog | None = None
+        self._persisted_payload = ""
+        self._persisted_at = ""
+        # True when the most recent persist attempt failed: `persisted` in the
+        # API payload must not claim durability for an unwritten change.
+        self._persist_failed = False
+        # Serialises payload construction and the write: building the payload
+        # outside the lock let a pre-activation snapshot overwrite a newer
+        # activation (lost update).
+        self._persist_lock = threading.Lock()
+        if store is not None:
+            self.attach_persistence(
+                store, tenant_id=self._tenant_id, audit=audit, restore=True,
+            )
+
     def set_sector_map(self, sector_map: dict[str, str]) -> None:
         """Provide ticker -> sector classifications for pre-trade checks."""
         self.sector_map = dict(sector_map)
+
+    # ── S21: durable risk state ──
+
+    def _state_key(self) -> str:
+        return f"risk_state:{self._tenant_id}"
+
+    def attach_persistence(
+        self,
+        store: Any,
+        tenant_id: str = "default",
+        audit: AuditLog | None = None,
+        restore: bool = True,
+    ) -> RiskMonitor:
+        """Wire a Store (and optional AuditLog) for durable risk state.
+
+        The key is tenant-scoped, so two tenants sharing one SQLite file do
+        not overwrite each other's kill switch or breach history. Restoring
+        reads the same key; a manually armed kill switch survives a restart.
+        """
+        tenant_changed = self._tenant_id != (tenant_id or "default")
+        store_changed = self._store is not store
+        self._store = store
+        self._tenant_id = tenant_id or "default"
+        if audit is not None:
+            self._audit = audit
+        if tenant_changed:
+            # Re-attaching to a different tenant must not inherit the previous
+            # tenant's level/breaches/kill switch when the new tenant has no
+            # persisted row (multi-tenant singleton deployments).
+            with self._persist_lock:
+                self._reset_in_memory_state()
+        elif store_changed:
+            # A different Store object for the same tenant (e.g. monitor API
+            # and routes each lazily construct one on the same SQLite file)
+            # must keep the live in-memory switch/breaches. Only the write
+            # bookkeeping is reset, forcing the next change to be re-persisted
+            # through the new handle.
+            with self._persist_lock:
+                self._persisted_payload = ""
+                self._persisted_at = ""
+                self._persist_failed = False
+        if restore:
+            self._restore_persisted_state()
+        return self
+
+    def _reset_in_memory_state(self) -> None:
+        self.risk_level = RiskLevel.GREEN
+        self._state_risk_level = RiskLevel.GREEN
+        self.kill_switch_active = False
+        self.breaches = []
+        self.portfolio_value = 0.0
+        self.peak_value = 0.0
+        self.daily_pnl = 0.0
+        self._last_state_breach = ""
+        self._active_breach_signatures = set()
+        self._persisted_payload = ""
+        self._persisted_at = ""
+        self._persist_failed = False
+
+    def has_persisted_state(self) -> bool:
+        """Whether a durable risk snapshot was restored or written successfully.
+
+        The engine uses this to decide whether `risk_state` is authoritative
+        over the older kill-switch flag in its own `engine_state` snapshot.
+        """
+        return bool(self._persisted_at) and not self._persist_failed
+
+    def _state_payload(self, kill_override: bool | None = None) -> dict:
+        """Risk snapshot payload.
+
+        `kill_override` lets restore compute a stored-row signature without
+        temporarily mutating the live (lock-free-read) kill-switch flag.
+        """
+        kill_switch = (
+            self.kill_switch_active if kill_override is None
+            else bool(kill_override)
+        )
+        return {
+            "version": 1,
+            "tenant_id": self._tenant_id,
+            "risk_level": self.risk_level.value,
+            "kill_switch_active": bool(kill_switch),
+            "breaches": [
+                {
+                    "breach_id": breach.breach_id,
+                    "breach_type": breach.breach_type.value,
+                    "severity": breach.severity.value,
+                    "message": breach.message,
+                    "current_value": breach.current_value,
+                    "limit_value": breach.limit_value,
+                    "ticker": breach.ticker,
+                    "timestamp": breach.timestamp,
+                    "auto_action": breach.auto_action,
+                }
+                for breach in self.breaches[-100:]
+            ],
+            "portfolio_value": float(self.portfolio_value),
+            "peak_value": float(self.peak_value),
+            "daily_pnl": float(self.daily_pnl),
+        }
+
+    def _persist_state(self) -> bool:
+        """Persist the risk snapshot when it changed. Never raises.
+
+        Called on every risk-level/breach/kill-switch change. The dirty check
+        keeps the write rate flat under a rebalance burst where every order
+        re-runs the same checks.
+        """
+        if self._store is None:
+            return False
+        with self._persist_lock:
+            # Build the payload inside the lock: a snapshot computed before a
+            # concurrent activation must not be written after it.
+            payload = self._state_payload()
+            signature = json.dumps(payload, sort_keys=True, default=str)
+            if signature == self._persisted_payload:
+                return False
+            try:
+                from quant_platform.core.store import exchange_now_iso
+
+                payload["updated_at"] = exchange_now_iso()
+                self._store.save_engine_state(payload, self._state_key())
+            except Exception as exc:
+                self._persist_failed = True
+                logger.error("Failed to persist risk state: %s", exc)
+                return False
+            self._persisted_payload = signature
+            self._persisted_at = str(payload["updated_at"])
+            self._persist_failed = False
+            return True
+
+    def _restore_persisted_state(self) -> bool:
+        """Restore level, breaches and kill switch from the Store."""
+        if self._store is None:
+            return False
+        with self._persist_lock:
+            restored = self._restore_persisted_state_locked()
+        if restored and self._persist_failed and self.kill_switch_active:
+            # An in-memory armed switch was kept against a stored disarmed
+            # row; retry the write outside the lock so the state becomes
+            # durable again (and `persisted` reflects reality until then).
+            self._persist_state()
+        return restored
+
+    def _restore_persisted_state_locked(self) -> bool:
+        try:
+            state = self._store.get_engine_state(self._state_key())
+        except Exception as exc:
+            self._persist_failed = True
+            logger.error("Failed to load persisted risk state: %s", exc)
+            return False
+        if not isinstance(state, dict):
+            self._persisted_at = ""
+            return False
+        try:
+            self.risk_level = RiskLevel(str(state.get("risk_level", "green")))
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid persisted risk level %r",
+                state.get("risk_level"),
+            )
+        restored_kill = bool(state.get("kill_switch_active", False))
+        kept_armed = self.kill_switch_active and not restored_kill
+        if kept_armed:
+            # Fail safe: never silently disarm an in-memory armed switch by
+            # re-attaching an older stored row (e.g. after a transient write
+            # failure). Startup monitors are created disarmed, so this only
+            # affects in-process re-attach.
+            logger.critical(
+                "Keeping the in-memory armed kill switch: the persisted row "
+                "does not record it; retrying the durable write"
+            )
+        else:
+            self.kill_switch_active = restored_kill
+        restored: list[RiskBreach] = []
+        for row in state.get("breaches") or []:
+            try:
+                restored.append(RiskBreach(
+                    breach_id=str(row.get("breach_id", "")),
+                    breach_type=BreachType(str(row.get("breach_type"))),
+                    severity=RiskLevel(str(row.get("severity"))),
+                    message=str(row.get("message", "")),
+                    current_value=float(row.get("current_value", 0) or 0),
+                    limit_value=float(row.get("limit_value", 0) or 0),
+                    ticker=str(row.get("ticker", "")),
+                    timestamp=str(row.get("timestamp", "")),
+                    auto_action=str(row.get("auto_action", "")),
+                ))
+            except (ValueError, TypeError, AttributeError):
+                continue
+        self.breaches = restored[-100:]
+        for attribute in ("portfolio_value", "peak_value", "daily_pnl"):
+            value = state.get(attribute)
+            if isinstance(value, (int, float)):
+                setattr(self, attribute, float(value))
+        # Which durable state does the stored row actually represent? Compute
+        # its signature without mutating the live flag (readers are lock-free).
+        stored_signature = json.dumps(
+            self._state_payload(kill_override=restored_kill),
+            sort_keys=True, default=str,
+        )
+        self._persisted_payload = stored_signature
+        self._persisted_at = str(state.get("updated_at") or "")
+        if kept_armed:
+            # The in-memory state differs from the row (armed vs disarmed).
+            # Keep `persisted=False` until the retried write succeeds; do not
+            # claim the older row recorded the armed state.
+            self._persist_failed = True
+        else:
+            self._persist_failed = False
+            if self.kill_switch_active:
+                logger.critical(
+                    "Persisted kill switch restored; orders remain blocked "
+                    "until explicitly deactivated",
+                )
+        return True
+
+    def _audit_kill_switch(self, active: bool, reason: str, actor: str) -> None:
+        """Compliance trail for an emergency action: who/when/why."""
+        if self._audit is None:
+            return
+        try:
+            self._audit.log(
+                AuditAction.RISK_BREACH,
+                component="risk",
+                details={
+                    "breach_type": (
+                        "kill_switch_activated" if active
+                        else "kill_switch_deactivated"
+                    ),
+                    "active": active,
+                    "reason": reason,
+                    "actor": actor,
+                    "tenant_id": self._tenant_id,
+                    "risk_level": self.risk_level.value,
+                },
+                reason=(
+                    f"Kill switch {'activated' if active else 'deactivated'}: "
+                    f"{reason}"
+                ),
+                result="success",
+            )
+        except Exception as exc:
+            logger.error("Kill-switch audit write failed: %s", exc)
 
     def _resolve_sector(self, ticker: str, order: dict | None = None) -> str:
         if order and order.get("sector"):
@@ -240,6 +515,9 @@ class RiskMonitor:
         # Hard bound as a last resort for rapidly changing messages.
         if len(self.breaches) > 1_000:
             self.breaches = self.breaches[-500:]
+        # S21: level/breach changes are durable; the dirty check makes this a
+        # no-op when a repeated check finds the same state.
+        self._persist_state()
         return is_approved, breaches
 
     def _check_order_rate(self) -> RiskBreach | None:
@@ -430,7 +708,17 @@ class RiskMonitor:
         current_dd = (self.peak_value - self.portfolio_value) / self.peak_value
 
         if current_dd > self.limits.kill_drawdown_pct:
+            was_active = self.kill_switch_active
             self.kill_switch_active = True
+            if not was_active:
+                # Automatic arming gets the same compliance trail as a manual
+                # one (who=risk_monitor:auto, when=now, why=the drawdown).
+                self._audit_kill_switch(
+                    True,
+                    f"drawdown {current_dd:.2%} exceeded kill threshold "
+                    f"{self.limits.kill_drawdown_pct:.2%}",
+                    actor="risk_monitor:auto",
+                )
             return RiskBreach(
                 breach_type=BreachType.DRAWDOWN,
                 severity=RiskLevel.KILL,
@@ -505,6 +793,9 @@ class RiskMonitor:
             if self.risk_level in (RiskLevel.KILL, RiskLevel.RED, RiskLevel.YELLOW):
                 self.risk_level = RiskLevel.GREEN
 
+        # Peak/level/breach changes are restart-critical (S21).
+        self._persist_state()
+
     def project_order(self, order: dict) -> None:
         """Fold an approved, not-yet-filled buy into the exposure view.
 
@@ -560,8 +851,15 @@ class RiskMonitor:
         pos["sector"] = sector
         self.sector_weights[sector] = self.sector_weights.get(sector, 0.0) + weight
 
-    def activate_kill_switch(self, reason: str = "Manual activation"):
-        """Emergency kill switch — blocks all new orders."""
+    def activate_kill_switch(self, reason: str = "Manual activation",
+                             actor: str = "manual") -> bool:
+        """Emergency kill switch — blocks all new orders.
+
+        The activation is persisted (S21) and audited with who/when/why, so a
+        restart cannot silently re-enable trading and compliance keeps a
+        record of the emergency action. Returns whether the state was durably
+        written (``False`` means the switch is armed in memory only).
+        """
         self.kill_switch_active = True
         self.risk_level = RiskLevel.KILL
         logger.critical("KILL SWITCH ACTIVATED: %s", reason)
@@ -571,12 +869,34 @@ class RiskMonitor:
             message=f"Kill switch: {reason}",
             auto_action="flatten",
         ))
+        persisted = self._persist_state()
+        self._audit_kill_switch(True, reason, actor)
+        self._export_kill_switch_gauge(True)
+        return persisted
 
-    def deactivate_kill_switch(self):
+    def deactivate_kill_switch(self, reason: str = "Manual deactivation",
+                               actor: str = "manual") -> bool:
         """Deactivate kill switch (requires manual confirmation)."""
         self.kill_switch_active = False
         self.risk_level = RiskLevel.YELLOW
         logger.info("Kill switch deactivated")
+        persisted = self._persist_state()
+        self._audit_kill_switch(False, reason, actor)
+        self._export_kill_switch_gauge(False)
+        return persisted
+
+    @staticmethod
+    def _export_kill_switch_gauge(active: bool) -> None:
+        """Keep the readiness/dead-man gauge current (S4)."""
+        try:
+            from quant_platform.utils.metrics import get_metrics
+
+            get_metrics().gauge(
+                "risk_kill_switch_active",
+                help="1 when the risk kill switch is armed",
+            ).set(1.0 if active else 0.0)
+        except Exception:
+            pass
 
     def get_status(self) -> dict:
         """Get current risk status summary."""
@@ -609,6 +929,17 @@ class RiskMonitor:
                 "max_drawdown": self.limits.max_drawdown_pct,
                 "kill_drawdown": self.limits.kill_drawdown_pct,
             },
+            # S21: whether this state is durable and when it was last written.
+            # `persisted` is False when the latest change could not be written
+            # (disk full/locked store) so the API never overstates durability.
+            "persisted": (
+                self._store is not None
+                and bool(self._persisted_at)
+                and not self._persist_failed
+            ),
+            "persisted_at": self._persisted_at,
+            "persist_error": self._persist_failed,
+            "tenant_id": self._tenant_id,
         }
 
 

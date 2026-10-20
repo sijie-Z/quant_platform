@@ -2,8 +2,8 @@
 
 > **STATUS: HISTORICAL RECORD — counts and file sizes are stale (2026-10). See #78.**
 > §1.4's finding (five referenced governance documents never existed) was real;
-> the dangling references were removed in 2026-10 (see #68). The live tree now
-> has 20 CLI subcommands and 101 endpoints, not the numbers below.
+> the dangling references were removed in 2026-10 (see #68). As of 2026-10-20 the
+> live tree has 21 CLI subcommands, 99 HTTP endpoints + 1 WebSocket, not the numbers below.
 
 > **目的**：记录本 session（2026-07-31）与用户关于 quant_platform 的完整讨论过程、架构思考、关键发现与优先级决策。
 > **读者**：其他 AI agent / 未来的会话 / 项目维护者。

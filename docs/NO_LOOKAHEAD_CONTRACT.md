@@ -3,14 +3,17 @@
 > 这是本平台所有量化研究代码必须遵守的铁律。任何违反此契约的代码都是 bug。
 > 回测的高收益只有在零前视偏差的前提下才有意义。
 
-> **STATUS: CONTRACT — rules 7 and 8 explicitly unmet; rules 1, 3, 4, 5 not re-verified since 2026-09-21. See #78.**
-
-> ⚠️ **当前有两条未满足**（2026-09-21 复核）：**第八条**（ST 用公告日期）是真实的未来函数，
-> 且方向上是抬高回测的；**第七条**（行业用生效日期）未满足，但方向上只是陈旧、不构成未来函数。
-> 两条的现状、证据与修复方向都在各自小节里。
+> **STATUS: CONTRACT — 2026-10-20 复核：8 条规则均已实现并有回归测试守护。**
 >
-> 本次只逐条追踪了第二、第六条（alpha 权重与 IC shift 链条，未发现违反）。
-> 第一、三、四、五条**本次没有重新复核**，不要按"未列出即无问题"理解。
+> 2026-09-21 复核时第七条（行业生效日期）与第八条（ST 公告日期）未满足。
+> 2026-10 的 Round 9/10 修复已将按日期的行业面板、ST 公告日掩码接入因子、
+> 信号与回测执行日；下方各节记录当前实现位置与仍然存在的、由数据源决定的缺口。
+
+> ⚠️ **残余缺口（不是未来函数，而是数据/工程限制）**：
+> - ST 历史取决于数据源：Tushare/Baostock 只提供当前名称/上市状态，不提供 ST 公告历史
+>   （`st_available=False`，不伪造全 False 列）；合成数据提供完整公告时间序列。
+> - 跨数据源价格基准尚未统一（Tushare/Baostock 均为后复权 hfq，调整只应用一次）。
+> - 无增量数据更新路径（每次按区间重取）。
 
 ---
 
@@ -82,8 +85,13 @@ A 股实际情况：季报结束后 1-2 个月才发布。用 fiscal_period_end 
 
 | 位置 | 实现 |
 |------|------|
-| `data/providers/synthetic.py:467-468` | publish_date = qdate + 40-50 天（模拟 A 股披露延迟） |
-| `data/providers/synthetic.py:494-497` | ffill 后保留 publish_date 列 |
+| `data/providers/synthetic.py` | 每份财报按 `publish_date` reindex 到首个交易日；周末/节假日公告映射到下一交易日，不提前 |
+| `data/providers/tushare_loader.py` | 财务数据按 `ann_date`/`f_ann_date` 映射到首个交易日；缺失公告日则拒绝构造 PIT 面板 |
+| `data/providers/baostock_provider.py` | 财报按实际公告日（不可得时按期末 + 明确 warning）映射，panel 带 `publish_date` |
+| `data/pipeline.py` | 财务面板以“公告日可得的交易日”为 `date` 索引；`get_financials_as_of()` 提供按 `publish_date <= as_of` 的查询 |
+
+> `get_financials_as_of()` 目前没有生产调用方；PIT 由上游面板对齐保证——因子只能看到
+> `date` 索引上已经公开的报告。它保留为显式查询 API，避免调用方自行推断。
 
 **不允许的写法**：
 ```python
@@ -107,7 +115,9 @@ mask = financials['publish_date'] <= signal_date
 
 | 位置 | 实现 |
 |------|------|
-| `backtest/walkforward.py:47-71` | 每个 fold 内传入 `factors`/`alpha_kwargs` 参数，基于 train 数据重新计算信号 |
+| `backtest/walkforward.py` | 每个 fold 内传入 `factors`/`alpha_kwargs`，基于 train 数据重新计算信号；OOS 指标只对 `test_slice` 的收益切片聚合（修复了 BUG-21 的 train+test 窗口） |
+
+**回归测试**：`tests/test_backtest/` 中断言 OOS 收益索引不包含训练区间、首折可在 train-only 数据上重算。
 
 **允许的写法**：
 ```python
@@ -138,9 +148,9 @@ for train_idx, test_idx in folds:
 
 | 位置 | 实现 |
 |------|------|
-| `data/providers/synthetic.py:231-280` | `if self.embedded_alpha:` 条件分支 |
-| `data/providers/synthetic.py:13-15` | 文档警告：`Never use embedded_alpha=True to validate strategy performance` |
-| `config/default.yaml:16` | `embedded_alpha: true`（默认开，面试友好） |
+| `data/providers/synthetic.py` | `if self.embedded_alpha:` 条件分支；强度由 `alpha_strength` 控制（默认 0.03，演示水平） |
+| `data/providers/synthetic.py` | 模块 docstring 明确警告 `Never use embedded_alpha=True to validate strategy performance` |
+| `config/default.yaml` | `data.synthetic.embedded_alpha: true`（默认开，仅供演示；研究前必须改 false） |
 
 ---
 
@@ -162,24 +172,19 @@ for train_idx, test_idx in folds:
 
 **规则**：行业分类用 effective_date，不是静态标签。当股票在回测期间发生行业变更时，使用变更生效后的分类。
 
-**状态**：⚠️ **当前不成立**（2026-09-21 复核）。
+**状态**：✅ **当前成立**（2026-10-20 复核；2026-09-21 时未满足）。
 
-`neutralize` 接受的是 `sector_map: Series`（asset → sector）并在每个日期上复用同一份映射
-（`factors/processing.py:99`、`:126-129`），而 `main.py` 传进去的是 `metadata["sector"]`——
-provider 的**样本起始分类**。实测（synthetic，120 只，2023-01-01 ~ 2025-12-31，seed 17）：
-38 只（32%）在样本内发生行业变更，它们**全部日期的中性化都用的是起始行业**。
-
-**方向上不是未来函数**：用变更生效**之前**的分类是**陈旧**，不是偷看未来——它永远不会读到 t
-之后的分类。所以这一条既不会抬高回测业绩，也不违反"无未来函数"；它只是让中性化对那 32% 的
-股票在变更后的区间内失效。
-
-**已在代码中实现的位置（部分）**：
+**实现路径**：
 
 | 位置 | 实现 |
 |------|------|
-| `data/providers/synthetic.py:605-641` | 行业分类附带 effective_date，~5%/半年变更率 |
-| `data/pipeline.py:188-215` | `get_industry_map(as_of_date)` 按 effective_date 返回当期分类 |
-| ⚠️ 缺口 | `get_industry_map` **没有任何生产调用方**（grep 仅命中自身定义与测试）；`neutralize` 也不接受按日期的映射。要真正做到这一条，需要把按日期的行业映射从 provider 一路传到 `process_factor` |
+| `data/providers/synthetic.py` | 行业分类附带 `effective_date`，约 5%/半年变更率 |
+| `data/pipeline.py` | `get_sector_panel()` 返回 date × asset 的当期行业面板；`get_industry_map(as_of_date)` 保留单日查询 |
+| `main.py` | `_load_data` 在启用 sector 中性化时调用 `get_sector_panel()` 并挂到 `metadata.attrs["sector_panel"]` |
+| `factors/processing.py` | `neutralize()` 接受 `sector_panel`，按日期取行业哑变量；无面板时回退静态 map |
+
+**仍存在的限制**：Tushare/Baostock 若拿不到行业变更历史，只能回退到当前分类（陈旧但
+不是未来函数）；该情况会记录在 trust metadata 中。
 
 ---
 
@@ -187,19 +192,23 @@ provider 的**样本起始分类**。实测（synthetic，120 只，2023-01-01 ~
 
 **规则**：ST 标记用 announce_date，不是 trigger_date。交易所发布 ST 公告之前，市场不知道。
 
-**状态**：⚠️ **当前不成立，且这一条是真实的未来函数**（2026-09-21 复核）。
+**状态**：✅ **当前成立**（因子/信号/执行日门禁；2026-09-21 时是真实的未来函数）。
 
-`_filter_universe`（`data/pipeline.py:97`）用的是 `metadata["is_st"]`，而 provider 对该字段的定义是
-"这只股票是否**在样本内某时点**变成 ST"（`data/providers/synthetic.py:555`，`trigger_idx` 随机落在
-`[60, len-60]`）。于是样本一开始就排除了约 3% 的股票——而这 3% 恰好是后来出事的股票，属于
-**逆向选择**，方向上会抬高所有基于该股票池的回测。
+**实现路径**：
 
-`get_st_status(as_of_date)` 按 announce_date 判断，但**没有任何生产调用方**。而且
-`_load_point_in_time_data()` 在 `_filter_universe()` **之后**才执行（`data/pipeline.py:61` 与 `:74`），
-所以即使去调用它，过滤时 `_st_timeseries` 也还是 `None`。
+| 位置 | 实现 |
+|------|------|
+| `data/pipeline.py` | `_build_st_eligibility_mask()` 按 `announce_date` → `end_date` 构建 (date × asset) 掩码；`tradable_mask` 合并 ST、上市/退市、停牌 |
+| `factors/*`、`alpha/*` | 因子与信号只在 `tradable_mask=True` 的资产日取值；ST 期间无因子值、无信号、无目标权重 |
+| `backtest/engine.py` | `run(tradable_mask=..., limit_up=..., limit_down=...)` 在**执行日**检查：ST/停牌/涨跌停阻断成交，未成交目标顺延到下一个可交易日 |
+| `main.py` | `pipeline.get_execution_gates()` 挂到 `metadata.attrs`，由 `_run_backtest` 传入引擎 |
 
-**修复方向**（未实施，会改变研究数字）：`valid_assets` 是"整个回测共用一个集合"，无法表达
-"某只股票从某个日期起不可交易"。要做到第八条，需要把它改成按日期的可交易掩码，并让回测消费它。
+**回归测试**：`tests/test_data/test_pipeline_pit_st_mask.py` 断言改动 D 之后的 ST 事件不会改变 D
+之前的股票池；`tests/test_backtest/` 覆盖 limit-up 买入、停牌买入、limit-down 卖出三种执行日场景。
+
+**仍存在的限制**：ST **历史**由数据源决定。Tushare/Baostock 只提供当前名称/上市状态
+（`st_available=False`，不伪造全 False 列），因此真实数据上只能退回静态/无 ST 筛选并明确标注；
+合成数据提供完整的 ST 公告时间序列，用于验证 PIT 语义。
 
 ---
 
@@ -211,4 +220,4 @@ provider 的**样本起始分类**。实测（synthetic，120 只，2023-01-01 ~
 
 ---
 
-*最后更新：2026-09-21*
+*最后更新：2026-10-20（Round 10 复核）*

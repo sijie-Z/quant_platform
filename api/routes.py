@@ -653,22 +653,218 @@ def _get_config_with_overrides(overrides: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Health
+# Health / readiness
 # ---------------------------------------------------------------------------
+
+_READINESS_SCHEDULER_STALE_SECONDS = 90.0
+_READINESS_DATA_MAX_TRADING_DAYS = 2
+
+
+def _metric_gauge_value(name: str) -> float | None:
+    """Read a label-free gauge from the process metrics collector."""
+    try:
+        from quant_platform.utils.metrics import get_metrics
+
+        entry = get_metrics().get_snapshot().get(name)
+        if not entry:
+            return None
+        value = entry.get("value")
+        return float(value) if isinstance(value, (int, float)) else None
+    except Exception:
+        return None
+
+
+def _trading_days_between(start_ts: float, end_ts: float) -> int:
+    """Exchange sessions between two epoch timestamps (Shanghai calendar)."""
+    from zoneinfo import ZoneInfo
+
+    from quant_platform.core.exchange_calendar import is_trading_day
+
+    tz = ZoneInfo("Asia/Shanghai")
+    start = datetime.fromtimestamp(start_ts, tz).date()
+    end = datetime.fromtimestamp(end_ts, tz).date()
+    if start >= end:
+        return 0
+    count = 0
+    cursor = start + timedelta(days=1)
+    while cursor <= end:
+        if is_trading_day(cursor):
+            count += 1
+        cursor += timedelta(days=1)
+    return count
+
+
+def _readiness_checks() -> tuple[bool, list[dict], dict]:
+    """Evaluate liveness of the trading components (S4 dead-man switch).
+
+    Readiness only judges components that are expected to be running: a
+    research-only web deployment is ready without an engine, while a running
+    engine with a dead loop, a stalled scheduler during the session, or data
+    older than two trading days is not.
+    """
+    now = time.time()
+    engine = _live_engine
+    engine_running = bool(engine is not None and getattr(engine, "_running", False))
+    scheduler = getattr(engine, "_scheduler", None) if engine is not None else None
+    scheduler_running = bool(
+        scheduler is not None and getattr(scheduler, "_running", False)
+    )
+
+    checks: list[dict] = []
+
+    market_open = False
+    if scheduler is not None:
+        try:
+            market_open = bool(scheduler.is_market_open())
+        except Exception:
+            market_open = False
+    # A live broker deliberately skips trading cycles outside the session;
+    # paper mode cycles continuously. The engine loop itself still beats
+    # every iteration (dead-man), but data is only expected when a fetch is
+    # due.
+    cycles_outside = getattr(engine, "cycles_outside_session", None) if engine else None
+    try:
+        expect_data = (
+            scheduler is None
+            or market_open
+            or bool(cycles_outside() if callable(cycles_outside) else False)
+        )
+    except Exception:
+        expect_data = True
+
+    last_cycle = _metric_gauge_value("last_engine_cycle_timestamp")
+    if engine_running:
+        interval = float(
+            getattr(engine, "_rebalance_interval", 300) or 300
+        )
+        # 2x the interval, with a 60s floor: a full-market fetch can take
+        # longer than 2x a 5s interval, and a slow-but-alive cycle must not
+        # flap readiness.
+        max_age = max(interval * 2.0, 60.0)
+        age = None if last_cycle is None else max(0.0, now - last_cycle)
+        ok = age is not None and age <= max_age
+        checks.append({
+            "name": "engine_cycle",
+            "ok": ok,
+            "last_timestamp": last_cycle,
+            "age_seconds": None if age is None else round(age, 1),
+            "max_age_seconds": max_age,
+            "reason": "" if ok else "engine loop heartbeat older than 2x interval",
+        })
+    else:
+        checks.append({
+            "name": "engine_cycle", "ok": True, "status": "not_running",
+            "last_timestamp": last_cycle,
+        })
+
+    last_tick = _metric_gauge_value("last_scheduler_tick_timestamp")
+    if engine_running and not scheduler_running:
+        checks.append({
+            "name": "scheduler_tick", "ok": False,
+            "last_timestamp": last_tick,
+            "reason": "engine is running but its scheduler thread is not",
+        })
+    elif scheduler_running:
+        age = None if last_tick is None else max(0.0, now - last_tick)
+        ok = age is not None and age <= _READINESS_SCHEDULER_STALE_SECONDS
+        checks.append({
+            "name": "scheduler_tick",
+            "ok": ok,
+            "last_timestamp": last_tick,
+            "age_seconds": None if age is None else round(age, 1),
+            "max_age_seconds": _READINESS_SCHEDULER_STALE_SECONDS,
+            "market_open": market_open,
+            "reason": "" if ok else "scheduler tick stale > 90s",
+        })
+    else:
+        checks.append({
+            "name": "scheduler_tick", "ok": True,
+            "status": "not_running", "last_timestamp": last_tick,
+        })
+
+    last_data = _metric_gauge_value("last_data_success_timestamp")
+    if engine_running and expect_data:
+        trading_days = (
+            None if last_data is None
+            else _trading_days_between(last_data, now)
+        )
+        ok = (
+            last_data is not None
+            and trading_days is not None
+            and trading_days <= _READINESS_DATA_MAX_TRADING_DAYS
+        )
+        checks.append({
+            "name": "market_data",
+            "ok": ok,
+            "last_timestamp": last_data,
+            "age_trading_days": trading_days,
+            "max_age_trading_days": _READINESS_DATA_MAX_TRADING_DAYS,
+            "reason": "" if ok else (
+                "no successful market-data fetch recorded"
+                if last_data is None
+                else "market data older than 2 trading days"
+            ),
+        })
+    else:
+        checks.append({
+            "name": "market_data", "ok": True,
+            "status": (
+                "market_closed" if engine_running else "engine_not_running"
+            ),
+            "last_timestamp": last_data,
+        })
+
+    ready = all(check.get("ok", False) for check in checks)
+    last_seen = {
+        "last_engine_cycle": last_cycle,
+        "last_scheduler_tick": last_tick,
+        "last_data_success": last_data,
+        "engine_running": engine_running,
+        "scheduler_running": scheduler_running,
+    }
+    return ready, checks, last_seen
+
 
 @router.get("/health")
 async def health():
+    """Liveness probe.
+
+    Deliberately does not fail when the exchange is closed: the Docker
+    healthcheck polls this endpoint. ``/api/readiness`` is the dead-man
+    switch that judges engine/scheduler/data heartbeats.
+    """
     with _run_lock:
         runs_completed = len(_run_store)
         runs_active = sum(
             1 for s in _run_status.values() if s.get("status") == "running"
         )
+    last_seen = {
+        "last_engine_cycle": _metric_gauge_value("last_engine_cycle_timestamp"),
+        "last_scheduler_tick": _metric_gauge_value("last_scheduler_tick_timestamp"),
+        "last_data_success": _metric_gauge_value("last_data_success_timestamp"),
+    }
     return {
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
         "runs_completed": runs_completed,
         "runs_active": runs_active,
+        **last_seen,
     }
+
+
+@router.get("/readiness")
+async def readiness():
+    """Dead-man switch: 503 when a running component's heartbeat is stale."""
+    from fastapi.responses import JSONResponse
+
+    ready, checks, last_seen = _readiness_checks()
+    payload = {
+        "status": "ready" if ready else "degraded",
+        "timestamp": datetime.now().isoformat(),
+        "checks": checks,
+        **last_seen,
+    }
+    return JSONResponse(status_code=200 if ready else 503, content=payload)
 
 
 # ---------------------------------------------------------------------------
@@ -2995,11 +3191,25 @@ async def activate_kill_switch(req: dict):
     action = req.get("action", "activate")
 
     if action == "activate":
-        monitor.activate_kill_switch(req.get("reason", "Manual activation"))
-        return {"status": "activated", "kill_switch": True}
+        monitor.activate_kill_switch(
+            req.get("reason", "Manual activation"), actor="api",
+        )
+        status = monitor.get_status()
+        return {
+            "status": "activated", "kill_switch": True,
+            "persisted": bool(status.get("persisted", False)),
+            "persist_error": bool(status.get("persist_error", False)),
+        }
     elif action == "deactivate":
-        monitor.deactivate_kill_switch()
-        return {"status": "deactivated", "kill_switch": False}
+        monitor.deactivate_kill_switch(
+            reason=req.get("reason", "Manual deactivation"), actor="api",
+        )
+        status = monitor.get_status()
+        return {
+            "status": "deactivated", "kill_switch": False,
+            "persisted": bool(status.get("persisted", False)),
+            "persist_error": bool(status.get("persist_error", False)),
+        }
     else:
         raise HTTPException(400, "action must be 'activate' or 'deactivate'")
 
@@ -3436,6 +3646,14 @@ _core_sm.set_transition_callback(
     )
 )
 _core_risk = get_risk_monitor()
+# S21: restore the persisted level/breaches/kill switch at startup and keep
+# every change durable. The key is tenant-scoped ('risk_state:default' here).
+try:
+    _core_risk.attach_persistence(
+        _core_store, tenant_id="default", audit=_core_audit, restore=True,
+    )
+except Exception:
+    logger.exception("Risk-state persistence setup failed")
 
 # Subscribe EventBus → WebSocket bridge for real-time push
 for _topic in ["order.filled", "order.rejected", "portfolio.snapshot",
@@ -3518,7 +3736,25 @@ def _start_live_engine(req: dict) -> dict:
     broker_type = req.get("broker", "simulated")
     initial_cash = req.get("initial_cash", 1_000_000)
     n_stocks = req.get("n_stocks", 30)
-    interval = req.get("rebalance_interval", 300)
+    # S20: 0/negative intervals made `Event.wait(timeout=...)` return
+    # immediately and hammer the broker; reject them at the edge with 422.
+    interval_raw = req.get("rebalance_interval", 300)
+    try:
+        if isinstance(interval_raw, bool) or not isinstance(
+            interval_raw, (int, float)
+        ):
+            raise ValueError
+        if not np.isfinite(float(interval_raw)):
+            raise ValueError
+        interval = int(interval_raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(
+            422, "rebalance_interval must be an integer number of seconds",
+        ) from exc
+    if interval != interval_raw or interval < 5:
+        raise HTTPException(
+            422, "rebalance_interval must be an integer >= 5 seconds",
+        )
 
     if broker_type == "simulated":
         broker = SimulatedBroker(initial_cash=initial_cash)
@@ -3905,10 +4141,20 @@ async def core_risk_kill_switch(req: dict):
     """Activate or deactivate the kill switch."""
     activate = req.get("activate", True)
     if activate:
-        _core_risk.activate_kill_switch(reason=req.get("reason", "Manual API activation"))
+        _core_risk.activate_kill_switch(
+            reason=req.get("reason", "Manual API activation"), actor="api",
+        )
     else:
-        _core_risk.deactivate_kill_switch()
-    return {"kill_switch_active": _core_risk.kill_switch_active, "risk_level": _core_risk.risk_level.value}
+        _core_risk.deactivate_kill_switch(
+            reason=req.get("reason", "Manual API deactivation"), actor="api",
+        )
+    status = _core_risk.get_status()
+    return {
+        "kill_switch_active": _core_risk.kill_switch_active,
+        "risk_level": _core_risk.risk_level.value,
+        "persisted": bool(status.get("persisted", False)),
+        "persist_error": bool(status.get("persist_error", False)),
+    }
 
 
 # ────────────────────────────────────────────────────────────────

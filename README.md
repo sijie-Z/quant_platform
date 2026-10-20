@@ -4,8 +4,8 @@
   <a href="https://github.com/sijie-Z/quant_platform/actions/workflows/ci.yml"><img src="https://github.com/sijie-Z/quant_platform/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/sijie-Z/quant_platform/actions/workflows/codeql.yml"><img src="https://github.com/sijie-Z/quant_platform/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
   <img src="https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/API-98%20endpoints-brightgreen" alt="API">
-  <img src="https://img.shields.io/badge/CLI-18%20commands-blueviolet" alt="CLI">
+  <img src="https://img.shields.io/badge/API-99%20endpoints-brightgreen" alt="API">
+  <img src="https://img.shields.io/badge/CLI-21%20commands-blueviolet" alt="CLI">
   <img src="https://img.shields.io/badge/前端-Vue%203%20%2B%20ECharts-orange" alt="Frontend">
   <img src="https://img.shields.io/badge/实盘-Paper%20%2F%20QMT-yellow" alt="Live Trading">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
@@ -22,9 +22,9 @@
 一个覆盖 **研究 → 验证 → 实盘** 全链路的 A 股量化平台：
 
 - **研究层**：20+ 因子引擎、IC/ICIR 评估、因子合成、Walk-Forward 验证、组合优化
-- **验证层**：Oracle IC / Known Alpha / MVO Audit 六项系统性验证；No-Lookahead 契约 8 条中 4 条已验证成立、3 条未接线（见「研究验证」一节）
+- **验证层**：Oracle IC / Known Alpha / Rank IC 对照等验证工具；No-Lookahead 契约 8 条均已实现并有回归测试守护，残余风险见「研究验证」与 HANDOVER
 - **实盘层**：实时行情、Paper Trading 模拟盘、QMT 实盘接口、实时风控熔断、执行算法
-- **展示层**：FastAPI 98 个 REST 端点 + WebSocket 实时推送 + Vue 3 Bloomberg 风格仪表盘
+- **展示层**：FastAPI 99 个 HTTP 端点 + WebSocket 实时推送 + Vue 3 Bloomberg 风格仪表盘
 
 > 设计原则：**先验证，后交易；先诚实，后优化。** 所有研究记录都携带 Trust Metadata（数据源、复权方式、PIT 状态、偏差警告），不做粉饰。
 
@@ -41,16 +41,16 @@
 | 因子处理 | 缩尾(1%/99%) → zscore 标准化 → 行业+市值中性化 |
 | 因子评估 | Rank IC / Pearson IC / ICIR / 分位数收益 / IC 衰减 / 相关性矩阵 |
 | 图网络因子 | 股票关联网络 + 4 种中心性度量（PageRank/特征向量/介数/度） |
-| LLM 因子 | 财经新闻情绪因子（Strategy 模式：关键词 ↔ OpenAI 可插拔） |
+| LLM 因子 | 财经新闻情绪因子（Strategy 模式：关键词 ↔ DeepSeek（OpenAI 兼容接口）可插拔） |
 
 ### 📈 回测与验证
 
 | 能力 | 说明 |
 |------|------|
-| 向量化回测 | 月频调仓 + 日频持仓漂移，热路径零 for 循环 |
-| A 股成本模型 | 佣金 0.03%（双边）+ 印花税 0.1%（仅卖出）+ 滑点 + 手数约束 |
+| 向量化回测 | 月频调仓 + 日频持仓漂移，横截面运算向量化（回测按交易日/调仓日推进，非逐股票循环） |
+| A 股成本模型 | 佣金 0.03%（双边，每笔最低佣金）+ 印花税 0.1%（仅卖出；CostModel 另支持 2023-08-28 起法定 0.05% 的按日期税率）+ 过户费 + 滑点 |
 | Walk-Forward | 滚动/扩展窗口 OOS 验证，每个 fold 内用 train-only 数据重算信号 |
-| 系统性验证 | Oracle Factor IC=1.0、Known Alpha Recovery、MVO 60/60 成功、Rank IC 手动对比 |
+| 系统性验证 | Oracle Factor / Known Alpha 诊断工具（`tools/diagnose_ic.py`、`tools/sanity_check.py`）、Rank IC 对手算、MVO/成本模型回归测试（历史 60/60 报告已作废，见「研究验证」） |
 | 风险建模 | VaR/CVaR、蒙特卡洛模拟、Barra 10 因子风险模型、压力测试 |
 
 ### 💹 实盘交易
@@ -59,16 +59,16 @@
 |------|------|
 | 实时行情 | AKShare 全市场快照 / 东方财富 WebSocket 推送 / Level 2 盘口 |
 | Paper Trading | 延迟模拟、部分成交、撤单失败、LOB 撮合、A 股规则（T+1/涨跌停/手数） |
-| 实盘接口 | QMT（xtquant）实盘 broker，代码格式自动转换，失败自动回退模拟盘 |
+| 实盘接口 | QMT（xtquant）实盘 broker，代码格式自动转换；连接失败直接中止（fail closed），不会自动回退模拟盘 |
 | 实时风控 | 仓位/行业/日亏损/回撤限额 + 5 级风险等级 + Kill Switch 熔断 |
 | 执行算法 | TWAP / VWAP / Iceberg + SmartRouter 智能路由 + TCA 成本分析 |
 | 运行内核 | EventBus（异步/背压/死信队列）+ StateMachine + 审计日志 + 调度器 |
 
 ### 🖥️ Web 平台
 
-- **FastAPI 98 端点**：pipeline / 分析 / 风控 / OMS / 实盘 / 监控 全覆盖
+- **FastAPI 99 个 HTTP 端点 + 1 个 WebSocket**：pipeline / 分析 / 风控 / OMS / 实盘 / 监控 全覆盖；其中 7 个分析/监控端点从存储 run 无法计算，返回 `available:false` 及原因（见「已知限制」）
 - **WebSocket 实时推送**：EventBus → WS 桥接，交易事件实时到达前端
-- **Vue 3 + ECharts 仪表盘**：Bloomberg 风格 11 行面板（净值曲线/因子热力图/风险仪表/持仓/归因）
+- **Vue 3 + ECharts 仪表盘**：Bloomberg 风格 12 行面板（净值曲线/因子热力图/风险仪表/持仓/归因）
 - **监控**：Prometheus 指标 + Grafana 16 面板模板 + 合规审计导出
 
 ---
@@ -76,7 +76,7 @@
 ## 快速开始
 
 ```bash
-# 1. 环境
+# 1. 环境（Python 3.11 / 3.12；CI 与 Docker 使用 3.12）
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 # core/store.py re-exports the local quant_core package; the editable
@@ -89,37 +89,85 @@ python -m venv .venv
 #    做研究/回测结论时请把 data.synthetic.embedded_alpha 设为 false。
 .venv\Scripts\python main.py run
 
-# 3. 启动 Web 平台（FastAPI + Vue）
+# 3. 构建前端（可选；Node 22，产物 frontend/dist 已 gitignore，不随仓库分发）
+cd frontend
+npm ci
+npm run build
+cd ..
+
+# 4. 启动 Web 平台（FastAPI + 已构建的 Vue 静态文件）
 .venv\Scripts\python main.py web
 # 浏览器打开 http://localhost:8000
+# 没有 frontend/dist 时仍可启动，但只提供 API（控制台会提示先构建前端）。
 # 默认只监听 127.0.0.1。远程访问请设置 QUANT_API_TOKEN，并在 UI Settings
 # 填入同一 token；未设置 token 时所有 /api（除 /api/health）仅允许回环访问。
 
-# 4. 运行所有测试
+# 5. 运行所有测试
 .venv\Scripts\python -m pytest tests/ -q
 ```
 
-### CLI 命令（20 个）
+前端开发模式：`cd frontend && npm ci && npm run dev`（Vite 5173，`/api` 代理到 127.0.0.1:8000）。
+
+> 上面的 Windows 示例使用 cmd/PowerShell 的 `.venv\Scripts\...`；在 Git Bash 中请改为
+> `.venv/Scripts/python`、`.venv/Scripts/pip`（或先 `source .venv/Scripts/activate`）。
+
+### Docker 部署（仅 API 服务）
 
 ```bash
-python main.py run                 # 完整流水线（数据→因子→信号→回测→报告）
-python main.py analyze             # 分析已有结果
-python main.py compare             # 多策略对比
-python main.py sweep               # 参数网格搜索
-python main.py walkforward         # Walk-Forward OOS 验证
-python main.py ml train/signal     # ML Alpha 信号（XGBoost/LightGBM）
-python main.py trade               # Paper Trading 仿真
-python main.py trade --broker qmt  # QMT 实盘（需 miniQMT）
-python main.py web                 # Web 服务
-python main.py research            # 研究 Agent
-python main.py screen              # 选股筛选
-python main.py execute             # 执行算法
-python main.py factor-store        # 因子健康度
-python main.py gate                # 策略门禁评估
-python main.py strategy            # 多策略管理
-python main.py check-lookahead     # 前视偏差检测
-python main.py config              # 配置管理
-python main.py profile             # 性能分析
+# QUANT_API_TOKEN 必填：容器发布 8000 端口后不再是回环地址，
+# 未设置 token 时所有 /api 请求都会被拒绝。
+QUANT_API_TOKEN=your-token docker compose up -d --build
+```
+
+`docker-compose.yml` 只定义 `api` 服务，**不包含 PostgreSQL**。持久化卷：
+`/app/data`（交易库/审计/EOD/NAV/引擎状态）、`/app/results`、`/app/.quant_cache`、
+`/app/.quant_versions`、`/app/.cache`、`/app/.agent_cache`、`/app/.sentiment_cache`；
+`stop_grace_period: 30s` 为引擎停止、状态落盘和 SQLite WAL checkpoint 留出时间。
+运维相关环境变量：`ALERT_WEBHOOK_URL`（告警 JSON POST）、`ALERT_WEBHOOK_TIMEOUT`、
+`QUANT_RETENTION_*_DAYS`（scheduler 每日保留任务；手动 retention 命令用 CLI 参数）；
+用法见 `docs/OPS_RUNBOOK.md` 第 12 节。
+PostgreSQL 由 `data/providers/postgres_provider.py` 支持，但需自行部署并在配置中选择
+`data.provider: postgres`，compose 不会替你启动数据库。
+
+### CLI 命令（21 个）
+
+```bash
+# 研究/回测流水线
+python main.py run                      # 完整流水线（数据→因子→信号→回测→报告）
+python main.py run --use-baostock       # 使用 Baostock 真实数据
+python main.py run --force              # 跳过缓存重算
+python main.py walkforward --folds 6 --method expanding   # Walk-Forward OOS 验证
+python main.py analyze --results-dir ./results            # 分析已有结果
+python main.py compare --optimizers equal_weight,risk_parity
+python main.py sweep --optimizers equal_weight,mean_variance --frequencies monthly,weekly
+python main.py profile                  # 各阶段耗时分析
+python main.py gate                     # 策略门禁评估
+python main.py check-lookahead          # 前视偏差检测
+
+# 因子/研究工具
+python main.py factor list              # 单因子研究报告
+python main.py factor-store stats       # 因子健康度/研究存储
+python main.py ml train --model lightgbm
+python main.py ml signal --model xgboost
+python main.py research report          # LLM 归因报告
+python main.py research validate --mode quick
+python main.py screen --rules "pe_ratio=lt:30,roe=gt:0.15"  # 选股筛选
+
+# 交易/执行
+python main.py trade                    # Paper Trading 仿真（默认 30 天、5 只蓝筹）
+python main.py trade --broker paper --days 60 --cash 5000000
+python main.py trade --broker qmt --universe "600519,000858,000001" --days 1  # QMT 实盘（需 miniQMT；真实券商每次只支持 1 个交易所日）
+python main.py execute                  # 因子→信号→订单→成交全链路
+python main.py strategy list            # 多策略管理
+
+# 配置/缓存/运行记录
+python main.py config list              # 配置版本管理
+python main.py cache list               # 流水线缓存
+python main.py runs list                # 历史运行与 validity
+python main.py data retention --archive-dir ./archive  # 归档并清理超过保留期的行
+
+# Web
+python main.py web
 ```
 
 ---
@@ -129,7 +177,7 @@ python main.py profile             # 性能分析
 ```
 quant_platform/
 │
-├── main.py                 # CLI 入口（18 命令）
+├── main.py                 # CLI 入口（21 命令）
 ├── app.py                  # FastAPI 应用
 │
 ├── core/                   # 运行内核：EventBus v2 / Store / StateMachine / Audit / Scheduler
@@ -144,8 +192,8 @@ quant_platform/
 ├── trading/                # 实盘：实时行情 / Paper / QMT / LiveEngine / SignalGenerator
 ├── strategy/               # 多策略管理
 ├── agent/                  # LLM：情绪因子 + RAG 研究 Agent
-├── api/                    # FastAPI 路由（98 端点）
-├── frontend/               # Vue 3 仪表盘（35 组件）
+├── api/                    # FastAPI 路由（99 HTTP 端点 + 1 WebSocket）
+├── frontend/               # Vue 3 仪表盘（37 组件）
 ├── reporting/              # 报告：文本/图表/自包含 HTML
 ├── operations/             # 基金运营：NAV / 投资者门户
 ├── compliance/             # 合规审计导出
@@ -160,42 +208,29 @@ quant_platform/
 ├── tools/                  # 研究工具：common_runner / sanity_check / attribution
 │
 ├── docs/                   # 文档：架构 / 里程碑 / 研究报告 / 协议
-├── tests/                  # 单元测试（81 个测试文件，覆盖全部模块）
+├── tests/                  # 单元测试（193 个测试文件，2,662 条用例，覆盖全部模块）
 ├── config/                 # YAML 配置（零硬编码）
-└── requirements.txt        # 精确版本锁定
+└── requirements.txt        # Python 依赖（版本锁定；adata 例外见下文）
 ```
 
 ---
 
 ## 研究验证
 
-本平台核心研究链路经过系统性验证（详见 `docs/VALIDATION_REPORT.md`）：
+2026-09-13 的巡检曾列出若干前视偏差与成本模型缺陷（BUG-21/23/03 等）。这些缺陷已在 2026-09/10 的修复轮次中修复，并各自有回归测试守护：
 
-| 验证项 | 方法 | 结果 |
-|--------|------|------|
-| Oracle Factor | 已知未来收益作为因子 → Rank IC | **IC = 1.000000**（计算与数据对齐正确） |
-| Known Alpha Recovery | 生成含已知 Alpha 的数据 → 因子引擎恢复 | **IC 与理论值一致** |
-| Rank IC 对比 | 手动 vs 官方计算 | **差异 < 0.001%** |
-| MVO Audit | 60 次调仓全日志 | **60/60 Success, 0 Fallback** |
-| WalkForward | 多 fold 滚动 OOS | ⚠️ **信号生成成立，指标窗口不成立** —— 每折信号确实只用 train-only 数据重算（已验证），但**报告的 OOS 指标覆盖 train+test**。见 BUG-21 |
-| No-Lookahead | 8 条不可协商契约 | ⚠️ **4 条已验证成立，3 条未接线，1 条未核** —— 见下方 |
+| 历史缺陷 | 当前状态 | 实现 / 回归测试 |
+|----------|----------|-----------------|
+| Walk-Forward OOS 指标覆盖 train+test（BUG-21） | 已修复：OOS 指标只取测试窗 | `backtest/walkforward.py` |
+| 财务数据未按 publish_date 过滤 | 已修复：合成数据按公告日 reindex；provider 提供公告日时按公告日 | `data/providers/synthetic.py`、`data/pipeline.py` |
+| 行业中性化只用静态 map | 已修复：按日期的 `sector_panel` 接入中性化 | `factors/processing.py`、`main.py` |
+| ST 过滤用全样本 `is_st` | 已修复：按公告日构建 `tradable_mask`；无 ST 历史的数据源显式标记不可用 | `data/pipeline.py`、`data/providers/*` |
+| ML CV 按 (日期, 股票) 拍平、训练/测试共享日期（BUG-23） | 已修复：按日期切分 + purge/embargo | `alpha/ml_signal.py` |
+| 成本模型系统性减半（BUG-03） | 已修复：印花税仅卖出、按资产拆分买卖名义额 | `backtest/cost_model.py`、`backtest/engine.py` |
 
-**逐条核对结果**（2026-09-13 巡检实测，详见 `docs/AUDIT_BUG_PATROL_2026-09-13.md`）：
+当前仍然存在的限制（不属于上述历史缺陷）：多租户隔离（#75 产品定位未定）、7 个分析/监控端点返回 `available:false`（见「已知限制」）、WebSocket token 的旧版查询串回退、跨数据源价格基准未统一、无增量数据更新路径。
 
-| 契约 | 状态 |
-|------|------|
-| 第一条 价格因子只用 signal_date 及之前 | ✅ 成立（截断测试 max\|diff\| = 0） |
-| 第二条 Alpha 权重只用历史 IC | ✅ 成立（`ic_s[ic_s.index < date]`） |
-| 第三条 基本面用 `publish_date` 而非期末 | ⚠️ **只实现了一半** —— 生成并保留了 `publish_date`，但**从未按它过滤**。实测 2021-06-30 的财报在 2021-07-01 即可见（`publish_date` 为 2021-08-17）。做 PIT 的 `get_financials_as_of()` 存在但只被测试调用 |
-| 第四条 Walk-Forward 每折用 train-only 重算信号 | ✅ 成立 |
-| 第五条 合成数据嵌入式 Alpha 仅用于演示 | 未核 |
-| 第六条 IC 计算 shift 链条正确 | ✅ 成立（与手算逐点对照 max\|diff\| = 0.00e+00） |
-| 第七条 行业分类用生效日期 | ❌ 未实现（`processing.py` 只接受静态 map） |
-| 第八条 ST 状态用公告日期 | ❌ 未实现（`pipeline.py:95` 用全样本 `is_st` 过滤） |
-
-> **另有两项验证能力当前不达标**（见 `docs/AUDIT_BUG_PATROL_2026-09-13.md`）：
-> ML 交叉验证按 `(日期, 股票)` 拍平行切分，训练与测试**共享真实日期**（BUG-23）；
-> 交易成本模型系统性减半（BUG-03）。**受影响的既有回测结果需要重新解释。**
+> `docs/VALIDATION_REPORT.md` 是 2026-06-20 的历史报告，数字早于上述修复，已标注 SUPERSEDED，不应作为当前证据引用。当前状态以 `docs/HANDOVER.md` 的第十轮记录为准。
 
 **诚实研究记录**（`lab/`）：每次因子运行都会在 SQLite Registry 中记录数据源、复权方式、PIT 状态、偏差警告，失败运行同样记录——系统从不隐藏自身的不确定性。
 
@@ -212,16 +247,26 @@ quant_platform/
 
 **核心发现**：A 股市场存在强均值回归 Alpha（40–80 交易日连续时间结构），但固定频率执行（月频）下因采样混叠系统性失效——信号存在 ≠ 策略可投资。这正是平台"诚实研究"的价值：不粉饰数据。
 
+> 上述里程碑是 2026 年早期的研究记录。涉及回测收益/IC 的数字早于 2026-09 的修复轮次，需在修正后的代码与数据上重跑后才能引用；判据见 `docs/HANDOVER.md` 第十节。
+
 ---
 
 ## 已知限制
 
 | 限制 | 说明 |
 |------|------|
-| 部分数据源需要 API key | Tushare（token）、OpenAI（LLM 因子） |
-| QMT 实盘需环境 | 需券商 miniQMT + xtquant 包 + 实盘账号 |
+| 部分数据源需要 API key | Tushare（token）、DeepSeek（LLM 因子，OpenAI 兼容接口） |
+| QMT 实盘需环境 | 需券商 miniQMT + xtquant 包 + 实盘账号；连接失败直接中止（fail closed），不会回退模拟盘 |
 | Level 2 数据 | 仅回放/模拟，无真实券商 L2 接入 |
-| 生产存储 | 默认 SQLite；生产环境建议切换 PostgreSQL（docker-compose 已包含） |
+| 生产存储 | 默认 SQLite；PostgreSQL 由 `data/providers/postgres_provider.py` 支持，需自行部署（docker-compose 不包含数据库） |
+| 多租户隔离 | API 不提供租户隔离（#75 产品定位未定） |
+| 7 个端点不可用 | `/api/walkforward`、`/api/risk/decompose`、`/api/analysis/ic-decay`、`/api/analysis/correlation`、`/api/monitor/tca-summary`、`/api/monitor/factor-status`、`/api/monitor/capacity-gauge` 从存储 run 无法计算，返回 `available:false` 及原因；替代路径见 HANDOVER |
+| WebSocket token 回退 | 当前前端用 `bearer.<token>` 子协议；`?token=` 仅为旧客户端保留 |
+| 跨数据源价格基准 | Tushare / Baostock 均产出后复权（hfq）价格，但跨数据源的价格基准尚未统一 |
+| 数据更新 | 无增量 append 路径，每次按区间重新拉取 |
+| 交易所日历 | 内置休市表覆盖至 2026 年；2027 年休市日需通过 `QUANT_EXCHANGE_HOLIDAYS` 追加 |
+| 回测交易性 | 执行日已按 `tradable_mask` / 涨跌停阻断成交；整手约束在执行层生效，向量化回测仍为权重层面 |
+| 可选依赖 | `adata` 为 `>=1.0.0`（其余依赖精确锁定）。仅当 `data.validated: true` 时作为第二数据源做跨源校验；不可用时记录警告并跳过校验（不阻断主数据源） |
 | **仅支持单进程部署** | 见下方"部署约束：单 worker" |
 
 ### 部署约束：单 worker
@@ -246,13 +291,14 @@ worker** 运行：不要给 `uvicorn` / `main.py web` 加 `--workers N` 或 `--r
 
 | 文档 | 内容 |
 |------|------|
+| `docs/HANDOVER.md` | 当前状态、历次修复记录与第十轮交接（**先读这份**） |
 | `docs/NO_LOOKAHEAD_CONTRACT.md` | 前视偏差零容忍契约（8 条铁规） |
-| `docs/VALIDATION_REPORT.md` | 六项系统性验证报告 |
+| `docs/VALIDATION_REPORT.md` | 2026-06-20 历史验证报告（已 SUPERSEDED，仅存档） |
 | `docs/KERNEL_ARCHITECTURE.md` | 实盘运行内核（控制平面）设计（提案，未接入运行路径） |
 | `PRODUCTION_PLAYBOOK.md` | 从回测到实盘的完整操作手册 |
 | `docs/PRODUCTION_ARCHITECTURE_V1.md` | 生产架构 v1（目标设计，未实现） |
 | `data/ASHARE_PITFALLS.md` | 10 大 A 股实盘陷阱及处理 |
-| `docs/OPS_RUNBOOK.md` | 运维手册 |
+| `docs/OPS_RUNBOOK.md` | 运维手册（启停、故障、备份/恢复、升级迁移） |
 | `docs/research/` | 系统研究报告（Alpha Discovery / 市场结构 / Regime） |
 
 ---

@@ -1,4 +1,4 @@
-# 交接说明（2026-09-23）
+# 交接说明（2026-09-23，更新至 2026-10-20 第十轮）
 
 > 这份文档写给接手这个仓库的人。它记录**当前状态、改过什么、还剩什么、以及那些代码里看不出来的坑**。
 > 未完成的工作全部开在 [Issues](https://github.com/sijie-Z/quant_platform/issues) 上，编号在下面对应。
@@ -161,13 +161,13 @@
 
 ---
 
-## 七、环境上的坑（代码里看不出来的）
+## 七、环境上的坑（历史开发机备注）
 
-- **必须用 `.venv312`**（Python 3.12 + 完整依赖）。仓库里还有一个 `.venv`，那是 Python 3.14 + 残缺依赖，用它跑出来的失败全是环境问题，不是代码问题。
-- **pytest 必须加 `--basetemp=/d/tmp_pytest_probe`** —— `pytest-of-admin` 那个临时目录的 ACL 是坏的，不加会有一百多个莫名其妙的 `tmp_path` 错误。
-- **ruff 用 `.venv` 里那个**（0.15.12，和 CI 的 pin 一致）。
+- 按 README 创建 `.venv`（Python 3.11/3.12；CI 与 Docker 使用 3.12）。`.venv312` / `.venv` 是旧开发机的本地目录，不在仓库里，不要当作仓库指令。
+- **pytest 如需自定义 `--basetemp`**：这台开发机曾出现 `pytest-of-admin` 临时目录 ACL 损坏；在正常机器上不需要这个 workaround。
+- **ruff 版本以 CI 的 pin 为准**（0.15.12）。
 - **CI 跑 `ruff check .`（整仓库）**，只查自己改的文件会漏掉 import 块规则 —— 已经因此挂过一次 CI。
-- **代理**：`HTTPS_PROXY=http://127.0.0.1:7899`。`gh`/git 走它；它偶尔会断，断了直连 GitHub 有时也能通。
+- **代理**：这台历史开发机上曾是 `HTTPS_PROXY=http://127.0.0.1:7899`；仅作环境备注。
 - **这台机器在内存压力下会崩解释器**（WMI 服务 + pandas access violation，以及 `bash: fork: Resource temporarily unavailable`），同时跑多个 agent 的测试套时特别明显。
 - **所有 agent 提交的 git 作者都是 `Builder`** —— 从 `git log` 分不出哪次是哪个 agent 做的。
 
@@ -214,7 +214,7 @@
 | 有测试守护的性质（第八节那三套） | 有 Registry 行但 `validity` 未标注的结论 | 任何 2026-09 修复**之前**产生的回测性能数字 |
 | 真实数据 + 纯 IC 测量（无交易） | 合成数据上的因子研究（#58） | `docs/ARCHITECTURE_V2.md` 里的方针陈述（#73） |
 | `MARKET_STRUCTURE_DISCOVERY_V3_REPORT.md`（80d IC −0.081, t=−4.58） | 2026-07 之前的所有 `docs/research/` 报告 | `PRODUCTION_ARCHITECTURE_V1.md` 的风控数字（#78） |
-| 该次提交的 git 历史 | | `CLAUDE.md` 的计数（实测 1631 测试 / 101 端点 / 20 命令，文档写的是 1077 / 97 / 18） |
+| 该次提交的 git 历史 | | `CLAUDE.md` 的计数（2026-10-20 已按 2,662 用例 / 99 HTTP + 1 WS / 21 命令校正；仍以实测为准） |
 
 完整的研究产物分档在 #72。
 
@@ -335,7 +335,7 @@
 
 ### 2026-10-20 第八轮（并发一致性 / 测试有效性 / CLI 与端点契约）
 
-这一轮以“实测”为主：并发一致性压测、变异检验（mutation testing）、CLI 全命令冒烟、99 个 API 端点全扫。所有修复带回归测试。
+这一轮以“实测”为主：并发一致性压测、变异检验（mutation testing）、CLI 全命令冒烟、当时 98 HTTP + 1 WS 端点全扫。所有修复带回归测试。
 
 | 领域 | 修复 |
 |---|---|
@@ -344,7 +344,7 @@
 | IC 评估 | 硬编码“每个截面至少 30 个有效资产”使 30 股票池 21/21 因子 IC 全 NaN（n_obs 0–3），门禁误报“弱 ICIR”；改为 `min(30, max(10, panel_width // 2))` 并接入 numba 与 pandas 两条路径，宽度不足时输出明确 warning；全部因子无观测时门禁 SKIPPED 并说明观测不足。30 股票池现在 19/21 因子可评估（N=133–250），门禁 FAIL 是真实的弱 ICIR |
 | ML | 260 天样本下 `ml train` / `ml signal` 曾以退出码 0 输出零样本与空信号；现在短历史自适应首个训练折（≥30 日期、≥60 样本、≥2 特征），样本不足抛 `InsufficientTrainingData`，CLI 退出 1、API 返回 422；全 NaN 特征显式丢弃，训练失败不落模型与 sidecar |
 | CLI | `check-lookahead` 已注册但 dispatch 缺失（只打印 help 并退出 1）；接入并新增“所有注册命令均有 dispatch”的静态守卫。`run` 从不生成 HTML 与 metrics.json，`research report` 因无生产者而死路；现在 `run` 写出自包含 HTML 与 metrics.json，`research report` 可回退读取 daily_returns.csv。`walkforward --folds` 只打印不生效；校验器新增 `n_folds` 并截断。`screen` 把 z-score 当 PE 阈值；CLI 与 API 均改用原始因子面板，未知因子返回 422。前视检测器在 Windows GBK 控制台因 ⚠/✓ 字符崩溃，输出改为 ASCII；排名对 1e-14 求和噪声敏感导致同一日期信号随面板长度变化（检测器把自己的因果信号判为有偏），排名前统一 `round(12)` |
-| API | 端点全扫（98 HTTP + 1 WS）确认 12 条缺陷。P0：已完成 run 因 `exposure.top_holdings.pnl_pct` 与不可评估因子统计为 NaN，`GET /result`、`/factors` 返回 500；pnl 只在两个价格都有限时计算、跳过不可评估因子，并在入库前用 `json.dumps(allow_nan=False)` 守卫。Barra 横截面回归未剔除停牌 NaN 收益，1236/1236 个因子收益全 NaN、协方差 100/100 NaN，两个端点每次 500；过滤非有限行并对协方差 `nan_to_num`。再分配资金不重置 `current_value`，1 亿 +1% 被算成 -99%；重置基线并拒绝未知策略。`trading/stop` 后 `run-once` / `order` 仍执行，检查 `_running`。OMS 与 smart-route 接受空 ticker，改 422。parallel sweep 非法参数 500→422；regime 数据不足 200+error→409；`portfolio/live` 回退最近 7 天并返回 `data_date/stale`；`data/quality` 标注 `source/synthetic/data_date_range`；QMT 不可用与缺 akshare 返回 503 |
+| API | 端点全扫（当时 98 HTTP + 1 WS）确认 12 条缺陷。P0：已完成 run 因 `exposure.top_holdings.pnl_pct` 与不可评估因子统计为 NaN，`GET /result`、`/factors` 返回 500；pnl 只在两个价格都有限时计算、跳过不可评估因子，并在入库前用 `json.dumps(allow_nan=False)` 守卫。Barra 横截面回归未剔除停牌 NaN 收益，1236/1236 个因子收益全 NaN、协方差 100/100 NaN，两个端点每次 500；过滤非有限行并对协方差 `nan_to_num`。再分配资金不重置 `current_value`，1 亿 +1% 被算成 -99%；重置基线并拒绝未知策略。`trading/stop` 后 `run-once` / `order` 仍执行，检查 `_running`。OMS 与 smart-route 接受空 ticker，改 422。parallel sweep 非法参数 500→422；regime 数据不足 200+error→409；`portfolio/live` 回退最近 7 天并返回 `data_date/stale`；`data/quality` 标注 `source/synthetic/data_date_range`；QMT 不可用与缺 akshare 返回 503 |
 | 日志/文档 | `get_logger(__name__)` 双重前缀（`quant_platform.quant_platform.*`）修正；HANDOVER 补充本轮记录 |
 
 验证：全量测试 **2074 passed / 3 skipped / 0 failed**（3m20s），ruff 全绿。CLI 实测：30 股票 `run` 得到 19/21 因子有限 IC（N=133–250）、HTML+metrics 落盘；`check-lookahead` 报告 0 偏差并退出 0；`ml train` 训练 3434 样本、`ml signal` 非空；`walkforward --folds 1` 实际执行 1 折。
@@ -361,4 +361,52 @@
 | 前端契约 | `exposure_report` 返回 `sector_exposure`（扇区面板此前永远为空）。因子散点/归因改用资产级前向收益面板（此前传入组合收益 Series，异常被吞，两个面板永远为空），并去掉第二次 `shift(-1)`。WalkForward 在 `available:false` 时显示原因而非 0 folds；MonitorDashboard 统一风险等级大小写并从后端播种 kill switch/实时限额；WS 完成不再与轮询重复应用、取消后不再拉取结果，失败 run 会广播；DataQuality/MonteCarlo/RiskDecomposition 正确识别错误/不可用；Compare/Sweep 用并集列，首行失败不再隐藏后续成功结果；LivePortfolio 显示 `data_date/stale`，OrderBlotter 拒绝用非当日收盘价成交；Regime 相关性标记不可用、推荐语映射修正；RiskMonitor 圆点/日亏条、超额峰度阈值、压力情景名、命令面板、Vite WS 代理、QMT 服务地址字段、Settings 明确为浏览器本地偏好 |
 | API 安全/资源 | 无 token 时**所有** `/api`（除 health）仅回环可访问，有 token 时全部鉴权；`/docs`、`/openapi.json` 纳入保护；CORS 预检不再被鉴权中间件拦截；默认监听改为 127.0.0.1（容器显式 0.0.0.0 + 必须设置 token）。`/api/screen` 的 config 路径限制在服务端 `config/` 内（路径穿越/配置注入）。OMS `limit_price`、策略 allocation/daily_return、`risk/check-order` 拒绝 NaN/Inf，校验错误响应统一清洗非有限值。运行窗口 ≤10 年且 start<end，sweep/parallel grid/worker/基本面代码数量设上限，Store 的 limit/days 统一钳制。失败 run 不再返回 traceback/绝对路径。前端 API token 改为 localStorage 运行时读取，不再打包进公开 bundle |
 
-验证：全量测试 **2195 passed / 3 skipped / 0 failed**（3m06s），ruff 全绿，前端生产构建通过。CLI 30 股票实测：新交易日历下 run 正常（Total Return 14.29%、Sharpe 0.56），HTML+metrics.json 落盘。已知未处理：多租户隔离（#75 产品定位未定，当前 API 不提供租户隔离）；7 个分析端点仍显式 `available:false`；WS token 仍走查询串（uvicorn 访问日志可见）；回测尚未按执行日可交易性阻断；交易所日历表覆盖至 2026 年。
+验证：全量测试 **2195 passed / 3 skipped / 0 failed**（3m06s），ruff 全绿，前端生产构建通过。CLI 30 股票实测：新交易日历下 run 正常（Total Return 14.29%、Sharpe 0.56），HTML+metrics.json 落盘。Round 9 时已知未处理：多租户隔离（#75 产品定位未定，当前 API 不提供租户隔离）；7 个分析端点仍显式 `available:false`；WS token 仍走查询串（uvicorn 访问日志可见）；回测尚未按执行日可交易性阻断；交易所日历表覆盖至 2026 年。**Round 10 已接入执行日交易性门禁；其余见第十轮。**
+
+### 2026-10-20 第十轮（全仓审计后的系统加固 + 文档准确性）
+
+第十轮以「只读审计 → 并行修复 → 内部对抗评审」的方式覆盖整个仓库，基线提交
+`40a5bcf`，全量测试 **2659 passed / 3 skipped / 0 failed**（基线 `40a5bcf` 为 2567 passed / 3 skipped；本波次 +92 条用例），ruff 全绿。
+这一轮不是单点修 bug，而是把「宣称」与「实现」逐项对齐。
+
+| 波次 | 主要内容 |
+|---|---|
+| API 性能/并发/生命周期 | 移除 async 路径里的阻塞 sleep；Store/pandas 计算移入线程池；pipeline 与 analytics 分离的有界池（饱和返回 429 + Retry-After）；`/trading/start` 并发锁；WebSocket 每客户端有界队列、慢客户端丢弃、断开清理；Store 幂等索引；lifespan 有序关闭并可在下次启动重建；run registry 加锁与状态感知清理；响应边界（limit/矩阵单元）；懒加载单例锁；500/503 错误脱敏；持仓批量落库；合规导出分页（>1000 行）；WS 子协议 token |
+| 运维 wave 1 | `trade` 真实成功/失败语义、QMT fail closed、真实行情校验、交易所日历驱动；docker-compose 持久化卷 + `stop_grace_period` + `QUANT_API_TOKEN` 必填；Grafana 面板只绑定真实指标；真实数据源不可用默认 fail closed 并把 requested/effective provider 写入 `metrics.json`；缓存/日志/配置版本有上限与清理；配置加载校验；配置版本原子写 + 密钥脱敏；每 run 独立输出目录；daemon watermark；监控脚本非零退出；Prometheus 格式 |
+| 运维 wave 2 | 调度器只在收盘后跑 EOD、不再使用硬编码 100 万权益、启动补齐遗漏交易日；`AlertSink`（日志常开 + `ALERT_WEBHOOK_URL`，5 分钟去重）；`GET /api/readiness` dead-man switch；`main.py data retention`（CSV 归档 → 删除 → checkpoint/VACUUM，`QUANT_RETENTION_*_DAYS`）；优雅停机；风控状态持久化；新写入的 P&L/会话/事件时间戳统一为 Asia/Shanghai naive（旧行不迁移） |
+| 数据 | Tushare 批次/复权失败 fail closed、不写部分缓存；Baostock 财报面板、失败不缓存、退市名单、显式 `st_available=False`；Tushare 历史成分 + 退市名单；Postgres 契约；单位统一（volume 股、turnover 分数、amount CNY）；Adata 契约；连接池键与空帧语义；pipeline 合约校验、重复行、`adj_factor`、空财务、PIT 掩码、板块限价、退市推断；合成数据停牌/上市/公告日 |
+| 回测 | 执行日可交易性门禁（`tradable_mask` / `limit_up` / `limit_down`，按执行日而非信号日）；ISO 周年分组；Walk-Forward 接受完整引擎配置、OOS 指标只取测试窗；成本模型（最低佣金、过户费、按资产名义额、日期化印花税）；市值加权基准；per-instrument 费率；成交量/波动率进入冲击模型；tick 引擎成交记账/T+1；回撤日期映射；年化口径；首月现金 warm-up；`weights_history` 只记录已执行调仓 |
+| 组合/风险数学 | RiskParity 改为凸对数障碍；Barra Ledoit-Wolf 强度；MVO 单位/风险项/目标波动；因子风险 Euler 分解；Monte Carlo 路径统计；bootstrap/Student-t 修正；归因 t 统计；投资者 Sharpe 统一口径；VaR 随机种子；long-only 校验；缺失收益协方差；Barra Newey-West；多重检验修正 |
+| 测试有效性 | 变异审计 **11/11 KILLED**；新增精确公式、边界、账本、门禁测试；z-score numba 与 pandas 的 ddof 对齐 |
+| 文档（本轮） | README / AGENTS / CLAUDE / HANDOVER / VALIDATION_REPORT / PRODUCTION_PLAYBOOK / OPS_RUNBOOK / ASHARE_PITFALLS / BEGINNER_GUIDE / NO_LOOKAHEAD_CONTRACT 按当前代码校正：QMT fail closed、可运行 CLI、Docker/PostgreSQL 事实、7 个 `available:false` 端点、PIT 真实状态、后复权 hfq（原文档误写前复权 qfq）、测试/端点/命令/组件计数、备份恢复与升级迁移、`metrics.json` provenance；VALIDATION_REPORT 标注 SUPERSEDED |
+
+**当前计数（2026-10-20 交接实测）**：`python main.py --help` 列出 **21 个命令**
+（新增 `data retention`）；`create_app` 暴露 **99 个 HTTP 端点 + 1 个 WebSocket**；
+pytest 收集 **2,662 条用例**（2,659 passed / 3 skipped；基线提交 40a5bcf 为 2567 passed / 3 skipped）；测试文件 193 个；
+Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --collect-only -q`
+和 `create_app().routes` 为准。
+
+**已知仍未处理（诚实清单，交接时）**：
+
+1. **多租户隔离**（#75）：产品定位未定，API 不提供租户隔离；`core/context.py` 的
+   TenantContext 不是端到端隔离。
+2. **7 个分析/监控端点从存储 run 无法计算**，显式返回 `available:false` 及原因：
+   `/api/walkforward`、`/api/risk/decompose`、`/api/analysis/ic-decay`、
+   `/api/analysis/correlation`、`/api/monitor/tca-summary`、
+   `/api/monitor/factor-status`、`/api/monitor/capacity-gauge`。替代路径分别是
+   `main.py walkforward`、`POST /api/barra/decompose`、`main.py run` 和预计算容量曲线。
+3. **WebSocket token**：当前前端用 `bearer.<token>` 子协议；`?token=` 仅为旧客户端保留。
+4. **回测整手限制**：执行层（TWAP/VWAP/Iceberg、paper broker、OMS）强制整手，
+   向量化日频回测仍是权重层面（已明确标注，未隐藏）。
+5. **交易所日历**：内置休市表覆盖至 2026 年；2027 年休市日需通过
+   `QUANT_EXCHANGE_HOLIDAYS` 追加。
+6. **跨数据源价格基准**：Tushare/Baostock 均为后复权 hfq、调整只应用一次，但跨源
+   价格基准尚未统一（D15/D41）。
+7. **增量数据**：无增量 append 路径（D32），每次按区间重新拉取。
+8. **ST 历史**：Tushare/Baostock 不提供 ST 公告历史（`st_available=False`，
+   不伪造全 False 列）；合成数据提供，用于 PIT 验证。
+9. **产品定位**（#75）与 `framework/contracts/`、`kernel/`、`services/` 等零运行时
+   导入目录的去留仍是显式决策项（#70/#77）。
+
+> 判据不变：任何"宣称"如果不能用测试或可运行命令表达，它就还不是真的。
+> 本轮文档校正的原则是**删掉无法验证的数字、标注不可用能力、把 roadmap 写成 roadmap**。
