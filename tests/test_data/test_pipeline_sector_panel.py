@@ -73,7 +73,12 @@ class _IndustryProvider(DataProvider):
             [DATES, ASSETS], names=["date", "asset"]
         )
         return pd.DataFrame(
-            {"market_cap": 1e10, "pb": 1.5, "pe": 15.0}, index=index
+            {
+                "market_cap": 1e10, "total_assets": 2e10, "net_assets": 1e10,
+                "revenue": 1e9, "net_profit": 1e8, "roe": 0.10,
+                "pb_ratio": 1.5, "pe_ratio": 15.0, "asset_growth": 0.05,
+            },
+            index=index,
         )
 
     def get_benchmark(self, start_date, end_date) -> pd.Series:

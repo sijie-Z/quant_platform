@@ -750,20 +750,22 @@ class LiveTradingEngine:
         Only ever called with a *known* book. Deleting rows from an unknown
         query was how one transient empty answer erased the persisted
         positions (D6).
+
+        The whole book is written with one bulk transaction (and the stale
+        rows pruned in the same transaction). This used to commit once per
+        position, and `_persist_engine_state` plus the end-of-cycle sync means
+        the book is persisted at least twice per cycle.
         """
-        held = set()
+        rows = []
         for pos in positions or []:
             row = self._position_row(pos)
-            code = str(row.get("code") or "")
-            if not code:
+            if not str(row.get("code") or ""):
                 continue
             row["tenant_id"] = self._tenant_id
-            self._store.save_position(row)
-            held.add(code)
-        for row in self._store.get_positions(self._tenant_id):
-            code = row.get("code")
-            if code and code not in held:
-                self._store.delete_position(code, tenant_id=self._tenant_id)
+            rows.append(row)
+        self._store.save_positions(
+            rows, tenant_id=self._tenant_id, prune_missing=True,
+        )
 
     @staticmethod
     def _position_row(pos) -> dict:

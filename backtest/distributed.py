@@ -203,7 +203,13 @@ def _run_single_backtest(args: tuple) -> BacktestResult:
 
     try:
         # Import inside worker to avoid pickling issues
-        from quant_platform.main import _compute_factors, _generate_signal, _load_data, _run_backtest
+        from quant_platform.main import (
+            _compute_factors,
+            _execution_gates,
+            _generate_signal,
+            _load_data,
+            _run_backtest,
+        )
         from quant_platform.utils.config import load_config
 
         # Merge config overrides. `load_config()` returns dataclasses, not
@@ -222,6 +228,7 @@ def _run_single_backtest(args: tuple) -> BacktestResult:
         backtest_result = _run_backtest(
             config, signal, prices, returns, benchmark, sector_map,
             fin_unstacked if fin_unstacked is not None else financials,
+            gates=_execution_gates(metadata),
         )
 
         # Extract key metrics with the shared metric definitions, so sweep

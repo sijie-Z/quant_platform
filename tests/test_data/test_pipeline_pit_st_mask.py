@@ -83,7 +83,12 @@ class _FixedProvider(DataProvider):
             [self._dates, self._assets], names=["date", "asset"]
         )
         return pd.DataFrame(
-            {"market_cap": 1e9, "pb": 1.5, "pe": 15.0}, index=index
+            {
+                "market_cap": 1e9, "total_assets": 2e9, "net_assets": 1e9,
+                "revenue": 1e8, "net_profit": 1e7, "roe": 0.10,
+                "pb_ratio": 1.5, "pe_ratio": 15.0, "asset_growth": 0.05,
+            },
+            index=index,
         )
 
     def get_benchmark(self, start_date, end_date) -> pd.Series:

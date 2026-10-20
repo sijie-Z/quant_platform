@@ -25,6 +25,11 @@ class DataConfig:
     start_date: str = "2021-01-01"
     end_date: str = "2025-12-31"
     frequency: str = "daily"
+    # A configured *real* provider that is unavailable must fail closed by
+    # default: silently substituting synthetic research data made a broken
+    # feed indistinguishable from production output. Set this (or pass
+    # `--allow-synthetic-fallback`) only for development.
+    allow_synthetic_fallback: bool = False
 
 
 @dataclass

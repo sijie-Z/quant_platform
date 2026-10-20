@@ -137,6 +137,7 @@ class BarraModel:
         self.specific_risk: pd.Series | None = None
         self._residual_history: list[pd.Series] = []
         self._last_residuals: pd.Series | None = None
+        self._last_regression_ok = False
         self._fitted = False
 
     @classmethod
@@ -326,9 +327,11 @@ class BarraModel:
         Returns:
             BarraFactorReturn with estimated factor returns
         """
+        self._last_regression_ok = False
         # Align data
         common = returns.index.intersection(exposures.index)
         if len(common) < 30:
+            self._last_regression_ok = False
             return BarraFactorReturn(
                 date=str(returns.name) if hasattr(returns, 'name') else "",
                 factor_returns={f: 0.0 for f in self.factor_names},
@@ -344,6 +347,7 @@ class BarraModel:
         valid = np.isfinite(y_full) & np.all(np.isfinite(X_full), axis=1)
         common = common[valid]
         if len(common) < 30:
+            self._last_regression_ok = False
             return BarraFactorReturn(
                 date=str(returns.name) if hasattr(returns, 'name') else "",
                 factor_returns={f: 0.0 for f in self.factor_names},
@@ -359,6 +363,7 @@ class BarraModel:
         try:
             beta, residuals, rank, sv = np.linalg.lstsq(X_with_intercept, y, rcond=None)
         except np.linalg.LinAlgError:
+            self._last_regression_ok = False
             return BarraFactorReturn(
                 date=str(returns.name) if hasattr(returns, 'name') else "",
                 factor_returns={f: 0.0 for f in self.factor_names},
@@ -385,6 +390,7 @@ class BarraModel:
         # Keep the per-asset residuals: specific risk is the volatility of
         # each asset's own residual, not one panel-wide average.
         self._last_residuals = pd.Series(y - y_pred, index=common)
+        self._last_regression_ok = True
 
         return BarraFactorReturn(
             date=str(returns.name) if hasattr(returns, 'name') else "",
@@ -441,6 +447,14 @@ class BarraModel:
             daily_returns = returns.iloc[i]
             result = self._cross_sectional_regression(daily_returns, exposures)
             result.date = str(date)
+            if not self._last_regression_ok:
+                # Failed cross-section (fewer than 30 valid assets, or a
+                # singular design). The old code appended an all-zero
+                # factor-return row anyway, and the covariance averaged those
+                # rows in: early/short-universe dates diluted factor risk and
+                # induced spurious low correlations. Skip them entirely.
+                self._last_residuals = None
+                continue
             self.factor_returns_history.append(result)
             if self._last_residuals is not None:
                 self._residual_history.append(self._last_residuals)
@@ -457,7 +471,15 @@ class BarraModel:
                      len(dates), len(self.factor_names))
 
     def _estimate_factor_covariance(self):
-        """Estimate factor covariance with exponential decay weighting."""
+        """Estimate factor covariance with exponential weights and Bartlett HAC.
+
+        The weighted covariance is Newey-West corrected with the configured
+        ``newey_west_lags`` using a Bartlett kernel; with ``newey_west_lags=0``
+        (or a single observation) the estimator reduces to the plain weighted
+        covariance.  Failed cross-sections (fewer than 30 valid assets) are
+        not in ``factor_returns_history`` at all, so they cannot dilute the
+        covariance with all-zero rows.
+        """
         if not self.factor_returns_history:
             return
 
@@ -487,6 +509,21 @@ class BarraModel:
             for j in range(n_factors):
                 cov[i, j] = np.average(centered[:, i] * centered[:, j], weights=weights)
 
+        # Newey-West / Bartlett HAC lag terms. The constructor always stored
+        # `newey_west_lags` and the module docstring promised HAC, but the
+        # parameter was never used: autocorrelated factor returns produced an
+        # understated covariance. gamma_l[t] = w_t * e_t e_{t-l}' (the weight
+        # of the later observation), with the Bartlett taper
+        # (1 - l/(L+1)) applied to gamma_l + gamma_l'.
+        n_lags = max(0, int(self.newey_west_lags))
+        n_lags = min(n_lags, max(0, n - 1))
+        for lag in range(1, n_lags + 1):
+            taper = 1.0 - lag / (n_lags + 1.0)
+            gamma_l = (
+                centered[lag:] * weights[lag:, np.newaxis]
+            ).T @ centered[:-lag]
+            cov += taper * (gamma_l + gamma_l.T)
+
         # Shrinkage toward identity
         if self.shrinkage_target == "identity":
             trace = np.trace(cov) / n_factors
@@ -498,7 +535,15 @@ class BarraModel:
         self.factor_covariance = cov
 
     def _ledoit_wolf_shrinkage(self, X: np.ndarray, weights: np.ndarray) -> float:
-        """Compute Ledoit-Wolf optimal shrinkage intensity."""
+        """Compute Ledoit-Wolf optimal shrinkage intensity.
+
+        ``delta = (pi_hat - rho_hat) / (n_eff * gamma_hat)`` with
+        ``n_eff = 1 / sum(w^2)`` the effective sample size.  The estimator
+        used to divide by ``n*n``, which for uniform weights is exactly ``n``
+        times too weak (a measured 2.4e-5 instead of 0.077 on a 1500-day
+        exponential-weight sample): the "shrunk" factor covariance was
+        effectively the raw sample covariance.
+        """
         n, p = X.shape
         if n < 2:
             return 0.5
@@ -522,7 +567,8 @@ class BarraModel:
             xk = centered[k]
             sum_sq += weights[k] * np.sum((np.outer(xk, xk) - S) ** 2)
 
-        delta = sum_sq / (n * n)
+        n_eff = 1.0 / max(float(np.sum(weights ** 2)), 1e-300)
+        delta = sum_sq / n_eff
         gamma = np.sum((S - F) ** 2)
 
         if gamma == 0:

@@ -42,10 +42,11 @@ class TestSimulatePnl:
         engine._simulate_pnl(returns)
 
         # One-sided turnover is 0.5 (cash -> fully invested), so the two-way
-        # traded value is 1.0 and the cost is 1.0 * commission = 0.001.
-        # This used to assert 999_500 -- the half-charged figure produced by
-        # passing one-sided turnover to a cost model that expects two-way.
-        assert engine.portfolio_values.iloc[-1] == pytest.approx(999_000.0)
+        # traded value is 1.0 and the cost is 1.0 * commission = 0.001 plus
+        # the B5 both-sides transfer fee (1e-5 of the 1.0 notional) = 0.00101.
+        # (The old figure passed one-sided turnover to a cost model that
+        # expects two-way.)
+        assert engine.portfolio_values.iloc[-1] == pytest.approx(998_990.0)
         assert engine.turnover_history is not None
         assert len(engine.turnover_history) == 1
         # The recorded turnover stays one-sided: it is a metric, not the base
@@ -80,7 +81,12 @@ class TestSimulatePnl:
         )
         engine = BacktestEngine(
             rebalance_frequency="monthly",
-            cost_model=CostModel(commission=0, stamp_tax=0, slippage=0),
+            # Zero-cost for the drift assertion: the B5 defaults (5 CNY floor,
+            # both-sides transfer fee) would charge the initial deployment.
+            cost_model=CostModel(
+                commission=0, stamp_tax=0, slippage=0,
+                min_commission=0, transfer_fee=0,
+            ),
         )
         engine.weights_history = {dates[0]: pd.Series({"A": 0.5, "B": 0.5})}
 
@@ -141,10 +147,23 @@ class TestSummaryReportsOptimizerFallbacks:
         summary = result["summary"]
 
         assert summary["n_rebalances"] > 0
-        assert summary["n_optimizer_fallbacks"] == summary["n_rebalances"]
-        assert summary["optimizer_fallback_rate"] == pytest.approx(1.0)
+        # M13: `n_rebalances` counts executed rebalances only, while the last
+        # month-end signal has no following trading day: it is optimized (and
+        # falls back) but never executed. Fallbacks are counted at optimization
+        # time, so the rate covers every optimized rebalance.
+        assert summary["n_rebalances"] == len(engine.weights_history)
+        assert summary["n_optimizer_fallbacks"] == len(engine.optimizer_outcomes)
+        assert summary["n_optimizer_fallbacks"] == (
+            summary["n_rebalances"] + len(engine.unexecuted_signals)
+        )
+        assert summary["optimizer_fallback_rate"] == pytest.approx(
+            summary["n_optimizer_fallbacks"] / summary["n_rebalances"]
+        )
         assert summary["effective_optimizer"].endswith("+equal_weight_fallback")
-        assert len(engine.optimizer_outcomes) == summary["n_rebalances"]
+        assert len(engine.unexecuted_signals) == 1
+        assert sum(
+            outcome["executed"] for outcome in engine.optimizer_outcomes.values()
+        ) == summary["n_rebalances"]
 
 
 class TestCovarianceWindowSeesNoFuture:
@@ -196,8 +215,10 @@ class TestCovarianceWindowSeesNoFuture:
             signal=signal, prices=closes, returns=returns,
             benchmark_returns=None, sector_map=sector_map,
         )
-        # The engine's own record of which dates produced weights, in order.
-        return sorted(engine.weights_history), windows, returns
+        # M13 keeps only executed rebalances in `weights_history`; a final
+        # rebalance with no following trading day is still optimized, so use
+        # the optimizer-outcome record for "one covariance per rebalance".
+        return sorted(engine.optimizer_outcomes), windows, returns
 
     def test_window_never_contains_the_rebalance_day(self, monkeypatch):
         rdates, windows, _ = self._run(monkeypatch)
@@ -251,12 +272,16 @@ class TestExecutionTiming:
     def _engine(timing: str, returns: pd.DataFrame, cost_model=None) -> BacktestEngine:
         # Zero cost by default: these tests are about *when* a weight takes
         # effect, and a fee would blur the timing signal they assert on. The
-        # cost's own date is checked separately below.
+        # cost's own date is checked separately below. The B5 defaults (5 CNY
+        # floor, both-sides transfer fee) are disabled explicitly.
         engine = BacktestEngine(
             rebalance_frequency="monthly",
             optimizer="equal_weight",
             execution_timing=timing,
-            cost_model=cost_model or CostModel(commission=0, stamp_tax=0, slippage=0),
+            cost_model=cost_model or CostModel(
+                commission=0, stamp_tax=0, slippage=0,
+                min_commission=0, transfer_fee=0,
+            ),
         )
         engine.weights_history = {
             returns.index[TestExecutionTiming.SIGNAL_DAY]: pd.Series({"A": 1.0, "B": 0.0})
@@ -324,7 +349,10 @@ class TestExecutionTiming:
         returns = self._returns()
         engine = self._engine(
             "next_close", returns,
-            cost_model=CostModel(commission=0.001, stamp_tax=0, slippage=0),
+            cost_model=CostModel(
+                commission=0.001, stamp_tax=0, slippage=0,
+                min_commission=0, transfer_fee=0,
+            ),
         )
 
         engine._simulate_pnl(returns)
@@ -350,7 +378,11 @@ class TestStampTaxDirection:
         return BacktestEngine(
             initial_capital=1_000_000,
             rebalance_frequency="monthly",
-            cost_model=CostModel(commission=0.0, stamp_tax=0.001, slippage=0.0),
+            # Isolate the stamp tax: no commission floor, no transfer fee.
+            cost_model=CostModel(
+                commission=0.0, stamp_tax=0.001, slippage=0.0,
+                min_commission=0, transfer_fee=0,
+            ),
             # Disable the turnover cap so the liquidation below is complete.
             constraints=PortfolioConstraints(max_turnover=1.0),
         )
@@ -387,3 +419,197 @@ class TestStampTaxDirection:
         # only half of it (-0.0005).
         assert engine.daily_returns.loc[dates[4]] == pytest.approx(-0.001)
         assert engine.portfolio_values.iloc[-1] == pytest.approx(999_000.0)
+
+
+class TestExecutionDayTradability:
+    """B1: the pipeline's flags gate the *execution* day, not the signal day.
+
+    A buy is blocked at limit-up or on a non-tradable (suspension/ST/listing)
+    day; a sell is blocked at limit-down or on a non-tradable day. The blocked
+    target is carried to the next tradable day, and no turnover or cost is
+    booked on the blocked day.
+    """
+
+    @staticmethod
+    def _engine(cost_model=None) -> BacktestEngine:
+        return BacktestEngine(
+            initial_capital=1_000_000,
+            rebalance_frequency="monthly",
+            optimizer="equal_weight",
+            # A liquidation is a one-sided 0.5 turnover; do not clamp it.
+            constraints=PortfolioConstraints(max_turnover=1.0),
+            cost_model=cost_model or CostModel(
+                commission=0, stamp_tax=0, slippage=0,
+                min_commission=0, transfer_fee=0,
+            ),
+        )
+
+    @staticmethod
+    def _flat_returns(n=5):
+        dates = pd.bdate_range("2024-01-01", periods=n)
+        return pd.DataFrame(0.0, index=dates, columns=["A", "B"]), dates
+
+    def test_buy_at_limit_up_is_deferred_and_costs_nothing_that_day(self):
+        returns, dates = self._flat_returns()
+        engine = self._engine(CostModel(
+            commission=0.001, stamp_tax=0, slippage=0,
+            min_commission=0, transfer_fee=0,
+        ))
+        engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
+        limit_up = pd.DataFrame(False, index=dates, columns=["A", "B"])
+        limit_up.loc[dates[1], "A"] = True
+
+        engine._simulate_pnl(returns, limit_up=limit_up)
+
+        assert engine.daily_returns.loc[dates[1]] == pytest.approx(0.0)
+        assert list(engine.turnover_history.index) == [dates[2]]
+        assert engine.daily_returns.loc[dates[2]] == pytest.approx(-0.001)
+
+    def test_buy_on_a_suspended_day_is_deferred(self):
+        returns, dates = self._flat_returns()
+        engine = self._engine()
+        engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
+        tradable = pd.DataFrame(True, index=dates, columns=["A", "B"])
+        tradable.loc[dates[1], "A"] = False
+
+        engine._simulate_pnl(returns, tradable_mask=tradable)
+
+        assert engine.daily_returns.loc[dates[1]] == pytest.approx(0.0)
+        assert list(engine.turnover_history.index) == [dates[2]]
+        assert engine.turnover_history.iloc[0] == pytest.approx(0.5)
+
+    def test_sell_at_limit_down_is_deferred(self):
+        returns, dates = self._flat_returns()
+        engine = self._engine(CostModel(
+            commission=0.001, stamp_tax=0, slippage=0,
+            min_commission=0, transfer_fee=0,
+        ))
+        engine.weights_history = {
+            dates[0]: pd.Series({"A": 1.0, "B": 0.0}),
+            dates[2]: pd.Series({"A": 0.0, "B": 0.0}),
+        }
+        limit_down = pd.DataFrame(False, index=dates, columns=["A", "B"])
+        limit_down.loc[dates[3], "A"] = True
+
+        engine._simulate_pnl(returns, limit_down=limit_down)
+
+        # Build executes on dates[1]; the liquidation is blocked on dates[3]
+        # (no turnover, no cost) and fills on dates[4].
+        assert list(engine.turnover_history.index) == [dates[1], dates[4]]
+        assert engine.daily_returns.loc[dates[3]] == pytest.approx(0.0)
+        assert engine.daily_returns.loc[dates[4]] == pytest.approx(-0.001)
+
+    def test_a_single_gate_panel_does_not_require_the_others(self):
+        """Supplying only limit_up must work; the omitted panels are neutral."""
+        returns, dates = self._flat_returns()
+        engine = self._engine()
+        engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
+        limit_up = pd.DataFrame(False, index=dates, columns=["A", "B"])
+
+        engine._simulate_pnl(returns, limit_up=limit_up)
+
+        assert list(engine.turnover_history.index) == [dates[1]]
+
+    def test_a_deferred_subset_does_not_wipe_the_rest_of_the_book(self):
+        """A blocked buy retried on its own must not NaN out executed holdings.
+
+        The retry delta is indexed by the blocked assets only; adding it to
+        the full book with plain `+` aligns every other label to NaN and
+        silently liquidates the portfolio.
+        """
+        returns, dates = self._flat_returns()
+        engine = self._engine()
+        engine.weights_history = {dates[0]: pd.Series({"A": 0.5, "B": 0.5})}
+        tradable = pd.DataFrame(True, index=dates, columns=["A", "B"])
+        tradable.loc[dates[1], "A"] = False
+
+        engine._simulate_pnl(returns, tradable_mask=tradable)
+
+        held = engine.weights_history[dates[0]]
+        assert held.sum() == pytest.approx(1.0)
+        assert held["A"] == pytest.approx(0.5)
+        assert held["B"] == pytest.approx(0.5)
+        assert float(held.isna().sum()) == 0.0
+
+
+class TestWeeklyIsoYearBoundary:
+    """B2: weekly rebalances group by ISO year + ISO week, chronologically."""
+
+    def test_late_december_does_not_collide_with_january_week_one(self):
+        dates = pd.DatetimeIndex([
+            "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05",
+            "2024-01-08", "2024-01-12",
+            "2024-12-30", "2024-12-31",
+            "2025-01-02", "2025-01-03", "2025-01-06", "2025-01-10",
+        ])
+        result = BacktestEngine(
+            rebalance_frequency="weekly",
+        )._get_rebalance_dates(dates)
+
+        assert result == sorted(result), "rebalance dates must be chronological"
+        assert pd.Timestamp("2024-01-05") in result, (
+            "the early-January-2024 rebalance collapsed into the next year"
+        )
+        assert pd.Timestamp("2024-12-31") not in result, (
+            "a late-December session became a spurious week-1 rebalance"
+        )
+        assert pd.Timestamp("2025-01-03") in result
+
+    def test_january_optimizer_never_receives_december_holdings(self):
+        dates = pd.bdate_range("2024-01-02", "2025-01-15")
+        assets = [f"S{i:02d}" for i in range(12)]
+        rng = np.random.default_rng(11)
+        prices = pd.DataFrame(
+            100 * np.exp(np.cumsum(
+                rng.normal(0, 0.005, (len(dates), len(assets))), axis=0,
+            )),
+            index=dates, columns=assets,
+        )
+        returns = prices.pct_change(fill_method=None).shift(-1)
+        signal = pd.DataFrame(
+            rng.normal(size=(len(dates), len(assets))),
+            index=dates, columns=assets,
+        )
+
+        engine = BacktestEngine(
+            rebalance_frequency="weekly",
+            optimizer="equal_weight",
+            covariance_method="sample",
+            constraints=PortfolioConstraints(max_weight=1.0, max_turnover=1.0),
+        )
+        inner = engine._get_optimizer()
+
+        class RecordingOptimizer:
+            def __init__(self):
+                self.calls = []
+                self.fallback_count = 0
+                self.last_fallback_reason = None
+
+            def optimize(self, signal=None, **kwargs):
+                weights = inner.optimize(signal=signal, **kwargs)
+                self.calls.append((kwargs.get("prev_weights"), weights.copy()))
+                return weights
+
+        recorder = RecordingOptimizer()
+        engine._get_optimizer = lambda: recorder
+        engine.run(
+            signal=signal, prices=prices, returns=returns,
+            benchmark_returns=None,
+            sector_map=pd.Series("Tech", index=assets),
+        )
+
+        order = list(engine.optimizer_outcomes)
+        assert order == sorted(order), "optimizer calls are not chronological"
+        assert pd.Timestamp("2024-12-31") not in order
+        assert any(d.year == 2024 and d.month == 1 for d in order), (
+            "no January-2024 rebalance was processed"
+        )
+
+        # Each call receives the previous chronological target as prev_weights,
+        # so no January-2024 call can see December-2024 holdings.
+        for i, (prev, _target) in enumerate(recorder.calls):
+            if i == 0:
+                assert prev is None
+                continue
+            assert order[i - 1] < order[i]
+            pd.testing.assert_series_equal(prev, recorder.calls[i - 1][1])

@@ -11,6 +11,15 @@ from abc import ABC, abstractmethod
 import pandas as pd
 
 
+class DataFetchIncompleteError(RuntimeError):
+    """Raised when a provider could not fetch every requested symbol.
+
+    Providers must never return (or cache) a silently truncated panel.  A
+    caller that gets this exception knows the result is unusable as a
+    complete cross-section and must retry, fall back, or fail closed.
+    """
+
+
 class DataProvider(ABC):
     """Abstract interface for market data providers.
 
@@ -32,6 +41,20 @@ class DataProvider(ABC):
 
         Returns DataFrame with MultiIndex (date, asset) and columns like
         open, high, low, close, volume, turnover, adj_factor.
+
+        ``fields`` is a column projection with one contract across all
+        providers: unknown names raise :class:`ValueError` (never silently
+        dropped) and the returned columns appear in the requested order.
+
+        Units are fixed at this boundary: ``volume`` is in shares, ``amount``
+        in CNY and ``turnover`` is a fraction (0.025 == 2.5%).  ``close`` is
+        the adjusted price series and ``adj_factor`` the divisor the pipeline
+        applies to obtain the return-generating price (adjustment applied
+        exactly once: ``close_adj = close / adj_factor``).
+
+        If any requested symbol cannot be fetched after bounded retries the
+        provider must raise :class:`DataFetchIncompleteError` rather than return a
+        truncated panel.
         """
         ...
 

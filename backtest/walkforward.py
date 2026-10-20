@@ -47,6 +47,20 @@ class WalkForwardValidator:
         mode: str = "rolling",     # "rolling" or "expanding"
         n_folds: int | None = None,
     ):
+        # M22: `start += step_size` never advanced for step_size <= 0, so the
+        # fold loop spun forever (or sliced invalid windows). Validate the
+        # window arithmetic at construction instead of hanging a worker.
+        for name, value in (
+            ("train_period", train_period),
+            ("test_period", test_period),
+            ("step_size", step_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
+            if value < 1:
+                raise ValueError(f"{name} must be >= 1, got {value!r}")
+        if mode not in ("rolling", "expanding"):
+            raise ValueError(f"mode must be 'rolling' or 'expanding', got {mode!r}")
         self.train_period = train_period
         self.test_period = test_period
         self.step_size = step_size
@@ -66,6 +80,17 @@ class WalkForwardValidator:
         engine_kwargs: dict | None = None,
         factors: dict[str, pd.DataFrame] | None = None,
         alpha_kwargs: dict | None = None,
+        cost_model=None,
+        constraints=None,
+        optimizer: str | None = None,
+        benchmark: str | None = None,
+        covariance_method: str | None = None,
+        covariance_lookback: int | None = None,
+        covariance_ewma_half_life: int | None = None,
+        execution_timing: str | None = None,
+        risk_free_rate: float | None = None,
+        periods_per_year: float | None = None,
+        execution_gates: dict | None = None,
     ) -> dict:
         """Run walk-forward validation.
 
@@ -76,6 +101,16 @@ class WalkForwardValidator:
                      train-period data. Eliminates look-ahead from IC weighting.
             alpha_kwargs: Dict with 'method', 'lookback', 'min_icir' for signal
                           recomputation. Required when factors is provided.
+            engine_kwargs: Raw BacktestEngine keyword arguments.
+            cost_model, constraints, optimizer, benchmark, covariance_method,
+            covariance_lookback, covariance_ewma_half_life, execution_timing,
+            risk_free_rate, periods_per_year:
+                First-class execution-model settings forwarded to every fold's
+                ``BacktestEngine`` (B3). They are merged over ``engine_kwargs``
+                (explicit values win). The old contract only forwarded what the
+                CLI happened to put in a three-key dict, so a configured
+                CostModel/optimizer/covariance silently reverted to engine
+                defaults for every OOS fold.
 
         Returns:
             dict with keys:
@@ -87,7 +122,23 @@ class WalkForwardValidator:
             - n_folds: number of folds used
             - signal_recomputed: True if signal was recomputed per fold
         """
-        engine_kwargs = engine_kwargs or {}
+        engine_kwargs = dict(engine_kwargs or {})
+        explicit_engine_config = {
+            "cost_model": cost_model,
+            "constraints": constraints,
+            "optimizer": optimizer,
+            "benchmark": benchmark,
+            "covariance_method": covariance_method,
+            "covariance_lookback": covariance_lookback,
+            "covariance_ewma_half_life": covariance_ewma_half_life,
+            "execution_timing": execution_timing,
+            "risk_free_rate": risk_free_rate,
+            "periods_per_year": periods_per_year,
+        }
+        engine_kwargs.update({
+            key: value for key, value in explicit_engine_config.items()
+            if value is not None
+        })
         alpha_kwargs = alpha_kwargs or {}
         signal_recomputed = factors is not None
 
@@ -156,8 +207,22 @@ class WalkForwardValidator:
                     factors, returns, train_sl, test_sl, alpha_kwargs,
                 )
             else:
-                # Backward compatible: use pre-computed signal
+                # Backward compatible: use pre-computed signal. The real alpha
+                # stays test-only, but the *index* is extended back over the
+                # train window with NaN rows: the engine takes its rebalance
+                # dates from the signal index, and without those earlier
+                # month-ends it sat in cash for the first weeks of every test
+                # window (B4). NaN signal rows make the engine fall back to an
+                # equal-weight warm-up portfolio, which is held into the test
+                # window; no train-period alpha is leaked.
                 fold_signal = signal.iloc[test_sl]
+                if train_sl.start < test_sl.start:
+                    warmup_index = signal.index[train_sl.start:test_sl.start]
+                    if len(warmup_index):
+                        warmup = pd.DataFrame(
+                            np.nan, index=warmup_index, columns=signal.columns,
+                        )
+                        fold_signal = pd.concat([warmup, fold_signal])
 
             test_prices = prices.iloc[test_sl]
             test_returns = returns.iloc[test_sl]
@@ -166,18 +231,24 @@ class WalkForwardValidator:
             engine = BacktestEngine(**engine_kwargs)
 
             try:
+                # Feed the engine the full panel -- including the 252-day
+                # warm-up before the train window -- so the first fold
+                # rebalance estimates covariance on a full window. The old
+                # code sliced `.loc[fold_signal.index[0]:]`, discarding the
+                # warm-up it had just computed (B4).
                 full_sl = slice(max(0, train_sl.start - 252), test_sl.stop)
                 full_prices = prices.iloc[full_sl]
                 full_returns = returns.iloc[full_sl]
 
-                if fold_signal.index[0] in full_prices.index:
+                if len(fold_signal) and fold_signal.index[0] in full_prices.index:
                     result = engine.run(
                         signal=fold_signal,
-                        prices=full_prices.loc[fold_signal.index[0]:],
-                        returns=full_returns.loc[fold_signal.index[0]:],
+                        prices=full_prices,
+                        returns=full_returns,
                         benchmark_returns=test_benchmark,
                         sector_map=sector_map,
                         financials=financials.iloc[full_sl] if financials is not None else None,
+                        **(execution_gates or {}),
                     )
                 else:
                     result = engine.run(
@@ -187,6 +258,7 @@ class WalkForwardValidator:
                         benchmark_returns=test_benchmark,
                         sector_map=sector_map,
                         financials=financials,
+                        **(execution_gates or {}),
                     )
 
                 # The engine is handed extra history so its first rebalance has

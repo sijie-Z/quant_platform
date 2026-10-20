@@ -199,11 +199,9 @@ class TestReportsPublishedOnNonTradingDays:
         assert (pd.to_datetime(reports["date"]).to_numpy() == expected_dates.to_numpy()).all()
 
     def test_holiday_published_reports_map_to_the_next_exchange_session(self):
-        """P7: 2024-02-12 is a Spring Festival closure, not a trading day.
-
-        The report must become visible on the next *exchange* session
-        (2024-02-19), not on the holiday itself and not merely on the next
-        business day.
+        """A report published on an exchange holiday must become visible on
+        the next *exchange* session, not on the holiday itself and not merely
+        on the next business day.
         """
         from quant_platform.utils.exchange_calendar import (
             EXCHANGE_HOLIDAYS,
@@ -214,6 +212,7 @@ class TestReportsPublishedOnNonTradingDays:
         reports = self._reports(provider)
         visible = pd.to_datetime(reports["date"])
         published = pd.to_datetime(reports["publish_date"])
+        sessions = trading_days(self.START, self.END)
 
         on_holiday = published.dt.strftime("%Y-%m-%d").isin(EXCHANGE_HOLIDAYS)
         assert on_holiday.any(), "seed must publish at least one report on a holiday"
@@ -222,14 +221,17 @@ class TestReportsPublishedOnNonTradingDays:
             "a holiday-published report is visible on the holiday itself"
         )
 
-        # Explicit date check for the Spring Festival publication.
-        spring = published.dt.strftime("%Y-%m-%d") == "2024-02-12"
-        assert spring.any()
-        assert (visible[spring] == pd.Timestamp("2024-02-19")).all()
+        # Explicit check for the first holiday publication this provider
+        # actually generates: it must land on the next exchange session.
+        first_holiday = published[on_holiday].min()
+        next_session = sessions[sessions.searchsorted(first_holiday, side="left")]
+        assert next_session > first_holiday
+        first = published == first_holiday
+        assert (visible[first] == next_session).all()
 
         # No report is dated on an exchange holiday anywhere in the panel.
-        sessions = set(trading_days(self.START, self.END))
-        assert visible.isin(sessions).all()
+        session_set = set(sessions)
+        assert visible.isin(session_set).all()
 
     def test_no_report_is_visible_before_it_was_published(self):
         provider = self._provider()

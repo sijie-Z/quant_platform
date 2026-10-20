@@ -81,6 +81,9 @@ class SyntheticDataProvider(DataProvider):
         self._financials: pd.DataFrame | None = None
         self._benchmark: pd.Series | None = None
         self._metadata: pd.DataFrame | None = None
+        # Created in `_generate_all`; initialised here so public accessors do
+        # not raise AttributeError on a fresh instance.
+        self._st_timeseries: pd.DataFrame | None = None
 
         # Derived data
         self._dates: pd.DatetimeIndex | None = None
@@ -106,7 +109,10 @@ class SyntheticDataProvider(DataProvider):
             pd.Timestamp(start_date):pd.Timestamp(end_date)
         ]
         if fields:
-            df = df[fields]
+            unknown = [col for col in fields if col not in df.columns]
+            if unknown:
+                raise ValueError(f"Unknown price fields: {unknown}")
+            df = df[list(fields)]
         return df
 
     def get_financials(
@@ -717,7 +723,11 @@ class SyntheticDataProvider(DataProvider):
                 })
 
         if not records:
-            return pd.DataFrame(columns=["asset", "announce_date", "is_st"])
+            # Always expose the full contract columns, even when empty: the
+            # pipeline's `_has_usable_st_timeseries` checks for `end_date`.
+            return pd.DataFrame(
+                columns=["asset", "trigger_date", "announce_date", "end_date", "is_st"]
+            )
 
         return pd.DataFrame(records)
 

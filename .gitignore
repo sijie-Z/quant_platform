@@ -21,6 +21,7 @@ env/
 
 # Cache
 .quant_cache/
+.quant_versions/
 .sentiment_cache/
 .pytest_cache/
 .agent_cache/

@@ -183,31 +183,40 @@ class MetricsCollector:
         return counters, gauges, histograms, help_map
 
     def export_text(self) -> str:
-        """Export all metrics in Prometheus text format."""
-        lines = []
+        """Export all metrics in Prometheus text format.
+
+        HELP/TYPE are emitted once per metric *family* (not once per label
+        set: repeating them for every series is non-canonical), and label
+        values are escaped so arbitrary text (quotes, backslashes, newlines)
+        cannot break the exposition.
+        """
+        lines: list[str] = []
         counters, gauges, histograms, help_map = self._snapshot_metrics()
+        emitted_families: set[str] = set()
+
+        def _family_header(name: str, metric_type: str) -> None:
+            if name in emitted_families:
+                return
+            emitted_families.add(name)
+            if name in help_map and help_map[name]:
+                lines.append(f"# HELP {name} {help_map[name]}")
+            lines.append(f"# TYPE {name} {metric_type}")
 
         # Counters
         for c in counters:
-            if c.name in help_map:
-                lines.append(f"# HELP {c.name} {help_map[c.name]}")
-            lines.append(f"# TYPE {c.name} counter")
+            _family_header(c.name, "counter")
             label_str = self._format_labels(c.labels)
             lines.append(f"{c.name}{label_str} {c.get()}")
 
         # Gauges
         for g in gauges:
-            if g.name in help_map:
-                lines.append(f"# HELP {g.name} {help_map[g.name]}")
-            lines.append(f"# TYPE {g.name} gauge")
+            _family_header(g.name, "gauge")
             label_str = self._format_labels(g.labels)
             lines.append(f"{g.name}{label_str} {g.get()}")
 
         # Histograms
         for h in histograms:
-            if h.name in help_map:
-                lines.append(f"# HELP {h.name} {help_map[h.name]}")
-            lines.append(f"# TYPE {h.name} histogram")
+            _family_header(h.name, "histogram")
             label_str = self._format_labels(h.labels)
             counts, total_sum, total_count = h.snapshot()
             for bucket, count in counts.items():
@@ -222,16 +231,35 @@ class MetricsCollector:
         return "\n".join(lines) + "\n"
 
     def get_snapshot(self) -> dict[str, Any]:
-        """Get a JSON-friendly snapshot of all metrics."""
+        """Get a JSON-friendly snapshot of all metrics.
+
+        The mapping key is the full label key (``name{k=v,...}``), not the
+        bare metric name: keying by name alone made two label sets of the
+        same metric overwrite each other in /api/metrics/json.
+        """
         snapshot = {}
         counters, gauges, histograms, _ = self._snapshot_metrics()
         for c in counters:
-            snapshot[c.name] = {"type": "counter", "value": c.get(), "labels": dict(c.labels)}
+            key = self._make_key(c.name, c.labels)
+            snapshot[key] = {
+                "name": c.name,
+                "type": "counter",
+                "value": c.get(),
+                "labels": dict(c.labels),
+            }
         for g in gauges:
-            snapshot[g.name] = {"type": "gauge", "value": g.get(), "labels": dict(g.labels)}
+            key = self._make_key(g.name, g.labels)
+            snapshot[key] = {
+                "name": g.name,
+                "type": "gauge",
+                "value": g.get(),
+                "labels": dict(g.labels),
+            }
         for h in histograms:
+            key = self._make_key(h.name, h.labels)
             _, total_sum, total_count = h.snapshot()
-            snapshot[h.name] = {
+            snapshot[key] = {
+                "name": h.name,
                 "type": "histogram",
                 "sum": total_sum,
                 "count": total_count,
@@ -254,10 +282,23 @@ class MetricsCollector:
         return f"{name}{{{label_str}}}"
 
     @staticmethod
+    def _escape_label_value(value: Any) -> str:
+        """Escape a Prometheus label value (backslash, quote, newline)."""
+        return (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+        )
+
+    @staticmethod
     def _format_labels(labels: dict[str, str]) -> str:
         if not labels:
             return ""
-        pairs = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+        pairs = ",".join(
+            f'{k}="{MetricsCollector._escape_label_value(v)}"'
+            for k, v in sorted(labels.items())
+        )
         return "{" + pairs + "}"
 
 

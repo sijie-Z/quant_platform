@@ -496,7 +496,9 @@ def covariance_numba(returns: pd.DataFrame) -> pd.DataFrame:
 def _zscore_numba(data: np.ndarray) -> np.ndarray:
     """Numba JIT: cross-sectional zscore standardization.
 
-    For each row (date), computes (x - mean) / std.
+    For each row (date), computes (x - mean) / std with the **population**
+    standard deviation (``ddof=0``). This is the documented convention for
+    both the accelerated and the pure-pandas path; see :func:`zscore_numba`.
     """
     n_rows, n_cols = data.shape
     result = data.copy()
@@ -521,7 +523,15 @@ def _zscore_numba(data: np.ndarray) -> np.ndarray:
 
 
 def zscore_numba(factor: pd.DataFrame) -> pd.DataFrame:
-    """Numba-accelerated zscore standardization with auto-fallback."""
+    """Numba-accelerated zscore standardization with auto-fallback.
+
+    Both paths divide by the **population** standard deviation
+    (``ddof=0``), matching :func:`_zscore_numba`. The pandas fallback used
+    ``Series.std()`` (``ddof=1``), so the two paths disagreed by
+    ``sqrt(n/(n-1))`` -- 5.1% at a 10-asset cross-section -- whenever the
+    accelerated kernel was unavailable. The population convention keeps
+    production factor values unchanged on the accelerated path.
+    """
     if HAS_NUMBA and factor.shape[1] >= 10:
         arr = factor.values.astype(np.float64)
         result = _zscore_numba(arr)
@@ -535,7 +545,7 @@ def zscore_numba(factor: pd.DataFrame) -> pd.DataFrame:
         if len(valid) < 10:
             continue
         mu = valid.mean()
-        sigma = valid.std()
+        sigma = valid.std(ddof=0)
         if sigma < 1e-10:
             result.loc[date] = 0.0
         else:

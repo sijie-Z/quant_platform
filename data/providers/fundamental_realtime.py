@@ -72,6 +72,14 @@ class FundamentalMetrics:
     def to_series(self) -> pd.Series:
         return pd.Series(self.to_dict())
 
+    def to_frame(self) -> pd.DataFrame:
+        """One-row frame that **keeps** provenance (``source``/``is_synthetic``).
+
+        Dropping those columns made fabricated fallback values
+        indistinguishable from live data once they left the dataclass.
+        """
+        return pd.DataFrame([self.to_dict()])
+
 
 class FundamentalDataProvider:
     """Real-time fundamental data provider with caching and rate limiting.
@@ -84,6 +92,8 @@ class FundamentalDataProvider:
         cache_ttl: Cache time-to-live in seconds
         rate_limit: Minimum seconds between API calls per source
         source: Preferred data source (only "eastmoney" is implemented)
+        strict: When True, an unavailable live API raises instead of
+            returning flagged synthetic values (fail closed).
     """
 
     def __init__(
@@ -91,10 +101,12 @@ class FundamentalDataProvider:
         cache_ttl: int = 300,
         rate_limit: float = 0.5,
         source: str = "eastmoney",
+        strict: bool = False,
     ):
         self._cache_ttl = cache_ttl
         self._rate_limit = rate_limit
         self._source = source
+        self._strict = bool(strict)
 
         self._cache: dict[str, tuple[float, FundamentalMetrics]] = {}
         self._lock = threading.Lock()
@@ -168,16 +180,24 @@ class FundamentalDataProvider:
         return result
 
     def get_as_dataframe(self, codes: list[str]) -> pd.DataFrame:
-        """Get fundamentals as a DataFrame (stocks x metrics)."""
+        """Get fundamentals as a DataFrame (stocks x metrics).
+
+        Provenance columns (``source``/``is_synthetic``, plus ``name`` and
+        ``timestamp``) are preserved so callers can tell live numbers from
+        synthetic fallbacks; they are not coerced to numeric.
+        """
         metrics = self.get_bulk(codes)
         data = {code: m.to_dict() for code, m in metrics.items()}
         df = pd.DataFrame(data).T
         df.index.name = "code"
-        # Drop non-numeric columns
-        for col in ["name", "timestamp", "source", "is_synthetic"]:
-            if col in df.columns:
-                df = df.drop(columns=[col])
-        return df.apply(pd.to_numeric, errors="coerce")
+        provenance_cols = [
+            col for col in ("name", "timestamp", "source", "is_synthetic")
+            if col in df.columns
+        ]
+        numeric_cols = [col for col in df.columns if col not in provenance_cols]
+        if numeric_cols:
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        return df
 
     def clear_cache(self):
         """Clear the cache."""
@@ -193,6 +213,7 @@ class FundamentalDataProvider:
             "synthetic_count": self._synthetic_count,
             "cached": len(self._cache),
             "cache_ttl": self._cache_ttl,
+            "strict": self._strict,
             "request_count": self._request_count,
             "cache_hits": self._cache_hits,
             "cache_misses": self._cache_misses,
@@ -236,6 +257,11 @@ class FundamentalDataProvider:
             return metrics
         except Exception as e:
             logger.debug("East Money API failed for %s: %s", code, e)
+            if self._strict:
+                # Fail closed: never fabricate ratios in strict mode.
+                raise RuntimeError(
+                    f"live fundamentals unavailable for {code} (strict mode): {e}"
+                ) from e
 
         logger.info("Using synthetic fundamentals for %s (live API unavailable)", code)
         metrics = self._generate_synthetic(code)

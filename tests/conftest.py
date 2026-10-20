@@ -2,10 +2,30 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.synthetic import SyntheticDataProvider
+
+
+@pytest.fixture(autouse=True)
+def _keep_platform_logger_propagating():
+    """Keep pytest's ``caplog`` working after any test calls setup_logging().
+
+    ``setup_logging()`` sets ``propagate = False`` on the package logger, so
+    once a logging/CLI test runs, caplog's root handler stops seeing platform
+    records and later warning assertions fail depending on test order. Set
+    propagation for each test and restore the previous value afterwards.
+    """
+    logger = logging.getLogger("quant_platform")
+    previous = logger.propagate
+    logger.propagate = True
+    try:
+        yield
+    finally:
+        logger.propagate = previous
 
 
 @pytest.fixture(scope="session")

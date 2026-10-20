@@ -23,6 +23,15 @@ from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Statutory A-share stamp tax schedule. The rate was cut from 0.1% to 0.05%
+# on 2023-08-28; a CostModel built without an explicit `stamp_tax` follows
+# these dates when the trade date is supplied. An explicit `stamp_tax` value
+# is a flat override (e.g. `config.costs.stamp_tax`).
+STAMP_TAX_SCHEDULE: tuple[tuple[pd.Timestamp, float], ...] = (
+    (pd.Timestamp("2023-08-28"), 0.0005),
+)
+STAMP_TAX_BEFORE_SCHEDULE = 0.001
+
 
 def _common_index(*values):
     """Label index shared by the pandas Series among `values`, or None."""
@@ -61,33 +70,59 @@ class CostModel:
     - "impact": Uses ExecutionCostCalculator (Almgren-Chriss + Square-Root ensemble).
       Requires daily_volume (average daily traded value in CNY, 人民币成交额)
       and volatility per asset. More accurate for large orders.
+
+    The vectorised path charges commission (with a per-order CNY minimum when
+    the per-order notional is known), the both-sides transfer fee, the
+    date-dependent sell-side stamp tax, and slippage. Per-instrument
+    commission/stamp overrides from an ``AssetUniverse`` are applied when the
+    traded Series' index carries the symbols (the backtest engine path).
     """
 
     def __init__(
         self,
         commission: float = 0.0003,
-        stamp_tax: float = 0.001,
+        stamp_tax: float | None = None,
         slippage: float = 0.001,
         slippage_model: str = "fixed",
         asset_universe=None,
         impact_model: str = "composite",  # composite, almgren_chriss, square_root
+        min_commission: float = 5.0,
+        transfer_fee: float = 0.00001,
     ):
         """
         Args:
             commission: Commission rate per trade (default 0.03%).
-            stamp_tax: Stamp tax on sell only (default 0.1%).
+            stamp_tax: Flat stamp tax on sells. ``None`` (default) follows the
+                statutory date schedule (0.1% before 2023-08-28, 0.05% from
+                that date) when ``compute_costs`` is given a ``date``; without
+                a date the pre-change 0.1% rate is used for backward
+                compatibility. An explicit value overrides the schedule
+                (config override).
             slippage: Slippage assumption (default 0.1%). Used as fixed bps or
                       as baseline for impact model.
             slippage_model: 'fixed' for constant bps, 'proportional' for
                            size-dependent impact, 'impact' for full market impact model.
             asset_universe: AssetUniverse for per-instrument cost overrides.
             impact_model: Which impact model to use when slippage_model='impact'.
+            min_commission: Commission floor in CNY per order. Applied on the
+                per-asset notional only when ``compute_costs`` is told the
+                portfolio value (i.e. the values passed are CNY notionals).
+                The weight-based engine is a per-asset-order approximation:
+                one order per rebalanced name.
+            transfer_fee: Transfer fee rate, both sides (default 0.001% =
+                0.00001).
         """
         self.commission = commission
-        self.stamp_tax = stamp_tax
+        # Numeric attribute kept for backward compatibility; the schedule is
+        # consulted instead when this was left at the default and a date is
+        # supplied.
+        self._stamp_tax_override = stamp_tax is not None
+        self.stamp_tax = STAMP_TAX_BEFORE_SCHEDULE if stamp_tax is None else stamp_tax
         self.slippage = slippage
         self.slippage_model = slippage_model
         self.asset_universe = asset_universe
+        self.min_commission = min_commission
+        self.transfer_fee = transfer_fee
 
         # Lazy-load impact model (only when needed)
         self._impact_calculator = None
@@ -95,6 +130,59 @@ class CostModel:
         # Set once, the first time a configured model cannot be used, so the
         # warning names the problem without repeating on every rebalance.
         self._slippage_fallback_warned = False
+
+    def _stamp_rate(self, date=None):
+        """Stamp-tax rate for a trade date (flat override wins)."""
+        if self._stamp_tax_override or date is None:
+            return self.stamp_tax
+        rate = STAMP_TAX_BEFORE_SCHEDULE
+        for change_date, new_rate in STAMP_TAX_SCHEDULE:
+            if pd.Timestamp(date) >= change_date:
+                rate = new_rate
+        return rate
+
+    def _instrument_rates(self, traded, symbol, date=None):
+        """Per-instrument commission/stamp overrides for a vectorised call.
+
+        Returns ``(commission_rate, stamp_rate)`` where either can be a
+        Series aligned to ``traded.index``. The engine passes a Series whose
+        index is the asset universe, so the overrides are reachable from the
+        vector path as well as from the scalar `symbol=` one (B7).
+        """
+        base_commission = self.commission
+        base_stamp = self._stamp_rate(date)
+        if self.asset_universe is None:
+            return base_commission, base_stamp
+
+        index = traded.index if isinstance(traded, pd.Series) else None
+        if isinstance(symbol, str) and symbol:
+            inst = self.asset_universe.get(symbol)
+            if inst is None:
+                return base_commission, base_stamp
+            commission_rate = (
+                inst.commission_rate
+                if inst.commission_rate is not None else base_commission
+            )
+            stamp_rate = (
+                inst.stamp_tax_rate
+                if inst.stamp_tax_rate is not None else base_stamp
+            )
+            return commission_rate, stamp_rate
+
+        if index is None:
+            return base_commission, base_stamp
+
+        commission_series = pd.Series(base_commission, index=index, dtype=float)
+        stamp_series = pd.Series(base_stamp, index=index, dtype=float)
+        for asset in index:
+            inst = self.asset_universe.get(asset) if isinstance(asset, str) else None
+            if inst is None:
+                continue
+            if inst.commission_rate is not None:
+                commission_series.loc[asset] = inst.commission_rate
+            if inst.stamp_tax_rate is not None:
+                stamp_series.loc[asset] = inst.stamp_tax_rate
+        return commission_series, stamp_series
 
     def compute_costs(
         self,
@@ -105,8 +193,10 @@ class CostModel:
         volatility=None,
         buy_turnover=None,
         sell_turnover=None,
+        date=None,
+        portfolio_value=None,
     ):
-        """Compute total transaction costs as a proportion of trade value.
+        """Compute total transaction costs.
 
         Args:
             turnover: Trade value (scalar, Series, or array). Only used for
@@ -118,27 +208,32 @@ class CostModel:
                 (人民币成交额), **not** a share count. Used by the
                 proportional and impact slippage models; participation is
                 traded CNY / daily traded CNY.
-            symbol: Instrument symbol for per-instrument cost lookup.
+            symbol: Instrument symbol for per-instrument cost lookup. For a
+                Series input, either a scalar symbol (single-asset Series) or
+                a sequence of symbols aligned to the Series. When omitted the
+                Series index itself is treated as the symbol list, which is
+                what the backtest engine relies on (B7).
             volatility: Daily volatility for impact model (annualized / sqrt(252)).
             buy_turnover: Per-asset buy notional (same units as ``turnover``).
                 When given, commission and slippage are charged on the total
                 two-way value and stamp tax on ``sell_turnover`` only.
             sell_turnover: Per-asset sell notional (same units as ``turnover``).
+            date: Trade date. Selects the statutory stamp-tax rate when no
+                flat ``stamp_tax`` override was configured (B11).
+            portfolio_value: Current portfolio value in CNY. When supplied,
+                ``turnover`` / ``buy_turnover`` / ``sell_turnover`` MUST be
+                CNY notional amounts, the per-order minimum commission is
+                applied, and the returned costs are a fraction of
+                ``portfolio_value``. When omitted the legacy contract holds:
+                values are the caller's trade-value units and the returned
+                cost is in the same units; the CNY floor cannot be applied
+                because the notional is unknown (documented large-account
+                approximation for such callers).
 
         Returns:
-            Total cost as proportion of trade value (same type as turnover).
+            Total cost as a proportion of trade value (same type as turnover;
+            a fraction of portfolio value when ``portfolio_value`` is given).
         """
-        # Look up per-instrument rates if available
-        commission_rate = self.commission
-        stamp_tax_rate = self.stamp_tax
-        if symbol and self.asset_universe is not None:
-            inst = self.asset_universe.get(symbol)
-            if inst is not None:
-                if inst.commission_rate is not None:
-                    commission_rate = inst.commission_rate
-                if inst.stamp_tax_rate is not None:
-                    stamp_tax_rate = inst.stamp_tax_rate
-
         if buy_turnover is not None or sell_turnover is not None:
             # Explicit buy/sell split: stamp tax is a sell-side tax, so it is
             # charged on the sell notional only. Charging it on a total with
@@ -148,17 +243,30 @@ class CostModel:
             buy = np.abs(0.0 if buy_turnover is None else buy_turnover)
             sell = np.abs(0.0 if sell_turnover is None else sell_turnover)
             traded = buy + sell
-            commission_cost = traded * commission_rate
-            stamp_cost = sell * stamp_tax_rate
+            rate_probe = buy if isinstance(buy, pd.Series) else sell
         else:
             abs_turnover = np.abs(turnover)
             traded = abs_turnover
-            commission_cost = abs_turnover * commission_rate
+            rate_probe = abs_turnover
 
+        commission_rate, stamp_tax_rate = self._instrument_rates(
+            rate_probe, symbol, date,
+        )
+
+        if buy_turnover is not None or sell_turnover is not None:
+            commission_cost = traded * commission_rate
+            stamp_cost = sell * stamp_tax_rate
+        else:
+            commission_cost = traded * commission_rate
             if is_sell is not None:
-                stamp_cost = abs_turnover * stamp_tax_rate * is_sell.astype(float)
+                stamp_cost = traded * stamp_tax_rate * is_sell.astype(float)
             else:
-                stamp_cost = abs_turnover * stamp_tax_rate * 0.5
+                stamp_cost = traded * stamp_tax_rate * 0.5
+
+        commission_cost = self._apply_commission_floor(
+            commission_cost, traded, portfolio_value is not None,
+        )
+        transfer_cost = traded * self.transfer_fee
 
         # --- Market impact / slippage ---
         if self.slippage_model == "impact" and daily_volume is not None and volatility is not None:
@@ -209,7 +317,33 @@ class CostModel:
                     )
             slippage_cost = traded * self.slippage
 
-        return commission_cost + stamp_cost + slippage_cost
+        total = commission_cost + stamp_cost + transfer_cost + slippage_cost
+        if portfolio_value is not None:
+            # Inputs were CNY notionals of a CNY portfolio; return a fraction.
+            return total / float(portfolio_value)
+        return total
+
+    def _apply_commission_floor(self, commission_cost, traded, notional_known):
+        """Apply the CNY per-order minimum where the notional is known.
+
+        The floor is meaningful only when ``traded`` is a CNY amount, which
+        :meth:`compute_costs` signals with ``portfolio_value``. Outside that
+        contract the amounts may be weights or arbitrary units and a CNY floor
+        would be nonsense, so this is a no-op there.
+        """
+        if not notional_known or self.min_commission <= 0:
+            return commission_cost
+        if isinstance(commission_cost, pd.Series):
+            floored = commission_cost.clip(lower=self.min_commission)
+            if isinstance(traded, pd.Series):
+                floored = floored.where(traded.reindex(floored.index) > 0, 0.0)
+            return floored
+        arr = np.asarray(commission_cost, dtype=float)
+        traded_arr = np.asarray(traded, dtype=float)
+        floored = np.maximum(arr, float(self.min_commission))
+        if arr.ndim == 0:
+            return float(floored) if float(traded_arr) > 0 else 0.0
+        return np.where(traded_arr > 0, floored, 0.0)
 
     # Reference price used to translate a CNY traded value into a share
     # quantity for the impact model, which takes shares. The square-root and

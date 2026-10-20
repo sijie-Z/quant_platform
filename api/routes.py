@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +15,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+from starlette.concurrency import run_in_threadpool
 
 from quant_platform.api.schemas import (
     AttributionItem,
@@ -66,6 +69,7 @@ from quant_platform.api.schemas import (
 from quant_platform.execution.oms import OrderManager
 from quant_platform.main import (
     _compute_factors,
+    _execution_gates,
     _generate_signal,
     _load_data,
     _run_backtest,
@@ -77,51 +81,294 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api")
 
-# Thread pool for background pipeline execution
-_executor = ThreadPoolExecutor(max_workers=2)
+# ---------------------------------------------------------------------------
+# Executors: pipeline work and analytics work get separate, bounded pools.
+#
+# One shared two-worker pool meant a `/compare` request could sit in front of
+# an accepted pipeline run, and a burst of analytics requests queued without
+# bound. Pipeline runs keep the existing 2-active-run cap; analytics requests
+# are rejected with 429 when both analytics workers are busy.
+# ---------------------------------------------------------------------------
 
-# In-memory store for run results (thread-safe for CPython dict ops)
+_PIPELINE_WORKERS = 2
+_ANALYTICS_WORKERS = 2
+_executors_lock = threading.Lock()
+_pipeline_executor: ThreadPoolExecutor | None = None
+_analytics_executor: ThreadPoolExecutor | None = None
+_analytics_slots = threading.BoundedSemaphore(_ANALYTICS_WORKERS)
+
+
+def _make_pipeline_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(
+        max_workers=_PIPELINE_WORKERS, thread_name_prefix="pipeline",
+    )
+
+
+def _make_analytics_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(
+        max_workers=_ANALYTICS_WORKERS, thread_name_prefix="analytics",
+    )
+
+
+def _get_pipeline_executor() -> ThreadPoolExecutor:
+    global _pipeline_executor
+    executor = _pipeline_executor
+    if executor is None:
+        with _executors_lock:
+            if _pipeline_executor is None:
+                _pipeline_executor = _make_pipeline_executor()
+            executor = _pipeline_executor
+    return executor
+
+
+def _get_analytics_executor() -> ThreadPoolExecutor:
+    global _analytics_executor
+    executor = _analytics_executor
+    if executor is None:
+        with _executors_lock:
+            if _analytics_executor is None:
+                _analytics_executor = _make_analytics_executor()
+            executor = _analytics_executor
+    return executor
+
+
+def ensure_executors() -> None:
+    """Create the executors if they are absent.
+
+    Called at application startup so a process that shut its executors down
+    (lifespan exit) and then started again -- as repeated `TestClient`
+    lifespans do -- still has live pools.
+    """
+    _get_pipeline_executor()
+    _get_analytics_executor()
+
+
+def _shutdown_executor(executor: ThreadPoolExecutor | None) -> None:
+    if executor is None:
+        return
+    try:
+        executor.shutdown(wait=True, cancel_futures=True)
+    except Exception:
+        logger.exception("Executor shutdown failed")
+
+
+def shutdown_executors() -> None:
+    """Stop both pools. Does not wait past each pool's own in-flight work.
+
+    Python cannot kill a running thread; `cancel_futures=True` only cancels
+    work that has not started. A pipeline already inside `_execute_pipeline`
+    keeps running until it returns, which is the documented limitation.
+    """
+    global _pipeline_executor, _analytics_executor
+    with _executors_lock:
+        pipeline, analytics = _pipeline_executor, _analytics_executor
+        _pipeline_executor = None
+        _analytics_executor = None
+    _shutdown_executor(analytics)
+    _shutdown_executor(pipeline)
+
+
+# In-memory store for run results. Every access goes through `_run_lock`:
+# cleanup runs on pipeline worker threads while HTTP handlers iterate the
+# same dicts on the loop, and a status-blind cleanup could evict a run that
+# was still executing.
+_run_lock = threading.RLock()
 _run_store: dict[str, dict[str, Any]] = {}
 _run_status: dict[str, dict[str, Any]] = {}
-_MAX_RUNS = 50  # Keep at most this many completed runs in memory
+_MAX_RUNS = 50  # Keep at most this many finished runs in memory
+_RUN_LIMIT = 2
+_run_slots = threading.BoundedSemaphore(_RUN_LIMIT)
+_run_slot_holders: set[str] = set()
+_run_futures: dict[str, Any] = {}
 
-# WebSocket connection manager for real-time updates
-_ws_clients: set[WebSocket] = set()
+
+class RunStatusWithPhase(RunStatus):
+    """RunStatus plus an additive phase field.
+
+    `status` keeps the values the UI already understands ("running" while a
+    run is queued or executing); `phase` distinguishes the two so a client is
+    not told a run is executing when it is still waiting for a worker.
+    """
+
+    phase: str = "executing"
+
+
+# WebSocket connection manager for real-time updates.
+#
+# Each client gets its own bounded queue and sender task. The old broadcast
+# iterated `_ws_clients` across `await ws.send_text(...)`, so a connect or
+# disconnect during a send raised "Set changed size during iteration" and
+# silently dropped the message for every remaining client; a single slow
+# client also delayed all the others.
+_WS_QUEUE_SIZE = 256
+_WS_SEND_TIMEOUT = 5.0
+_WS_MAX_CLIENTS = 100
+_HIGH_RATE_TOPICS = frozenset({"market.tick"})
 _LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
+
+
+class _WSClient:
+    """One connected WebSocket plus its bounded outbound queue."""
+
+    __slots__ = ("ws", "queue", "task", "closed", "dropped")
+
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=_WS_QUEUE_SIZE)
+        self.task: asyncio.Task | None = None
+        self.closed = False
+        self.dropped = 0
+
+
+_ws_clients: set[_WSClient] = set()
 
 # The server's event loop, captured by the first WebSocket connection. Events
 # are published from worker threads, which cannot look their own loop up.
 _main_loop: asyncio.AbstractEventLoop | None = None
 
 
+def _serialize_ws_payload(payload: dict) -> str | None:
+    """Serialize a broadcast payload, logging instead of raising.
+
+    `json.dumps` used to sit outside the try block, so one unserializable
+    event payload (e.g. a numpy scalar) killed the whole broadcast.
+    """
+    try:
+        return json.dumps(payload)
+    except (TypeError, ValueError):
+        logger.exception("Dropping WebSocket broadcast: payload is not serializable")
+        return None
+
+
+def _enqueue_ws_message(msg: str, topic: str = "") -> None:
+    """Fan a message out to every live client without awaiting.
+
+    Never awaits, so the live set cannot change under it and a slow client
+    cannot head-of-line block the rest. When a client's queue is full the
+    oldest message is dropped: for high-rate topics like `market.tick` the
+    newest tick is worth more than the backlog, and a bounded queue is what
+    keeps one stalled browser from growing server memory without limit.
+    """
+    for client in tuple(_ws_clients):
+        if client.closed:
+            _ws_clients.discard(client)
+            continue
+        try:
+            client.queue.put_nowait(msg)
+            continue
+        except asyncio.QueueFull:
+            pass
+        try:
+            client.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            client.queue.put_nowait(msg)
+        except asyncio.QueueFull:
+            pass
+        client.dropped += 1
+        if client.dropped == 1 or client.dropped % 1000 == 0:
+            logger.warning(
+                "WebSocket client queue full (dropped=%d, topic=%s); "
+                "dropping the oldest message",
+                client.dropped, topic or "status",
+            )
+
+
 async def _broadcast_status(run_id: str, status: dict):
     """Push status update to all connected WebSocket clients."""
-    global _ws_clients
     if not _ws_clients:
         return
-    msg = json.dumps({"type": "status", "run_id": run_id, **status})
-    dead = set()
-    for ws in _ws_clients:
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.add(ws)
-    _ws_clients -= dead
+    msg = _serialize_ws_payload({"type": "status", "run_id": run_id, **status})
+    if msg is None:
+        return
+    _enqueue_ws_message(msg, topic="status")
 
 
 async def _broadcast_event(event_type: str, data: dict):
     """Push an event to all connected WebSocket clients."""
-    global _ws_clients
     if not _ws_clients:
         return
-    msg = json.dumps({"type": "event", "event": event_type, "data": data, "ts": datetime.now().isoformat()})
-    dead = set()
-    for ws in _ws_clients:
+    msg = _serialize_ws_payload({
+        "type": "event", "event": event_type, "data": data,
+        "ts": datetime.now().isoformat(),
+    })
+    if msg is None:
+        return
+    _enqueue_ws_message(
+        msg,
+        topic=event_type if event_type in _HIGH_RATE_TOPICS else "",
+    )
+
+
+async def _ws_sender_loop(client: _WSClient) -> None:
+    """Deliver one client's queued messages until it fails or disconnects."""
+    try:
+        while True:
+            msg = await client.queue.get()
+            if client.closed:
+                break
+            try:
+                await asyncio.wait_for(
+                    client.ws.send_text(msg), timeout=_WS_SEND_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "WebSocket send failed or timed out (%.0fs); closing client: %s",
+                    _WS_SEND_TIMEOUT, exc,
+                )
+                break
+    except asyncio.CancelledError:
+        pass
+    finally:
+        client.closed = True
+        _ws_clients.discard(client)
         try:
-            await ws.send_text(msg)
+            await asyncio.wait_for(client.ws.close(), timeout=1.0)
         except Exception:
-            dead.add(ws)
-    _ws_clients -= dead
+            pass
+
+
+async def _close_all_ws_clients() -> None:
+    """Close every live WebSocket (lifespan shutdown)."""
+    for client in tuple(_ws_clients):
+        client.closed = True
+        _ws_clients.discard(client)
+        task = client.task
+        if task is not None and not task.done():
+            task.cancel()
+        try:
+            await asyncio.wait_for(client.ws.close(), timeout=1.0)
+        except Exception:
+            pass
+
+
+def _log_broadcast_future(future) -> None:
+    """Surface exceptions from a fire-and-forget broadcast future.
+
+    The returned future used to be discarded, so a RuntimeError raised by the
+    broadcast coroutine was never retrieved or logged.
+    """
+    try:
+        exc = future.exception()
+    except Exception:
+        return
+    if exc is not None:
+        logger.error("WebSocket broadcast failed: %s", exc, exc_info=exc)
+
+
+def _submit_broadcast(coro, loop: asyncio.AbstractEventLoop | None) -> None:
+    if loop is None:
+        coro.close()
+        return
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+    except RuntimeError:
+        coro.close()
+        return
+    future.add_done_callback(_log_broadcast_future)
 
 
 def _remember_loop() -> asyncio.AbstractEventLoop | None:
@@ -152,16 +399,15 @@ def _on_bus_event(event):
     since the only trace was the absence of messages.
 
     Handing the coroutine to the server's loop works from any thread, so the
-    event no longer depends on which thread published it.
+    event no longer depends on which thread published it. The returned future
+    is retained with a done callback that logs, instead of vanishing.
     """
     if not _ws_clients:
         return
     loop = _main_loop
     if loop is None or loop.is_closed() or not loop.is_running():
         return
-    asyncio.run_coroutine_threadsafe(
-        _broadcast_event(event.topic, event.data), loop
-    )
+    _submit_broadcast(_broadcast_event(event.topic, event.data), loop)
 
 
 def _latest_run_id() -> str:
@@ -173,13 +419,20 @@ def _latest_run_id() -> str:
     against empty string, so `max` returned the first-inserted run and IC decay
     and factor correlation always served the *oldest* run. `started_at` lives
     in `_run_status`.
+
+    A snapshot is taken under `_run_lock`: cleanup runs on pipeline worker
+    threads and mutates the same dict.
     """
-    if not _run_status:
-        raise HTTPException(400, "No completed run found. Run pipeline first.")
-    return max(
-        _run_status.keys(),
-        key=lambda k: _run_status[k].get("started_at", "") or "",
-    )
+    with _run_lock:
+        if not _run_status:
+            raise HTTPException(400, "No completed run found. Run pipeline first.")
+        return max(
+            _run_status,
+            key=lambda k: (_run_status.get(k) or {}).get("started_at", "") or "",
+        )
+
+
+_TERMINAL_RUN_STATUSES = ("completed", "failed")
 
 
 def _cleanup_old_runs():
@@ -188,30 +441,200 @@ def _cleanup_old_runs():
     `_run_store` only receives successful runs, so cleaning it alone let every
     failed run keep a full traceback in `_run_status` for the process
     lifetime.
+
+    Only finished runs are evicted. The old final loop dropped the oldest
+    entries regardless of status, so a cleanup triggered by >100 accumulated
+    entries could delete a *running* run record (reproduced: 120 running
+    entries -> 20 evicted).
     """
-    if len(_run_store) <= _MAX_RUNS and len(_run_status) <= _MAX_RUNS:
-        return
+    with _run_lock:
+        if len(_run_store) <= _MAX_RUNS and len(_run_status) <= _MAX_RUNS:
+            return
 
-    finished = [
-        (rid, s.get("completed_at") or s.get("started_at") or "")
-        for rid, s in _run_status.items()
-        if s.get("status") in ("completed", "failed")
-    ]
-    finished.sort(key=lambda x: x[1])
-    excess = max(
-        len(_run_store) - _MAX_RUNS,
-        len(_run_status) - _MAX_RUNS,
-        1,
+        finished = [
+            (rid, s.get("completed_at") or s.get("started_at") or "")
+            for rid, s in _run_status.items()
+            if s.get("status") in _TERMINAL_RUN_STATUSES
+        ]
+        finished.sort(key=lambda x: x[1])
+        excess = max(
+            len(_run_store) - _MAX_RUNS,
+            len(_run_status) - _MAX_RUNS,
+            1,
+        )
+        for rid, _ in finished[:excess]:
+            _run_store.pop(rid, None)
+            _run_status.pop(rid, None)
+
+        stuck = sum(
+            1 for s in _run_status.values()
+            if s.get("status") not in _TERMINAL_RUN_STATUSES
+        )
+        if stuck > _MAX_RUNS * 2:
+            # Deliberately no eviction: a running/queued record is the handle
+            # a client polls, and deleting it turns a slow run into a 404.
+            logger.error(
+                "Run registry holds %d non-terminal entries (cap %d); "
+                "refusing to evict active runs",
+                stuck, _MAX_RUNS * 2,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Run registry helpers (all mutations under `_run_lock`)
+# ---------------------------------------------------------------------------
+
+def _set_run_fields(run_id: str, **fields: Any) -> dict | None:
+    """Update a status entry if it still exists; returns a snapshot."""
+    with _run_lock:
+        entry = _run_status.get(run_id)
+        if entry is None:
+            return None
+        entry.update(fields)
+        return dict(entry)
+
+
+def _run_status_snapshot(run_id: str) -> dict | None:
+    with _run_lock:
+        entry = _run_status.get(run_id)
+        return dict(entry) if entry is not None else None
+
+
+def _release_run_slot(run_id: str) -> None:
+    """Release a pipeline slot exactly once.
+
+    Called from `_execute_pipeline`'s guaranteed finally *and* from the
+    executor future's done callback; the holder set makes the second call a
+    no-op, so a failed submit (which never runs the body) still frees its
+    slot and a normal completion cannot double-release.
+    """
+    with _run_lock:
+        if run_id not in _run_slot_holders:
+            return
+        _run_slot_holders.discard(run_id)
+    try:
+        _run_slots.release()
+    except ValueError:
+        pass
+
+
+def _mark_run_failed_unexpected(run_id: str, exc: BaseException) -> None:
+    """Mark a run failed when its worker future dies outside the catch path.
+
+    `_execute_pipeline` catches `Exception`, not `BaseException`, and an
+    exception raised inside its own except/finally escapes into the discarded
+    Future. Without this callback the run stayed "running" forever and held
+    its slot, so two such runs made every later POST /run return 429 until
+    the process restarted.
+    """
+    snapshot = None
+    with _run_lock:
+        entry = _run_status.get(run_id)
+        if entry is not None and entry.get("status") == "running":
+            entry.update(
+                status="failed",
+                phase="failed",
+                error=f"{type(exc).__name__}: pipeline worker exited unexpectedly"[:500],
+                completed_at=datetime.now().isoformat(),
+            )
+            snapshot = dict(entry)
+    logger.error(
+        "Pipeline run %s exited unexpectedly: %r", run_id, exc, exc_info=exc,
     )
-    for rid, _ in finished[:excess]:
-        _run_store.pop(rid, None)
-        _run_status.pop(rid, None)
+    if snapshot is not None:
+        _submit_broadcast(_broadcast_status(run_id, snapshot), _main_loop)
 
-    # Entries stuck in "running" have no completed_at; keep at most twice the
-    # cap and drop the oldest so a stuck producer cannot grow the dict forever.
-    while len(_run_status) > _MAX_RUNS * 2:
-        oldest = min(_run_status, key=lambda k: _run_status[k].get("started_at", ""))
-        _run_status.pop(oldest, None)
+
+def _on_run_future_done(run_id: str, future) -> None:
+    """Done callback for a pipeline executor future."""
+    try:
+        exc = future.exception()
+    except BaseException as exc:  # noqa: BLE001 - cancelled futures raise here
+        _mark_run_failed_unexpected(run_id, exc)
+    else:
+        if exc is not None:
+            _mark_run_failed_unexpected(run_id, exc)
+    with _run_lock:
+        _run_futures.pop(run_id, None)
+    _release_run_slot(run_id)
+
+
+# ---------------------------------------------------------------------------
+# Small bounded primitives shared by several endpoints
+# ---------------------------------------------------------------------------
+
+def _bounded_limit(value: int, default: int = 100, maximum: int = 1000) -> int:
+    """Clamp a caller-supplied limit (same rule as `store._clamp_limit`)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, min(number, maximum))
+
+
+def _error_code_header(code: str) -> dict[str, str]:
+    """Stable machine-readable code for a 5xx response.
+
+    The HTTP body keeps a generic human message (no exception text, paths or
+    SQL); the code lets clients and dashboards distinguish failures without
+    parsing prose.
+    """
+    return {"X-Error-Code": code}
+
+
+def _internal_error(
+    status_code: int, code: str, message: str,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail=message,
+        headers=_error_code_header(code),
+    )
+
+
+#: Bounded pool for sync endpoints that rerun the full data pipeline
+#: (`_load_data` + `_compute_factors`). AnyIO's default limiter is 40 tokens,
+#: so without this a burst could run dozens of full pipelines at once.
+_COMPUTE_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _run_bounded_compute(fn, *args):
+    """Run a full-pipeline compute handler under the shared 2-slot bound."""
+    if not _COMPUTE_SLOTS.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Compute capacity exhausted; retry shortly",
+            headers={"Retry-After": "10"},
+        )
+    try:
+        return fn(*args)
+    finally:
+        _COMPUTE_SLOTS.release()
+
+
+async def _run_analytics(fn, *args):
+    """Run an analytics job on the dedicated executor, 429 when saturated."""
+    if not _analytics_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Analytics capacity exhausted; retry shortly",
+            headers={"Retry-After": "5"},
+        )
+    loop = asyncio.get_running_loop()
+    try:
+        future = loop.run_in_executor(_get_analytics_executor(), fn, *args)
+    except Exception:
+        _analytics_slots.release()
+        raise
+
+    def _release(_future) -> None:
+        try:
+            _analytics_slots.release()
+        except ValueError:
+            pass
+
+    future.add_done_callback(_release)
+    return await future
 
 
 def _get_config_with_overrides(overrides: dict[str, Any]) -> Any:
@@ -235,11 +658,16 @@ def _get_config_with_overrides(overrides: dict[str, Any]) -> Any:
 
 @router.get("/health")
 async def health():
+    with _run_lock:
+        runs_completed = len(_run_store)
+        runs_active = sum(
+            1 for s in _run_status.values() if s.get("status") == "running"
+        )
     return {
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "runs_completed": len(_run_store),
-        "runs_active": sum(1 for s in _run_status.values() if s.get("status") == "running"),
+        "runs_completed": runs_completed,
+        "runs_active": runs_active,
     }
 
 
@@ -251,9 +679,19 @@ async def health():
 async def websocket_endpoint(ws: WebSocket, token: str = ""):
     # BaseHTTPMiddleware never sees WebSocket scopes, so the HTTP token guard
     # does not cover this stream (which carries order.filled and risk events).
+    #
+    # Preferred transport: the `bearer.<token>` subprotocol, because browsers
+    # cannot set handshake headers and a `?token=` query string is written to
+    # the uvicorn access log. The query parameter remains accepted for older
+    # clients.
+    offered = list((getattr(ws, "scope", None) or {}).get("subprotocols") or [])
+    bearer = next((p for p in offered if p.startswith("bearer.")), "")
+    protocol_token = bearer[len("bearer."):] if bearer else ""
+    effective_token = protocol_token or token
+
     expected = os.environ.get("QUANT_API_TOKEN", "")
     if expected:
-        if token != expected:
+        if effective_token != expected:
             await ws.close(code=1008)
             return
     else:
@@ -264,18 +702,34 @@ async def websocket_endpoint(ws: WebSocket, token: str = ""):
         if host not in _LOOPBACK_HOSTS:
             await ws.close(code=1008)
             return
+    if len(_ws_clients) >= _WS_MAX_CLIENTS:
+        await ws.close(code=1013)
+        return
     # Capture the loop here: this is the one place guaranteed to be running on
     # it before events start flowing. See _on_bus_event.
     _remember_loop()
-    await ws.accept()
-    _ws_clients.add(ws)
+    if bearer:
+        await ws.accept(subprotocol=bearer)
+    else:
+        await ws.accept()
+    client = _WSClient(ws)
+    client.task = asyncio.create_task(_ws_sender_loop(client))
+    _ws_clients.add(client)
     try:
         while True:
             await ws.receive_text()  # keep alive
     except WebSocketDisconnect:
         pass
     finally:
-        _ws_clients.discard(ws)
+        client.closed = True
+        _ws_clients.discard(client)
+        task = client.task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +738,8 @@ async def websocket_endpoint(ws: WebSocket, token: str = ""):
 
 @router.get("/config", response_model=ConfigInfo)
 async def get_config():
-    config = load_config(None)
+    # YAML read: never on the event loop.
+    config = await run_in_threadpool(load_config, None)
     return ConfigInfo(
         default_config={
             "n_stocks": config.universe.n_stocks,
@@ -309,48 +764,70 @@ async def get_config():
 # Run pipeline (async, non-blocking)
 # ---------------------------------------------------------------------------
 
-@router.post("/run", response_model=RunStatus)
+@router.post("/run", response_model=RunStatusWithPhase)
 async def run_pipeline(req: RunRequest):
     """Start a full pipeline run in a background thread.
 
     Returns immediately with run_id. Poll /run/{run_id}/status for progress.
+    The response carries `phase="queued"` until a worker actually picks the
+    run up, then `"executing"`; `status` stays "running" throughout so the
+    existing UI contract is unchanged. A third concurrent run is rejected
+    with 429 (the pipeline pool has two workers).
     """
-    # The thread pool has two workers; queueing unbounded pipeline runs is a
-    # cheap way to exhaust the server.
-    active_runs = sum(
-        1 for status in _run_status.values() if status.get("status") == "running"
-    )
-    if active_runs >= 2:
+    if not _run_slots.acquire(blocking=False):
         raise HTTPException(
-            429, "Two pipeline runs are already queued/running; try again later"
+            429,
+            "Two pipeline runs are already queued/running; try again later",
+            headers={"Retry-After": "5"},
         )
+
     run_id = uuid.uuid4().hex[:12]
-    _run_status[run_id] = {
-        "status": "running",
-        "progress": 0,
-        "stage": "data",
-        "started_at": datetime.now().isoformat(),
-        "completed_at": None,
-        "error": None,
-    }
+    try:
+        with _run_lock:
+            _run_status[run_id] = {
+                "status": "running",
+                "phase": "queued",
+                "progress": 0,
+                "stage": "data",
+                "started_at": datetime.now().isoformat(),
+                "completed_at": None,
+                "error": None,
+            }
+            _run_slot_holders.add(run_id)
 
-    # Offload to thread pool — does NOT block the event loop
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(_executor, _execute_pipeline, run_id, req)
+        # Offload to the pipeline-only pool — does NOT block the event loop.
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            _get_pipeline_executor(), _execute_pipeline, run_id, req,
+        )
+        with _run_lock:
+            _run_futures[run_id] = future
+        future.add_done_callback(
+            lambda done, rid=run_id: _on_run_future_done(rid, done)
+        )
+    except BaseException:
+        with _run_lock:
+            _run_status.pop(run_id, None)
+            _run_futures.pop(run_id, None)
+        _release_run_slot(run_id)
+        raise
 
-    return RunStatus(
+    snapshot = _run_status_snapshot(run_id) or {}
+    return RunStatusWithPhase(
         run_id=run_id,
-        status=_run_status[run_id]["status"],
-        progress=_run_status[run_id]["progress"],
-        stage=_run_status[run_id]["stage"],
-        started_at=_run_status[run_id]["started_at"],
-        completed_at=_run_status[run_id].get("completed_at"),
-        error=_run_status[run_id].get("error"),
+        status=snapshot.get("status", "running"),
+        phase=snapshot.get("phase", "queued"),
+        progress=snapshot.get("progress", 0),
+        stage=snapshot.get("stage", "data"),
+        started_at=snapshot.get("started_at") or datetime.now().isoformat(),
+        completed_at=snapshot.get("completed_at"),
+        error=snapshot.get("error"),
     )
 
 
 def _execute_pipeline(run_id: str, req: RunRequest):
     """Run the full quant pipeline (called from thread pool)."""
+    _set_run_fields(run_id, phase="executing")
     try:
         config = _get_config_with_overrides({
             "universe.n_stocks": req.n_stocks,
@@ -401,6 +878,7 @@ def _execute_pipeline(run_id: str, req: RunRequest):
             bt_results = _run_backtest(
                 config, signal, prices, returns, benchmark,
                 sector_map, fin_unstacked,
+                gates=_execution_gates(metadata),
             )
 
         # Stage 6: Build response
@@ -587,7 +1065,8 @@ def _execute_pipeline(run_id: str, req: RunRequest):
                 "Run produced non-JSON-compliant numbers (NaN/Inf); "
                 "marking the run failed instead of storing it."
             ) from exc
-        _run_store[run_id] = record
+        with _run_lock:
+            _run_store[run_id] = record
 
         _update_status(run_id, 100, "done")
 
@@ -596,57 +1075,61 @@ def _execute_pipeline(run_id: str, req: RunRequest):
         # type/message (with the run id for correlation). The status endpoint
         # previously exposed absolute paths and source lines to any caller.
         full_traceback = traceback.format_exc()
-        _run_status[run_id].update(
+        snapshot = _set_run_fields(
+            run_id,
             status="failed",
+            phase="failed",
             error=f"{type(exc).__name__}: {exc}"[:500],
             completed_at=datetime.now().isoformat(),
         )
         logger.error("Pipeline %s failed: %s", run_id, full_traceback)
         # Failures were never broadcast, so the frontend's WS failure branch
         # was dead and the run only surfaced through the next poll.
-        loop = _main_loop
-        if loop is not None and loop.is_running():
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    _broadcast_status(run_id, _run_status[run_id]), loop
-                )
-            except RuntimeError:
-                pass
+        if snapshot is not None:
+            _submit_broadcast(_broadcast_status(run_id, snapshot), _main_loop)
 
     finally:
-        _cleanup_old_runs()
+        # The slot is released even when the failure path itself raises; the
+        # done callback would otherwise be the only release path.
+        try:
+            _cleanup_old_runs()
+        finally:
+            _release_run_slot(run_id)
 
 
 def _update_status(run_id: str, progress: int, stage: str):
-    _run_status[run_id].update(progress=progress, stage=stage)
+    fields: dict[str, Any] = {"progress": progress, "stage": stage}
     if stage == "done":
-        _run_status[run_id].update(status="completed", completed_at=datetime.now().isoformat())
+        fields.update(
+            status="completed", phase="completed",
+            completed_at=datetime.now().isoformat(),
+        )
+    snapshot = _set_run_fields(run_id, **fields)
+    if snapshot is None:
+        logger.warning("Status update for unknown run %s ignored", run_id)
+        return
     # Broadcast to WebSocket clients (non-blocking from the worker thread).
     # `asyncio.get_event_loop()` raises on Python 3.12 in a thread with no
     # loop, so progress events were silently dropped; use the loop captured
     # by the WebSocket endpoint instead.
     loop = _main_loop
     if loop is not None and loop.is_running():
-        try:
-            asyncio.run_coroutine_threadsafe(
-                _broadcast_status(run_id, _run_status[run_id]), loop
-            )
-        except RuntimeError:
-            pass
+        _submit_broadcast(_broadcast_status(run_id, snapshot), loop)
 
 
-@router.get("/run/{run_id}/status", response_model=RunStatus)
+@router.get("/run/{run_id}/status", response_model=RunStatusWithPhase)
 async def get_run_status(run_id: str):
-    """Poll pipeline run status."""
-    if run_id not in _run_status:
+    """Poll pipeline run status (including queued-vs-executing phase)."""
+    s = _run_status_snapshot(run_id)
+    if s is None:
         raise HTTPException(status_code=404, detail="Run not found")
-    s = _run_status[run_id]
-    return RunStatus(
+    return RunStatusWithPhase(
         run_id=run_id,
-        status=s["status"],
-        progress=s["progress"],
-        stage=s["stage"],
-        started_at=s["started_at"],
+        status=s.get("status", "running"),
+        phase=s.get("phase", "executing"),
+        progress=s.get("progress", 0),
+        stage=s.get("stage", "data"),
+        started_at=s.get("started_at") or datetime.now().isoformat(),
         completed_at=s.get("completed_at"),
         error=s.get("error"),
     )
@@ -655,9 +1138,10 @@ async def get_run_status(run_id: str):
 @router.get("/run/{run_id}/result", response_model=RunResult)
 async def get_run_result(run_id: str):
     """Get completed run results."""
-    if run_id not in _run_store:
+    with _run_lock:
+        data = _run_store.get(run_id)
+    if data is None:
         raise HTTPException(status_code=404, detail="Result not found")
-    data = _run_store[run_id]
     return RunResult(
         run_id=run_id,
         performance=data.get("performance"),
@@ -932,6 +1416,36 @@ def _compute_attribution(
     return result
 
 
+#: Hard bound on any single chart series in a run result. A 20-year daily run
+#: is ~5,000 points; beyond this the frontend cannot show more pixels anyway
+#: and the JSON payload grows without bound. The most recent point is always
+#: retained so the chart still ends at the present.
+_MAX_CHART_POINTS = 2000
+
+
+def _downsample_series(values: list, max_points: int = _MAX_CHART_POINTS) -> list:
+    if len(values) <= max_points:
+        return values
+    step = int(np.ceil(len(values) / max_points))
+    sampled = values[::step]
+    if sampled[-1] is not values[-1]:
+        sampled.append(values[-1])
+    return sampled
+
+
+def _downsample_dates(dates: list[str], values: list,
+                      max_points: int = _MAX_CHART_POINTS) -> tuple[list[str], list]:
+    if len(values) <= max_points or len(dates) != len(values):
+        return dates, values
+    step = int(np.ceil(len(values) / max_points))
+    sampled_dates = dates[::step]
+    sampled_values = values[::step]
+    if sampled_values[-1] is not values[-1]:
+        sampled_dates.append(dates[-1])
+        sampled_values.append(values[-1])
+    return sampled_dates, sampled_values
+
+
 def _build_chart_data(
     strategy_returns: pd.Series,
     benchmark_returns: pd.Series | None = None,
@@ -1054,9 +1568,25 @@ def _build_chart_data(
         except Exception:
             pass
 
+    # Bound every long series before it enters the run record. Drawdown
+    # periods, turnover, scatter and attribution are already capped above;
+    # the equity-aligned series were not, so a long run serialized one point
+    # per trading day forever.
+    equity_values = equity.tolist()
+    dates, equity_values = _downsample_dates(dates, equity_values)
+    drawdown = _downsample_series(drawdown)
+    if bench_equity is not None:
+        bench_equity = _downsample_series(bench_equity)
+    if excess_cumulative is not None:
+        excess_cumulative = _downsample_series(excess_cumulative)
+    if rolling_sharpe is not None and rolling_sharpe_dates is not None:
+        rolling_sharpe_dates, rolling_sharpe = _downsample_dates(
+            rolling_sharpe_dates, rolling_sharpe,
+        )
+
     return ChartData(
         dates=dates,
-        equity=equity.tolist(),
+        equity=equity_values,
         benchmark=bench_equity,
         drawdown=drawdown,
         rolling_sharpe=rolling_sharpe,
@@ -1321,13 +1851,16 @@ async def get_demo():
 @router.get("/factors")
 async def get_latest_factors():
     """Return factor IC rankings from the most recent completed run."""
-    if not _run_store:
-        return {"factors": []}
+    with _run_lock:
+        if not _run_store:
+            return {"factors": []}
+        status = {rid: dict(s) for rid, s in _run_status.items()}
+        store = dict(_run_store)
     latest_rid = max(
-        _run_store.keys(),
-        key=lambda rid: _run_status.get(rid, {}).get("completed_at", ""),
+        store,
+        key=lambda rid: status.get(rid, {}).get("completed_at", ""),
     )
-    return {"factors": _run_store[latest_rid].get("factors", [])}
+    return {"factors": store[latest_rid].get("factors", [])}
 
 
 # ---------------------------------------------------------------------------
@@ -1337,13 +1870,18 @@ async def get_latest_factors():
 @router.get("/runs")
 async def list_runs():
     """List recent runs with status."""
+    with _run_lock:
+        snapshot = [(rid, dict(s)) for rid, s in _run_status.items()]
     runs = []
-    for rid, s in sorted(_run_status.items(), key=lambda x: x[1].get("started_at", ""), reverse=True):
+    for rid, s in sorted(
+        snapshot, key=lambda x: x[1].get("started_at", "") or "", reverse=True,
+    ):
         runs.append({
             "run_id": rid,
-            "status": s["status"],
-            "progress": s["progress"],
-            "stage": s["stage"],
+            "status": s.get("status", "running"),
+            "phase": s.get("phase", "executing"),
+            "progress": s.get("progress", 0),
+            "stage": s.get("stage", "data"),
             "started_at": s.get("started_at"),
             "completed_at": s.get("completed_at"),
         })
@@ -1351,14 +1889,13 @@ async def list_runs():
 
 
 # ---------------------------------------------------------------------------
-# Compare (runs in thread pool)
+# Compare (runs in the analytics pool)
 # ---------------------------------------------------------------------------
 
 @router.post("/compare", response_model=CompareResult)
 async def compare_strategies(req: CompareRequest):
     """Compare multiple optimizers side by side."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _run_compare, req)
+    return await _run_analytics(_run_compare, req)
 
 
 def _run_compare(req: CompareRequest) -> CompareResult:
@@ -1375,6 +1912,7 @@ def _run_compare(req: CompareRequest) -> CompareResult:
             bt_results = _run_backtest(
                 config, signal, prices, returns, benchmark,
                 sector_map, fin_unstacked, optimizer_override=opt,
+                gates=_execution_gates(metadata),
             )
             s = bt_results["summary"]
             table.append({
@@ -1402,8 +1940,7 @@ def _run_compare(req: CompareRequest) -> CompareResult:
 @router.post("/sweep", response_model=SweepResult)
 async def sweep_parameters(req: SweepRequest):
     """Grid search over parameters."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _run_sweep, req)
+    return await _run_analytics(_run_sweep, req)
 
 
 def _run_sweep(req: SweepRequest) -> SweepResult:
@@ -1425,6 +1962,7 @@ def _run_sweep(req: SweepRequest) -> SweepResult:
                 config, signal, prices, returns, benchmark,
                 sector_map, fin_unstacked,
                 optimizer_override=opt, frequency_override=freq,
+                gates=_execution_gates(metadata),
             )
             s = bt_results["summary"]
             table.append({
@@ -1461,9 +1999,55 @@ def _run_sweep(req: SweepRequest) -> SweepResult:
 # Live Portfolio — Holdings Import & Tracking
 # ---------------------------------------------------------------------------
 
-# Global OMS instance (initialized lazily)
+# Global OMS instance (initialized lazily, guarded by `_singleton_lock`)
 _oms_instance = None
 _holdings_data: dict[str, Any] = {}
+
+# Bound concurrent network-bound portfolio fetches. `/portfolio/live` is a
+# sync handler, so Starlette would otherwise run as many of them as AnyIO's
+# default thread limiter allows (40) -- each one issuing up to 100 sequential
+# baostock queries against a module-global login session.
+_live_portfolio_slots = threading.BoundedSemaphore(1)
+_LIVE_PORTFOLIO_DEADLINE = 30.0
+
+
+def _parse_holdings_rows(rows: list) -> dict[str, Any]:
+    """Validate/normalize imported holdings (pandas work, off the loop)."""
+    df = pd.DataFrame(rows)
+    if "code" not in df.columns or "hold_vol" not in df.columns:
+        # Try to infer columns
+        if len(df.columns) >= 2:
+            df.columns = ["code", "hold_vol"]
+        else:
+            raise HTTPException(400, "CSV must have 'code' and 'hold_vol' columns")
+
+    # Clean data (vectorized, from reference project)
+    df = df.dropna(subset=["code", "hold_vol"])
+    df = df.drop_duplicates(subset="code", keep="first")
+    df["hold_vol"] = pd.to_numeric(df["hold_vol"], errors="coerce")
+    df = df[df["hold_vol"] > 0]
+    df["code"] = df["code"].astype(str).str.strip().str.zfill(6)
+    # `r"\\d{6}"` is a 6-character pattern -- escaped backslash, then six
+    # literal `d`s -- so it matched nothing and only `\dddddd` would have
+    # passed. Every import came back {"status": "ok", "n_stocks": 0}.
+    before = len(df)
+    df = df[df["code"].str.fullmatch(r"\d{6}")]
+    if df.empty and before > 0:
+        # Not a silent success: the file had rows, none of them usable.
+        raise HTTPException(
+            400,
+            f"None of the {before} rows had a 6-digit code. Note that codes "
+            "are zero-padded -- a numeric column read from a spreadsheet "
+            "may have lost its leading zeros.",
+        )
+
+    return {
+        "holdings": df.to_dict(orient="records"),
+        "n_stocks": len(df),
+        "total_shares": int(df["hold_vol"].sum()),
+        "imported_at": datetime.now().isoformat(),
+        "sample": df.head(5).to_dict(orient="records"),
+    }
 
 
 @router.post("/portfolio/import")
@@ -1475,46 +2059,16 @@ async def import_holdings(file_content: dict):
         if not rows:
             raise HTTPException(400, "No data provided")
 
-        df = pd.DataFrame(rows)
-        if "code" not in df.columns or "hold_vol" not in df.columns:
-            # Try to infer columns
-            if len(df.columns) >= 2:
-                df.columns = ["code", "hold_vol"]
-            else:
-                raise HTTPException(400, "CSV must have 'code' and 'hold_vol' columns")
-
-        # Clean data (vectorized, from reference project)
-        df = df.dropna(subset=["code", "hold_vol"])
-        df = df.drop_duplicates(subset="code", keep="first")
-        df["hold_vol"] = pd.to_numeric(df["hold_vol"], errors="coerce")
-        df = df[df["hold_vol"] > 0]
-        df["code"] = df["code"].astype(str).str.strip().str.zfill(6)
-        # `r"\\d{6}"` is a 6-character pattern -- escaped backslash, then six
-        # literal `d`s -- so it matched nothing and only `\dddddd` would have
-        # passed. Every import came back {"status": "ok", "n_stocks": 0}.
-        before = len(df)
-        df = df[df["code"].str.fullmatch(r"\d{6}")]
-        if df.empty and before > 0:
-            # Not a silent success: the file had rows, none of them usable.
-            raise HTTPException(
-                400,
-                f"None of the {before} rows had a 6-digit code. Note that codes "
-                "are zero-padded -- a numeric column read from a spreadsheet "
-                "may have lost its leading zeros.",
-            )
-
-        _holdings_data = {
-            "holdings": df.to_dict(orient="records"),
-            "n_stocks": len(df),
-            "total_shares": int(df["hold_vol"].sum()),
-            "imported_at": datetime.now().isoformat(),
-        }
+        # Pandas parsing/cleaning is CPU-bound; keep it off the event loop.
+        parsed = await run_in_threadpool(_parse_holdings_rows, rows)
+        sample = parsed.pop("sample")
+        _holdings_data = parsed
 
         return {
             "status": "ok",
-            "n_stocks": len(df),
-            "total_shares": int(df["hold_vol"].sum()),
-            "sample": df.head(5).to_dict(orient="records"),
+            "n_stocks": parsed["n_stocks"],
+            "total_shares": parsed["total_shares"],
+            "sample": sample,
         }
     except HTTPException:
         raise
@@ -1532,12 +2086,32 @@ async def get_holdings():
 
 @router.get("/portfolio/live")
 def get_live_portfolio():
-    """Get live portfolio snapshot with current prices from baostock."""
+    """Get live portfolio snapshot with current prices from baostock.
+
+    Only one refresh runs at a time (`_live_portfolio_slots`); a second
+    concurrent request gets 503 + Retry-After instead of occupying another
+    worker thread for up to 100 sequential upstream queries. The sequential
+    loop itself is capped by `_LIVE_PORTFOLIO_DEADLINE`: past the deadline the
+    partial book is returned with `partial=true`.
+    """
     if not _holdings_data or not _holdings_data.get("holdings"):
         # An HTTP error, not a 200 with an `error` key: the frontend treated
         # the latter as a valid empty portfolio and reported success.
         raise HTTPException(409, "No holdings imported. Import CSV first.")
 
+    if not _live_portfolio_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=503,
+            detail="A live portfolio refresh is already in progress; retry shortly",
+            headers={"Retry-After": "10"},
+        )
+    try:
+        return _fetch_live_portfolio()
+    finally:
+        _live_portfolio_slots.release()
+
+
+def _fetch_live_portfolio() -> dict:
     holdings = pd.DataFrame(_holdings_data["holdings"])
     codes = holdings["code"].tolist()
 
@@ -1561,7 +2135,17 @@ def get_live_portfolio():
         # Ask for a short window and keep the latest bar, reporting its date.
         lookback = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
+        deadline = time.monotonic() + _LIVE_PORTFOLIO_DEADLINE
+        deadline_hit = False
         for code in codes[:100]:  # Limit to 100 stocks for speed
+            if time.monotonic() >= deadline:
+                deadline_hit = True
+                logger.warning(
+                    "Live portfolio price fetch hit the %.0fs deadline after "
+                    "%d/%d codes; returning partial data",
+                    _LIVE_PORTFOLIO_DEADLINE, len(prices), min(len(codes), 100),
+                )
+                break
             bs_code = _to_bs_code(code)
             try:
                 rs = bs.query_history_k_data_plus(
@@ -1620,6 +2204,7 @@ def get_live_portfolio():
             "n_no_price": len(codes) - len(prices),
             "data_date": data_date,
             "stale": data_date != today,
+            "partial": deadline_hit,
             "holdings": top[["code", "hold_vol", "close", "preclose",
                              "market_value", "pnl", "pnl_pct"]].to_dict(orient="records"),
             "timestamp": datetime.now().isoformat(),
@@ -1627,21 +2212,37 @@ def get_live_portfolio():
     except HTTPException:
         raise
     except Exception as e:
-        # 200 + {"error": ...} looked like a successful empty portfolio.
-        raise HTTPException(503, f"Live portfolio unavailable: {e}") from e
+        # 200 + {"error": ...} looked like a successful empty portfolio; raw
+        # exception text leaked internals. Log with context, answer generically.
+        logger.exception("Live portfolio fetch failed")
+        raise _internal_error(
+            503, "live_portfolio_unavailable",
+            "Live portfolio unavailable; see server logs",
+        ) from e
 
 
 # ---------------------------------------------------------------------------
 # Order Management System
 # ---------------------------------------------------------------------------
 
+# One lock for every lazy singleton below. The getters are reachable both from
+# the event loop (async routes) and from AnyIO worker threads (sync routes);
+# an unguarded `if x is None: x = construct()` could build two OMS books or
+# two providers, the second overwriting and leaking the first.
+_singleton_lock = threading.Lock()
+
+
 def _get_oms() -> OrderManager:
     """Get or create the global OMS instance."""
     global _oms_instance
-    if _oms_instance is None:
-        from quant_platform.execution.oms import OrderManager
-        _oms_instance = OrderManager(initial_cash=10_000_000.0)
-    return _oms_instance
+    instance = _oms_instance
+    if instance is None:
+        with _singleton_lock:
+            if _oms_instance is None:
+                from quant_platform.execution.oms import OrderManager
+                _oms_instance = OrderManager(initial_cash=10_000_000.0)
+            instance = _oms_instance
+    return instance
 
 
 _rt_market_instance = None
@@ -1654,10 +2255,14 @@ def _get_rt_market():
     cache was always cold and every call triggered a full market scrape.
     """
     global _rt_market_instance
-    if _rt_market_instance is None:
-        from quant_platform.trading.realtime import RealTimeMarket
-        _rt_market_instance = RealTimeMarket()
-    return _rt_market_instance
+    instance = _rt_market_instance
+    if instance is None:
+        with _singleton_lock:
+            if _rt_market_instance is None:
+                from quant_platform.trading.realtime import RealTimeMarket
+                _rt_market_instance = RealTimeMarket()
+            instance = _rt_market_instance
+    return instance
 
 
 @router.post("/oms/order")
@@ -1752,10 +2357,10 @@ async def oms_new_trading_day():
 
 
 @router.get("/oms/blotter")
-async def get_blotter():
-    """Get order blotter (all filled orders)."""
+async def get_blotter(limit: int = Query(200, ge=1, le=2000)):
+    """Get order blotter (all orders, newest first, bounded)."""
     oms = _get_oms()
-    return {"orders": oms.get_order_blotter()}
+    return {"orders": oms.get_order_blotter(limit=limit)}
 
 
 @router.get("/oms/positions")
@@ -1808,7 +2413,15 @@ def baostock_health():
         bs.logout()
         return {"status": "ok" if ok else "error", "source": "baostock"}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        # Short reason only: exception text can carry paths and library
+        # internals. The detail stays in the server log.
+        logger.exception("Baostock health check failed")
+        return {
+            "status": "error",
+            "source": "baostock",
+            "error": type(e).__name__,
+            "code": "baostock_unavailable",
+        }
 
 
 @router.get("/market/baostock/stock/{code}")
@@ -1871,7 +2484,11 @@ def get_stock_realtime(code: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, str(e)) from e
+        logger.exception("Baostock stock quote failed for %s", code)
+        raise _internal_error(
+            500, "baostock_quote_failed",
+            "Market data unavailable; see server logs",
+        ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -1889,8 +2506,7 @@ async def run_walkforward(req: dict):
     if "chart_data" not in result:
         raise HTTPException(400, "Run has no chart data")
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _run_walkforward, result, req)
+    return await _run_analytics(_run_walkforward, result, req)
 
 
 def _run_walkforward(result: dict, params: dict) -> dict:
@@ -1966,8 +2582,7 @@ async def run_monte_carlo(req: dict):
             422, "n_simulations must be 1..10000 and horizon_days 1..2520",
         )
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _run_monte_carlo, result, req)
+    return await _run_analytics(_run_monte_carlo, result, req)
 
 
 def _run_monte_carlo(result: dict, params: dict) -> dict:
@@ -2029,8 +2644,7 @@ async def decompose_risk(req: dict):
         raise HTTPException(400, "No completed run found. Run pipeline first.")
 
     result = _run_store[run_id]
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _decompose_risk, result)
+    return await _run_analytics(_decompose_risk, result)
 
 
 def _decompose_risk(result: dict) -> dict:
@@ -2146,8 +2760,7 @@ async def detect_regime(req: dict):
         raise HTTPException(400, "No completed run found. Run pipeline first.")
 
     result = _run_store[run_id]
-    loop = asyncio.get_running_loop()
-    regime = await loop.run_in_executor(_executor, _detect_regime, result)
+    regime = await _run_analytics(_detect_regime, result)
     if isinstance(regime, dict) and "error" in regime:
         # 200 + {"error": ...} reads as a successful empty result to clients.
         raise HTTPException(409, regime["error"])
@@ -2213,6 +2826,11 @@ def _detect_regime(result: dict) -> dict:
 
 @router.post("/screen", response_model=ScreenResponse)
 def screen_stocks(req: ScreenRequest):
+    """Screen stocks using boolean factor rules (bounded compute pool)."""
+    return _run_bounded_compute(_screen_stocks_impl, req)
+
+
+def _screen_stocks_impl(req: ScreenRequest) -> ScreenResponse:
     """Screen stocks using boolean factor rules.
 
     Computes factors for the configured universe then applies user-defined
@@ -2257,7 +2875,11 @@ def screen_stocks(req: ScreenRequest):
             config, use_baostock=use_baostock
         )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Data load failed: {e}") from e
+        logger.exception("Screen: data load failed")
+        raise _internal_error(
+            503, "screen_data_unavailable",
+            "Data load failed; see server logs for details",
+        ) from e
 
     try:
         _processed_factors, ic_results, sector_map, fin_unstacked, raw_factors = _compute_factors(
@@ -2265,7 +2887,11 @@ def screen_stocks(req: ScreenRequest):
             return_raw=True,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Factor computation failed: {e}") from e
+        logger.exception("Screen: factor computation failed")
+        raise _internal_error(
+            500, "screen_factor_error",
+            "Factor computation failed; see server logs for details",
+        ) from e
 
     if not req.rules:
         raise HTTPException(422, "at least one screen rule is required")
@@ -2337,10 +2963,14 @@ def _get_risk_monitor():
     /api/risk/* act on the same object the engine checks.
     """
     global _risk_monitor
-    if _risk_monitor is None:
-        from quant_platform.risk.circuit_breaker import get_risk_monitor
-        _risk_monitor = get_risk_monitor()
-    return _risk_monitor
+    instance = _risk_monitor
+    if instance is None:
+        with _singleton_lock:
+            if _risk_monitor is None:
+                from quant_platform.risk.circuit_breaker import get_risk_monitor
+                _risk_monitor = get_risk_monitor()
+            instance = _risk_monitor
+    return instance
 
 
 @router.get("/risk/status")
@@ -2496,7 +3126,8 @@ async def generate_report(req: dict):
     from quant_platform.reporting.html_report import generate_html_report
 
     run_id = req.get("run_id", "")
-    result = _run_store.get(run_id)
+    with _run_lock:
+        result = _run_store.get(run_id)
     if not result:
         raise HTTPException(404, f"Run {run_id} not found. Run a pipeline first.")
 
@@ -2528,7 +3159,10 @@ async def generate_report(req: dict):
     }
 
     output_path = f"results/report_{run_id[:8]}.html"
-    path = generate_html_report(report_input, output_path=output_path)
+    # HTML generation + file write are blocking; keep them off the loop.
+    path = await run_in_threadpool(
+        lambda: generate_html_report(report_input, output_path=output_path),
+    )
     return {"path": path, "run_id": run_id}
 
 
@@ -2541,10 +3175,14 @@ _multi_strategy_mgr = None
 
 def _get_multi_strategy_mgr():
     global _multi_strategy_mgr
-    if _multi_strategy_mgr is None:
-        from quant_platform.strategy.multi_strategy import MultiStrategyManager
-        _multi_strategy_mgr = MultiStrategyManager()
-    return _multi_strategy_mgr
+    instance = _multi_strategy_mgr
+    if instance is None:
+        with _singleton_lock:
+            if _multi_strategy_mgr is None:
+                from quant_platform.strategy.multi_strategy import MultiStrategyManager
+                _multi_strategy_mgr = MultiStrategyManager()
+            instance = _multi_strategy_mgr
+    return instance
 
 
 _strategy_orchestrator = None
@@ -2558,10 +3196,14 @@ def _get_strategy_orchestrator():
     purges its ledgers instead of orphaning capital.
     """
     global _strategy_orchestrator
-    if _strategy_orchestrator is None:
-        from quant_platform.strategy.portfolio_orchestrator import PortfolioOrchestrator
-        _strategy_orchestrator = PortfolioOrchestrator(_get_multi_strategy_mgr())
-    return _strategy_orchestrator
+    instance = _strategy_orchestrator
+    if instance is None:
+        with _singleton_lock:
+            if _strategy_orchestrator is None:
+                from quant_platform.strategy.portfolio_orchestrator import PortfolioOrchestrator
+                _strategy_orchestrator = PortfolioOrchestrator(_get_multi_strategy_mgr())
+            instance = _strategy_orchestrator
+    return instance
 
 
 @router.post("/strategy/add")
@@ -2806,6 +3448,7 @@ for _topic in ["order.filled", "order.rejected", "portfolio.snapshot",
 # ---------------------------------------------------------------------------
 
 _live_engine = None
+_trading_start_lock = threading.Lock()
 
 
 def _get_live_engine():
@@ -2813,13 +3456,46 @@ def _get_live_engine():
     return _live_engine
 
 
+def _rollback_engine_start(engine) -> None:
+    """Undo the pre-published engine slot after a failed start."""
+    global _live_engine
+    if _live_engine is engine:
+        _live_engine = None
+    try:
+        engine.stop()
+    except Exception:
+        logger.exception("Rollback of a failed engine start: stop() failed")
+
+
 @router.post("/trading/start")
 def trading_start(req: dict):
-    """Start the live trading engine with full core architecture."""
+    """Start the live trading engine with full core architecture.
+
+    The whole start path is serialized by a module-level lock. Two concurrent
+    calls used to both pass the running check, construct two engines on the
+    same broker/store, and leave the first one orphaned (unreachable by
+    /trading/stop); now the loser gets 409 before constructing anything.
+
+    `_live_engine` is published *before* `engine.start()` -- broker connect,
+    state restore and the health check take a long window -- so a concurrent
+    /trading/stop can always reach the engine being started.
+    """
+    if not _trading_start_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="A trading engine start is already in progress.",
+        )
+    try:
+        return _start_live_engine(req)
+    finally:
+        _trading_start_lock.release()
+
+
+def _start_live_engine(req: dict) -> dict:
     from quant_platform.trading.broker import SimulatedBroker
     from quant_platform.trading.engine import LiveTradingEngine
 
-    global _live_engine, _core_sm, _core_risk
+    global _live_engine, _core_sm, _core_audit, _core_risk
 
     # Refuse to start a second engine.
     #
@@ -2829,7 +3505,7 @@ def trading_start(req: dict):
     # store, and the orphan's kill switch became unreachable because
     # `_core_risk` was rebound too. LiveTradingEngine.start()'s own
     # `if self._running: return` guard is per-instance and cannot help.
-    existing = _get_live_engine()
+    existing = _live_engine
     if existing is not None and getattr(existing, "_running", False):
         raise HTTPException(
             status_code=409,
@@ -2862,8 +3538,13 @@ def trading_start(req: dict):
             )
         except Exception as e:
             # Missing xtquant / unreachable terminal is an availability
-            # problem, not an internal fault; 500 hid the actionable message.
-            raise HTTPException(503, f"QMT broker unavailable: {e}") from e
+            # problem, not an internal fault.
+            logger.exception("QMT broker unavailable")
+            raise _internal_error(
+                503, "qmt_broker_unavailable",
+                "QMT broker unavailable; check the xtquant installation and "
+                "terminal connection (see server logs)",
+            ) from e
 
     # Fresh state machine per engine start, but NOT a fresh risk monitor:
     # risk state must survive an engine restart, and the Monitor dashboard's
@@ -2890,33 +3571,44 @@ def trading_start(req: dict):
         n_stocks=n_stocks,
     )
 
-    # Set default universe: top stocks by market cap
-    try:
-        from quant_platform.trading.realtime import RealTimeMarket
-        rt = _get_rt_market()
-        snapshot = rt.get_market_snapshot()
-        # Top N by market cap, filter out ST and new stocks
-        snapshot = snapshot[~snapshot['名称'].str.contains('ST|退', na=False)]
-        snapshot = snapshot[snapshot['总市值'] > 0]
-        top = snapshot.nlargest(n_stocks * 2, '总市值')
-        codes = top['代码'].tolist()[:n_stocks]
-        engine.set_universe(codes)
-    except Exception as e:
-        logger.warning("Failed to set universe from market: %s, using defaults", e)
-        engine.set_universe([
-            '600519', '000001', '601318', '000858', '600036',
-            '601166', '600276', '000333', '002415', '600900',
-            '601888', '300750', '600030', '601398', '600887',
-            '000568', '002304', '600585', '601012', '600809',
-            '000651', '601668', '002714', '600309', '601899',
-            '002475', '600048', '601601', '000725', '002352',
-        ])
+    # Publish the engine before the long start() sequence (broker connect,
+    # state restore, health check). The exception path rolls the slot back.
+    _live_engine = engine
 
     try:
+        # Set default universe: top stocks by market cap
+        try:
+            from quant_platform.trading.realtime import RealTimeMarket
+            rt = _get_rt_market()
+            snapshot = rt.get_market_snapshot()
+            # Top N by market cap, filter out ST and new stocks
+            snapshot = snapshot[~snapshot['名称'].str.contains('ST|退', na=False)]
+            snapshot = snapshot[snapshot['总市值'] > 0]
+            top = snapshot.nlargest(n_stocks * 2, '总市值')
+            codes = top['代码'].tolist()[:n_stocks]
+            engine.set_universe(codes)
+        except Exception as e:
+            logger.warning("Failed to set universe from market: %s, using defaults", e)
+            engine.set_universe([
+                '600519', '000001', '601318', '000858', '600036',
+                '601166', '600276', '000333', '002415', '600900',
+                '601888', '300750', '600030', '601398', '600887',
+                '000568', '002304', '600585', '601012', '600809',
+                '000651', '601668', '002714', '600309', '601899',
+                '002475', '600048', '601601', '000725', '002352',
+            ])
+
         engine.start()
+    except HTTPException:
+        _rollback_engine_start(engine)
+        raise
     except Exception as e:
-        raise HTTPException(503, f"Trading engine failed to start: {e}") from e
-    _live_engine = engine
+        logger.exception("Live trading engine failed to start")
+        _rollback_engine_start(engine)
+        raise _internal_error(
+            503, "trading_start_failed",
+            "Trading engine failed to start; see server logs",
+        ) from e
 
     return {"status": "started", "broker": broker_type, "n_stocks": n_stocks}
 
@@ -2924,10 +3616,13 @@ def trading_start(req: dict):
 @router.post("/trading/stop")
 def trading_stop():
     """Stop the live trading engine."""
-    engine = _get_live_engine()
-    if engine:
-        engine.stop()
-        return {"status": "stopped"}
+    # Serialize with trading_start so a start cannot publish a new engine
+    # while stop is tearing the previous one down.
+    with _trading_start_lock:
+        engine = _live_engine
+        if engine:
+            engine.stop()
+            return {"status": "stopped"}
     return {"status": "no_engine"}
 
 
@@ -3018,9 +3713,16 @@ def market_snapshot():
             "stale": rt.snapshot_is_stale,
         }
     except ImportError as e:
-        raise HTTPException(503, str(e)) from e
+        logger.exception("Market data dependency missing")
+        raise _internal_error(
+            503, "market_data_dependency_missing",
+            "Market data provider dependency is not installed",
+        ) from e
     except Exception as e:
-        raise HTTPException(500, str(e)) from e
+        logger.exception("Market data request failed")
+        raise _internal_error(
+            500, "market_data_failed", "Market data unavailable; see server logs",
+        ) from e
 
 
 @router.get("/market/gainers")
@@ -3032,9 +3734,16 @@ def market_gainers():
         df = rt.get_top_gainers(20)
         return {"stocks": df.to_dict('records')}
     except ImportError as e:
-        raise HTTPException(503, str(e)) from e
+        logger.exception("Market data dependency missing")
+        raise _internal_error(
+            503, "market_data_dependency_missing",
+            "Market data provider dependency is not installed",
+        ) from e
     except Exception as e:
-        raise HTTPException(500, str(e)) from e
+        logger.exception("Market data request failed")
+        raise _internal_error(
+            500, "market_data_failed", "Market data unavailable; see server logs",
+        ) from e
 
 
 @router.get("/market/losers")
@@ -3046,9 +3755,16 @@ def market_losers():
         df = rt.get_top_losers(20)
         return {"stocks": df.to_dict('records')}
     except ImportError as e:
-        raise HTTPException(503, str(e)) from e
+        logger.exception("Market data dependency missing")
+        raise _internal_error(
+            503, "market_data_dependency_missing",
+            "Market data provider dependency is not installed",
+        ) from e
     except Exception as e:
-        raise HTTPException(500, str(e)) from e
+        logger.exception("Market data request failed")
+        raise _internal_error(
+            500, "market_data_failed", "Market data unavailable; see server logs",
+        ) from e
 
 
 @router.get("/market/sectors")
@@ -3061,9 +3777,16 @@ def market_sectors():
         records = df.head(30).to_dict('records')
         return {"sectors": records}
     except ImportError as e:
-        raise HTTPException(503, str(e)) from e
+        logger.exception("Market data dependency missing")
+        raise _internal_error(
+            503, "market_data_dependency_missing",
+            "Market data provider dependency is not installed",
+        ) from e
     except Exception as e:
-        raise HTTPException(500, str(e)) from e
+        logger.exception("Market data request failed")
+        raise _internal_error(
+            500, "market_data_failed", "Market data unavailable; see server logs",
+        ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -3072,55 +3795,87 @@ def market_sectors():
 
 @router.get("/core/events")
 async def core_events(topic: str = "", limit: int = 50):
-    """Get event bus history."""
-    return {"events": _core_bus.get_history(topic=topic, limit=limit)}
+    """Get event bus history (bounded; the ring buffer holds 100k events)."""
+    limit = _bounded_limit(limit, default=50, maximum=1000)
+    return {
+        "events": await run_in_threadpool(
+            _core_bus.get_history, topic=topic, limit=limit,
+        ),
+    }
 
 
 @router.get("/core/events/metrics")
 async def core_events_metrics():
     """Get event bus metrics (publish counts, subscriber counts)."""
-    return _core_bus.get_metrics()
+    return await run_in_threadpool(_core_bus.get_metrics)
 
 
 @router.get("/core/store/stats")
 async def core_store_stats():
     """Get SQLite store statistics."""
-    return _core_store.get_stats()
+    return await run_in_threadpool(_core_store.get_stats)
 
 
 @router.get("/core/store/orders")
 async def core_store_orders(status: str = "", code: str = "", limit: int = 100):
     """Get orders from persistent store."""
-    return {"orders": _core_store.get_orders(status=status, code=code, limit=limit)}
+    return {
+        "orders": await run_in_threadpool(
+            _core_store.get_orders, status=status, code=code, limit=limit,
+        ),
+    }
 
 
 @router.get("/core/store/trades")
 async def core_store_trades(code: str = "", limit: int = 100):
     """Get trade history from persistent store."""
-    return {"trades": _core_store.get_trades(code=code, limit=limit)}
+    return {
+        "trades": await run_in_threadpool(
+            _core_store.get_trades, code=code, limit=limit,
+        ),
+    }
 
 
 @router.get("/core/store/pnl")
 async def core_store_pnl(days: int = 30):
     """Get P&L history from persistent store."""
-    return {"history": _core_store.get_pnl_history(days=days)}
+    return {
+        "history": await run_in_threadpool(
+            _core_store.get_pnl_history, days=days,
+        ),
+    }
 
 
 @router.get("/core/store/signals")
 async def core_store_signals(consumed: int = -1, limit: int = 100):
     """Get signal history from persistent store."""
-    return {"signals": _core_store.get_signals(consumed=consumed, limit=limit)}
+    return {
+        "signals": await run_in_threadpool(
+            _core_store.get_signals, consumed=consumed, limit=limit,
+        ),
+    }
 
 
 @router.get("/core/store/sessions")
 async def core_store_sessions(limit: int = 20):
     """Get trading session history."""
-    return {"sessions": _core_store.get_sessions(limit=limit)}
+    # The store re-clamps too; this makes limit=-1 / 0 / 1e9 explicit at the
+    # API boundary (SQLite treats LIMIT -1 as unlimited).
+    limit = _bounded_limit(limit, default=20, maximum=1000)
+    return {
+        "sessions": await run_in_threadpool(
+            _core_store.get_sessions, limit=limit,
+        ),
+    }
 
 
 @router.get("/core/state")
 async def core_state():
     """Get state machine current state and history."""
+    return await run_in_threadpool(_core_state_payload)
+
+
+def _core_state_payload() -> dict:
     return {
         "current_state": _core_sm.state_str,
         "state_duration": round(_core_sm.state_duration, 1),
@@ -3131,13 +3886,18 @@ async def core_state():
 @router.get("/core/audit")
 async def core_audit(action: str = "", limit: int = 50):
     """Get recent audit log entries."""
-    return {"events": _core_audit.get_recent(action=action, limit=limit)}
+    limit = _bounded_limit(limit, default=50, maximum=1000)
+    return {
+        "events": await run_in_threadpool(
+            _core_audit.get_recent, action=action, limit=limit,
+        ),
+    }
 
 
 @router.get("/core/risk")
 async def core_risk():
     """Get current risk monitor status."""
-    return _core_risk.get_status()
+    return await run_in_threadpool(_core_risk.get_status)
 
 
 @router.post("/core/risk/kill-switch")
@@ -3157,6 +3917,11 @@ async def core_risk_kill_switch(req: dict):
 
 @router.post("/ml/train", response_model=MLPerformanceResponse)
 def ml_train(req: MLTrainRequest):
+    """Train an ML alpha model (bounded full-pipeline compute)."""
+    return _run_bounded_compute(_ml_train_impl, req)
+
+
+def _ml_train_impl(req: MLTrainRequest) -> MLPerformanceResponse:
     """Train ML model for alpha signal generation."""
     try:
         from quant_platform.alpha.ml_signal import (
@@ -3193,13 +3958,47 @@ def ml_train(req: MLTrainRequest):
         # not an internal failure.
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
-        logger.error("ML train failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("ML train failed")
+        raise _internal_error(
+            500, "ml_train_failed", "ML training failed; see server logs",
+        ) from e
 
 
 @router.post("/ml/predict", response_model=MLSignalResponse)
 def ml_predict(req: MLTrainRequest):
-    """Generate ML-based alpha signals."""
+    """Generate ML alpha signals (bounded full-pipeline compute)."""
+    return _run_bounded_compute(_ml_predict_impl, req)
+
+
+#: Upper bound on the dates x assets matrix returned by `/ml/predict`. The
+#: default universe x full history is ~630k cells / ~4.7 MiB of JSON, and the
+#: serialization alone blocks for ~200 ms. When the matrix exceeds this, the
+#: *most recent* dates are kept and older dates are dropped (documented in the
+#: endpoint docstring) rather than returning a 413 for the default request.
+_MAX_ML_MATRIX_CELLS = 250_000
+
+
+def _truncate_signal_matrix(signal: pd.DataFrame) -> pd.DataFrame:
+    """Keep the most recent dates such that dates x assets <= the cap."""
+    n_assets = max(1, len(signal.columns))
+    max_dates = max(1, _MAX_ML_MATRIX_CELLS // n_assets)
+    if len(signal.index) <= max_dates:
+        return signal
+    logger.warning(
+        "Truncating /ml/predict response from %d to %d dates (%d assets) to "
+        "stay under %d matrix cells",
+        len(signal.index), max_dates, len(signal.columns),
+        _MAX_ML_MATRIX_CELLS,
+    )
+    return signal.iloc[-max_dates:]
+
+
+def _ml_predict_impl(req: MLTrainRequest) -> MLSignalResponse:
+    """Generate ML-based alpha signals.
+
+    The response matrix is capped at `_MAX_ML_MATRIX_CELLS` cells; when the
+    signal is larger, only the most recent dates are returned.
+    """
     try:
         from quant_platform.alpha.ml_signal import (
             InsufficientTrainingData,
@@ -3222,6 +4021,9 @@ def ml_predict(req: MLTrainRequest):
         # TypeError and this endpoint returned 500 on every request.
         signal = generator.generate(processed_factors, returns)
 
+        # Bound the matrix before serializing it.
+        signal = _truncate_signal_matrix(signal)
+
         dates = [str(d) for d in signal.index]
         assets = list(signal.columns)
         signal_data = [
@@ -3233,8 +4035,10 @@ def ml_predict(req: MLTrainRequest):
     except InsufficientTrainingData as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
-        logger.error("ML predict failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("ML predict failed")
+        raise _internal_error(
+            500, "ml_predict_failed", "ML prediction failed; see server logs",
+        ) from e
 
 
 # ────────────────────────────────────────────────────────────────
@@ -3243,6 +4047,11 @@ def ml_predict(req: MLTrainRequest):
 
 @router.post("/ic-monitor/compute", response_model=ICMonitorSummary)
 def ic_monitor_compute(req: ICMonitorRequest):
+    """Compute IC statistics (bounded full-pipeline compute)."""
+    return _run_bounded_compute(_ic_monitor_compute_impl, req)
+
+
+def _ic_monitor_compute_impl(req: ICMonitorRequest) -> ICMonitorSummary:
     """Compute IC statistics for all factors with decay detection."""
     try:
         from quant_platform.factors.ic_monitor import FactorICMonitor, ICMonitorConfig
@@ -3279,12 +4088,20 @@ def ic_monitor_compute(req: ICMonitorRequest):
 
         return ICMonitorSummary(factors=factor_stats, alerts=alerts, adaptive_weights=weights)
     except Exception as e:
-        logger.error("IC monitor compute failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("IC monitor compute failed")
+        raise _internal_error(
+            500, "ic_monitor_compute_failed",
+            "IC monitor computation failed; see server logs",
+        ) from e
 
 
 @router.get("/ic-monitor/alerts")
 def ic_monitor_alerts():
+    """Get current IC decay alerts (bounded full-pipeline compute)."""
+    return _run_bounded_compute(_ic_monitor_alerts_impl)
+
+
+def _ic_monitor_alerts_impl():
     """Get current IC decay alerts."""
     try:
         from quant_platform.factors.ic_monitor import FactorICMonitor
@@ -3298,8 +4115,11 @@ def ic_monitor_alerts():
         monitor.compute_all(processed_factors, returns)
         return {"alerts": monitor.get_alerts()}
     except Exception as e:
-        logger.error("IC monitor alerts failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("IC monitor alerts failed")
+        raise _internal_error(
+            500, "ic_monitor_alerts_failed",
+            "IC monitor alerts unavailable; see server logs",
+        ) from e
 
 
 # ────────────────────────────────────────────────────────────────
@@ -3337,6 +4157,11 @@ def _resolve_portfolio_weights(requested: dict[str, float] | None, prices: pd.Da
 
 @router.post("/barra/decompose", response_model=BarraRiskResponse)
 def barra_decompose(req: BarraDecomposeRequest):
+    """Decompose portfolio risk using Barra 10-factor model (bounded compute)."""
+    return _run_bounded_compute(_barra_decompose_impl, req)
+
+
+def _barra_decompose_impl(req: BarraDecomposeRequest) -> BarraRiskResponse:
     """Decompose portfolio risk using Barra 10-factor model."""
     try:
         from quant_platform.risk.barra import BarraModel
@@ -3376,12 +4201,20 @@ def barra_decompose(req: BarraDecomposeRequest):
             factor_exposures={k: round(v, 6) for k, v in result.factor_exposures.items()},
         )
     except Exception as e:
-        logger.error("Barra decompose failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("Barra decompose failed")
+        raise _internal_error(
+            500, "barra_decompose_failed",
+            "Barra risk decomposition failed; see server logs",
+        ) from e
 
 
 @router.post("/barra/covariance", response_model=BarraCovarianceResponse)
 def barra_covariance(req: BarraDecomposeRequest):
+    """Get Barra factor covariance matrix (bounded full-pipeline compute)."""
+    return _run_bounded_compute(_barra_covariance_impl, req)
+
+
+def _barra_covariance_impl(req: BarraDecomposeRequest) -> BarraCovarianceResponse:
     """Get Barra factor covariance matrix."""
     try:
         from quant_platform.risk.barra import BarraModel
@@ -3410,8 +4243,11 @@ def barra_covariance(req: BarraDecomposeRequest):
             covariance=cov_df.values.tolist(),
         )
     except Exception as e:
-        logger.error("Barra covariance failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("Barra covariance failed")
+        raise _internal_error(
+            500, "barra_covariance_failed",
+            "Barra covariance computation failed; see server logs",
+        ) from e
 
 
 # ────────────────────────────────────────────────────────────────
@@ -3420,6 +4256,11 @@ def barra_covariance(req: BarraDecomposeRequest):
 
 @router.post("/parallel/sweep", response_model=ParallelSweepResponse)
 def parallel_sweep(req: ParallelSweepRequest):
+    """Run a parallel parameter sweep (bounded compute)."""
+    return _run_bounded_compute(_parallel_sweep_impl, req)
+
+
+def _parallel_sweep_impl(req: ParallelSweepRequest) -> ParallelSweepResponse:
     """Run parameter sweep in parallel using multiple processes."""
     try:
         from quant_platform.backtest.distributed import ParallelBacktester
@@ -3443,8 +4284,11 @@ def parallel_sweep(req: ParallelSweepRequest):
         # Invalid parameter keys/values are client errors, not server faults.
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
-        logger.error("Parallel sweep failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("Parallel sweep failed")
+        raise _internal_error(
+            500, "parallel_sweep_failed",
+            "Parallel sweep failed; see server logs",
+        ) from e
 
 
 # ────────────────────────────────────────────────────────────────
@@ -3471,23 +4315,58 @@ async def prometheus_metrics_json():
 
 
 # ──────────────────────────────────────────────
-# PostgreSQL Store
+# Store statistics
 # ──────────────────────────────────────────────
+
+_stats_cache_lock = threading.Lock()
+_stats_cache: dict[str, Any] = {"key": None, "at": 0.0, "payload": None}
+_STATS_CACHE_TTL = 5.0
+
+
+def _store_backend(store) -> str:
+    """The store's real backend (the old endpoint always claimed sqlite)."""
+    if "postgres" in type(store).__name__.lower():
+        return "postgresql"
+    return "sqlite"
+
 
 @router.get("/postgres/stats", response_model=PostgresStoreStatsResponse)
 async def postgres_stats():
-    """Get PostgreSQL store statistics."""
-    from quant_platform.core.store import Store
-    store = Store()
-    stats = store.get_stats()
-    return PostgresStoreStatsResponse(
-        backend=stats.get("backend", "sqlite"),
+    """Get store statistics from the process-wide store.
+
+    This used to construct a brand-new `Store()` per poll on the event loop:
+    every request re-ran schema creation/migrations and opened a connection,
+    and the response always said "sqlite" because it never looked at the
+    configured backend. The process store is reused, `get_stats` runs in a
+    worker thread, and the result is cached briefly (an inventory poll does
+    not need to COUNT(*) every table on every request).
+    """
+    store = _core_store
+    cache_key = id(store)
+    now = time.monotonic()
+    with _stats_cache_lock:
+        cached = _stats_cache["payload"]
+        if (
+            cached is not None
+            and _stats_cache["key"] == cache_key
+            and now - _stats_cache["at"] < _STATS_CACHE_TTL
+        ):
+            return cached
+
+    stats = await run_in_threadpool(store.get_stats)
+    payload = PostgresStoreStatsResponse(
+        backend=stats.get("backend") or _store_backend(store),
         orders=stats.get("orders", 0),
         positions=stats.get("positions", 0),
         trades=stats.get("trades", 0),
         pnl_snapshots=stats.get("pnl_snapshots", 0),
         signals=stats.get("signals", 0),
     )
+    with _stats_cache_lock:
+        _stats_cache.update(
+            key=cache_key, at=time.monotonic(), payload=payload,
+        )
+    return payload
 
 
 # ──────────────────────────────────────────────
@@ -3497,16 +4376,51 @@ async def postgres_stats():
 # Global simulated provider instance for demo
 _ws_provider = None
 
+#: How long the quote endpoints wait for a just-started provider to report a
+#: connection. Waiting uses `asyncio.sleep`; the old code executed a blocking
+#: `time.sleep(0.5)` inside an `async def`, freezing the whole event loop for
+#: half a second per request.
+_QUOTE_READY_TIMEOUT = 2.0
+_QUOTE_READY_POLL = 0.05
+
 
 def _get_ws_provider():
     global _ws_provider
-    if _ws_provider is None:
-        from quant_platform.data.providers.websocket_provider import SimulatedWebSocketProvider
-        _ws_provider = SimulatedWebSocketProvider(
-            codes=["600519", "000001", "300750", "601318", "000858"],
-            update_interval=1.0,
-        )
-    return _ws_provider
+    instance = _ws_provider
+    if instance is None:
+        with _singleton_lock:
+            if _ws_provider is None:
+                from quant_platform.data.providers.websocket_provider import SimulatedWebSocketProvider
+                _ws_provider = SimulatedWebSocketProvider(
+                    codes=["600519", "000001", "300750", "601318", "000858"],
+                    update_interval=1.0,
+                )
+            instance = _ws_provider
+    return instance
+
+
+async def _await_ws_provider_ready(provider) -> None:
+    """Wait (without blocking the loop) for a quote provider to connect."""
+    if provider.is_connected:
+        return
+    try:
+        provider.start()
+    except Exception as e:
+        logger.exception("Quote provider failed to start")
+        raise _internal_error(
+            503, "quote_provider_start_failed",
+            "Quote provider unavailable; see server logs",
+        ) from e
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _QUOTE_READY_TIMEOUT
+    while not provider.is_connected:
+        if loop.time() >= deadline:
+            raise HTTPException(
+                status_code=503,
+                detail="Quote provider is still starting; retry shortly",
+                headers={"Retry-After": "1"},
+            )
+        await asyncio.sleep(_QUOTE_READY_POLL)
 
 
 @router.get("/ws-quotes/start")
@@ -3537,10 +4451,7 @@ async def ws_quotes_stats():
 async def ws_quote_by_code(code: str):
     """Get real-time quote for a single stock."""
     provider = _get_ws_provider()
-    if not provider.is_connected:
-        provider.start()
-        import time
-        time.sleep(0.5)
+    await _await_ws_provider_ready(provider)
     quote = provider.get_quote(code)
     if not quote:
         raise HTTPException(404, f"No quote for {code}")
@@ -3551,10 +4462,7 @@ async def ws_quote_by_code(code: str):
 async def ws_all_quotes():
     """Get all cached real-time quotes."""
     provider = _get_ws_provider()
-    if not provider.is_connected:
-        provider.start()
-        import time
-        time.sleep(0.5)
+    await _await_ws_provider_ready(provider)
     quotes = provider.get_all_quotes()
     return [RealtimeQuoteResponse(**q.to_dict()) for q in quotes.values()]
 
@@ -3568,12 +4476,16 @@ _l2_provider = None
 
 def _get_l2_provider():
     global _l2_provider
-    if _l2_provider is None:
-        from quant_platform.data.providers.level2_provider import Level2DataProvider
-        _l2_provider = Level2DataProvider(
-            codes=["600519", "000001", "300750", "601318", "000858"],
-        )
-    return _l2_provider
+    instance = _l2_provider
+    if instance is None:
+        with _singleton_lock:
+            if _l2_provider is None:
+                from quant_platform.data.providers.level2_provider import Level2DataProvider
+                _l2_provider = Level2DataProvider(
+                    codes=["600519", "000001", "300750", "601318", "000858"],
+                )
+            instance = _l2_provider
+    return instance
 
 
 @router.get("/l2/start")
@@ -3614,8 +4526,16 @@ def l2_order_book(code: str):
 
 
 @router.get("/l2/ticks/{code}", response_model=list[TickDataResponse])
-def l2_ticks(code: str, limit: int = 100):
-    """Get recent tick data for a stock."""
+def l2_ticks(
+    code: str,
+    limit: int = Query(100, ge=1, le=5000),
+):
+    """Get recent tick data for a stock (limit 1..5000).
+
+    A raw limit was passed to `ticks[-limit:]`: 0 returned the entire
+    10,000-tick buffer and a negative limit dropped the oldest rows instead
+    of rejecting the request.
+    """
     provider = _get_l2_provider()
     if not provider.is_running:
         provider.start()
@@ -3626,7 +4546,7 @@ def l2_ticks(code: str, limit: int = 100):
 
 
 @router.get("/l2/vwap/{code}", response_model=VWAPResponse)
-def l2_vwap(code: str, n_ticks: int = 100):
+def l2_vwap(code: str, n_ticks: int = Query(100, ge=1, le=5000)):
     """Compute VWAP from recent ticks."""
     provider = _get_l2_provider()
     if not provider.is_running:
@@ -3645,7 +4565,7 @@ def l2_vwap(code: str, n_ticks: int = 100):
 
 
 @router.get("/l2/flow/{code}", response_model=TradeFlowResponse)
-def l2_trade_flow(code: str, n_ticks: int = 100):
+def l2_trade_flow(code: str, n_ticks: int = Query(100, ge=1, le=5000)):
     """Compute buy/sell trade flow imbalance."""
     provider = _get_l2_provider()
     if not provider.is_running:
@@ -3667,10 +4587,29 @@ _fundamental_provider = None
 
 def _get_fundamental_provider():
     global _fundamental_provider
-    if _fundamental_provider is None:
-        from quant_platform.data.providers.fundamental_realtime import FundamentalDataProvider
-        _fundamental_provider = FundamentalDataProvider()
-    return _fundamental_provider
+    instance = _fundamental_provider
+    if instance is None:
+        with _singleton_lock:
+            if _fundamental_provider is None:
+                from quant_platform.data.providers.fundamental_realtime import FundamentalDataProvider
+                _fundamental_provider = FundamentalDataProvider()
+            instance = _fundamental_provider
+    return instance
+
+
+#: The provider paces outbound requests at 0.5 s per uncached code, so one
+#: 100-code call can hold a worker thread for ~50 s. Only one such fetch runs
+#: at a time; the rest get 429 rather than piling up on AnyIO's thread pool.
+_fundamental_fetch_slots = threading.BoundedSemaphore(1)
+
+
+def _acquire_fundamental_slot() -> None:
+    if not _fundamental_fetch_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="A fundamentals fetch is already in progress; retry shortly",
+            headers={"Retry-After": "15"},
+        )
 
 
 @router.get("/fundamentals/stats")
@@ -3689,31 +4628,39 @@ def get_fundamentals(code: str):
 
 @router.post("/fundamentals/bulk", response_model=list[FundamentalMetricsResponse])
 def get_fundamentals_bulk(codes: list[str]):
-    """Get fundamentals for multiple stocks."""
+    """Get fundamentals for multiple stocks (one paced fetch at a time)."""
     # Each uncached code performs an outbound request with a 0.5s pause; an
     # unbounded list is both a resource and a quota-abuse vector.
     if len(codes) > 100:
         raise HTTPException(422, "at most 100 codes per request")
-    provider = _get_fundamental_provider()
-    metrics = provider.get_bulk(codes)
+    _acquire_fundamental_slot()
+    try:
+        provider = _get_fundamental_provider()
+        metrics = provider.get_bulk(codes)
+    finally:
+        _fundamental_fetch_slots.release()
     return [FundamentalMetricsResponse(**m.to_dict()) for m in metrics.values()]
 
 
 @router.post("/fundamentals/screen", response_model=FundamentalScreenResponse)
 def screen_fundamentals(req: FundamentalScreenRequest):
-    """Screen stocks by fundamental criteria."""
+    """Screen stocks by fundamental criteria (one paced fetch at a time)."""
     from quant_platform.data.providers.fundamental_realtime import FundamentalScreener
-    provider = _get_fundamental_provider()
-    screener = FundamentalScreener(provider)
-    passed = screener.screen(
-        req.codes,
-        pe_min=req.pe_min, pe_max=req.pe_max,
-        pb_min=req.pb_min, pb_max=req.pb_max,
-        roe_min=req.roe_min, roe_max=req.roe_max,
-        market_cap_min=req.market_cap_min,
-        dividend_yield_min=req.dividend_yield_min,
-        debt_ratio_max=req.debt_ratio_max,
-    )
+    _acquire_fundamental_slot()
+    try:
+        provider = _get_fundamental_provider()
+        screener = FundamentalScreener(provider)
+        passed = screener.screen(
+            req.codes,
+            pe_min=req.pe_min, pe_max=req.pe_max,
+            pb_min=req.pb_min, pb_max=req.pb_max,
+            roe_min=req.roe_min, roe_max=req.roe_max,
+            market_cap_min=req.market_cap_min,
+            dividend_yield_min=req.dividend_yield_min,
+            debt_ratio_max=req.debt_ratio_max,
+        )
+    finally:
+        _fundamental_fetch_slots.release()
     return FundamentalScreenResponse(
         total=len(req.codes), passed=len(passed), codes=passed,
     )
@@ -3721,17 +4668,75 @@ def screen_fundamentals(req: FundamentalScreenRequest):
 
 @router.post("/fundamentals/rank", response_model=FundamentalRankResponse)
 def rank_fundamentals(req: FundamentalRankRequest):
-    """Rank stocks by a fundamental metric."""
+    """Rank stocks by a fundamental metric (one paced fetch at a time)."""
     from quant_platform.data.providers.fundamental_realtime import FundamentalScreener
-    provider = _get_fundamental_provider()
-    screener = FundamentalScreener(provider)
-    ranked = screener.rank_by(
-        req.codes, metric=req.metric,
-        ascending=req.ascending, top_n=req.top_n,
-    )
+    _acquire_fundamental_slot()
+    try:
+        provider = _get_fundamental_provider()
+        screener = FundamentalScreener(provider)
+        ranked = screener.rank_by(
+            req.codes, metric=req.metric,
+            ascending=req.ascending, top_n=req.top_n,
+        )
+    finally:
+        _fundamental_fetch_slots.release()
     return FundamentalRankResponse(
         metric=req.metric,
         ranked=[{"code": code, "value": round(val, 4)} for code, val in ranked],
     )
+
+
+# ---------------------------------------------------------------------------
+# Application lifecycle helpers (called from app.py's lifespan)
+# ---------------------------------------------------------------------------
+
+def initialize_singletons() -> None:
+    """Construct the critical lazy singletons at startup, under the lock.
+
+    First-use races used to be possible from both the loop and AnyIO worker
+    threads; creating the OMS and risk monitor up front means request handlers
+    only ever read an already-initialized object.
+    """
+    _get_oms()
+    _get_risk_monitor()
+
+
+async def _stop_with_timeout(label: str, fn, timeout: float) -> None:
+    try:
+        await asyncio.wait_for(asyncio.to_thread(fn), timeout=timeout)
+    except TimeoutError:
+        logger.error("%s did not finish within %.0fs", label, timeout)
+    except Exception:
+        logger.exception("%s failed", label)
+
+
+async def shutdown_api_resources() -> None:
+    """Stop the live engine, providers and WebSocket clients (bounded).
+
+    Python cannot kill a thread: if `engine.stop()` (or a provider's stop)
+    hangs past its timeout, the underlying thread keeps running until the
+    process exits. The bounded wait only guarantees shutdown does not block
+    the server indefinitely.
+    """
+    global _live_engine, _ws_provider, _l2_provider, _fundamental_provider
+
+    engine = _live_engine
+    if engine is not None:
+        await _stop_with_timeout("Live trading engine stop", engine.stop, 15.0)
+        _live_engine = None
+
+    for name, provider in (
+        ("WebSocket quote provider", _ws_provider),
+        ("Level 2 provider", _l2_provider),
+        ("Fundamental provider", _fundamental_provider),
+    ):
+        stop = getattr(provider, "stop", None) if provider is not None else None
+        if stop is not None:
+            await _stop_with_timeout(f"{name} stop", stop, 5.0)
+    _ws_provider = None
+    _l2_provider = None
+    _fundamental_provider = None
+
+    await _close_all_ws_clients()
 
 

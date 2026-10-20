@@ -134,3 +134,76 @@ class TestConfigHashCoversTheRun:
             result = cache.load_stage("stage", key)
             assert result is None  # Should handle gracefully
             assert not path.exists()  # Should clean up corrupted file
+
+
+class TestCacheRetention:
+    """S11: the cache used to grow without bound and kept entries written
+    under retired schema generations."""
+
+    @staticmethod
+    def _age(path, days):
+        import os
+        import time
+        stamp = time.time() - days * 86400
+        os.utime(path, (stamp, stamp))
+
+    def test_retired_schema_entries_are_pruned(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = PipelineCache(tmpdir, auto_prune=False)
+            cache.save_stage("data", "new", {"v": 1})
+            retired = cache._make_path("data", "old")
+            retired.write_bytes(b"old")
+            cache._meta_path(retired).write_text(json.dumps({
+                "schema": 0, "stage": "data", "created": 0,
+            }))
+
+            removed = cache.prune()
+
+            assert removed == 1
+            assert not retired.exists()
+            assert cache._make_path("data", "new").exists()
+
+    def test_entries_older_than_the_ttl_are_pruned(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = PipelineCache(tmpdir, max_age_days=7, auto_prune=False)
+            cache.save_stage("data", "stale", {"v": 1})
+            self._age(cache._make_path("data", "stale"), days=30)
+
+            cache.prune()
+
+            assert not cache._make_path("data", "stale").exists()
+
+    def test_lru_cap_keeps_the_newest_entries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = PipelineCache(tmpdir, max_entries=2, auto_prune=False)
+            for index in range(4):
+                cache.save_stage("data", f"k{index}", {"v": index})
+                # Distinguish the mtimes deterministically.
+                self._age(cache._make_path("data", f"k{index}"), days=10 - index)
+
+            removed = cache.prune()
+
+            assert removed == 2
+            remaining = cache.list_cached()
+            assert remaining == ["data_k2", "data_k3"]
+
+    def test_construction_prunes_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = PipelineCache(tmpdir, auto_prune=False)
+            first.save_stage("data", "stale", {"v": 1})
+            self._age(first._make_path("data", "stale"), days=90)
+
+            PipelineCache(tmpdir, max_age_days=30)
+
+            assert first.list_cached() == []
+
+    def test_clear_removes_metadata_too(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = PipelineCache(tmpdir)
+            cache.save_stage("data", "k", {"v": 1})
+
+            cache.clear()
+
+            assert list(cache.cache_dir.glob("*.meta.json")) == []

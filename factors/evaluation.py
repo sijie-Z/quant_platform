@@ -140,6 +140,12 @@ def rank_ic(
         if len(common) < min_assets:
             continue
         ic = f[common].rank().corr(r[common].rank(), method="pearson")
+        # A constant cross-section (or constant target) has zero rank
+        # variance and yields NaN. The numba kernel skips those dates; the
+        # pandas fallback used to keep them as NaN entries, so the two paths
+        # returned series of different lengths. Drop NaN here as well.
+        if not np.isfinite(ic):
+            continue
         ic_series.append((date, ic))
 
     if not ic_series:

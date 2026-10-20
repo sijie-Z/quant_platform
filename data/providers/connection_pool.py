@@ -33,6 +33,10 @@ from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Bump when the cached payload's schema/semantics change; it is part of every
+# cache key so a unit/contract fix cannot be masked by a stale in-process hit.
+CACHE_SCHEMA_VERSION = "2"
+
 
 class SourceStatus(StrEnum):
     HEALTHY = "healthy"
@@ -55,6 +59,7 @@ class SourceHealth:
     avg_latency_ms: float = 0.0
     _latencies: list[float] = field(default_factory=list, repr=False)
     circuit_open_until: float = 0.0
+    last_error: str = ""
 
     @property
     def available(self) -> bool:
@@ -78,10 +83,11 @@ class SourceHealth:
         if self.status == SourceStatus.DEGRADED:
             self.status = SourceStatus.HEALTHY
 
-    def record_failure(self):
+    def record_failure(self, reason: str = ""):
         self.failure_count += 1
         self.consecutive_failures += 1
         self.last_failure = time.time()
+        self.last_error = str(reason)
         # Circuit breaker: open after 3 consecutive failures
         if self.consecutive_failures >= 3:
             self.status = SourceStatus.CIRCUIT_OPEN
@@ -106,6 +112,7 @@ class DataProviderPool:
         self,
         providers: dict[str, Any],
         priorities: dict[str, int] | None = None,
+        min_rows: int = 1,
     ):
         self._providers = providers
         self._lock = threading.Lock()
@@ -128,6 +135,9 @@ class DataProviderPool:
         # Cache for deduplication
         self._cache: dict[str, tuple[float, Any]] = {}
         self._cache_ttl = 60  # seconds
+        # A response with fewer rows than this is treated as empty.  One
+        # empty frame must not disable failover to a healthy secondary source.
+        self._min_rows = max(0, int(min_rows))
 
     def get_prices(
         self,
@@ -157,6 +167,11 @@ class DataProviderPool:
 
                 if result is None:
                     raise ValueError("provider returned None")
+                if self._is_unusable_result(result) and self._another_source_available(name):
+                    raise ValueError(
+                        f"provider returned an empty/short frame "
+                        f"(<{self._min_rows} row(s)); failing over"
+                    )
                 health.record_success(latency)
                 # Store a copy: the caller receives `result` and may mutate
                 # it, which used to corrupt the cache for the next request.
@@ -165,7 +180,7 @@ class DataProviderPool:
                 return result
 
             except Exception as e:
-                health.record_failure()
+                health.record_failure(str(e))
                 logger.warning("Source %s failed: %s", name, e)
 
         logger.error("All data sources failed for prices %s to %s", start_date, end_date)
@@ -198,12 +213,17 @@ class DataProviderPool:
 
                 if result is None:
                     raise ValueError("provider returned None")
+                if self._is_unusable_result(result) and self._another_source_available(name):
+                    raise ValueError(
+                        f"provider returned an empty/short financial frame "
+                        f"(<{self._min_rows} row(s)); failing over"
+                    )
                 health.record_success(latency)
                 self._set_cache(cache_key, self._copy_result(result))
                 return result
 
             except Exception as e:
-                health.record_failure()
+                health.record_failure(str(e))
                 logger.warning("Source %s financials failed: %s", name, e)
 
         return None
@@ -220,6 +240,7 @@ class DataProviderPool:
                 "consecutive_failures": health.consecutive_failures,
                 "avg_latency_ms": round(health.avg_latency_ms, 1),
                 "available": health.available,
+                "last_error": health.last_error,
             }
         return result
 
@@ -243,20 +264,42 @@ class DataProviderPool:
 
     # ── Internal ──
 
-    @staticmethod
-    def _make_cache_key(
-        prefix: str, start_date: str, end_date: str, kwargs: dict,
-    ) -> str:
-        """The cache key includes kwargs, not just the date range.
+    def _is_unusable_result(self, value: Any) -> bool:
+        """True for an empty/undersized frame that should trigger failover."""
+        try:
+            return len(value) < self._min_rows
+        except TypeError:
+            return False
 
-        Without it, a request for one field set was served the cached result
-        of a different one for 60 seconds.
+    def _another_source_available(self, name: str) -> bool:
+        """Whether a different, currently usable source exists for failover."""
+        return any(
+            other != name and health.available
+            for other, health in self._health.items()
+        )
+
+    def _make_cache_key(
+        self, prefix: str, start_date: str, end_date: str, kwargs: dict,
+    ) -> str:
+        """Cache key includes the provider identities and a schema version.
+
+        The same request routed through a different provider set (or after a
+        payload-contract bump) must not be served another configuration's
+        result.  ``kwargs`` are included so a field projection is not served
+        the cache of a different one.
         """
+        identities = "|".join(
+            f"{name}={type(provider).__module__}.{type(provider).__name__}"
+            for name, provider in sorted(self._providers.items())
+        )
         try:
             suffix = json.dumps(kwargs, sort_keys=True, default=str)
         except TypeError:
             suffix = repr(sorted(kwargs.items(), key=lambda item: item[0]))
-        return f"{prefix}_{start_date}_{end_date}_{suffix}"
+        return (
+            f"{prefix}_{CACHE_SCHEMA_VERSION}_{identities}_"
+            f"{start_date}_{end_date}_{suffix}"
+        )
 
     @staticmethod
     def _copy_result(value: Any) -> Any:

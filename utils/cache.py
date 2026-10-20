@@ -4,6 +4,19 @@ Caches intermediate results (data pipeline output, factors, alpha signal)
 to avoid recomputation when running the same config repeatedly. Uses pickle
 with config hash as cache key.
 
+Retention (issue S11): the cache is bounded by default. Every entry carries a
+small ``*.meta.json`` sidecar recording the data-schema generation and the
+creation time. ``PipelineCache`` prunes on construction (and exposes
+``prune()`` for the CLI):
+
+- entries written under a retired ``DATA_SCHEMA_VERSION`` are deleted
+  (they can never be served again: the schema version is part of the key);
+- entries older than ``max_age_days`` are deleted;
+- the oldest entries beyond ``max_entries`` are deleted (LRU by mtime).
+
+Limits are configurable per instance and through the environment:
+``QUANT_CACHE_MAX_AGE_DAYS`` and ``QUANT_CACHE_MAX_ENTRIES``.
+
 Usage:
     from quant_platform.utils.cache import PipelineCache
 
@@ -21,6 +34,7 @@ import json
 import os
 import pickle
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +43,8 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_CACHE_DIR = Path("./.quant_cache")
+DEFAULT_MAX_AGE_DAYS = 30.0
+DEFAULT_MAX_ENTRIES = 64
 
 # Bump whenever the data layer changes the meaning or layout of what it
 # produces (columns, adjustment convention, PIT handling, ...). Cached stages
@@ -47,6 +63,28 @@ DATA_SCHEMA_VERSION = 5
 CACHE_KEY_VERSION = 2
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r (expected a number)", name, raw)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r (expected an integer)", name, raw)
+        return default
+
+
 class PipelineCache:
     """Caches pipeline stages to disk for fast re-runs.
 
@@ -56,12 +94,36 @@ class PipelineCache:
     slot), explicit CLI/environment overrides, and the data schema version.
     """
 
-    def __init__(self, cache_dir: str | Path = DEFAULT_CACHE_DIR):
+    def __init__(
+        self,
+        cache_dir: str | Path = DEFAULT_CACHE_DIR,
+        *,
+        max_age_days: float | None = None,
+        max_entries: int | None = None,
+        auto_prune: bool = True,
+    ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_age_days = (
+            _env_float("QUANT_CACHE_MAX_AGE_DAYS", DEFAULT_MAX_AGE_DAYS)
+            if max_age_days is None else float(max_age_days)
+        )
+        self.max_entries = (
+            _env_int("QUANT_CACHE_MAX_ENTRIES", DEFAULT_MAX_ENTRIES)
+            if max_entries is None else int(max_entries)
+        )
+        if auto_prune:
+            try:
+                self.prune()
+            except Exception as exc:  # pruning must never break a run
+                logger.warning("Cache prune failed: %s", exc)
 
     def _make_path(self, stage: str, cache_key: str) -> Path:
         return self.cache_dir / f"{stage}_{cache_key}.pkl"
+
+    @staticmethod
+    def _meta_path(path: Path) -> Path:
+        return path.with_name(f"{path.name}.meta.json")
 
     @staticmethod
     def make_config_hash(
@@ -115,10 +177,7 @@ class PipelineCache:
                 logger.debug("Failed to load cache %s: %s", stage, e)
                 # Another writer may hold the file on Windows; a failed
                 # cleanup must not escape as PermissionError.
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                self._remove_entry(path)
         return None
 
     def save_stage(self, stage: str, cache_key: str, data: Any) -> None:
@@ -139,6 +198,7 @@ class PipelineCache:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
+            self._write_meta(path, stage)
             logger.info("Cached: %s (%s)", stage, cache_key)
         except Exception as e:
             logger.debug("Failed to save cache %s: %s", stage, e)
@@ -148,14 +208,108 @@ class PipelineCache:
                 pass
 
     def clear(self) -> int:
-        """Clear all cached files. Returns number of files removed."""
+        """Clear all cached files (and metadata). Returns files removed."""
         count = 0
         for p in self.cache_dir.glob("*.pkl"):
-            p.unlink()
+            self._remove_entry(p)
             count += 1
+        for meta in self.cache_dir.glob("*.pkl.meta.json"):
+            try:
+                meta.unlink()
+            except OSError:
+                pass
         logger.info("Cleared %d cache files", count)
         return count
 
     def list_cached(self) -> list[str]:
         """List cached stages."""
         return sorted(p.stem for p in self.cache_dir.glob("*.pkl"))
+
+    # ------------------------------------------------------------------
+    # Retention
+    # ------------------------------------------------------------------
+
+    def prune(self) -> int:
+        """Enforce schema-version, TTL and LRU limits. Returns files removed.
+
+        Files without a metadata sidecar are pre-retention entries whose key
+        can no longer be reproduced after a schema/key bump; they are aged by
+        their mtime against the same TTL and count limits.
+        """
+        now = time.time()
+        removed = 0
+        survivors: list[tuple[float, Path]] = []
+
+        for path in self.cache_dir.glob("*.pkl"):
+            meta = self._read_meta(path)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+
+            if meta is not None and meta.get("schema") != DATA_SCHEMA_VERSION:
+                self._remove_entry(path)
+                removed += 1
+                continue
+
+            age_days = (now - mtime) / 86400.0
+            if self.max_age_days is not None and age_days > self.max_age_days:
+                self._remove_entry(path)
+                removed += 1
+                continue
+
+            survivors.append((mtime, path))
+
+        if self.max_entries is not None and self.max_entries >= 0:
+            survivors.sort(key=lambda item: item[0], reverse=True)
+            for _mtime, path in survivors[self.max_entries:]:
+                self._remove_entry(path)
+                removed += 1
+
+        if removed:
+            logger.info(
+                "Cache prune removed %d entr%s (schema=%d, max_age=%sd, max_entries=%s)",
+                removed, "y" if removed == 1 else "ies",
+                DATA_SCHEMA_VERSION, self.max_age_days, self.max_entries,
+            )
+        return removed
+
+    def _remove_entry(self, path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            self._meta_path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _write_meta(self, path: Path, stage: str) -> None:
+        meta = {
+            "schema": DATA_SCHEMA_VERSION,
+            "stage": stage,
+            "created": time.time(),
+        }
+        meta_path = self._meta_path(path)
+        tmp = meta_path.with_name(f"{meta_path.name}.tmp.{os.getpid()}")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            os.replace(tmp, meta_path)
+        except Exception as exc:
+            logger.debug("Failed to write cache metadata for %s: %s", path, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _read_meta(self, path: Path) -> dict | None:
+        meta_path = self._meta_path(path)
+        if not meta_path.exists():
+            return None
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None

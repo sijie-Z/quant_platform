@@ -105,8 +105,43 @@ def test_major_stock_list_spans_exchanges_and_boards(monkeypatch):
     prefixes = {c[:2] for c in codes}
     assert {"60", "68", "00", "30"} <= prefixes
     assert "000300" not in codes  # index filtered out by type=1
-    assert "600999" not in codes  # delisted filtered out by status=1
     assert all(len(c) == 6 and c.isdigit() for c in codes)
+
+
+def test_delisted_names_stay_in_the_universe(monkeypatch):
+    """Delisted names must survive (survivorship bias, D06).
+
+    With no range requested the universe is the whole type=1 security list,
+    so ``status=0`` names are included; a range *after* the delisting drops
+    them, while a range that overlaps their listing window keeps them.
+    """
+    fake = FakeBaostock(basic_rows=_universe())
+    provider = _provider_with(fake, monkeypatch)
+
+    all_codes = provider._get_major_stocks_list(n=1000)
+    assert "600999" in all_codes
+
+    after_delisting = provider._get_major_stocks_list(
+        n=1000, start_date="2024-01-01", end_date="2024-12-31",
+    )
+    # Fake delisted name has outDate "" in _universe(), so range filtering
+    # cannot exclude it there; assert the range filter itself with an
+    # explicit outDate.
+    rows = _universe() + [_basic_row("600998", status="0")]
+    for row in rows:
+        if row[0].endswith("600998"):
+            row[3] = "2022-01-01"
+    fake2 = FakeBaostock(basic_rows=rows)
+    provider2 = _provider_with(fake2, monkeypatch)
+    codes_2024 = provider2._get_major_stocks_list(
+        n=1000, start_date="2024-01-01", end_date="2024-12-31",
+    )
+    codes_2021 = provider2._get_major_stocks_list(
+        n=1000, start_date="2021-01-01", end_date="2021-12-31",
+    )
+    assert "600998" not in codes_2024
+    assert "600998" in codes_2021
+    assert after_delisting  # sanity: sample is non-empty
 
 
 def test_major_stock_list_is_deterministic(monkeypatch):
@@ -161,7 +196,27 @@ def test_stock_basic_universe_is_cached(monkeypatch, tmp_path):
     provider._get_major_stocks_list()
 
     assert fake.basic_query_count == 1
-    assert (tmp_path / "stock_basic_universe.json").exists()
+    # The cache key is versioned (D19): a constant filename would replay
+    # stale universe data forever.
+    assert (tmp_path / mod._STOCK_BASIC_CACHE_FILE).exists()
+
+
+def test_stock_basic_universe_cache_expires(monkeypatch, tmp_path):
+    """A universe cache older than the TTL is refetched (D06/D19)."""
+    import os
+    import time as _time
+
+    fake = FakeBaostock(basic_rows=_universe())
+    monkeypatch.setattr(mod, "CACHE_DIR", tmp_path)
+    provider = _provider_with(fake, monkeypatch, cache_enabled=True)
+
+    provider._get_major_stocks_list()
+    cache_file = tmp_path / mod._STOCK_BASIC_CACHE_FILE
+    stale = _time.time() - (mod._UNIVERSE_CACHE_TTL_DAYS + 1) * 86400
+    os.utime(cache_file, (stale, stale))
+
+    provider._get_major_stocks_list()
+    assert fake.basic_query_count == 2
 
 
 def test_stock_basic_universe_cache_does_not_depend_on_parquet(monkeypatch, tmp_path):

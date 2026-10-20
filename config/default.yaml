@@ -18,6 +18,10 @@ data:
   start_date: "2021-01-01"
   end_date: "2025-12-31"
   frequency: "daily"       # daily, weekly, monthly
+  # A configured REAL provider that is unavailable fails the run by default.
+  # Set true (or pass --allow-synthetic-fallback) only for development: the
+  # fallback is recorded in metrics.json/manifest as synthetic.
+  allow_synthetic_fallback: false
 
 # --- Factors ---
 factors:
@@ -26,7 +30,8 @@ factors:
     momentum_1m: {enabled: true, params: {period: 21}}
     momentum_3m: {enabled: true, params: {period: 63}}
     momentum_6m: {enabled: true, params: {period: 126}}
-    momentum_12m: {enabled: true, params: {period: 252}, exclude_recent: 21}
+    # Momentum12M skips the most recent 21 days by design (factor default).
+    momentum_12m: {enabled: true, params: {period: 252}}
     volatility_20d: {enabled: true, params: {period: 20}}
     volatility_60d: {enabled: true, params: {period: 60}}
     turnover_20d: {enabled: true, params: {period: 20}}

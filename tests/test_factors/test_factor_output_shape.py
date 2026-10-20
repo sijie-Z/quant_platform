@@ -73,9 +73,22 @@ def _registered_factors() -> list[str]:
 def _compute(name: str, prices, turnover, financials) -> object:
     """Factor output on the guard's panel, supplying whatever its category needs."""
     inst = get_registry().get(name)()
+    # Candle factors declare required inputs and (correctly) refuse to run
+    # without them; derive a well-formed OHLC panel so the shape contract is
+    # still exercised for every registered factor.
+    ohlc = {
+        "open": prices.shift(1).fillna(prices),
+        "high": prices * 1.01,
+        "low": prices * 0.99,
+    }
+    extra = {
+        field: ohlc[field]
+        for field in getattr(inst, "required_inputs", ())
+        if field in ohlc
+    }
     if inst.category.value == "fundamental":
-        return inst.compute(prices, financials=financials)
-    return inst.compute(prices, turnover=turnover)
+        return inst.compute(prices, financials=financials, **extra)
+    return inst.compute(prices, turnover=turnover, **extra)
 
 
 def _shape_violation(out: object, prices: pd.DataFrame) -> str | None:

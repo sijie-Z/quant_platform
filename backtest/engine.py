@@ -9,14 +9,33 @@ Design:
 - Monthly rebalancing: weights computed on the last trading day of each month,
   executed at next day's close, held until next rebalance.
 - All P&L is net of transaction costs.
+
+Fill model and lots
+-------------------
+This is a **weight-based** engine. Quantities are never converted to shares,
+so the configured ``lot_size`` (100 shares) is *not* enforced here; lot
+rounding is the job of the tick/execution layer. Treat backtest weights as
+"research notionals" and the engine as lot-agnostic by design (B8). The
+tradability gate below *is* enforced per asset-day when the caller supplies
+the panels.
+
+Execution-day tradability
+-------------------------
+``run`` accepts the pipeline's per-date ``tradable_mask`` (suspension / ST /
+listing / delisting), plus ``limit_up`` and ``limit_down`` panels. Buys are
+blocked on limit-up and non-tradable days, sells on limit-down and
+non-tradable days. Blocked trades are carried to the next tradable day; no
+cost or turnover is booked for them. Without the panels the engine behaves
+exactly as before.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from quant_platform.backtest.cost_model import CostModel
-from quant_platform.backtest.metrics import all_metrics
+from quant_platform.backtest.metrics import all_metrics, annualization_years
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.portfolio.covariance import estimate_covariance
 from quant_platform.portfolio.optimizers import (
@@ -27,6 +46,11 @@ from quant_platform.portfolio.optimizers import (
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ``backtest.benchmark`` values the engine can actually compute. Any other
+# value would silently fall through to "use the caller's series", which is how
+# `market_cap_weight` used to be accepted-but-not-implemented (B6).
+_SUPPORTED_BENCHMARKS = ("equal_weight", "market_cap_weight")
 
 
 class BacktestEngine:
@@ -44,16 +68,28 @@ class BacktestEngine:
         covariance_lookback: int = 252,
         covariance_ewma_half_life: int = 63,
         execution_timing: str = "next_close",
+        risk_free_rate: float = 0.03,
+        periods_per_year: float | None = None,
     ):
         self.initial_capital = initial_capital
         self.rebalance_frequency = rebalance_frequency
         self.cost_model = cost_model or CostModel()
         self.constraints = constraints or PortfolioConstraints()
         self.optimizer_name = optimizer
+        if benchmark not in _SUPPORTED_BENCHMARKS:
+            raise ValueError(
+                f"Unknown benchmark: {benchmark!r}. Supported values: "
+                f"{', '.join(_SUPPORTED_BENCHMARKS)}. Pass a pre-computed "
+                "series only through benchmark_returns."
+            )
         self.benchmark_type = benchmark
         self.covariance_method = covariance_method
         self.covariance_lookback = covariance_lookback
         self.covariance_ewma_half_life = covariance_ewma_half_life
+        # B12: annualization basis and risk-free are explicit, not constants.
+        # ``None`` for periods_per_year means "infer from the return index".
+        self.risk_free_rate = risk_free_rate
+        self.periods_per_year = periods_per_year
 
         # `next_close` (default): the signal is computed from rdate's close and
         # executed at the *next* trading day's close, which is what the module
@@ -71,11 +107,17 @@ class BacktestEngine:
         self.portfolio_values: pd.Series | None = None
         self.benchmark_returns: pd.Series | None = None
         self.weights_history: dict[pd.Timestamp, pd.Series] = {}
+        self.unexecuted_signals: dict[pd.Timestamp, pd.Series] = {}
         self.turnover_history: pd.Series | None = None
         self.optimizer_outcomes: dict[pd.Timestamp, dict] = {}
         self.optimizer_fallback_count = 0
         self.skipped_rebalances = 0
         self.covariance_failures = 0
+        # Rebalances where covariance estimation produced nothing and MVO ran
+        # on an identity matrix. Kept separate from equal-weight fallbacks so
+        # `effective_optimizer` names the right risk model (M27).
+        self.identity_covariance_fallbacks = 0
+        self._executed_signal_dates: set[pd.Timestamp] = set()
         # Sum of per-rebalance costs in return units. Reported in the summary
         # so the strategy gates can evaluate the configured cost-drag limit.
         self.total_cost_drag = 0.0
@@ -91,6 +133,71 @@ class BacktestEngine:
         """
         return returns.mean(axis=1)
 
+    @staticmethod
+    def _extract_market_cap_panel(financials) -> pd.DataFrame | None:
+        """Pull a (date x asset) market-cap panel out of the `financials` input.
+
+        Accepted shapes, in order:
+        - a MultiIndex-column frame from ``financials.unstack("asset")``
+          (columns are ``(field, asset)``; main.py passes this shape),
+        - a long frame indexed by ``(date, asset)`` with a ``market_cap``
+          column,
+        - a plain (date x asset) market-cap panel.
+        """
+        if financials is None or not isinstance(financials, pd.DataFrame):
+            return None
+        if isinstance(financials.columns, pd.MultiIndex):
+            fields = financials.columns.get_level_values(0)
+            if "market_cap" not in fields:
+                return None
+            return financials["market_cap"]
+        if "market_cap" in financials.columns:
+            panel = financials["market_cap"]
+            if isinstance(panel, pd.Series) and isinstance(
+                panel.index, pd.MultiIndex,
+            ):
+                panel = panel.unstack("asset")
+            if isinstance(panel, pd.DataFrame):
+                return panel
+        return financials
+
+    @classmethod
+    def _compute_market_cap_weight_benchmark(
+        cls, returns: pd.DataFrame, financials,
+    ) -> pd.Series:
+        """Cap-weighted benchmark from point-in-time market caps (B6).
+
+        Market caps are forward-filled over time only: on each date the
+        benchmark uses the latest cap observed at or before that date, never a
+        later observation. Names without a cap or without a return that day
+        are excluded from that date's weights; a date with no usable caps
+        yields NaN rather than a fabricated zero.
+        """
+        caps = cls._extract_market_cap_panel(financials)
+        if caps is None or caps.empty:
+            raise ValueError(
+                "benchmark='market_cap_weight' requires a financials panel "
+                "with market_cap data (date x asset)"
+            )
+        if not isinstance(caps.index, pd.DatetimeIndex):
+            raise ValueError(
+                "benchmark='market_cap_weight': financials must be indexed by date"
+            )
+        # Point-in-time: reindex to the union and forward-fill so a value only
+        # becomes visible on/after its own date; then project onto the return
+        # grid.
+        all_dates = caps.index.union(returns.index).sort_values()
+        caps = caps.reindex(all_dates).ffill().reindex(
+            index=returns.index, columns=returns.columns,
+        )
+        usable = returns.notna() & caps.notna() & (caps > 0)
+        weights = caps.where(usable)
+        row_sum = weights.sum(axis=1)
+        weights = weights.div(row_sum.where(row_sum > 0), axis=0)
+        bench = (returns.fillna(0.0) * weights.fillna(0.0)).sum(axis=1)
+        bench = bench.where(row_sum > 0)
+        return bench.rename("benchmark_return")
+
     def run(
         self,
         signal: pd.DataFrame,
@@ -99,6 +206,13 @@ class BacktestEngine:
         benchmark_returns: pd.Series,
         sector_map: pd.Series,
         financials: pd.DataFrame | None = None,
+        tradable_mask: pd.DataFrame | None = None,
+        limit_up: pd.DataFrame | None = None,
+        limit_down: pd.DataFrame | None = None,
+        daily_volume: pd.DataFrame | None = None,
+        volatility: pd.DataFrame | None = None,
+        risk_free_rate: float | None = None,
+        periods_per_year: float | None = None,
     ) -> dict:
         """Execute the backtest.
 
@@ -108,19 +222,54 @@ class BacktestEngine:
             returns: (date x asset) daily returns.
             benchmark_returns: Series of benchmark daily returns.
             sector_map: Series mapping asset -> sector name.
-            financials: (date x asset) financial data, for market cap.
+            financials: financial data for the market-cap benchmark. Accepts
+                the ``financials.unstack("asset")`` shape main.py passes, a
+                long (date, asset) frame with a ``market_cap`` column, or a
+                plain (date x asset) cap panel.
+            tradable_mask: (date x asset) True where a new position is
+                allowed. False on suspension / ST / listing / delisting days.
+                Missing entries default to tradable.
+            limit_up: (date x asset) True where the asset closed limit-up.
+                Buys are blocked there.
+            limit_down: (date x asset) True where the asset closed
+                limit-down. Sells are blocked there.
+            daily_volume: (date x asset) traded value in CNY, fed to the
+                proportional/impact slippage models (B8).
+            volatility: (date x asset) daily volatility estimate for the
+                impact model. When omitted and an impact/proportional model
+                is configured, a 20-day rolling std of ``returns`` shifted by
+                one bar (observable at the execution close) is used.
+            risk_free_rate: Annual risk-free override for this run (defaults
+                to the constructor value).
+            periods_per_year: Annualization override for this run (defaults to
+                the constructor value; ``None`` infers from the return index).
 
         Returns:
             Dict with daily_returns, portfolio_values, benchmark_returns,
-            weights_history, and summary metrics.
+            weights_history (executed rebalances only), turnover_history, and
+            summary metrics. ``summary["since_first_execution"]`` carries the
+            same metric block computed from the first fill onward (B13);
+            ``summary["n_rebalances"]`` counts executed rebalances (M13).
         """
         logger.info("Starting backtest: capital=%.0f, freq=%s, optimizer=%s",
                      self.initial_capital, self.rebalance_frequency, self.optimizer_name)
 
+        # External callers derive signals from DataFrames that carry pandas
+        # attrs (e.g. ``excluded_mask``); on pandas 3 those attrs propagate
+        # into downstream selections and crash inside Series.nlargest. Clear
+        # them at the engine boundary on a shallow copy (the caller's object
+        # is left untouched).
+        signal = signal.copy(deep=False)
+        signal.attrs = {}
+
         # Pre-compute benchmark daily returns
         if self.benchmark_type == "equal_weight":
             self.benchmark_returns = self._compute_equal_weight_benchmark(returns)
-        else:
+        elif self.benchmark_type == "market_cap_weight":
+            self.benchmark_returns = self._compute_market_cap_weight_benchmark(
+                returns, financials,
+            )
+        else:  # pragma: no cover - constructor rejects unknown values
             self.benchmark_returns = benchmark_returns
 
         rebalance_dates = self._get_rebalance_dates(signal.index)
@@ -131,10 +280,12 @@ class BacktestEngine:
                      self.rebalance_frequency)
 
         self.weights_history = {}
+        self.unexecuted_signals = {}
         self.optimizer_outcomes = {}
         self.optimizer_fallback_count = 0
         self.skipped_rebalances = 0
         self.covariance_failures = 0
+        self.identity_covariance_fallbacks = 0
         prev_weights = None
         # One optimizer instance for the whole run, so its fallback counter
         # accumulates; a fresh instance per rebalance hid every fallback.
@@ -203,6 +354,13 @@ class BacktestEngine:
                     str(rdate)[:10], self.covariance_method, exc,
                 )
 
+            # M27: MVO silently substitutes the identity matrix for a missing
+            # covariance. Count that as a risk-model fallback so the summary
+            # cannot claim a real covariance-driven optimizer ran.
+            identity_cov = cov is None and self.optimizer_name == "mean_variance"
+            if identity_cov:
+                self.identity_covariance_fallbacks += 1
+
             # Optimize
             fallbacks_before = optimizer.fallback_count
             weights = optimizer.optimize(
@@ -225,35 +383,97 @@ class BacktestEngine:
                 "optimizer": self.optimizer_name,
                 "fallback": fell_back,
                 "reason": fallback_reason,
+                "identity_covariance": identity_cov,
                 "n_assets": int((weights > 0).sum()),
                 "gross_exposure": float(weights.sum()),
+                "executed": False,
             }
 
             self.weights_history[rdate] = weights
             prev_weights = weights
 
         # Simulate daily P&L
-        self._simulate_pnl(returns)
+        self._simulate_pnl(
+            returns,
+            tradable_mask=tradable_mask,
+            limit_up=limit_up,
+            limit_down=limit_down,
+            daily_volume=daily_volume,
+            volatility=volatility,
+        )
+
+        # M13: only rebalances that actually reached an execution day belong
+        # in `weights_history` / `n_rebalances`. A signal whose date is the
+        # last bar has no following trading day (dropped by the schedule) and
+        # used to be reported as a held portfolio.
+        executed = self._executed_signal_dates
+        self.unexecuted_signals = {
+            rdate: weights for rdate, weights in self.weights_history.items()
+            if rdate not in executed
+        }
+        self.weights_history = {
+            rdate: weights for rdate, weights in self.weights_history.items()
+            if rdate in executed
+        }
+        for rdate, outcome in self.optimizer_outcomes.items():
+            outcome["executed"] = rdate in executed
+
+        rf = self.risk_free_rate if risk_free_rate is None else risk_free_rate
+        ppy = self.periods_per_year if periods_per_year is None else periods_per_year
 
         # Compute metrics
-        summary = all_metrics(self.daily_returns, self.benchmark_returns)
+        summary = all_metrics(
+            self.daily_returns, self.benchmark_returns,
+            periods_per_year=ppy, risk_free=rf,
+        )
         n_rebalances = len(self.weights_history)
         summary["n_rebalances"] = n_rebalances
+        summary["n_unexecuted_signals"] = len(self.unexecuted_signals)
         summary["optimizer"] = self.optimizer_name
         summary["initial_capital"] = self.initial_capital
         summary["n_optimizer_fallbacks"] = self.optimizer_fallback_count
         summary["optimizer_fallback_rate"] = (
             self.optimizer_fallback_count / n_rebalances if n_rebalances else 0.0
         )
-        summary["effective_optimizer"] = (
-            self.optimizer_name
-            if self.optimizer_fallback_count == 0
-            else f"{self.optimizer_name}+equal_weight_fallback"
-        )
         summary["n_skipped_rebalances"] = self.skipped_rebalances
         summary["n_covariance_failures"] = self.covariance_failures
+        summary["n_identity_covariance_fallbacks"] = self.identity_covariance_fallbacks
+        if self.optimizer_fallback_count > 0:
+            summary["effective_optimizer"] = (
+                f"{self.optimizer_name}+equal_weight_fallback"
+            )
+        elif self.identity_covariance_fallbacks > 0:
+            # MVO ran every affected rebalance on eye(n); say so instead of
+            # reporting a mean-variance risk model that was not used.
+            summary["effective_optimizer"] = f"{self.optimizer_name}(identity_cov)"
+        else:
+            summary["effective_optimizer"] = self.optimizer_name
 
-        years = len(self.daily_returns) / 252.0
+        # B13: report the metrics the strategy actually earned once invested,
+        # alongside the from-inception block. A month-end strategy sits in
+        # cash for the first weeks while the benchmark moves, which distorts
+        # Sharpe/vol/excess for short samples.
+        first_exec = None
+        if self.turnover_history is not None and len(self.turnover_history):
+            first_exec = self.turnover_history.index.min()
+        if first_exec is not None:
+            since_returns = self.daily_returns.loc[first_exec:]
+            since_bench = None
+            if self.benchmark_returns is not None and len(self.benchmark_returns):
+                since_bench = self.benchmark_returns.loc[
+                    self.benchmark_returns.index >= first_exec
+                ]
+            summary["since_first_execution"] = all_metrics(
+                since_returns, since_bench,
+                periods_per_year=ppy, risk_free=rf,
+            )
+            summary["first_execution_date"] = str(first_exec.date())
+            leading = self.daily_returns.loc[:first_exec]
+            summary["n_leading_cash_days"] = int(
+                (leading.iloc[:-1] == 0).sum()
+            ) if len(leading) else 0
+
+        years = annualization_years(self.daily_returns, ppy)
         summary["annual_turnover"] = (
             float(self.turnover_history.sum()) / years
             if years > 0 and self.turnover_history is not None
@@ -273,6 +493,7 @@ class BacktestEngine:
             "portfolio_values": self.portfolio_values,
             "benchmark_returns": self.benchmark_returns,
             "weights_history": self.weights_history,
+            "unexecuted_signals": self.unexecuted_signals,
             "turnover_history": self.turnover_history,
             "summary": summary,
         }
@@ -282,13 +503,22 @@ class BacktestEngine:
         if self.rebalance_frequency == "daily":
             return list(dates)
         elif self.rebalance_frequency == "weekly":
-            # Last trading day of each week
-            grouped = dates.to_series().groupby([dates.year, dates.isocalendar().week])
-            return [pd.Timestamp(d) for d in grouped.last().sort_index().values]
+            # Last trading day of each ISO week. Grouping by the *calendar*
+            # year put a late-December session (ISO week 1 of the next year)
+            # in the same bucket as the first week of the current January:
+            # the early-January rebalance vanished, a spurious Dec-31 one
+            # appeared, the list came back non-chronological, and the January
+            # optimizer received the December target as prev_weights -- a
+            # look-ahead through the turnover constraint (B2).
+            iso = dates.isocalendar()
+            grouped = dates.to_series().groupby([
+                iso["year"].to_numpy(), iso["week"].to_numpy(),
+            ])
+            return sorted(pd.Timestamp(d) for d in grouped.last().values)
         elif self.rebalance_frequency == "monthly":
             # Last trading day of each month (using actual trading calendar)
             grouped = dates.to_series().groupby([dates.year, dates.month])
-            return [pd.Timestamp(d) for d in grouped.last().sort_index().values]
+            return sorted(pd.Timestamp(d) for d in grouped.last().values)
         else:
             raise ValueError(f"Unknown rebalance frequency: {self.rebalance_frequency}")
 
@@ -337,33 +567,145 @@ class BacktestEngine:
             schedule.append((index[pos + 1], rdate))
         return schedule
 
-    def _simulate_pnl(self, returns: pd.DataFrame) -> None:
-        """Simulate daily P&L with costs.
+    @staticmethod
+    def _align_gate(panel, dates, columns, default: bool):
+        """Reindex a boolean gate panel onto (dates x columns)."""
+        if panel is None:
+            return None
+        return (
+            panel.reindex(index=dates, columns=columns)
+            .fillna(default)
+            .astype(bool)
+        )
+
+    @staticmethod
+    def _align_float(panel, dates, columns):
+        """Reindex a numeric panel onto (dates x columns)."""
+        if panel is None:
+            return None
+        return panel.reindex(index=dates, columns=columns).astype(float)
+
+    def _simulate_pnl(
+        self,
+        returns: pd.DataFrame,
+        tradable_mask: pd.DataFrame | None = None,
+        limit_up: pd.DataFrame | None = None,
+        limit_down: pd.DataFrame | None = None,
+        daily_volume: pd.DataFrame | None = None,
+        volatility: pd.DataFrame | None = None,
+    ) -> None:
+        """Simulate daily P&L with costs and an execution-day tradability gate.
 
         Between executions, weights drift with price movements. On an
         execution date, the new weights take effect at that close, turnover is
         computed against the held weights, and the cost is charged for that
         day -- so `turnover_history` is indexed by execution date too.
+
+        When ``tradable_mask`` / ``limit_up`` / ``limit_down`` are supplied
+        (B1), each asset's trade is checked on the *execution* date, not the
+        signal date: buys are blocked where the asset is not tradable or
+        closed limit-up, sells where it is not tradable or closed limit-down.
+        Blocked deltas are retried on following days until they fill or a
+        newer rebalance supersedes them; no cost or turnover is booked for a
+        blocked trade.
         """
         all_dates = returns.index.sort_values()
+        columns = returns.columns
         schedule = self._execution_schedule(returns)
 
+        gates_enabled = any(
+            panel is not None for panel in (tradable_mask, limit_up, limit_down)
+        )
+        mask_panel = self._align_gate(tradable_mask, all_dates, columns, True)
+        up_panel = self._align_gate(limit_up, all_dates, columns, False)
+        down_panel = self._align_gate(limit_down, all_dates, columns, False)
+        if gates_enabled:
+            # Supplying one gate panel must not dereference the two the caller
+            # omitted (the gate check indexes all three). The neutral values
+            # are "tradable" and "not at the limit".
+            if mask_panel is None:
+                mask_panel = pd.DataFrame(True, index=all_dates, columns=columns)
+            if up_panel is None:
+                up_panel = pd.DataFrame(False, index=all_dates, columns=columns)
+            if down_panel is None:
+                down_panel = pd.DataFrame(False, index=all_dates, columns=columns)
+        volume_panel = self._align_float(daily_volume, all_dates, columns)
+
+        vol_panel = self._align_float(volatility, all_dates, columns)
+        if (
+            vol_panel is None
+            and getattr(self.cost_model, "slippage_model", "fixed") == "impact"
+        ):
+            # At close(d) only returns dated before d are observable (row d is
+            # the close(d)->close(d+1) return). Shifted rolling std gives the
+            # impact model a causal daily-volatility estimate.
+            vol_panel = (
+                returns.rolling(20, min_periods=5).std().shift(1).reindex(
+                    index=all_dates, columns=columns,
+                ).fillna(0.02)
+            )
+
         self.total_cost_drag = 0.0
+        self._executed_signal_dates = set()
         capital = self.initial_capital
-        current_weights = pd.Series(0.0, index=returns.columns)
+        current_weights = pd.Series(0.0, index=columns)
         daily_ret_list = []
         turnover_records = []
 
         next_idx = 0
+        pending_rdate: pd.Timestamp | None = None
+        pending_target: pd.Series | None = None
+        pending_assets: pd.Index = pd.Index([])
 
         for date in all_dates:
             rebalance_cost = 0.0
-            if next_idx < len(schedule) and date >= schedule[next_idx][0]:
-                exec_date, rdate = schedule[next_idx]
-                target_weights = self.weights_history.get(rdate, current_weights)
-                target_weights = target_weights.reindex(returns.columns, fill_value=0.0)
 
-                turnover = (target_weights - current_weights).abs().sum() / 2
+            # A scheduled rebalance starts on its execution date. If a previous
+            # rebalance still has blocked deltas outstanding, the newer signal
+            # supersedes it: its target was computed with older information.
+            if next_idx < len(schedule) and date >= schedule[next_idx][0]:
+                _, rdate = schedule[next_idx]
+                if pending_rdate is not None and len(pending_assets):
+                    logger.warning(
+                        "Rebalance %s superseded by %s before its blocked trades "
+                        "could execute (%d asset(s))",
+                        str(pending_rdate)[:10], str(rdate)[:10], len(pending_assets),
+                    )
+                pending_rdate = rdate
+                pending_target = self.weights_history.get(
+                    rdate, current_weights,
+                ).reindex(columns, fill_value=0.0)
+                pending_assets = pending_target.index
+                next_idx += 1
+
+            if pending_rdate is not None and pending_target is not None:
+                target = pending_target
+                candidates = pending_assets
+                delta = (target - current_weights).reindex(
+                    candidates, fill_value=0.0,
+                )
+
+                if gates_enabled:
+                    allowed = pd.Series(True, index=candidates)
+                    buys = delta.index[delta > 0]
+                    sells = delta.index[delta < 0]
+                    if len(buys):
+                        allowed.loc[buys] = (
+                            mask_panel.loc[date].reindex(buys)
+                            & ~up_panel.loc[date].reindex(buys)
+                        )
+                    if len(sells):
+                        allowed.loc[sells] = (
+                            mask_panel.loc[date].reindex(sells)
+                            & ~down_panel.loc[date].reindex(sells)
+                        )
+                    allowed = allowed.fillna(True).astype(bool)
+                else:
+                    allowed = pd.Series(True, index=candidates)
+
+                executable_delta = delta.where(allowed, 0.0)
+                turnover = float(executable_delta.abs().sum()) / 2.0
+
                 # Enforce the turnover cap at execution time too. Optimizer
                 # constraints only see target-level turnover, while realized
                 # turnover also includes weight drift and candidate-set
@@ -378,44 +720,79 @@ class BacktestEngine:
                     and turnover > self.constraints.max_turnover
                 ):
                     scale = self.constraints.max_turnover / turnover
-                    target_weights = (
-                        current_weights + scale * (target_weights - current_weights)
-                    )
-                    turnover = (target_weights - current_weights).abs().sum() / 2
+                    executable_delta = executable_delta * scale
+                    turnover = float(executable_delta.abs().sum()) / 2.0
 
-                if turnover > 0:
+                if turnover > 0 and capital > 0:
                     # `turnover` is one-sided (the convention documented in
-                    # portfolio/constraints.py), but CostModel.compute_costs
-                    # charges commission and slippage on the value it is given
-                    # and halves stamp tax on the assumption that half of it is
-                    # sells -- which only holds for the *two-way* traded value.
-                    # Passing one-sided turnover halved every component.
-                    #
-                    # Stamp tax is a sell-side tax: passing only the total
-                    # two-way value with `is_sell=None` made the model assume
-                    # half of it was sells, so an initial from-cash build paid
-                    # 0.05% on buys it never owed and a full liquidation paid
-                    # only half of the 0.1% it did owe. Hand the model the
-                    # actual per-asset buy and sell notionals instead.
-                    delta = target_weights - current_weights
-                    buy_value = delta.clip(lower=0.0)
-                    sell_value = (-delta).clip(lower=0.0)
-                    rebalance_cost = float(
-                        self.cost_model.compute_costs(
-                            turnover * 2,
-                            buy_turnover=buy_value,
-                            sell_turnover=sell_value,
-                        ).sum()
-                    )
-                    self.total_cost_drag += rebalance_cost
-                turnover_records.append((exec_date, turnover))
+                    # portfolio/constraints.py); the cost model is handed the
+                    # actual per-asset buy/sell *CNY notionals* so commission,
+                    # the per-order minimum and the sell-side stamp tax are
+                    # each charged exactly once, on the right side.
+                    buy_value = executable_delta.clip(lower=0.0)
+                    sell_value = (-executable_delta).clip(lower=0.0)
+                    buy_notional = buy_value * capital
+                    sell_notional = sell_value * capital
 
-                # Record what was actually executed. Reporting, exposure and
-                # capacity consume weights_history; storing the pre-clamp
-                # target made them describe a portfolio that was never held.
-                self.weights_history[rdate] = target_weights
-                current_weights = target_weights.copy()
-                next_idx += 1
+                    volume_row = None
+                    if volume_panel is not None and date in volume_panel.index:
+                        volume_row = volume_panel.loc[date]
+                        if volume_row.notna().any():
+                            volume_row = volume_row.fillna(
+                                float(volume_row.median())
+                            )
+                        else:
+                            volume_row = None
+
+                    vol_row = None
+                    if vol_panel is not None and date in vol_panel.index:
+                        vol_row = vol_panel.loc[date]
+                        if vol_row.notna().any():
+                            vol_row = vol_row.fillna(float(vol_row.median()))
+                        else:
+                            vol_row = None
+
+                    costs = self.cost_model.compute_costs(
+                        float(buy_notional.sum() + sell_notional.sum()),
+                        buy_turnover=buy_notional,
+                        sell_turnover=sell_notional,
+                        daily_volume=volume_row,
+                        volatility=vol_row,
+                        date=date,
+                        portfolio_value=capital,
+                    )
+                    rebalance_cost = float(np.sum(costs))
+                    self.total_cost_drag += rebalance_cost
+
+                    # `executable_delta` is indexed by the pending candidate
+                    # subset (blocked assets retried on later days), not by the
+                    # full portfolio. Plain `+` aligns the missing labels to
+                    # NaN and silently wiped every position that was not part
+                    # of today's retry subset.
+                    current_weights = current_weights.add(
+                        executable_delta, fill_value=0.0,
+                    ).clip(lower=0.0)
+                    turnover_records.append((date, turnover))
+                    self._executed_signal_dates.add(pending_rdate)
+                    # Record what was actually executed. Reporting, exposure
+                    # and capacity consume weights_history; storing the
+                    # pre-clamp target made them describe a portfolio that was
+                    # never held.
+                    self.weights_history[pending_rdate] = current_weights.copy()
+
+                if gates_enabled:
+                    blocked = allowed[~allowed & (delta.abs() > 1e-12)].index
+                else:
+                    blocked = pd.Index([])
+                pending_assets = blocked
+                if len(pending_assets) == 0:
+                    if (
+                        pending_rdate is not None
+                        and float((target - current_weights).abs().sum()) < 1e-9
+                    ):
+                        self._executed_signal_dates.add(pending_rdate)
+                    pending_rdate = None
+                    pending_target = None
 
             daily_ret_assets = returns.loc[date].reindex(current_weights.index, fill_value=0.0)
             portfolio_return = (current_weights * daily_ret_assets).sum()

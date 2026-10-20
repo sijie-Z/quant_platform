@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import sys
@@ -97,15 +98,71 @@ async def _lifespan(_app: FastAPI):
     The bus is a process-wide singleton, but nothing ever started it. Without
     consumer loops every publish fell back to inline synchronous delivery,
     async handlers were skipped, and dead-letter retry never ran.
+
+    Shutdown used to stop only the bus. The live trading engine, the market
+    providers, connected WebSocket clients, the non-daemon executor threads
+    and the SQLite connections were all abandoned, so an in-flight pipeline
+    kept the process alive until it finished (or was SIGKILLed) and the
+    engine's final session/NAV writes were lost.
     """
+    from quant_platform.api import routes as api_routes
     from quant_platform.core.events import get_event_bus
+
+    # Executors were shut down by a previous lifespan exit; recreate them and
+    # pre-build the critical singletons before any request can race them.
+    api_routes.ensure_executors()
+    api_routes.initialize_singletons()
 
     bus = get_event_bus()
     await bus.start()
     try:
         yield
     finally:
-        await bus.stop()
+        await _shutdown_resources(api_routes, bus)
+
+
+async def _bounded_await(label: str, awaitable, timeout: float) -> None:
+    """Await a shutdown step, logging instead of hanging the process."""
+    try:
+        await asyncio.wait_for(awaitable, timeout=timeout)
+    except TimeoutError:
+        logging.getLogger(__name__).error(
+            "%s did not finish within %.0fs; continuing shutdown", label, timeout,
+        )
+    except Exception:
+        logging.getLogger(__name__).exception("%s failed", label)
+
+
+async def _shutdown_resources(api_routes, bus) -> None:
+    log = logging.getLogger(__name__)
+    # 1. Engine, market providers, WebSocket clients (bounded inside).
+    await _bounded_await(
+        "API resource shutdown", api_routes.shutdown_api_resources(), 30.0,
+    )
+    # 2. Executors: cancel queued work, wait (bounded) for running work.
+    #    Python cannot kill a running thread; a multi-minute pipeline keeps
+    #    its thread until it returns, but the server no longer waits forever.
+    await _bounded_await(
+        "Executor shutdown",
+        asyncio.to_thread(api_routes.shutdown_executors),
+        10.0,
+    )
+    # 3. Event bus: stop consumer loops. `stop()` cancels consumers and drops
+    #    queued events by design (event_bus_v2); the timeout only bounds it.
+    await _bounded_await("EventBus stop", bus.stop(), 5.0)
+    # 4. Close the process-wide SQLite connections (reopened lazily if the
+    #    store is used again in the same process, e.g. repeated lifespans).
+    try:
+        api_routes._core_store.close()
+    except Exception:
+        log.exception("Store close failed")
+    try:
+        from quant_platform.api import monitor as monitor_module
+        monitor_store = monitor_module._core_store
+        if monitor_store is not None and monitor_store is not api_routes._core_store:
+            monitor_store.close()
+    except Exception:
+        log.exception("Monitor store close failed")
 
 
 def _json_safe(value):

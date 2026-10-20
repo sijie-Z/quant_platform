@@ -27,6 +27,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant_platform.backtest.metrics import sharpe_ratio as _sharpe_ratio
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -155,11 +156,15 @@ class InvestorPortal:
         drawdown = (full_nav - peak) / peak
         max_drawdown = float(drawdown.min())
 
-        # Volatility and Sharpe
+        # Volatility and Sharpe. Sharpe uses the platform-wide definition from
+        # backtest.metrics -- (CAGR - risk_free) / annualized volatility with
+        # risk_free=3% -- so the investor portal, the backtest summary and the
+        # research reports rank strategies identically. The old code used
+        # arithmetic mean * 252 / vol with rf=0, which produced a different
+        # number from the same NAV series.
         daily_returns = nav_curve["daily_return"].dropna()
         volatility = float(daily_returns.std() * np.sqrt(self.TRADING_DAYS_PER_YEAR))
-        mean_return = float(daily_returns.mean() * self.TRADING_DAYS_PER_YEAR)
-        sharpe_ratio = mean_return / volatility if volatility > 0 else 0
+        sharpe_ratio = float(_sharpe_ratio(daily_returns))
 
         # Monthly returns
         monthly_returns = self._compute_monthly_returns(df)

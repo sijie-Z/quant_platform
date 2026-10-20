@@ -82,15 +82,18 @@ class WebSocketQuoteProvider:
 
     Args:
         source: Data source ("eastmoney" or "sina")
-        reconnect_interval: Seconds between reconnection attempts
-        max_reconnect: Maximum reconnection attempts (0 = unlimited)
+        reconnect_interval: Initial seconds between reconnection attempts
+        max_reconnect: Maximum reconnection attempts before giving up
+            (default 10; pass 0 for the legacy unlimited behaviour)
+        max_backoff: Upper bound for the exponential reconnect delay
     """
 
     def __init__(
         self,
         source: str = "eastmoney",
         reconnect_interval: float = 5.0,
-        max_reconnect: int = 0,
+        max_reconnect: int = 10,
+        max_backoff: float = 60.0,
     ):
         if not HAS_WEBSOCKET:
             raise ImportError(
@@ -98,14 +101,17 @@ class WebSocketQuoteProvider:
             )
 
         self._source = source
-        self._reconnect_interval = reconnect_interval
-        self._max_reconnect = max_reconnect
+        self._reconnect_interval = max(0.0, float(reconnect_interval))
+        self._max_reconnect = max(0, int(max_reconnect))
+        self._max_backoff = max(self._reconnect_interval, float(max_backoff))
 
         self._quotes: dict[str, RealtimeQuote] = {}
         self._lock = threading.Lock()
         self._ws: websocket.WebSocketApp | None = None
         self._thread: threading.Thread | None = None
         self._running = False
+        self._exhausted = False
+        self._last_error = ""
         self._subscribed_codes: set[str] = set()
         self._callbacks: list[Callable[[RealtimeQuote], None]] = []
         self._reconnect_count = 0
@@ -147,6 +153,7 @@ class WebSocketQuoteProvider:
             return
 
         self._running = True
+        self._exhausted = False
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         logger.info("WebSocket provider started (source=%s)", self._source)
@@ -165,26 +172,49 @@ class WebSocketQuoteProvider:
         return self._running and self._ws is not None
 
     @property
+    def status(self) -> str:
+        """Coarse health signal for monitoring."""
+        if self._exhausted:
+            return "exhausted"
+        if not self._running:
+            return "stopped"
+        if self._ws is None:
+            return "connecting"
+        if self._last_message_time and time.time() - self._last_message_time > 60:
+            return "stale"
+        return "connected"
+
+    @property
     def stats(self) -> dict:
         return {
             "source": self._source,
+            "status": self.status,
             "connected": self.is_connected,
+            "exhausted": self._exhausted,
+            "last_error": self._last_error,
             "subscribed": len(self._subscribed_codes),
             "cached_quotes": len(self._quotes),
             "message_count": self._message_count,
             "last_message_age_s": round(time.time() - self._last_message_time, 1)
             if self._last_message_time else None,
             "reconnect_count": self._reconnect_count,
+            "max_reconnect": self._max_reconnect,
         }
 
     # ── Internal ──
 
+    def _backoff_delay(self) -> float:
+        """Exponential backoff, capped at ``max_backoff``."""
+        exponent = max(0, self._reconnect_count - 1)
+        return min(self._reconnect_interval * (2 ** exponent), self._max_backoff)
+
     def _run_loop(self):
-        """Reconnection loop."""
+        """Reconnection loop with a finite cap and exponential backoff."""
         while self._running:
             try:
                 self._connect()
             except Exception as e:
+                self._last_error = str(e)
                 logger.warning("WebSocket error: %s", e)
 
             if not self._running:
@@ -192,11 +222,21 @@ class WebSocketQuoteProvider:
 
             self._reconnect_count += 1
             if self._max_reconnect and self._reconnect_count >= self._max_reconnect:
-                logger.error("Max reconnection attempts reached")
+                logger.error(
+                    "Max reconnection attempts reached (%d); giving up",
+                    self._max_reconnect,
+                )
+                self._exhausted = True
+                self._running = False
                 break
 
-            logger.info("Reconnecting in %.1fs...", self._reconnect_interval)
-            time.sleep(self._reconnect_interval)
+            delay = self._backoff_delay()
+            logger.info("Reconnecting in %.1fs...", delay)
+            deadline = time.time() + delay
+            # Sleep in small slices so stop() does not have to wait the whole
+            # (possibly minute-long) backoff.
+            while self._running and time.time() < deadline:
+                time.sleep(min(0.2, max(0.0, deadline - time.time())))
 
     def _connect(self):
         """Create and run WebSocket connection."""
@@ -225,6 +265,8 @@ class WebSocketQuoteProvider:
         """Called when connection opens."""
         logger.info("WebSocket connected to %s", self._source)
         self._reconnect_count = 0
+        self._exhausted = False
+        self._last_error = ""
         if self._subscribed_codes:
             self._send_subscribe(list(self._subscribed_codes))
 
@@ -253,6 +295,7 @@ class WebSocketQuoteProvider:
 
     def _on_error(self, ws, error):
         """Called on WebSocket error."""
+        self._last_error = str(error)
         logger.warning("WebSocket error: %s", error)
 
     def _on_close(self, ws, close_status_code, close_msg):

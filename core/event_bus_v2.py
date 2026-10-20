@@ -786,7 +786,19 @@ class AsyncEventBus:
         self._loop = asyncio.get_running_loop()
         self._started = True
 
+        # Subscription queues belong to the event loop that was running when
+        # the handler subscribed. After a stop/start pair (repeated app
+        # lifespans, test clients) that loop is gone; reusing its queues makes
+        # every consumer loop raise "bound to a different event loop" in a
+        # tight loop. Rebuild the transport and keep the subscriptions.
         with self._lock:
+            for topic, handlers in self._handlers.items():
+                rebuilt = []
+                for handler, queue, stats, handler_type in handlers:
+                    new_queue = asyncio.Queue(maxsize=queue.maxsize)
+                    self._queue_keys.pop(id(queue), None)
+                    rebuilt.append((handler, new_queue, stats, handler_type))
+                self._handlers[topic] = rebuilt
             registered = [
                 (topic, handler, queue, stats, handler_type)
                 for topic, handlers in self._handlers.items()
@@ -868,6 +880,9 @@ class AsyncEventBus:
             except Exception as e:
                 logger.error("Consumer loop error for '%s': %s",
                            stats.handler_name, e)
+                # Never spin: a loop-bound queue or a broken handler would
+                # otherwise flood the log at millions of lines per second.
+                await asyncio.sleep(0.05)
 
     async def _sync_consumer_loop(
         self,
@@ -904,6 +919,7 @@ class AsyncEventBus:
             except Exception as e:
                 logger.error("Sync consumer loop error for '%s': %s",
                            stats.handler_name, e)
+                await asyncio.sleep(0.05)
 
     async def _dlq_retry_loop(self):
         """Periodically retry dead letters."""

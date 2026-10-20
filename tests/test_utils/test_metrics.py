@@ -179,7 +179,7 @@ class TestInstrumentDecorator:
         assert result == 42
 
         snap = m.get_snapshot()
-        assert "pipeline_stage_total" in snap
+        assert any(key.startswith("pipeline_stage_total") for key in snap)
 
     def test_decorator_error(self):
         m = get_metrics()
@@ -193,7 +193,7 @@ class TestInstrumentDecorator:
             bad_func()
 
         snap = m.get_snapshot()
-        assert "pipeline_stage_errors_total" in snap
+        assert any(key.startswith("pipeline_stage_errors_total") for key in snap)
 
 
 class TestConcurrentExport:
@@ -281,8 +281,18 @@ class TestHTTPMiddleware:
         assert "api_duration_seconds_bucket" in text
 
         snap = m.get_snapshot()
-        assert snap["api_requests_total"]["value"] == 1.0
-        assert snap["api_duration_seconds"]["count"] == 1
+        requests = [
+            entry for key, entry in snap.items()
+            if key.startswith("api_requests_total")
+        ]
+        assert len(requests) == 1
+        assert requests[0]["value"] == 1.0
+        durations = [
+            entry for key, entry in snap.items()
+            if key.startswith("api_duration_seconds")
+        ]
+        assert len(durations) == 1
+        assert durations[0]["count"] == 1
 
     def test_route_template_is_used_as_the_label(self):
         """A path parameter must not create one label set per URL."""
@@ -309,3 +319,57 @@ class TestHTTPMiddleware:
         text = m.export_text()
         assert 'path="/items/{item_id}"' in text
         assert 'path="/items/1"' not in text
+
+
+class TestSnapshotKeyedByLabelSet:
+    """S22: two label sets of one metric used to overwrite each other in the
+    JSON snapshot, so /api/metrics/json reported only the last series."""
+
+    def test_two_label_sets_both_survive(self):
+        m = MetricsCollector()
+        m.counter("api_requests_total", labels={"path": "/a"}).inc(2)
+        m.counter("api_requests_total", labels={"path": "/b"}).inc(3)
+
+        snap = m.get_snapshot()
+
+        a = snap["api_requests_total{path=/a}"]
+        b = snap["api_requests_total{path=/b}"]
+        assert a["value"] == 2.0
+        assert b["value"] == 3.0
+        assert a["name"] == "api_requests_total"
+        assert a["labels"] == {"path": "/a"}
+
+    def test_gauges_and_histograms_are_keyed_by_label_set(self):
+        m = MetricsCollector()
+        m.gauge("risk_level", labels={"source": "a"}).set(1)
+        m.gauge("risk_level", labels={"source": "b"}).set(2)
+        m.histogram("latency", labels={"path": "/x"}).observe(0.1)
+
+        snap = m.get_snapshot()
+
+        assert snap["risk_level{source=a}"]["value"] == 1.0
+        assert snap["risk_level{source=b}"]["value"] == 2.0
+        assert snap["latency{path=/x}"]["count"] == 1
+
+
+class TestExpositionFormat:
+    """S22: label values must be escaped and HELP/TYPE emitted once."""
+
+    def test_label_values_are_escaped(self):
+        m = MetricsCollector()
+        m.counter("weird_total", labels={"msg": 'a"b\\c\nd'}).inc()
+
+        text = m.export_text()
+
+        assert 'msg="a\\"b\\\\c\\nd"' in text
+
+    def test_help_and_type_emitted_once_per_family(self):
+        m = MetricsCollector()
+        m.counter("requests_total", labels={"path": "/a"}, help="reqs").inc()
+        m.counter("requests_total", labels={"path": "/b"}).inc()
+
+        text = m.export_text()
+
+        assert text.count("# TYPE requests_total counter") == 1
+        assert text.count("# HELP requests_total reqs") == 1
+        assert text.count("requests_total{") == 2

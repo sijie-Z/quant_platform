@@ -9,7 +9,12 @@ Presents a complete picture of backtest results in a single report, including:
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
+import time
+from datetime import datetime
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,6 +33,14 @@ from quant_platform.risk.var import var_summary
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+#: Per-run artifact layout (issue S15):
+#:   <results_dir>/runs/<timestamp>_<config_hash>_<run_id>/...
+#:   <results_dir>/latest_manifest.json   (pointer to the published run)
+MANIFEST_FILENAME = "manifest.json"
+LATEST_MANIFEST_FILENAME = "latest_manifest.json"
+RUNS_DIRNAME = "runs"
+_PUBLISH_LOCK = ".publish.lock"
 
 
 def generate_dashboard(
@@ -243,6 +256,180 @@ def generate_dashboard(
 
 
 # ------------------------------------------------------------------
+# Per-run artifact directories (issue S15)
+# ------------------------------------------------------------------
+
+def create_run_dir(
+    base_dir: str | Path,
+    run_id: str,
+    config_hash: str = "",
+    timestamp: str | None = None,
+) -> Path:
+    """Create (atomically) and return a unique per-run output directory.
+
+    The name carries the timestamp, config hash and run id, so two concurrent
+    runs can never write over each other's CSVs even in the same results dir.
+    """
+    base = Path(base_dir)
+    stamp = timestamp or datetime.now().strftime("%Y%m%dT%H%M%S")
+    safe_hash = (config_hash or "nohash")[:12]
+    safe_run = (run_id or stamp)[:16]
+    run_dir = base / RUNS_DIRNAME / f"{stamp}_{safe_hash}_{safe_run}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def write_manifest(run_dir: str | Path, manifest: dict) -> Path:
+    """Atomically write ``manifest.json`` inside a run directory."""
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / MANIFEST_FILENAME
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def read_manifest(run_dir: str | Path) -> dict | None:
+    """Read a run's manifest, or None when absent/corrupt."""
+    path = Path(run_dir) / MANIFEST_FILENAME
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def resolve_run_dir(results_dir: str | Path) -> Path:
+    """Return the run directory holding the results to analyze.
+
+    Order: the path itself when it contains a manifest (a run dir passed
+    directly), the published pointer, the newest complete run under
+    ``runs/``, and finally the legacy flat ``results/`` layout.
+    """
+    base = Path(results_dir)
+    if (base / MANIFEST_FILENAME).exists():
+        return base
+
+    pointer_path = base / LATEST_MANIFEST_FILENAME
+    if pointer_path.exists():
+        try:
+            with open(pointer_path, encoding="utf-8") as f:
+                pointer = json.load(f)
+            candidate = base / str(pointer.get("run_dir", ""))
+            if candidate.is_dir() and (candidate / MANIFEST_FILENAME).exists():
+                return candidate
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    runs = base / RUNS_DIRNAME
+    if runs.is_dir():
+        candidates = sorted(
+            (
+                d for d in runs.iterdir()
+                if d.is_dir() and (d / MANIFEST_FILENAME).exists()
+            ),
+            key=lambda d: d.name,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0]
+
+    return base
+
+
+def publish_run_artifacts(
+    results_dir: str | Path,
+    run_dir: str | Path,
+    manifest: dict,
+    timeout: float = 2.0,
+) -> bool:
+    """Copy a run's artifacts to the top-level results dir, all-or-nothing.
+
+    Top-level convenience copies are only written while holding an exclusive
+    publish lock, so two concurrent runs cannot interleave files from
+    different runs at the top level. If the lock cannot be acquired the
+    copies are skipped (the run directory and its manifest remain the
+    authoritative artifacts).
+
+    Returns True when the copies/pointer were published.
+    """
+    base = Path(results_dir)
+    run_dir = Path(run_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    lock_path = base / _PUBLISH_LOCK
+    deadline = time.monotonic() + timeout
+
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > 120:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "Another run holds the publish lock; skipping top-level "
+                    "copies for %s", run_dir,
+                )
+                return False
+            time.sleep(0.01)
+
+    try:
+        artifacts = manifest.get("artifacts") or []
+        for name in artifacts:
+            source = run_dir / name
+            if not source.is_file():
+                continue
+            tmp = base / f"{name}.tmp.{os.getpid()}"
+            try:
+                shutil.copyfile(source, tmp)
+                os.replace(tmp, base / name)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        pointer = {
+            "run_id": manifest.get("run_id", ""),
+            "config_hash": manifest.get("config_hash", ""),
+            "run_dir": (
+                str(run_dir.relative_to(base)).replace("\\", "/")
+                if run_dir.is_relative_to(base) else str(run_dir)
+            ),
+            "manifest": (
+                str((run_dir / MANIFEST_FILENAME).relative_to(base)).replace("\\", "/")
+                if run_dir.is_relative_to(base) else str(run_dir / MANIFEST_FILENAME)
+            ),
+            "published_at": datetime.now().isoformat(),
+        }
+        pointer_path = base / LATEST_MANIFEST_FILENAME
+        tmp = pointer_path.with_name(f"{pointer_path.name}.tmp.{os.getpid()}")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(pointer, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, pointer_path)
+        return True
+    finally:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
 
@@ -265,17 +452,25 @@ def _analyze_drawdown_detail(returns: pd.Series) -> dict | None:
 
     trough_pos = int(drawdown.argmin())
     peak_pos = int(np.argmax(wealth[:trough_pos]))
-    # Position 0 is the inception value of 1.0; label it with the first
-    # trading date rather than inventing a date.
-    peak_date = sr.index[0] if peak_pos == 0 else sr.index[peak_pos - 1]
-    trough_date = sr.index[trough_pos - 1]
+    # Wealth position k >= 1 is reached at the close of the k-th return. The
+    # series is labelled by return-period *start* (the row dated t is the
+    # close(t) -> close(t+1) return), so that close carries the next label --
+    # `sr.index[k]`, clamped at the end. The old `index[k - 1]` labelled the
+    # peak/trough one trading day early (B10).
+    def _close_date(pos: int):
+        if pos <= 0:
+            return sr.index[0]
+        return sr.index[min(pos, len(sr) - 1)]
+
+    peak_date = _close_date(peak_pos)
+    trough_date = _close_date(trough_pos)
     peak_value = wealth[peak_pos]
 
     recovery_date = None
     recovery_days = None
     for pos in range(trough_pos + 1, len(wealth)):
         if wealth[pos] >= peak_value:
-            recovery_date = sr.index[pos - 1]
+            recovery_date = sr.index[min(pos, len(sr) - 1)]
             recovery_days = (recovery_date - peak_date).days
             break
 

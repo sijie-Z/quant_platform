@@ -181,9 +181,14 @@ class TestNestedConfigIsCoerced:
         types, and a section that is never read from YAML still has the right
         type because the dataclass default_factory produces one. This asserts
         the YAML content actually arrives.
+
+        ``validate=False``: the sentinel values (``n_stocks=987654+...``,
+        ``provider='synthetic__sentinel__'``, ...) are deliberately outside
+        every range/enum so they cannot equal a default. Validation is covered
+        separately in tests/test_utils/test_config.py.
         """
         raw = _build_sentinel_raw()
-        cfg = load_config(raw=raw)
+        cfg = load_config(raw=raw, validate=False)
 
         problems = []
         _diff(schema.Config, cfg, raw, "", problems)

@@ -63,6 +63,17 @@ def generate_html_report(
     chart = results.get("chart_data", {})
     exposure = results.get("exposure", {})
     stress = results.get("stress_tests", [])
+    provenance = results.get("provenance", {}) or {}
+    provider_label = provenance.get("effective_provider", "N/A")
+    if provenance.get("synthetic"):
+        provider_label += " (SYNTHETIC)"
+    data_range = ""
+    if provenance.get("start_date") or provenance.get("end_date"):
+        data_range = (
+            f"{provenance.get('start_date', '?')} → "
+            f"{provenance.get('end_date', '?')} "
+            f"(data date: {provenance.get('data_date') or 'n/a'})"
+        )
 
     dates_json = json.dumps(chart.get("dates", []))
     equity_json = json.dumps(chart.get("equity", []))
@@ -153,8 +164,9 @@ def generate_html_report(
   <div class="meta">
     Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
     Period: {chart.get('dates', [''])[0]} → {chart.get('dates', [''])[-1]}<br>
-    Optimizer: {perf.get('optimizer', 'N/A')}
-  </div>
+    Optimizer: {perf.get('optimizer', 'N/A')}<br>
+    Provider: {provider_label} (requested: {provenance.get('requested_provider', 'N/A')})<br>
+    Data: {data_range or 'n/a'}</div>
 </div>
 
 <!-- KPI Strip -->

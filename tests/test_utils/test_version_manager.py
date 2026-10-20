@@ -306,3 +306,162 @@ class TestAutoSave:
         assert restored["factors"]["technical"]["momentum_1m"]["params"]["period"] == 21
         assert restored["instruments"][0]["symbol"] == "600519"
         assert restored["instruments"][1]["multiplier"] == 300
+
+
+class TestSecretRedaction:
+    """S13: raw execution.qmt.password was written to version.yaml and
+    printed by config show/diff in plaintext."""
+
+    def _config(self):
+        return {
+            "execution": {
+                "qmt": {
+                    "account": "123456",
+                    "password": "super-secret",
+                    "server": "localhost:58610",
+                },
+            },
+            "data": {"provider": "synthetic"},
+        }
+
+    def test_password_is_not_written_to_disk(self, vm):
+        vid = vm.save(self._config())
+
+        stored = (vm._root / vid / "version.yaml").read_text(encoding="utf-8")
+
+        assert "super-secret" not in stored
+        assert "***REDACTED***" in stored
+
+    def test_show_returns_redacted_values(self, vm):
+        vid = vm.save(self._config())
+
+        shown = vm.show(vid)
+
+        assert shown["execution"]["qmt"]["password"] == "***REDACTED***"
+        assert shown["execution"]["qmt"]["account"] == "123456"
+
+    def test_old_unredacted_snapshots_are_redacted_on_read(self, vm):
+        vid = vm.save(self._config())
+        # Simulate a snapshot written before redaction existed.
+        path = vm._root / vid / "version.yaml"
+        path.write_text(yaml.dump(self._config()), encoding="utf-8")
+
+        assert vm.show(vid)["execution"]["qmt"]["password"] == "***REDACTED***"
+
+    def test_diff_does_not_leak_the_secret(self, vm):
+        vm.save(self._config())
+        changed = self._config()
+        changed["execution"]["qmt"]["server"] = "otherhost:58610"
+        vm.save(changed)
+
+        diff = vm.diff("v1", "v2")
+
+        assert "otherhost" in diff
+        assert "super-secret" not in diff
+
+    def test_rollback_omits_redacted_secret_instead_of_writing_placeholder(
+        self, vm, tmp_versions_dir,
+    ):
+        vm.save(self._config())
+        target = tmp_versions_dir / "active.yaml"
+
+        vm.rollback("v1", target_path=target)
+
+        restored = yaml.safe_load(target.read_text(encoding="utf-8"))
+        assert "password" not in restored["execution"]["qmt"]
+        assert restored["execution"]["qmt"]["account"] == "123456"
+
+
+class TestConcurrentSaves:
+    """S13: id allocation + index update were non-atomic RMW, so concurrent
+    saves lost versions and index entries (v2 went missing in the probe)."""
+
+    def test_threads_saving_concurrently_do_not_lose_versions(self, tmp_versions_dir):
+        import threading
+
+        vm = VersionManager(str(tmp_versions_dir))
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def save_many(tag):
+            try:
+                barrier.wait(timeout=5)
+                for index in range(6):
+                    vm.save({"who": tag, "i": index}, description=tag)
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=save_many, args=(tag,))
+            for tag in ("a", "b")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert errors == []
+        versions = vm.list()
+        assert len(versions) == 12
+        ids = {v.id for v in versions}
+        assert len(ids) == 12
+        # Every version directory has an index entry and vice versa.
+        dirs = {p.name for p in tmp_versions_dir.iterdir() if p.is_dir() and p.name.startswith("v")}
+        assert dirs == ids
+
+    def test_lock_blocks_a_second_holder(self, tmp_versions_dir):
+        import threading
+
+        from quant_platform.utils.version_manager import _FileLock
+
+        lock_path = tmp_versions_dir / ".test.lock"
+        started = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def hold():
+            with _FileLock(lock_path, timeout=5):
+                started.set()
+                release.wait(timeout=5)
+
+        def contend():
+            started.wait(timeout=5)
+            try:
+                with _FileLock(lock_path, timeout=0.2):
+                    errors.append("acquired while held")
+            except TimeoutError:
+                pass
+
+        holder = threading.Thread(target=hold)
+        waiter = threading.Thread(target=contend)
+        holder.start()
+        waiter.start()
+        waiter.join(timeout=10)
+        release.set()
+        holder.join(timeout=10)
+
+        assert errors == []
+
+
+class TestPrune:
+    def test_prune_keeps_the_newest_versions(self, vm, sample_config):
+        for index in range(5):
+            vm.save(sample_config, description=f"v{index}")
+
+        removed = vm.prune(keep=2)
+
+        assert sorted(removed) == ["v1", "v2", "v3"]
+        assert [v.id for v in vm.list()] == ["v5", "v4"]
+
+    def test_prune_by_age(self, vm, sample_config):
+        vm.save(sample_config)
+        versions = vm.list()
+        # Force the stored timestamp far into the past.
+        index = vm._load_index()
+        index["v1"].timestamp = "2000-01-01T00:00:00"
+        vm._save_index(index)
+
+        removed = vm.prune(keep=10, max_age_days=30)
+
+        assert removed == ["v1"]
+        assert versions  # silence unused warning without changing behaviour

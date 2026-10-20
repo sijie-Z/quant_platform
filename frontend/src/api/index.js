@@ -332,19 +332,24 @@ export function triggerMonitorKillSwitch(params) {
 // version returned only the first socket and reconnected unconditionally
 // from onclose, so `ws.close()` in a component's unmount handler scheduled a
 // new, unowned socket three seconds later — one leaked connection per visit.
-// When the API token is configured, it must travel in the query string
-// because browsers cannot set headers on a WebSocket handshake.
+//
+// The API token travels as the `bearer.<token>` WebSocket subprotocol, not
+// as a `?token=` query string: uvicorn's access log records the URL (query
+// string included), so the query form wrote the long-lived token into the
+// logs on every reconnect. The backend still accepts `?token=` for older
+// clients, but browsers cannot set handshake headers, so the subprotocol is
+// the only header-based transport available.
 export function createStatusSocket(onMessage, onError) {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = getApiToken()
-  const query = token ? `?token=${encodeURIComponent(token)}` : ''
+  const subprotocols = token ? [`bearer.${token}`] : []
   let socket = null
   let timer = null
   let disposed = false
 
   const connect = () => {
     if (disposed) return
-    socket = new WebSocket(`${protocol}//${location.host}/api/ws${query}`)
+    socket = new WebSocket(`${protocol}//${location.host}/api/ws`, subprotocols)
 
     socket.onmessage = (event) => {
       try {

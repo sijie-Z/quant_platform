@@ -84,39 +84,45 @@ class OrderManager:
         # This checked `pos.quantity`, the full holding, so a buy and a sell in
         # the same session went through. `available` excludes today's purchases
         # and is released by `new_trading_day()`.
-        if side == "sell":
-            pos = self.positions.get(ticker)
-            available = pos.available if pos else 0
-            if available < quantity:
-                held = pos.quantity if pos else 0
-                raise ValueError(
-                    f"Insufficient sellable position: {ticker} has {available} "
-                    f"available today (holding {held}, of which "
-                    f"{held - available} was bought today and is T+1 locked), "
-                    f"trying to sell {quantity}"
-                )
+        #
+        # The check and the insert must be atomic: a fill from
+        # `smart_route_order`'s thread runs under the same RLock, so without
+        # it a sell could pass against `available` and interleave with a fill
+        # that empties the position.
+        with self._lock:
+            if side == "sell":
+                pos = self.positions.get(ticker)
+                available = pos.available if pos else 0
+                if available < quantity:
+                    held = pos.quantity if pos else 0
+                    raise ValueError(
+                        f"Insufficient sellable position: {ticker} has {available} "
+                        f"available today (holding {held}, of which "
+                        f"{held - available} was bought today and is T+1 locked), "
+                        f"trying to sell {quantity}"
+                    )
 
-        # Get tenant from context if available
-        tenant_id = "default"
-        if TenantContext is not None:
-            try:
-                tenant_id = TenantContext.get_current().tenant_id
-            except Exception:
-                pass
+            # Get tenant from context if available
+            tenant_id = "default"
+            if TenantContext is not None:
+                try:
+                    tenant_id = TenantContext.get_current().tenant_id
+                except Exception:
+                    pass
 
-        order = Order(
-            ticker=ticker,
-            tenant_id=tenant_id,
-            side=OrderSide(side),
-            order_type=OrderType(order_type),
-            quantity=quantity,
-            limit_price=limit_price,
-            status=OrderStatus.PENDING,
-            created_at=datetime.now().isoformat(),
-            strategy=strategy,
-            notes=notes,
-        )
-        self.orders[order.order_id] = order
+            order = Order(
+                ticker=ticker,
+                tenant_id=tenant_id,
+                side=OrderSide(side),
+                order_type=OrderType(order_type),
+                quantity=quantity,
+                limit_price=limit_price,
+                status=OrderStatus.PENDING,
+                created_at=datetime.now().isoformat(),
+                strategy=strategy,
+                notes=notes,
+            )
+            self.orders[order.order_id] = order
         logger.info("Created order %s: %s %s x%d @ %s",
                      order.order_id, side, ticker, quantity,
                      limit_price or "market")
@@ -124,11 +130,12 @@ class OrderManager:
 
     def submit_order(self, order_id: str) -> Order:
         """Submit order (PENDING -> SUBMITTED)."""
-        order = self.orders[order_id]
-        if order.status != OrderStatus.PENDING:
-            raise ValueError(f"Cannot submit order in {order.status} state")
-        order.status = OrderStatus.SUBMITTED
-        order.submitted_at = datetime.now().isoformat()
+        with self._lock:
+            order = self.orders[order_id]
+            if order.status != OrderStatus.PENDING:
+                raise ValueError(f"Cannot submit order in {order.status} state")
+            order.status = OrderStatus.SUBMITTED
+            order.submitted_at = datetime.now().isoformat()
         logger.info("Submitted order %s", order_id)
         return order
 
@@ -248,11 +255,12 @@ class OrderManager:
 
     def cancel_order(self, order_id: str, reason: str = "") -> Order:
         """Cancel an order."""
-        order = self.orders[order_id]
-        if order.is_complete:
-            raise ValueError(f"Cannot cancel order in {order.status} state")
-        order.status = OrderStatus.CANCELLED
-        order.notes = f"{order.notes} | Cancelled: {reason}".strip(" | ")
+        with self._lock:
+            order = self.orders[order_id]
+            if order.is_complete:
+                raise ValueError(f"Cannot cancel order in {order.status} state")
+            order.status = OrderStatus.CANCELLED
+            order.notes = f"{order.notes} | Cancelled: {reason}".strip(" | ")
         logger.info("Cancelled order %s: %s", order_id, reason)
         return order
 
@@ -313,14 +321,16 @@ class OrderManager:
         `_trade_date_offset` field commented "For T+1 simulation" that nothing
         ever read, and no day-boundary method existed at all.
         """
-        for pos in self.positions.values():
-            pos.available = pos.quantity
+        with self._lock:
+            for pos in self.positions.values():
+                pos.available = pos.quantity
 
     def update_prices(self, prices: dict[str, float]):
         """Update all positions with current market prices."""
-        for ticker, pos in self.positions.items():
-            if ticker in prices:
-                pos.update_price(prices[ticker])
+        with self._lock:
+            for ticker, pos in self.positions.items():
+                if ticker in prices:
+                    pos.update_price(prices[ticker])
 
     # ── Portfolio Analytics ──
 
@@ -336,102 +346,114 @@ class OrderManager:
                 return pos.market_value
             return pos.avg_cost * pos.quantity
 
-        positions_value = sum(marked_value(p) for p in self.positions.values())
-        total_unrealized = sum(p.unrealized_pnl for p in self.positions.values())
-        total_realized = sum(p.realized_pnl for p in self.positions.values())
+        with self._lock:
+            positions_value = sum(marked_value(p) for p in self.positions.values())
+            total_unrealized = sum(p.unrealized_pnl for p in self.positions.values())
+            total_realized = sum(p.realized_pnl for p in self.positions.values())
 
-        total_value = self.cash + positions_value
-        daily_pnl = total_value - self.initial_cash
+            total_value = self.cash + positions_value
+            daily_pnl = total_value - self.initial_cash
 
-        # Calculate weights
-        for pos in self.positions.values():
-            value = marked_value(pos)
-            pos.weight = value / total_value if total_value > 0 else 0
+            # Calculate weights
+            for pos in self.positions.values():
+                value = marked_value(pos)
+                pos.weight = value / total_value if total_value > 0 else 0
 
-        snapshot = PortfolioSnapshot(
-            timestamp=datetime.now().isoformat(),
-            total_value=round(total_value, 2),
-            cash=round(self.cash, 2),
-            positions_value=round(positions_value, 2),
-            n_positions=len(self.positions),
-            total_unrealized_pnl=round(total_unrealized, 2),
-            total_realized_pnl=round(total_realized, 2),
-            daily_pnl=round(daily_pnl, 2),
-            positions=list(self.positions.values()),
-        )
-        self.snapshots.append(snapshot)
-        # `/api/oms/positions` and `/api/risk/status` call this on every poll;
-        # without a cap the list grew for the life of the process.
-        if len(self.snapshots) > 1_000:
-            self.snapshots = self.snapshots[-500:]
+            snapshot = PortfolioSnapshot(
+                timestamp=datetime.now().isoformat(),
+                total_value=round(total_value, 2),
+                cash=round(self.cash, 2),
+                positions_value=round(positions_value, 2),
+                n_positions=len(self.positions),
+                total_unrealized_pnl=round(total_unrealized, 2),
+                total_realized_pnl=round(total_realized, 2),
+                daily_pnl=round(daily_pnl, 2),
+                positions=list(self.positions.values()),
+            )
+            self.snapshots.append(snapshot)
+            # `/api/oms/positions` and `/api/risk/status` call this on every poll;
+            # without a cap the list grew for the life of the process.
+            if len(self.snapshots) > 1_000:
+                self.snapshots = self.snapshots[-500:]
         return snapshot
 
-    def get_order_blotter(self, tenant_id: str = "") -> list[dict]:
-        """Get all orders as a list of dicts, optionally filtered by tenant.
+    def get_order_blotter(self, tenant_id: str = "", limit: int = 500) -> list[dict]:
+        """Get orders as a list of dicts, optionally filtered by tenant.
 
         This used to iterate `self.blotter`, which only receives orders once
         they are complete (filled/cancelled/rejected). Pending, submitted and
         partially filled orders were invisible to `/api/oms/blotter` even
         though they existed and had already moved cash or positions.
+
+        `limit` bounds the response: the OMS book is never pruned, so the
+        blotter used to return every order ever created.
         """
+        try:
+            limit = max(0, int(limit))
+        except (TypeError, ValueError):
+            limit = 500
         result = []
-        for order in sorted(
-            self.orders.values(), key=lambda o: o.created_at, reverse=True,
-        ):
-            if tenant_id and order.tenant_id != tenant_id:
-                continue
-            result.append({
-                "order_id": order.order_id,
-                "tenant_id": order.tenant_id,
-                "ticker": order.ticker,
-                "side": order.side.value,
-                "type": order.order_type.value,
-                "quantity": order.quantity,
-                "remaining_quantity": max(
-                    0, order.quantity - order.filled_quantity,
-                ),
-                "avg_fill_price": round(order.avg_fill_price, 2),
-                "filled_quantity": order.filled_quantity,
-                "commission": order.total_commission,
-                "tax": order.total_tax,
-                "slippage": order.total_slippage,
-                "status": order.status.value,
-                "created_at": order.created_at,
-                "filled_at": order.filled_at,
-                "strategy": order.strategy,
-            })
+        with self._lock:
+            for order in sorted(
+                self.orders.values(), key=lambda o: o.created_at, reverse=True,
+            ):
+                if tenant_id and order.tenant_id != tenant_id:
+                    continue
+                result.append({
+                    "order_id": order.order_id,
+                    "tenant_id": order.tenant_id,
+                    "ticker": order.ticker,
+                    "side": order.side.value,
+                    "type": order.order_type.value,
+                    "quantity": order.quantity,
+                    "remaining_quantity": max(
+                        0, order.quantity - order.filled_quantity,
+                    ),
+                    "avg_fill_price": round(order.avg_fill_price, 2),
+                    "filled_quantity": order.filled_quantity,
+                    "commission": order.total_commission,
+                    "tax": order.total_tax,
+                    "slippage": order.total_slippage,
+                    "status": order.status.value,
+                    "created_at": order.created_at,
+                    "filled_at": order.filled_at,
+                    "strategy": order.strategy,
+                })
+                if len(result) >= limit:
+                    break
         return result
 
     def get_trade_cost_analysis(self) -> dict:
         """Compute TCA metrics across all filled orders."""
-        if not self.blotter:
-            return {}
+        with self._lock:
+            if not self.blotter:
+                return {}
 
-        total_commission = sum(o.total_commission for o in self.blotter)
-        total_tax = sum(o.total_tax for o in self.blotter)
-        total_slippage = sum(o.total_slippage for o in self.blotter)
-        total_volume = sum(
-            o.avg_fill_price * o.filled_quantity for o in self.blotter
-        )
+            total_commission = sum(o.total_commission for o in self.blotter)
+            total_tax = sum(o.total_tax for o in self.blotter)
+            total_slippage = sum(o.total_slippage for o in self.blotter)
+            total_volume = sum(
+                o.avg_fill_price * o.filled_quantity for o in self.blotter
+            )
 
-        buy_orders = [o for o in self.blotter if o.side == OrderSide.BUY]
-        sell_orders = [o for o in self.blotter if o.side == OrderSide.SELL]
+            buy_orders = [o for o in self.blotter if o.side == OrderSide.BUY]
+            sell_orders = [o for o in self.blotter if o.side == OrderSide.SELL]
 
-        return {
-            "total_orders": len(self.blotter),
-            "buy_orders": len(buy_orders),
-            "sell_orders": len(sell_orders),
-            "total_commission": round(total_commission, 2),
-            "total_tax": round(total_tax, 2),
-            "total_slippage": round(total_slippage, 2),
-            "total_volume": round(total_volume, 2),
-            "cost_bps": round(
-                (total_commission + total_tax + total_slippage) / total_volume * 10000, 2
-            ) if total_volume > 0 else 0,
-            "avg_order_size": round(
-                total_volume / len(self.blotter), 0
-            ) if self.blotter else 0,
-        }
+            return {
+                "total_orders": len(self.blotter),
+                "buy_orders": len(buy_orders),
+                "sell_orders": len(sell_orders),
+                "total_commission": round(total_commission, 2),
+                "total_tax": round(total_tax, 2),
+                "total_slippage": round(total_slippage, 2),
+                "total_volume": round(total_volume, 2),
+                "cost_bps": round(
+                    (total_commission + total_tax + total_slippage) / total_volume * 10000, 2
+                ) if total_volume > 0 else 0,
+                "avg_order_size": round(
+                    total_volume / len(self.blotter), 0
+                ) if self.blotter else 0,
+            }
 
     # ── Persistence ──
 

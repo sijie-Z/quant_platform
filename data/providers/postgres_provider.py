@@ -55,9 +55,11 @@ try:
 except ImportError:
     HAS_ASYNCPG = False
 
+import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import DataProvider
+from quant_platform.data.schema import FINANCIAL_COLUMNS
 
 Base = declarative_base() if HAS_SQLALCHEMY else None
 
@@ -434,7 +436,18 @@ class PostgresDataProvider(DataProvider):
     """PostgreSQL-backed data provider.
 
     Reads OHLCV data from a PostgreSQL/TimescaleDB database.
-    Falls back to synthetic data if connection fails.
+
+    Adjustment contract: ``daily_prices.close`` must be the **raw**
+    (unadjusted) close and ``daily_prices.adj_factor`` the cumulative
+    adjustment divisor, so the pipeline computes
+    ``close_adj = close / adj_factor`` exactly once.  A factor that is NULL,
+    non-positive or non-finite would silently corrupt the return series, so
+    such rows are rejected with an actionable error instead of being divided.
+
+    ``st_available`` is False: this provider has no ST history (the static
+    ``stock_metadata.is_st`` flag is all it carries), so callers must treat
+    per-date ST screening as unavailable.  SQL NULL ``is_st`` values are
+    coalesced to False for the static flag only.
 
     Args:
         dsn: PostgreSQL connection string
@@ -446,6 +459,8 @@ class PostgresDataProvider(DataProvider):
 
         self._engine = create_engine(dsn, pool_pre_ping=True)
         self._connected = False
+        # No point-in-time ST history is supplied by this source.
+        self.st_available = False
         try:
             with self._engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
@@ -475,18 +490,33 @@ class PostgresDataProvider(DataProvider):
             ORDER BY date, code
         """
         df = pd.read_sql(query, self._engine, params={"start": start_date, "end": end_date})
-        if df.empty:
-            return df
-        df["date"] = pd.to_datetime(df["date"])
         pivot_cols = fields or ["open", "high", "low", "close", "volume", "turnover", "adj_factor"]
+        if df.empty:
+            # Empty results must still satisfy the MultiIndex contract:
+            # downstream code calls get_level_values("asset") unconditionally.
+            index = pd.MultiIndex.from_arrays([[], []], names=["date", "asset"])
+            return pd.DataFrame(index=index, columns=list(pivot_cols), dtype=float)
+
+        df["date"] = pd.to_datetime(df["date"])
         missing = [c for c in pivot_cols if c not in df.columns]
         if missing:
             raise ValueError(f"Unknown price fields: {missing}")
 
+        # Validate the documented adjustment convention before it reaches the
+        # pipeline's blind division.  A NULL/zero/negative/infinite divisor
+        # would produce inf/NaN adjusted prices or silently halve returns.
+        factors = pd.to_numeric(df["adj_factor"], errors="coerce")
+        factor_values = factors.to_numpy(dtype=float)
+        valid = np.isfinite(factor_values) & (factor_values > 0)
+        if not bool(valid.all()):
+            raise ValueError(
+                "daily_prices.adj_factor must be a positive finite cumulative "
+                f"adjustment divisor (close must be raw); {int((~valid).sum())} "
+                "row(s) violate the contract"
+            )
+
         # Contract (data/providers/base.py): MultiIndex (date, asset) with one
-        # column per field. The old pivot returned a date x code frame holding
-        # only `fields[0]` (open by default), and concatenating several pivots
-        # produced duplicate column labels instead of a MultiIndex.
+        # column per field.
         result = df.set_index(["date", "code"])[pivot_cols].sort_index()
         result.index = result.index.set_names(["date", "asset"])
         return result
@@ -499,17 +529,45 @@ class PostgresDataProvider(DataProvider):
         if not self._connected:
             raise ConnectionError("PostgreSQL not connected")
 
-        query = """
-            SELECT date, code, market_cap, pe_ratio, pb_ratio, roe, revenue, net_profit
+        select_cols = ", ".join(
+            ["date", "code", *FINANCIAL_COLUMNS, "publish_date"]
+        )
+        query = f"""
+            SELECT {select_cols}
             FROM financials
             WHERE date BETWEEN :start AND :end
             ORDER BY date, code
         """
         df = pd.read_sql(query, self._engine, params={"start": start_date, "end": end_date})
-        if not df.empty:
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index(["date", "code"])
-        return df
+
+        index = pd.MultiIndex.from_arrays([[], []], names=["date", "asset"])
+        if df.empty:
+            return pd.DataFrame(
+                index=index, columns=[*FINANCIAL_COLUMNS, "publish_date"]
+            )
+
+        df["date"] = pd.to_datetime(df["date"])
+        missing = [c for c in FINANCIAL_COLUMNS if c not in df.columns]
+        if missing:
+            raise ValueError(
+                "financials table is missing required columns: "
+                f"{missing} (expected FINANCIAL_COLUMNS from data.schema)"
+            )
+        # publish_date is required for point-in-time use; when the table does
+        # not carry it, expose NaT explicitly instead of pretending the panel
+        # is PIT-capable.
+        if "publish_date" not in df.columns:
+            logger.warning(
+                "financials table has no publish_date; get_financials_as_of "
+                "cannot filter this panel point-in-time"
+            )
+            df["publish_date"] = pd.NaT
+        else:
+            df["publish_date"] = pd.to_datetime(df["publish_date"], errors="coerce")
+
+        df = df.set_index(["date", "code"])
+        df.index = df.index.set_names(["date", "asset"])
+        return df.sort_index()
 
     def get_benchmark(
         self,
@@ -528,18 +586,51 @@ class PostgresDataProvider(DataProvider):
         if not df.empty:
             df["date"] = pd.to_datetime(df["date"])
             df = df.set_index("date")
-            return df["return_value"]
-        return pd.Series(dtype=float)
+            series = df["return_value"]
+            series.name = "benchmark"
+            return series
+        return pd.Series(dtype=float, name="benchmark")
 
     def get_metadata(self) -> pd.DataFrame:
         if not self._connected:
             raise ConnectionError("PostgreSQL not connected")
 
-        query = "SELECT code, sector, market_cap_group, is_st, listing_date FROM stock_metadata"
+        query = (
+            "SELECT code, sector, market_cap_group, is_st, listing_date, "
+            "delisting_date FROM stock_metadata"
+        )
         df = pd.read_sql(query, self._engine)
-        if not df.empty:
-            df = df.set_index("code")
+        if df.empty:
+            return pd.DataFrame(
+                columns=["sector", "market_cap_group", "is_st",
+                         "listing_date", "delisting_date"],
+                index=pd.Index([], name="asset"),
+            )
+
+        df = df.set_index("code")
+        df.index.name = "asset"
+        # SQL NULL means "unknown"; the static flag cannot express that and a
+        # bare `~is_st` on object NULLs raises TypeError downstream.  Coalesce
+        # for this static flag, and expose st_available=False on the provider
+        # so the absence of a real ST history remains visible.
+        if "is_st" in df.columns:
+            df["is_st"] = df["is_st"].fillna(False).astype(bool)
+        for col in ("listing_date", "delisting_date"):
+            if col not in df.columns:
+                df[col] = pd.NaT
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+        if "sector" not in df.columns:
+            df["sector"] = "Unknown"
+        if "market_cap_group" not in df.columns:
+            df["market_cap_group"] = "mid"
+        df.attrs["st_available"] = False
         return df
+
+    def get_st_timeseries(self) -> pd.DataFrame:
+        """Explicitly expose that no ST history is available."""
+        return pd.DataFrame(
+            columns=["asset", "trigger_date", "announce_date", "end_date", "is_st"]
+        )
 
     def close(self):
         if self._engine:

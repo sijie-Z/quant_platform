@@ -383,95 +383,119 @@ class MACDFactor(BaseFactor):
 # ---------------------------------------------------------------------------
 # K-Line candlestick features  (inspired by Qlib Alpha158)
 # ---------------------------------------------------------------------------
+#
+# D39: these factors used to fall back to an all-zero panel (or an unrelated
+# pct_change) when the caller omitted OHLC inputs.  The fallback silently fed
+# constant zeros into the alpha combination whenever the enabled-factor list
+# included candle factors but the caller passed only `turnover` (which is what
+# main._compute_factors does today).  Each factor now declares
+# `required_inputs` and refuses to compute without them.  main.py is another
+# wave's file: the required wiring is to pass adjusted open/high/low into
+# `_compute_factors` (see D:/tmp/_orchestrate/data_pipeline_fix_report.md).
+
+
+def _require_inputs(factor_name: str, required: tuple[str, ...], kwargs) -> None:
+    """Raise an actionable error when a declared OHLC input is missing."""
+    missing = [name for name in required if kwargs.get(name) is None]
+    if missing:
+        raise ValueError(
+            f"{factor_name} requires input(s) {list(required)} from the "
+            f"caller; missing {missing}. Pass adjusted open/high/low panels "
+            "(main._compute_factors currently passes only turnover). "
+            "Returning a placeholder panel would silently inject zeros or "
+            "noise into the alpha combination."
+        )
 
 
 class CandleMidpointFactor(BaseFactor):
     """KMID: (close - open) / open. Positive = green candle."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open",)
 
     @property
     def name(self) -> str:
         return "kmid"
 
     def compute(self, prices, **kwargs):
-        o = kwargs.get("open")
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        o = kwargs["open"]
         c = prices
-        if o is not None:
-            return (c - o) / o.replace(0, float("nan"))
-        return prices.pct_change(fill_method=None)
+        return (c - o) / o.replace(0, float("nan"))
 
 
 class CandleLengthFactor(BaseFactor):
     """KLEN: (high - low) / open. Intraday range."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open", "high", "low")
 
     @property
     def name(self) -> str:
         return "klen"
 
     def compute(self, prices, **kwargs):
-        h = kwargs.get("high")
-        l = kwargs.get("low")
-        o = kwargs.get("open")
-        if h is not None and l is not None and o is not None:
-            return (h - l) / o.replace(0, float("nan"))
-        return prices.pct_change(fill_method=None).abs()
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        h = kwargs["high"]
+        l = kwargs["low"]
+        o = kwargs["open"]
+        return (h - l) / o.replace(0, float("nan"))
 
 
 class CandleUpperShadowFactor(BaseFactor):
     """KUP: (high - max(open, close)) / open. Upper wick."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open", "high")
 
     @property
     def name(self) -> str:
         return "kup"
 
     def compute(self, prices, **kwargs):
-        h = kwargs.get("high")
-        o = kwargs.get("open")
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        h = kwargs["high"]
+        o = kwargs["open"]
         c = prices
-        if h is not None and o is not None:
-            import numpy as np
-            upper = h - np.maximum(o.values, c.values)
-            return pd.DataFrame(upper, index=prices.index, columns=prices.columns) / o.replace(0, float("nan"))
-        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        upper = h - np.maximum(o.values, c.values)
+        return pd.DataFrame(
+            upper, index=prices.index, columns=prices.columns
+        ) / o.replace(0, float("nan"))
 
 
 class CandleLowerShadowFactor(BaseFactor):
     """KLOW: (min(open, close) - low) / open. Lower wick."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open", "low")
 
     @property
     def name(self) -> str:
         return "klow"
 
     def compute(self, prices, **kwargs):
-        l = kwargs.get("low")
-        o = kwargs.get("open")
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        l = kwargs["low"]
+        o = kwargs["open"]
         c = prices
-        if l is not None and o is not None:
-            import numpy as np
-            lower = np.minimum(o.values, c.values) - l.values if hasattr(l, 'values') else (np.minimum(o, c) - l)
-            return pd.DataFrame(lower, index=prices.index, columns=prices.columns) / o.replace(0, float("nan"))
-        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        lower = np.minimum(o.values, c.values) - l.values
+        return pd.DataFrame(
+            lower, index=prices.index, columns=prices.columns
+        ) / o.replace(0, float("nan"))
 
 
 class CandleSoftnessFactor(BaseFactor):
     """KSFT: (2*close - high - low) / open. Close in range."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open", "high", "low")
 
     @property
     def name(self) -> str:
         return "ksft"
 
     def compute(self, prices, **kwargs):
-        h = kwargs.get("high")
-        l = kwargs.get("low")
-        o = kwargs.get("open")
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        h = kwargs["high"]
+        l = kwargs["low"]
+        o = kwargs["open"]
         c = prices
-        if h is not None and l is not None and o is not None:
-            return (2 * c - h - l) / o.replace(0, float("nan"))
-        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        return (2 * c - h - l) / o.replace(0, float("nan"))
 
 
 # ---------------------------------------------------------------------------

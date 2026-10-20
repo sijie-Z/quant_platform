@@ -168,3 +168,90 @@ class TestFactorSectionParsing:
         cfg = load_config(raw={})
 
         assert "momentum_1m" in cfg.factors.enabled_technicals
+
+
+class TestConfigValidation:
+    """S12: nonsense values used to load and fail much later (or never).
+
+    Each invalid value must raise ConfigValidationError naming the path.
+    """
+
+    @pytest.mark.parametrize("raw, needle", [
+        ({"universe": {"n_stocks": -5}}, "universe.n_stocks"),
+        ({"universe": {"n_stocks": 0}}, "universe.n_stocks"),
+        ({"portfolio": {"constraints": {"max_weight": 2.5}}}, "max_weight"),
+        ({"portfolio": {"constraints": {"max_weight": 0}}}, "max_weight"),
+        ({"portfolio": {"constraints": {"max_sector_exposure": -1}}},
+         "max_sector_exposure"),
+        ({"portfolio": {"constraints": {"lot_size": 0}}}, "lot_size"),
+        ({"costs": {"commission": 5.0}}, "commission"),
+        ({"costs": {"stamp_tax": -0.5}}, "stamp_tax"),
+        ({"costs": {"slippage": -0.1}}, "slippage"),
+        ({"backtest": {"rebalance_frequency": "fortnightly"}},
+         "rebalance_frequency"),
+        ({"data": {"provider": "no_such_provider"}}, "provider"),
+        ({"data": {"start_date": "not-a-date"}}, "start_date"),
+        ({"data": {"start_date": "2025-01-01", "end_date": "2024-01-01"}},
+         "start_date"),
+        ({"risk": {"var": {"confidence": 1.5}}}, "confidence"),
+        ({"execution": {"qmt": {"mode": "paper"}}}, "qmt.mode"),
+    ])
+    def test_invalid_values_are_rejected(self, raw, needle):
+        from quant_platform.utils.config import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError) as exc_info:
+            load_config(raw=raw)
+
+        assert needle in str(exc_info.value)
+
+    def test_unknown_per_factor_key_is_rejected(self):
+        """`exclude_recent` beside `params` used to be silently dropped."""
+        from quant_platform.utils.config import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError) as exc_info:
+            load_config(raw={
+                "factors": {
+                    "technical": {
+                        "momentum_12m": {
+                            "enabled": True,
+                            "params": {"period": 252},
+                            "exclude_recent": 21,
+                        },
+                    },
+                },
+            })
+
+        message = str(exc_info.value)
+        assert "exclude_recent" in message
+        assert "params" in message
+
+    def test_valid_configs_still_load(self):
+        """Backward compatibility: a normal custom config is unchanged."""
+        cfg = load_config(raw={
+            "universe": {"n_stocks": 100},
+            "data": {"provider": "synthetic", "start_date": "2023-01-01"},
+            "portfolio": {"constraints": {"max_weight": 0.10, "lot_size": 100}},
+            "backtest": {"rebalance_frequency": "weekly"},
+        })
+        assert cfg.universe.n_stocks == 100
+
+
+class TestEnvironmentOverrides:
+    """S23: documented env overrides must actually apply (restart-only)."""
+
+    def test_qmt_password_env_wins_over_config(self, monkeypatch):
+        monkeypatch.setenv("QMT_PASSWORD", "env-secret")
+        cfg = load_config(raw={
+            "execution": {"qmt": {"password": "yaml-secret"}},
+        })
+        assert cfg.execution.qmt.password == "env-secret"
+
+    def test_qmt_password_config_used_when_env_absent(self, monkeypatch):
+        monkeypatch.delenv("QMT_PASSWORD", raising=False)
+        cfg = load_config(raw={"execution": {"qmt": {"password": "yaml-secret"}}})
+        assert cfg.execution.qmt.password == "yaml-secret"
+
+    def test_data_provider_env_override(self, monkeypatch):
+        monkeypatch.setenv("QUANT_DATA_PROVIDER", "baostock")
+        cfg = load_config(raw={"data": {"provider": "synthetic"}})
+        assert cfg.data.provider == "baostock"

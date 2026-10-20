@@ -276,6 +276,32 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_orders_tenant ON orders(tenant_id);
                 CREATE INDEX IF NOT EXISTS idx_trades_tenant ON trades(tenant_id);
                 CREATE INDEX IF NOT EXISTS idx_positions_tenant ON positions(tenant_id);
+
+                -- Query-plan indexes for the default history queries.
+                --
+                -- These covered growing tables (trades/events/signals/
+                -- sessions) whose filter+sort columns had no index: every
+                -- dashboard poll did a full scan and a temp B-tree sort.
+                -- They are created *after* the tenant migration so the
+                -- composite order index works on databases written before
+                -- multi-tenancy, and `IF NOT EXISTS` keeps startup idempotent
+                -- for existing databases.
+                CREATE INDEX IF NOT EXISTS idx_trades_code_executed
+                    ON trades(code, executed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_trades_executed
+                    ON trades(executed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_topic_timestamp
+                    ON events(topic, timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_signals_consumed_generated
+                    ON signals(consumed, generated_at DESC);
+                -- The unfiltered signal query (consumed=-1) still sorts by
+                -- generated_at, so it needs a leading-column index of its own.
+                CREATE INDEX IF NOT EXISTS idx_signals_generated
+                    ON signals(generated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_sessions_started
+                    ON sessions(started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_orders_tenant_status_created
+                    ON orders(tenant_id, status, created_at DESC);
             """)
         logger.info("Store initialized: %s", self._db_path)
 
@@ -415,24 +441,146 @@ class Store:
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
 
+    #: Batch size for compliance export pagination.
+    _EXPORT_BATCH = 1000
+
+    @staticmethod
+    def _widen_export_window(start_date: str, end_date: str) -> tuple[str, str]:
+        """Widen the SQL date window by a day on each side.
+
+        The exporter's Python filter remains authoritative (it normalizes
+        timezone-aware timestamps to local wall-clock time). A raw SQL bound
+        could otherwise drop a +08:00 print on the end date before Python
+        ever saw it.
+        """
+        start, end = start_date, end_date
+        if start_date:
+            try:
+                start = (
+                    datetime.fromisoformat(start_date) - timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+            except ValueError:
+                start = start_date
+        if end_date:
+            try:
+                end = (
+                    datetime.fromisoformat(end_date) + timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+            except ValueError:
+                end = end_date
+        return start, end
+
+    def get_orders_for_export(
+        self, tenant_id: str = "", start_date: str = "", end_date: str = "",
+    ) -> list[dict]:
+        """Every order in the (widened) range, pages internally.
+
+        Compliance exports need the complete record set. `get_orders` clamps
+        to 1000 rows for API safety, so an export over a larger range silently
+        lost older rows. This dedicated query has no API clamp and pages with
+        a keyset cursor instead of OFFSET.
+        """
+        start, end = self._widen_export_window(start_date, end_date)
+        collected: list[dict] = []
+        last: tuple[str, str] | None = None
+        while True:
+            query = "SELECT * FROM orders WHERE 1=1"
+            params: list = []
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            if start:
+                query += " AND created_at >= ?"
+                params.append(start)
+            if end:
+                query += " AND created_at <= ?"
+                params.append(end + "T23:59:59")
+            if last is not None:
+                query += (
+                    " AND (created_at < ? OR "
+                    "(created_at = ? AND order_id < ?))"
+                )
+                params.extend([last[0], last[0], last[1]])
+            query += " ORDER BY created_at DESC, order_id DESC LIMIT ?"
+            params.append(self._EXPORT_BATCH)
+            with self._conn() as conn:
+                batch = [dict(r) for r in conn.execute(query, params).fetchall()]
+            collected.extend(batch)
+            if len(batch) < self._EXPORT_BATCH:
+                return collected
+            last = (batch[-1]["created_at"], batch[-1]["order_id"])
+
     # ── Positions ──
+
+    _POSITION_INSERT = """
+        INSERT OR REPLACE INTO positions
+        (code, tenant_id, name, quantity, available, avg_cost, current_price,
+         market_value, unrealized_pnl, realized_pnl, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    @staticmethod
+    def _position_values(pos: dict, tenant_id: str, now: str) -> tuple:
+        code = pos["code"]
+        quantity = pos["quantity"]
+        avg_cost = pos["avg_cost"]
+        return (
+            code, pos.get("tenant_id", tenant_id),
+            pos.get("name", ""), quantity,
+            pos.get("available", quantity), avg_cost,
+            pos.get("current_price", 0), pos.get("market_value", 0),
+            pos.get("unrealized_pnl", 0), pos.get("realized_pnl", 0),
+            now,
+        )
 
     def save_position(self, pos: dict):
         """Save or update a position."""
         with self._lock, self._conn() as conn:
-            conn.execute("""
-                    INSERT OR REPLACE INTO positions
-                    (code, tenant_id, name, quantity, available, avg_cost, current_price,
-                     market_value, unrealized_pnl, realized_pnl, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                pos['code'], pos.get('tenant_id', 'default'),
-                pos.get('name', ''), pos['quantity'],
-                pos.get('available', pos['quantity']), pos['avg_cost'],
-                pos.get('current_price', 0), pos.get('market_value', 0),
-                pos.get('unrealized_pnl', 0), pos.get('realized_pnl', 0),
-                datetime.now().isoformat(),
-            ))
+            conn.execute(
+                self._POSITION_INSERT,
+                self._position_values(pos, "default", datetime.now().isoformat()),
+            )
+
+    def save_positions(
+        self,
+        positions: list[dict],
+        tenant_id: str = "",
+        prune_missing: bool = False,
+    ) -> None:
+        """Upsert a whole position book in one transaction.
+
+        The live engine used to call `save_position` once per position inside
+        a loop -- each call took the write lock and committed separately, so
+        a 50-position book cost tens of commits *per persist* (and it is
+        persisted at least twice per cycle). This writes the book with one
+        `executemany` and, when `prune_missing` is set, deletes the tenant's
+        rows that are not in the book in the same transaction. Only call it
+        with a *known* book: pruning from an unknown/empty query is what
+        erased persisted positions before (D6).
+
+        `tenant_id` (when given) is the prune scope and the default tenant for
+        rows that do not carry one; a row's own `tenant_id` still wins.
+        """
+        tenant = tenant_id or "default"
+        now = datetime.now().isoformat()
+        rows = [self._position_values(pos, tenant, now) for pos in positions or []]
+        with self._lock, self._conn() as conn:
+            if rows:
+                conn.executemany(self._POSITION_INSERT, rows)
+            if prune_missing and tenant_id:
+                codes = [row[0] for row in rows]
+                if codes:
+                    placeholders = ", ".join("?" for _ in codes)
+                    conn.execute(
+                        "DELETE FROM positions WHERE tenant_id = ? "
+                        f"AND code NOT IN ({placeholders})",
+                        [tenant_id, *codes],
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM positions WHERE tenant_id = ?",
+                        (tenant_id,),
+                    )
 
     def delete_position(self, code: str, tenant_id: str = ""):
         """Remove a position."""
@@ -533,6 +681,44 @@ class Store:
             params.append(limit)
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
+
+    def get_trades_for_export(
+        self, tenant_id: str = "", start_date: str = "", end_date: str = "",
+    ) -> list[dict]:
+        """Every trade in the (widened) range, pages internally.
+
+        See `get_orders_for_export`: compliance exports must not be truncated
+        by the 1000-row API clamp.
+        """
+        start, end = self._widen_export_window(start_date, end_date)
+        collected: list[dict] = []
+        last: tuple[str, str] | None = None
+        while True:
+            query = "SELECT * FROM trades WHERE 1=1"
+            params: list = []
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            if start:
+                query += " AND executed_at >= ?"
+                params.append(start)
+            if end:
+                query += " AND executed_at <= ?"
+                params.append(end + "T23:59:59")
+            if last is not None:
+                query += (
+                    " AND (executed_at < ? OR "
+                    "(executed_at = ? AND trade_id < ?))"
+                )
+                params.extend([last[0], last[0], last[1]])
+            query += " ORDER BY executed_at DESC, trade_id DESC LIMIT ?"
+            params.append(self._EXPORT_BATCH)
+            with self._conn() as conn:
+                batch = [dict(r) for r in conn.execute(query, params).fetchall()]
+            collected.extend(batch)
+            if len(batch) < self._EXPORT_BATCH:
+                return collected
+            last = (batch[-1]["executed_at"], batch[-1]["trade_id"])
 
     # ── P&L History ──
 
@@ -709,6 +895,8 @@ class Store:
 
     def get_sessions(self, limit: int = 20) -> list[dict]:
         """Get trading session history."""
+        # SQLite treats LIMIT -1 as unlimited; the API used to forward -1 raw.
+        limit = _clamp_limit(limit, default=20, maximum=1000)
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?",
@@ -855,6 +1043,10 @@ class Store:
         """Get store statistics."""
         with self._conn() as conn:
             return {
+                # The real backend, not a hardcoded label. `/api/postgres/stats`
+                # always claimed "sqlite" because it never looked at the store
+                # it had constructed.
+                "backend": "sqlite",
                 "orders": conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
                 "positions": conn.execute("SELECT COUNT(*) FROM positions WHERE quantity > 0").fetchone()[0],
                 "trades": conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0],

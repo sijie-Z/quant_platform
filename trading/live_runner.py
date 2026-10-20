@@ -25,8 +25,11 @@ Usage:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -47,9 +50,21 @@ from quant_platform.trading.broker import (
     SimulatedBroker,
     create_broker,
 )
+from quant_platform.utils.exchange_calendar import is_trading_day, trading_days
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_EXCHANGE_TZ = ZoneInfo("Asia/Shanghai")
+
+#: RiskLevel enum -> numeric value used by the Grafana "Risk Level" panel.
+_RISK_LEVEL_VALUES = {
+    "green": 0.0,
+    "yellow": 1.0,
+    "orange": 2.0,
+    "red": 3.0,
+    "kill": 4.0,
+}
 
 
 # ── Data Models ──
@@ -112,6 +127,8 @@ class SessionReport:
     avg_daily_volume: float
     paper_metrics: PaperBrokerMetrics | None = None
     broker_type: str = ""
+    status: str = "completed"
+    failed_cycles: int = 0
     daily_reports: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -130,6 +147,8 @@ class SessionReport:
             "max_drawdown_pct": round(self.max_drawdown_pct, 4),
             "avg_daily_volume": round(self.avg_daily_volume, 2),
             "broker_type": self.broker_type,
+            "status": self.status,
+            "failed_cycles": self.failed_cycles,
         }
 
 
@@ -156,26 +175,42 @@ class LiveRunner:
         dual_track: bool = True,
         risk_monitor: RiskMonitor | None = None,
         store: Store | None = None,
+        broker: Any | None = None,
         **broker_kwargs,
     ):
         self._initial_cash = initial_cash
         self._dual_track = dual_track
         self._session_id = ""
         self._broker_type_name = broker_type
-
-        # Primary broker
-        try:
-            self._broker = create_broker(broker_type, initial_cash=initial_cash, **broker_kwargs)
-            self._broker.connect()
-        except Exception as e:
-            logger.error("Failed to create/connect broker '%s': %s", broker_type, e)
-            if broker_type in ("qmt", "qmt_sim", "qmt_live"):
-                logger.warning("QMT unavailable — falling back to SimulatedBroker")
-                self._broker = create_broker("simulated", initial_cash=initial_cash)
-                self._broker.connect()
-                self._broker_type_name = "simulated"
-            else:
+        # A real broker never falls back to the simulated book: a QMT outage
+        # that silently becomes paper trading is indistinguishable from a
+        # successful live run. connect() returning False is a hard failure.
+        if broker is not None:
+            self._broker = broker
+            if not self._broker.connect():
+                raise RuntimeError(
+                    f"Broker '{type(broker).__name__}' failed to connect. "
+                    "Refusing to continue (fail closed)."
+                )
+        else:
+            try:
+                self._broker = create_broker(
+                    broker_type, initial_cash=initial_cash, **broker_kwargs,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to create broker '%s': %s", broker_type, e,
+                )
                 raise
+            if not self._broker.connect():
+                raise RuntimeError(
+                    f"Broker '{broker_type}' failed to connect. "
+                    "Refusing to continue (fail closed)."
+                )
+        self._is_simulated = isinstance(self._broker, SimulatedBroker)
+        # Market-data feed for real brokers. It must return fresh quotes;
+        # synthetic random-walk prices are only allowed for the paper broker.
+        self._price_provider: Callable[[list[str]], dict[str, float]] | None = None
 
         # Paper broker (for TCA comparison)
         self._paper_broker: PaperBroker | None = None
@@ -218,10 +253,14 @@ class LiveRunner:
         self._peak_equity = initial_cash
         self._current_date = ""
         self._day_start_equity: float | None = None
+        self._session_status = "active"
+        self._failed_cycles = 0
 
         # Reports
         self._daily_reports: list[DailyReport] = []
         self._session_report: SessionReport | None = None
+        # Last observed cumulative totals for delta-based counters.
+        self._metric_state: dict[str, float] = {}
 
     # ── Setup ──
 
@@ -229,6 +268,16 @@ class LiveRunner:
         """Set the trading universe."""
         self._universe = [c for c in codes if isinstance(c, str) and c.strip()]
         logger.info("Universe set: %d stocks", len(self._universe))
+
+    def set_price_provider(self, provider: Callable[[list[str]], dict[str, float]]):
+        """Set the fresh-quote feed for a real broker.
+
+        ``provider(codes)`` must return ``{code: price}`` with current market
+        prices. The runner refuses to run a real broker without one: feeding
+        synthetic random-walk prices into live orders would send real orders
+        at invented prices.
+        """
+        self._price_provider = provider
 
     def set_prices(self, prices: dict[str, float]):
         """Feed market prices for the current cycle."""
@@ -533,6 +582,7 @@ class LiveRunner:
         # Mark to market before anything reads equity.
         self._mark_to_market()
         self._update_risk_state()
+        self._publish_runtime_metrics()
 
         # Generate and execute signals
         signals = self._generate_signals()
@@ -628,7 +678,7 @@ class LiveRunner:
 
         # Save P&L
         self._store.save_pnl_snapshot({
-            "timestamp": f"{self._current_date}T15:00:00",
+            "timestamp": self._pnl_timestamp(),
             "total_equity": equity,
             "cash": report.cash,
             "market_value": equity - report.cash,
@@ -637,41 +687,84 @@ class LiveRunner:
 
         return report
 
-    def run(self, days: int = 30, seed: int = 42):
-        """Run a multi-day simulation.
+    def _pnl_timestamp(self) -> str:
+        """P&L timestamp: close-of-day for simulated history, now for live.
 
-        Generates synthetic price paths for the universe and
-        executes daily cycles.
+        The old code always wrote ``<date>T15:00:00`` with a back-dated
+        calendar date, so a run at 10:00 created a P&L row for a session that
+        had not happened yet.
+        """
+        if self._is_simulated:
+            return f"{self._current_date}T15:00:00"
+        return datetime.now(_EXCHANGE_TZ).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def run(self, days: int = 30, seed: int = 42):
+        """Run the trading loop over exchange sessions.
+
+        Simulated/paper brokers replay the last ``days`` *exchange* sessions
+        (weekends and closures skipped) with a reproducible random walk.
+
+        Real brokers (QMT/XTP) execute a single live exchange day and require
+        a fresh quote feed (``set_price_provider`` or ``broker.get_quotes``):
+        synthetic prices are never fed into real orders.
         """
         if not self._universe:
             raise ValueError("Universe not set. Call set_universe() first.")
+        days = int(days)
+        if days < 1:
+            raise ValueError(f"days must be >= 1, got {days}")
+
+        if not self._is_simulated:
+            today = datetime.now(_EXCHANGE_TZ).date()
+            if not is_trading_day(today):
+                raise RuntimeError(
+                    f"Exchange is closed on {today}; refusing to run a live cycle."
+                )
+            if days != 1:
+                raise ValueError(
+                    "Real brokers support one exchange day per run; use --days 1."
+                )
+            if self._price_provider is None and not callable(
+                getattr(self._broker, "get_quotes", None)
+            ):
+                raise RuntimeError(
+                    f"Real broker '{self._broker_type_name}' requires a market-data "
+                    "feed (set_price_provider() or broker.get_quotes()). Refusing to "
+                    "feed synthetic prices into live orders."
+                )
+            dates = [str(today)]
+        else:
+            dates = self._run_dates(days)
 
         self._start_session()
         rng = np.random.default_rng(seed)
 
-        # Generate synthetic price paths
+        # Synthetic base prices (simulated broker only)
         base_prices = {}
         for code in self._universe:
-            int(code[0:3]) if code.isdigit() else hash(code) % 1000
             base_prices[code] = 10.0 + rng.uniform(5, 195)
 
+        failed_cycles = 0
         # D9: one broker/execution failure used to abort the entire multi-day
         # run and leave the session `active` with `_running=True` forever.
         # Failures are now isolated to the affected day and `_end_session()`
         # always runs.
         try:
-            for d in range(days):
-                date = (datetime.now() - timedelta(days=days - d)).strftime("%Y-%m-%d")
-                prices = {}
-                for code in self._universe:
-                    # Random walk with 15% annual vol
-                    daily_ret = rng.normal(0.0003, 0.01)
-                    base_prices[code] *= (1 + daily_ret)
-                    base_prices[code] = max(base_prices[code], 0.5)
-                    prices[code] = round(base_prices[code], 2)
+            for date in dates:
                 try:
+                    if self._is_simulated:
+                        prices = {}
+                        for code in self._universe:
+                            # Random walk with 15% annual vol
+                            daily_ret = rng.normal(0.0003, 0.01)
+                            base_prices[code] *= (1 + daily_ret)
+                            base_prices[code] = max(base_prices[code], 0.5)
+                            prices[code] = round(base_prices[code], 2)
+                    else:
+                        prices = self._fresh_prices()
                     self.run_once(date=date, prices=prices)
                 except Exception as e:
+                    failed_cycles += 1
                     logger.error(
                         "Trading day %s aborted: %s", date, e, exc_info=True,
                     )
@@ -680,14 +773,53 @@ class LiveRunner:
                     }, source="live_runner")
                     continue
         finally:
-            self._end_session()
+            fills = sum(report.n_fills for report in self._daily_reports)
+            # Never claim a session succeeded when nothing filled.
+            self._end_session(status="completed" if fills > 0 else "failed")
 
+        self._failed_cycles = failed_cycles
         return self.generate_report()
+
+    def _run_dates(self, days: int) -> list[str]:
+        """The last ``days`` exchange sessions ending today (Shanghai time).
+
+        Calendar days included weekends and exchange holidays and shifted the
+        P&L rows by the run length; sessions now match the scheduler's
+        calendar.
+        """
+        today = datetime.now(_EXCHANGE_TZ).date()
+        start = today - timedelta(days=max(days * 2 + 10, 30))
+        sessions = trading_days(start, today)
+        return [str(ts.date()) for ts in sessions[-days:]]
+
+    def _fresh_prices(self) -> dict[str, float]:
+        """Fetch fresh quotes for a real-broker cycle, or raise."""
+        raw: dict[str, Any] = {}
+        if self._price_provider is not None:
+            raw = self._price_provider(list(self._universe)) or {}
+        else:
+            getter = getattr(self._broker, "get_quotes", None)
+            if callable(getter):
+                raw = getter(list(self._universe)) or {}
+        prices: dict[str, float] = {}
+        for code, value in (raw or {}).items():
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if price > 0 and np.isfinite(price):
+                prices[code] = price
+        if not prices:
+            raise RuntimeError(
+                "market data feed returned no fresh quotes; cycle skipped"
+            )
+        return prices
 
     # ── Session Management ──
 
     def _start_session(self):
         self._running = True
+        self._session_status = "active"
         self._session_id = uuid.uuid4().hex[:12]
         self._store.save_session({
             "session_id": self._session_id,
@@ -696,11 +828,12 @@ class LiveRunner:
             "started_at": datetime.now().isoformat(),
         })
 
-    def _end_session(self):
+    def _end_session(self, status: str = "completed"):
         self._running = False
+        self._session_status = status
         self._store.save_session({
             "session_id": self._session_id,
-            "status": "completed",
+            "status": status,
             "stopped_at": datetime.now().isoformat(),
             "total_trades": self._trade_count,
         })
@@ -764,6 +897,84 @@ class LiveRunner:
             sector_weights=sector_weights,
         )
 
+    # ── Metrics (Grafana producers) ──
+
+    def _publish_runtime_metrics(self) -> None:
+        """Emit the trading/risk/EventBus/store series the dashboard queries.
+
+        Every gauge is read from the live objects (broker account, risk
+        monitor status, EventBus counters, Store stats) -- no fabricated
+        values. Failures are swallowed: monitoring must not abort a cycle.
+        """
+        try:
+            from quant_platform.utils.metrics import get_metrics
+
+            m = get_metrics()
+            broker_kind = type(self._broker).__name__
+
+            account = self._broker.get_account() or {}
+            n_positions = account.get("n_positions", 0) or 0
+            pnl = account.get("total_pnl")
+            if pnl is None:
+                pnl = float(account.get("total_equity", self._initial_cash) or 0) - self._initial_cash
+            m.gauge(
+                "trading_active_positions",
+                labels={"broker": broker_kind},
+                help="Open positions reported by the broker",
+            ).set(float(n_positions))
+            m.gauge(
+                "trading_portfolio_pnl",
+                labels={"broker": broker_kind},
+                help="Portfolio P&L reported by the broker (CNY)",
+            ).set(float(pnl or 0.0))
+
+            status = self._risk.get_status() or {}
+            level = str(status.get("risk_level", "green")).lower()
+            m.gauge(
+                "risk_level",
+                labels={"source": "risk_monitor"},
+                help="Risk level: 0=GREEN 1=YELLOW 2=ORANGE 3=RED 4=KILL",
+            ).set(_RISK_LEVEL_VALUES.get(level, 0.0))
+            m.gauge(
+                "risk_kill_switch_active",
+                labels={"source": "risk_monitor"},
+                help="1 when the kill switch is active",
+            ).set(1.0 if status.get("kill_switch") else 0.0)
+
+            bus_metrics = self._bus.get_metrics() or {}
+            dlq = bus_metrics.get("dead_letter_queue") or {}
+            self._emit_delta_counter(
+                m, "eventbus_events_published_total",
+                float(bus_metrics.get("published", 0) or 0),
+            )
+            self._emit_delta_counter(
+                m, "eventbus_events_delivered_total",
+                float(bus_metrics.get("delivered", 0) or 0),
+            )
+            self._emit_delta_counter(
+                m, "eventbus_dead_letters_total",
+                float(dlq.get("total_enqueued", bus_metrics.get("dead_letters", 0)) or 0),
+            )
+
+            stats = self._store.get_stats() or {}
+            self._emit_delta_counter(
+                m, "store_orders_total", float(stats.get("orders", 0) or 0),
+            )
+            self._emit_delta_counter(
+                m, "store_trades_total", float(stats.get("trades", 0) or 0),
+            )
+        except Exception as exc:  # monitoring must never break trading
+            logger.debug("Runtime metric publish failed: %s", exc)
+
+    def _emit_delta_counter(self, metrics, name: str, total: float) -> None:
+        """Increment a Prometheus counter by the delta of a cumulative total."""
+        previous = self._metric_state.get(name, 0.0)
+        delta = total - previous
+        counter = metrics.counter(name)
+        if delta > 0:
+            counter.inc(delta)
+        self._metric_state[name] = max(previous, total)
+
     def _get_cash(self) -> float:
         acct = self._broker.get_account()
         return acct.get("cash", 0)
@@ -786,6 +997,8 @@ class LiveRunner:
                 total_return_pct=0, annualized_return_pct=0,
                 sharpe_ratio=0, max_drawdown_pct=0,
                 avg_daily_volume=0, broker_type=self._broker_type_name,
+                status=self._session_status,
+                failed_cycles=self._failed_cycles,
             )
 
         # Calculate metrics
@@ -831,6 +1044,8 @@ class LiveRunner:
             max_drawdown_pct=max_dd * 100,
             avg_daily_volume=round(avg_volume, 2),
             broker_type=self._broker_type_name,
+            status=self._session_status,
+            failed_cycles=self._failed_cycles,
             daily_reports=[r.to_dict() for r in self._daily_reports],
         )
 

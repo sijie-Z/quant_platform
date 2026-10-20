@@ -106,8 +106,11 @@ class ComplianceExporter:
         Returns:
             ExportResult with file path and record count.
         """
-        trades = self._store.get_trades(
-            tenant_id=tenant_id or "", limit=100_000,
+        # Dedicated export query: no API row clamp (get_trades stops at 1000,
+        # which silently dropped older records of a larger date range) and
+        # internal keyset pagination for the whole range.
+        trades = self._store.get_trades_for_export(
+            tenant_id=tenant_id or "",
             start_date=start, end_date=end,
         )
         filtered = self._filter_by_date(trades, "executed_at", start, end)
@@ -149,8 +152,9 @@ class ComplianceExporter:
         Returns:
             ExportResult with file path and record count.
         """
-        orders = self._store.get_orders(
-            tenant_id=tenant_id or "", limit=100_000,
+        # Dedicated export query: no API row clamp, keyset pagination.
+        orders = self._store.get_orders_for_export(
+            tenant_id=tenant_id or "",
             start_date=start, end_date=end,
         )
         filtered = self._filter_by_date(orders, "created_at", start, end)

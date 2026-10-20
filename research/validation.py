@@ -35,11 +35,16 @@ class DeflatedSharpeResult:
     """Result of a Deflated Sharpe Ratio test."""
     observed_sharpe: float
     expected_max_sharpe: float   # E[max SR under null]
-    deflated_p_value: float      # P(SR >= observed | null)
+    deflated_p_value: float      # P(SR >= observed | null), deflated for N trials
     num_trials: int              # Number of strategies tested
     skew: float                  # Return skewness
     kurtosis: float              # Return kurtosis (excess)
     significant: bool            # p < significance_level
+    # One-sided p-value of the observed Sharpe against zero, WITHOUT the
+    # E[max SR] deflation. Used as the input to Benjamini-Hochberg in
+    # ``validate_factor_batch`` so the multiple-testing correction is applied
+    # once, not twice.
+    raw_p_value: float = 1.0
 
 
 class FactorValidator:
@@ -159,11 +164,14 @@ class FactorValidator:
             e_max_sr = expected_max_sharpe / math.sqrt(252)
 
         if se_sr < 1e-12:
+            raw_p = 0.0 if sr > 0 else 1.0
             deflated_p = 0.0 if sr > e_max_sr else 1.0
         else:
             # Z-test: is the per-period SR above E[max SR]?
             z = (sr - e_max_sr) / se_sr
             deflated_p = _norm_sf(z)
+            # Same test against zero, without the multiple-trials deflation.
+            raw_p = _norm_sf(sr / se_sr)
 
         significant = deflated_p < self.significance_level
 
@@ -181,6 +189,7 @@ class FactorValidator:
             skew=round(skew, 6),
             kurtosis=round(excess_kurt, 6),
             significant=significant,
+            raw_p_value=round(raw_p, 6),
         )
 
     def multiple_testing_correction(
@@ -224,14 +233,22 @@ class FactorValidator:
     ) -> dict[str, DeflatedSharpeResult]:
         """Validate a batch of factors, applying multiple testing correction.
 
+        Multiple-testing policy (corrected once, not twice): the Deflated
+        Sharpe p-value already deflates for ``num_trials`` through the
+        E[max SR] term. Running Benjamini-Hochberg on those deflated
+        p-values corrected for the same N trials a second time and made the
+        batch test far too conservative. This method therefore applies BH to
+        the *raw* one-sided p-values (``raw_p_value``) and reports the DSR
+        p-value separately as an effect-size adjustment; the ``significant``
+        flag follows the BH decision. With a single factor BH is a no-op and
+        the DSR decision is used.
+
         Args:
             factor_returns: Dict of factor_name -> daily returns array.
             num_trials: Number of trials (defaults to len(factor_returns)).
 
         Returns:
-            Dict of factor_name -> DeflatedSharpeResult. Only factors that
-            pass both the DSR test and multiple testing correction are
-            marked as significant.
+            Dict of factor_name -> DeflatedSharpeResult.
         """
         if num_trials is None:
             num_trials = len(factor_returns)
@@ -243,10 +260,10 @@ class FactorValidator:
         for name, rets in factor_returns.items():
             result = self.deflated_sharpe_test(rets, num_trials=num_trials)
             results[name] = result
-            raw_p_values.append(result.deflated_p_value)
+            raw_p_values.append(result.raw_p_value)
             factor_names.append(name)
 
-        # Apply multiple testing correction
+        # Apply the multiple-testing correction once, to the raw p-values.
         if len(raw_p_values) > 1:
             significant_mask = self.multiple_testing_correction(raw_p_values, method="bh")
             for i, name in enumerate(factor_names):
@@ -259,6 +276,7 @@ class FactorValidator:
                     skew=results[name].skew,
                     kurtosis=results[name].kurtosis,
                     significant=bool(significant_mask[i]),
+                    raw_p_value=results[name].raw_p_value,
                 )
 
         n_significant = sum(1 for r in results.values() if r.significant)

@@ -26,6 +26,14 @@ logger = get_logger(__name__)
 # refuses to cache a silent fallback under the requested provider's key.
 _LAST_DATA_PROVIDER = ""
 
+# Provenance of the most recent `_load_data()` call, recorded in metrics.json
+# and the HTML report so synthetic output can never masquerade as a real feed.
+_LAST_DATA_PROVENANCE: dict = {}
+
+
+class DataProviderUnavailableError(RuntimeError):
+    """A configured real data provider could not be used (fail closed)."""
+
 
 # ---------------------------------------------------------------------------
 # Shared pipeline core — used by run / compare / sweep
@@ -76,10 +84,29 @@ def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
     from quant_platform.data.providers.baostock_provider import BaostockDataProvider
     from quant_platform.data.providers.synthetic import SyntheticDataProvider
     from quant_platform.data.providers.tushare_loader import TushareProvider
+    from quant_platform.utils.metrics import get_metrics
 
+    metrics = get_metrics()
     provider = None
     provider_name = ""
     configured_provider = getattr(config.data, 'provider', 'synthetic')
+    requested_provider = (
+        "baostock" if use_baostock
+        else "tushare" if use_tushare
+        else configured_provider
+    )
+    allow_fallback = bool(
+        getattr(config.data, "allow_synthetic_fallback", False)
+    )
+    failures: list[str] = []
+
+    def _record_failure(name: str, error: Exception) -> None:
+        failures.append(f"{name}: {error}")
+        metrics.counter(
+            "data_provider_failures_total",
+            labels={"provider": name},
+            help="Data-provider initialization failures",
+        ).inc()
 
     # Try configured provider first
     if configured_provider == "baostock" or use_baostock:
@@ -88,6 +115,7 @@ def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
             provider_name = "baostock"
             logger.info("Using Baostock real data provider (free, no API key)")
         except Exception as e:
+            _record_failure("baostock", e)
             logger.warning("Baostock unavailable (%s)", e)
 
     if provider is None and (configured_provider == "tushare" or use_tushare):
@@ -99,7 +127,8 @@ def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
             provider_name = "tushare"
             logger.info("Using Tushare real data provider")
         except (RuntimeError, ImportError) as e:
-            logger.warning("Tushare unavailable (%s), falling back...", e)
+            _record_failure("tushare", e)
+            logger.warning("Tushare unavailable (%s)", e)
 
     if provider is None and configured_provider == "postgres":
         try:
@@ -108,14 +137,30 @@ def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
             provider_name = "postgres"
             logger.info("Using PostgreSQL data provider")
         except Exception as e:
-            logger.warning("PostgreSQL unavailable (%s), falling back...", e)
+            _record_failure("postgres", e)
+            logger.warning("PostgreSQL unavailable (%s)", e)
 
-    # Final fallback: synthetic
+    # Fail closed: a configured real provider that is unavailable must not
+    # silently become synthetic research data. Synthetic is allowed only for
+    # an explicitly synthetic request (config or CLI) or an explicit
+    # development opt-in.
     if provider is None:
+        if requested_provider != "synthetic" and not allow_fallback:
+            detail = "; ".join(failures) or "provider initialization failed"
+            raise DataProviderUnavailableError(
+                f"Configured data provider '{requested_provider}' is "
+                f"unavailable ({detail}). Refusing to fall back to synthetic "
+                "data. Fix the provider/credentials, or pass "
+                "--allow-synthetic-fallback (or set "
+                "data.allow_synthetic_fallback: true) for a development run."
+            )
         embedded = getattr(config.data.synthetic, 'embedded_alpha', False)
         alpha_strength = getattr(config.data.synthetic, 'alpha_strength', 0.03)
-        if configured_provider != "synthetic":
-            logger.warning("Configured provider '%s' unavailable, falling back to synthetic", configured_provider)
+        if requested_provider != "synthetic":
+            logger.warning(
+                "Configured provider '%s' unavailable, falling back to "
+                "synthetic (explicitly allowed)", requested_provider,
+            )
         provider = SyntheticDataProvider(
             n_stocks=config.universe.n_stocks,
             start_date=config.data.start_date,
@@ -151,7 +196,20 @@ def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
         exclude_st=config.universe.exclude_st,
         exclude_suspended=config.universe.exclude_suspended,
     )
-    pipeline.run()
+    try:
+        pipeline.run()
+    except Exception:
+        metrics.counter(
+            "data_provider_failures_total",
+            labels={"provider": provider_name or requested_provider},
+            help="Data-provider initialization failures",
+        ).inc()
+        raise
+    metrics.counter(
+        "data_provider_success_total",
+        labels={"provider": provider_name},
+        help="Successful data-provider loads",
+    ).inc()
 
     metadata = pipeline.metadata
     # The point-in-time sector panel rides along on the metadata frame so the
@@ -188,11 +246,46 @@ def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
     if metadata is not None and sector_panel is not None:
         metadata.attrs["sector_panel"] = sector_panel
 
-    global _LAST_DATA_PROVIDER
+    # Execution-day tradability travels on metadata (not on the price panel:
+    # DataFrame attrs propagate into derived frames and any DataFrame-valued
+    # attr can crash pandas' internals). `_run_backtest` forwards these to the
+    # engine, which checks them on the fill date, not the signal date.
+    if metadata is not None and hasattr(metadata, "attrs"):
+        try:
+            gates = pipeline.get_execution_gates()
+        except Exception as exc:  # defensive: gates must not kill the run
+            logger.warning("Execution gates unavailable (%s); fills are ungated", exc)
+            gates = {}
+        if gates:
+            metadata.attrs["execution_gates"] = gates
+        try:
+            ohlc = pipeline.get_factor_ohlc()
+        except Exception as exc:  # defensive: OHLC must not kill the run
+            logger.warning("Adjusted OHLC unavailable (%s); candle factors skipped", exc)
+            ohlc = {}
+        if ohlc:
+            metadata.attrs["factor_ohlc"] = ohlc
+
+    global _LAST_DATA_PROVIDER, _LAST_DATA_PROVENANCE
     _LAST_DATA_PROVIDER = provider_name or configured_provider
 
+    factor_prices = pipeline.get_factor_prices()
+    data_date = ""
+    if factor_prices is not None and len(factor_prices.index) > 0:
+        data_date = str(factor_prices.index[-1])[:10]
+    _LAST_DATA_PROVENANCE = {
+        "requested_provider": requested_provider,
+        "effective_provider": _LAST_DATA_PROVIDER,
+        "synthetic": _LAST_DATA_PROVIDER == "synthetic",
+        "start_date": str(config.data.start_date),
+        "end_date": str(config.data.end_date),
+        "data_date": data_date,
+        "fallback_allowed": allow_fallback,
+        "failures": failures,
+    }
+
     return (
-        pipeline.get_factor_prices(),
+        factor_prices,
         pipeline.returns,
         pipeline.benchmark,
         metadata,
@@ -244,6 +337,10 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
     factor_params = (
         getattr(config.factors, "params", {}) if config is not None else {}
     )
+    # Adjusted OHLC for factors that declare `required_inputs` (candle
+    # factors). It rides on metadata like the sector panel and execution
+    # gates so the 6-tuple load contract stays intact.
+    factor_ohlc = getattr(metadata, "attrs", {}).get("factor_ohlc", {}) if metadata is not None else {}
     for factor_name in registry.list_all():
         if enabled_factors is not None and factor_name not in enabled_factors:
             continue
@@ -260,6 +357,10 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
             kwargs = {}
             if turnover is not None:
                 kwargs["turnover"] = turnover
+            for field in getattr(inst, "required_inputs", ()):
+                panel = factor_ohlc.get(field) if factor_ohlc else None
+                if panel is not None:
+                    kwargs[field] = panel
             if inst.category.value == "fundamental" and fin_unstacked is not None:
                 result = inst.run(prices, fin_unstacked, **kwargs)
             else:
@@ -346,14 +447,45 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
                 name, summary.get("n_obs", 0),
             )
 
+    # Producer for the Grafana "Factor IC Decay" panel.
+    try:
+        import math
+
+        from quant_platform.utils.metrics import get_metrics
+
+        metrics = get_metrics()
+        for name, summary in ic_results.items():
+            mean_ic = summary.get("mean_ic")
+            if mean_ic is None or not math.isfinite(float(mean_ic)):
+                continue
+            metrics.gauge(
+                "factor_ic_value",
+                labels={"factor": name},
+                help="Mean Rank IC of the computed factor",
+            ).set(float(mean_ic))
+    except Exception as exc:  # monitoring must not break the pipeline
+        logger.debug("Factor metric publish failed: %s", exc)
+
     if return_raw:
         return processed_factors, ic_results, sector_map, fin_unstacked, raw_factors
     return processed_factors, ic_results, sector_map, fin_unstacked
 
 
+def _execution_gates(metadata):
+    """Execution-day tradability panels attached by `_load_data`, if any."""
+    attrs = getattr(metadata, "attrs", None)
+    return attrs.get("execution_gates") if attrs else None
+
+
 def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financials,
-                  optimizer_override=None, frequency_override=None):
-    """Set up and run backtest engine. Returns results dict."""
+                  optimizer_override=None, frequency_override=None, gates=None):
+    """Set up and run backtest engine. Returns results dict.
+
+    ``gates`` is the pipeline's execution-day tradability set
+    (``tradable_mask``/``limit_up``/``limit_down``, normally read from
+    ``metadata.attrs["execution_gates"]``). Without it the engine fills at
+    any next-bar close, including limit-up opens and suspension days.
+    """
     from quant_platform.backtest.cost_model import CostModel
     from quant_platform.backtest.engine import BacktestEngine
     from quant_platform.portfolio.constraints import PortfolioConstraints
@@ -390,6 +522,7 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
         signal=signal, prices=prices, returns=returns,
         benchmark_returns=benchmark, sector_map=sector_map,
         financials=financials,
+        **(gates or {}),
     )
 
 
@@ -533,19 +666,32 @@ def _json_safe(value):
     return value
 
 
-def _write_run_artifacts(results: dict, ic_results: dict, metadata, config) -> tuple[Path, Path]:
+def _write_run_artifacts(
+    results: dict,
+    ic_results: dict,
+    metadata,
+    config,
+    output_dir: str | Path | None = None,
+    provenance: dict | None = None,
+) -> tuple[Path, Path]:
     """Write the standalone HTML report and metrics.json for a CLI run.
 
     Both were promised by the docs but never produced: `run` only wrote CSVs
     and PNGs, and `research report` required a metrics.json nobody generated.
+
+    ``output_dir`` overrides ``config.output.results_dir`` so each run can
+    write into its own per-run directory (issue S15). ``provenance`` records
+    the requested/effective data provider, synthetic flag and data date in
+    both metrics.json and the HTML report (issue S8).
     """
     import json
     from datetime import datetime
 
     from quant_platform.reporting.html_report import generate_html_report
 
-    output_dir = Path(config.output.results_dir)
+    output_dir = Path(output_dir or config.output.results_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    provenance = provenance or {}
 
     strategy_returns = results["daily_returns"].dropna()
     summary = results.get("summary", {})
@@ -597,6 +743,7 @@ def _write_run_artifacts(results: dict, ic_results: dict, metadata, config) -> t
         "chart_data": _chart_payload(results),
         "exposure": _exposure_payload(results, metadata),
         "stress_tests": stress_rows,
+        "provenance": provenance,
     }
     html_path = Path(generate_html_report(
         payload,
@@ -606,6 +753,7 @@ def _write_run_artifacts(results: dict, ic_results: dict, metadata, config) -> t
     metrics = {
         "schema_version": 1,
         "generated_at": datetime.now().isoformat(),
+        "provenance": provenance,
         "performance": summary,
         "risk": risk,
         "factors": factors,
@@ -632,37 +780,54 @@ def _write_run_artifacts(results: dict, ic_results: dict, metadata, config) -> t
 
 def cmd_run(args) -> int:
     """Execute full pipeline: data -> factors -> alpha -> portfolio -> backtest -> report."""
+    import uuid
+
     import yaml
 
     from quant_platform.utils.cache import PipelineCache
     from quant_platform.utils.metrics import pipeline_stage
 
     config_path = _resolve_config_path(args.config)
+    if not Path(config_path).exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
 
     with open(config_path, encoding="utf-8") as f:
         raw_config = yaml.safe_load(f)
 
     config = load_config(raw=raw_config)
+    if getattr(args, "allow_synthetic_fallback", False):
+        # Explicit development opt-in for a silent synthetic fallback.
+        config.data.allow_synthetic_fallback = True
 
+    run_id = uuid.uuid4().hex[:12]
     use_baostock = bool(getattr(args, "use_baostock", False))
     requested_provider = (
         "baostock" if use_baostock
         else getattr(config.data, "provider", "synthetic")
     )
-    cache_key = PipelineCache.make_config_hash(
+    config_hash = PipelineCache.make_config_hash(
         raw_config,
         provider=requested_provider,
         overrides={"use_baostock": use_baostock},
     )
+    cache_key = config_hash
     cache = PipelineCache(args.cache_dir)
     use_cache = not args.force and not args.no_cache
 
-    # Auto-save config version before running
-    from quant_platform.utils.version_manager import VersionManager
-    vm = VersionManager()
-    desc = args.description or f"Run: alpha={config.alpha.method} optimizer={config.portfolio.optimizer}"
-    version_id = vm.save(raw_config, description=desc)
-    logger.info("Config auto-saved as version %s", version_id)
+    def _save_config_version() -> None:
+        """Persist the config snapshot only for successful runs (issue S11)."""
+        try:
+            from quant_platform.utils.version_manager import VersionManager
+
+            vm = VersionManager()
+            desc = args.description or (
+                f"Run: alpha={config.alpha.method} "
+                f"optimizer={config.portfolio.optimizer}"
+            )
+            version_id = vm.save(raw_config, description=desc, run_id=run_id)
+            logger.info("Config auto-saved as version %s", version_id)
+        except Exception as exc:  # version history must not fail a run
+            logger.warning("Failed to save the config version: %s", exc)
 
     logger.info("=" * 60)
     logger.info("Quant Platform: Starting full pipeline run")
@@ -675,31 +840,52 @@ def cmd_run(args) -> int:
     # ------------------------------------------------------------------
     logger.info("[1/6] Loading data...")
     data_tuple = None
+    provenance: dict = {}
     # Stage name carries a version. This entry used to be a 5-tuple without
     # `turnover`, and on a cache hit the code set `turnover = None` -- which
     # made TurnoverFactor fall back to a price SMA. Identical inputs therefore
     # produced a different `turnover_20d` depending on whether the cache was
     # warm. Reading old entries back is what caused that, so a new stage name
     # retires them rather than trying to detect the shape.
+    #
+    # data_v3 also carries the data provenance (requested/effective provider,
+    # synthetic flag, dates) so a cache hit can still write it to the report.
     if use_cache:
-        data_tuple = cache.load_stage("data_v2", cache_key)
+        cached_payload = cache.load_stage("data_v3", cache_key)
+        if isinstance(cached_payload, dict):
+            data_tuple = cached_payload.get("data")
+            provenance = cached_payload.get("provenance") or {}
 
     if data_tuple is not None:
         prices, returns, benchmark, metadata, financials, turnover = data_tuple
         logger.info("Data loaded from cache")
     else:
-        prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_baostock=use_baostock)
+        prices, returns, benchmark, metadata, financials, turnover = _load_data(
+            config, use_baostock=use_baostock,
+        )
+        provenance = dict(_LAST_DATA_PROVENANCE)
         # A silent fallback (e.g. Tushare configured but unreachable) must not
         # be stored under the requested provider's key: after credentials are
         # fixed that entry would keep serving synthetic data.
         if use_cache and requested_provider == _LAST_DATA_PROVIDER:
-            cache.save_stage("data_v2", cache_key,
-                             (prices, returns, benchmark, metadata, financials, turnover))
+            cache.save_stage("data_v3", cache_key, {
+                "data": (prices, returns, benchmark, metadata, financials, turnover),
+                "provenance": provenance,
+            })
         elif use_cache:
             logger.warning(
                 "Not caching data: requested provider '%s' fell back to '%s'",
                 requested_provider, _LAST_DATA_PROVIDER,
             )
+
+    if provenance:
+        logger.info(
+            "Data provenance: requested=%s effective=%s synthetic=%s data_date=%s",
+            provenance.get("requested_provider"),
+            provenance.get("effective_provider"),
+            provenance.get("synthetic"),
+            provenance.get("data_date"),
+        )
 
     # ------------------------------------------------------------------
     # 2. Factors
@@ -764,6 +950,7 @@ def cmd_run(args) -> int:
         if not qualifiers:
             logger.warning("Screener returned no qualifying stocks — skipping backtest")
             print("\n  SCREENER RESULT: No stocks matched the rules.\n")
+            _save_config_version()
             return 0
 
         # Build equal-weight signal from qualifying stocks
@@ -788,17 +975,30 @@ def cmd_run(args) -> int:
     logger.info("[5/6] Running backtest...")
     with pipeline_stage("backtest"):
         results = _run_backtest(config, signal, prices, returns, benchmark,
-                                sector_map, fin_unstacked)
+                                sector_map, fin_unstacked,
+                                gates=_execution_gates(metadata))
 
     # ------------------------------------------------------------------
     # 6. Report
     # ------------------------------------------------------------------
     logger.info("[6/6] Generating report...")
-    from quant_platform.reporting.dashboard import generate_dashboard
+    import json
+    from datetime import datetime
+
+    from quant_platform.reporting.dashboard import (
+        create_run_dir,
+        generate_dashboard,
+        publish_run_artifacts,
+        write_manifest,
+    )
+
+    results_base = Path(config.output.results_dir)
+    run_dir = create_run_dir(results_base, run_id, config_hash)
+    logger.info("Run artifacts: %s", run_dir)
 
     report = generate_dashboard(
         results=results, metadata=metadata,
-        output_dir=config.output.results_dir,
+        output_dir=str(run_dir),
         save_plots=config.output.save_plots,
         plot_format=config.output.plot_format,
         ic_results=ic_results,
@@ -810,13 +1010,47 @@ def cmd_run(args) -> int:
     try:
         html_path, metrics_path = _write_run_artifacts(
             results, ic_results, metadata, config,
+            output_dir=run_dir, provenance=provenance,
         )
     except Exception as exc:
         logger.error("Failed to write the HTML report / metrics.json: %s", exc)
         return 1
+
+    manifest = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "config_hash": config_hash,
+        "created_at": datetime.now().isoformat(),
+        "requested_provider": provenance.get("requested_provider"),
+        "provider": provenance.get("effective_provider"),
+        "synthetic": bool(provenance.get("synthetic")),
+        "date_range": {
+            "start": provenance.get("start_date"),
+            "end": provenance.get("end_date"),
+            "data_date": provenance.get("data_date"),
+        },
+        "metrics": {"performance": results.get("summary", {})},
+        "artifacts": sorted(
+            p.name for p in run_dir.iterdir()
+            if p.is_file() and p.name != "manifest.json"
+        ),
+    }
+    try:
+        write_manifest(run_dir, manifest)
+        published = publish_run_artifacts(results_base, run_dir, manifest)
+    except Exception as exc:
+        logger.error("Failed to write the run manifest: %s", exc)
+        return 1
+
     logger.info("HTML report: %s", html_path)
     logger.info("Metrics: %s", metrics_path)
-    logger.info("Results saved to: %s", config.output.results_dir)
+    logger.info("Results saved to: %s", run_dir)
+    if not published:
+        logger.warning(
+            "Top-level results copies were skipped (another run holds the "
+            "publish lock); use the run directory or latest_manifest.json.",
+        )
+    _save_config_version()
     logger.info("Pipeline complete.")
     return 0
 
@@ -834,9 +1068,18 @@ def cmd_analyze(args) -> int:
         print("Run 'python main.py run' first to generate results.")
         return 1
 
-    returns_file = results_dir / "daily_returns.csv"
-    bench_file = results_dir / "benchmark_returns.csv"
-    weights_file = results_dir / "weights_history.csv"
+    # A run now writes into results/runs/<id>/ with a manifest; analyze the
+    # published/latest run directory instead of mixing top-level CSVs from
+    # different runs (issue S15). The legacy flat layout still works.
+    from quant_platform.reporting.dashboard import resolve_run_dir
+
+    run_dir = resolve_run_dir(results_dir)
+    if run_dir != results_dir:
+        print(f"Analyzing run: {run_dir}")
+
+    returns_file = run_dir / "daily_returns.csv"
+    bench_file = run_dir / "benchmark_returns.csv"
+    weights_file = run_dir / "weights_history.csv"
 
     if not returns_file.exists():
         logger.error("daily_returns.csv not found in %s", results_dir)
@@ -882,13 +1125,13 @@ def cmd_analyze(args) -> int:
     report = generate_dashboard(
         results=results,
         metadata=None,
-        output_dir=str(results_dir),
+        output_dir=str(run_dir),
         save_plots=True,
         plot_format="png",
     )
 
     print(report)
-    logger.info("Analysis complete. Charts regenerated in: %s", results_dir)
+    logger.info("Analysis complete. Charts regenerated in: %s", run_dir)
     return 0
 
 
@@ -922,6 +1165,7 @@ def cmd_compare(args) -> int:
             bt_results = _run_backtest(
                 config, signal, prices, returns, benchmark,
                 sector_map, fin_unstacked, optimizer_override=opt,
+                gates=_execution_gates(metadata),
             )
             summary = bt_results["summary"]
             results_table.append({
@@ -990,6 +1234,7 @@ def cmd_sweep(args) -> int:
                 config, signal, prices, returns, benchmark,
                 sector_map, fin_unstacked,
                 optimizer_override=opt, frequency_override=freq,
+                gates=_execution_gates(metadata),
             )
 
             summary = bt_results["summary"]
@@ -1028,9 +1273,17 @@ def cmd_cache(args) -> int:
     """Manage pipeline cache."""
     from quant_platform.utils.cache import PipelineCache
 
-    cache = PipelineCache(args.cache_dir)
+    cache_dir = getattr(args, "cache_dir", None) or ".quant_cache"
+    subcommand = getattr(args, "subcommand", None)
+    if subcommand is None:
+        # argparse `required=True` normally prevents this; keep a defensive
+        # nonzero exit so a programmatic caller cannot get a false success.
+        print("Error: a cache subcommand is required (list, clear, prune).", file=sys.stderr)
+        return 2
 
-    if args.subcommand == "list":
+    cache = PipelineCache(cache_dir)
+
+    if subcommand == "list":
         entries = cache.list_cached()
         if entries:
             print(f"Cached stages ({len(entries)}):")
@@ -1038,9 +1291,19 @@ def cmd_cache(args) -> int:
                 print(f"  {e}")
         else:
             print("Cache is empty.")
-    elif args.subcommand == "clear":
+    elif subcommand == "clear":
         count = cache.clear()
         print(f"Cleared {count} cached files.")
+    elif subcommand == "prune":
+        if getattr(args, "max_age_days", None) is not None:
+            cache.max_age_days = float(args.max_age_days)
+        if getattr(args, "max_entries", None) is not None:
+            cache.max_entries = int(args.max_entries)
+        removed = cache.prune()
+        print(
+            f"Pruned {removed} cache entr{'y' if removed == 1 else 'ies'} "
+            f"(max_age_days={cache.max_age_days}, max_entries={cache.max_entries})."
+        )
 
     return 0
 
@@ -1119,7 +1382,12 @@ def cmd_web(args) -> int:
             print(f"  UI:   http://{args.host}:{args.port}/")
         else:
             print("  UI:   Frontend not built. Run: cd frontend && npm run build")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    import logging as _logging
+
+    from quant_platform.utils.logging import resolve_level
+
+    uvicorn_log_level = _logging.getLevelName(resolve_level()).lower()
+    uvicorn.run(app, host=args.host, port=args.port, log_level=uvicorn_log_level)
     return 0
 
 
@@ -1155,6 +1423,28 @@ def cmd_ml(args) -> int:
                 "zero-IC model as a success."
             )
             return 1
+
+        # Producer for the Grafana "ML Model Performance" panel.
+        try:
+            import math
+
+            from quant_platform.utils.metrics import get_metrics
+
+            metrics = get_metrics()
+            if math.isfinite(float(perf.test_ic)):
+                metrics.gauge(
+                    "ml_model_test_ic",
+                    labels={"model_type": args.model},
+                    help="Test-set IC of the trained ML model",
+                ).set(float(perf.test_ic))
+            if math.isfinite(float(perf.test_icir)):
+                metrics.gauge(
+                    "ml_model_test_icir",
+                    labels={"model_type": args.model},
+                    help="Test-set ICIR of the trained ML model",
+                ).set(float(perf.test_icir))
+        except Exception as exc:
+            logger.debug("ML metric publish failed: %s", exc)
 
         print("=" * 60)
         print(f"  ML MODEL TRAINING — {args.model.upper()}")
@@ -1582,6 +1872,20 @@ def cmd_config(args) -> int:
         else:
             print("Cancelled.")
 
+    elif args.subcommand == "prune":
+        keep = int(getattr(args, "keep", 20) or 20)
+        if keep < 1:
+            print("Error: --keep must be >= 1.", file=sys.stderr)
+            return 2
+        removed = vm.prune(
+            keep=keep,
+            max_age_days=getattr(args, "max_age_days", None),
+        )
+        if removed:
+            print(f"Pruned {len(removed)} version(s): {', '.join(removed)}")
+        else:
+            print("Nothing to prune.")
+
     return 0
 
 
@@ -1637,7 +1941,8 @@ def cmd_profile(args) -> int:
 
     # Stage 4: Backtest
     t0 = time.perf_counter()
-    _run_backtest(config, signal, prices, returns, benchmark, sector_map, fin_unstacked)
+    _run_backtest(config, signal, prices, returns, benchmark, sector_map, fin_unstacked,
+                  gates=_execution_gates(metadata))
     timings["4_backtest"] = time.perf_counter() - t0
 
     total = time.perf_counter() - total_start
@@ -1656,37 +1961,74 @@ def cmd_profile(args) -> int:
 
 
 def cmd_trade(args) -> int:
-    """Execute live trading via LiveRunner (Paper or QMT)."""
+    """Execute live trading via LiveRunner (Paper or QMT).
+
+    Exit codes: 2 for a usage error (e.g. ``--days 0``), 1 when the broker
+    fails to connect, when every cycle failed, or when nothing filled, and 0
+    only for a session that actually traded.
+    """
     from quant_platform.trading.live_runner import LiveRunner
 
     broker_type = args.broker
+    days = int(args.days)
+    if days < 1:
+        print("Error: --days must be >= 1.", file=sys.stderr)
+        return 2
+
     universe = [c.strip() for c in args.universe.split(",")] if args.universe else [
         "600519", "000858", "000001", "002001", "300750",
     ]
+
+    config = load_config(_resolve_config_path(getattr(args, "config", None)))
+
+    broker_kwargs: dict = {}
+    if broker_type in ("qmt", "qmt_sim", "qmt_live"):
+        # Account/server/password/mode come from execution.qmt (password
+        # env-first); `--broker qmt` no longer silently means "simulated".
+        broker_kwargs = _resolve_qmt_kwargs(config)
+        if broker_type == "qmt_live":
+            broker_kwargs["mode"] = "live"
+        elif broker_type == "qmt_sim":
+            broker_kwargs["mode"] = "sim"
+        elif broker_type == "qmt":
+            broker_kwargs["mode"] = config.execution.qmt.mode
+        mode = broker_kwargs.get("mode", "sim")
+        print(f"  QMT mode:  {mode}  Account: {broker_kwargs.get('account', '') or '(unset)'}")
 
     print("=" * 60)
     print("  LIVE TRADING RUNNER")
     print("=" * 60)
     print(f"  Broker:    {broker_type}")
     print(f"  Universe:  {len(universe)} stocks")
-    print(f"  Days:      {args.days}")
+    print(f"  Days:      {days}")
     print(f"  Capital:   {args.cash:,.0f} CNY")
     print(f"  DualTrack: {not args.no_dual_track}")
     print("=" * 60)
 
-    runner = LiveRunner(
-        broker_type=broker_type,
-        initial_cash=args.cash,
-        dual_track=not args.no_dual_track,
-    )
+    try:
+        runner = LiveRunner(
+            broker_type=broker_type,
+            initial_cash=args.cash,
+            dual_track=not args.no_dual_track,
+            **broker_kwargs,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     runner.set_universe(universe)
 
-    report = runner.run(days=args.days, seed=args.seed)
+    try:
+        report = runner.run(days=days, seed=args.seed)
+    except (RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     d = report.to_dict()
 
     print(f"\nSession: {d['session_id']}")
     print(f"  Broker:         {d.get('broker_type', broker_type)}")
+    print(f"  Status:         {d.get('status', 'completed')}")
     print(f"  Days traded:    {d['days_traded']}")
+    print(f"  Failed cycles:  {d.get('failed_cycles', 0)}")
     print(f"  Total orders:   {d['total_orders']}")
     print(f"  Total fills:    {d['total_fills']}")
     print(f"  Initial:        {d['initial_capital']:,.0f} CNY")
@@ -1696,6 +2038,29 @@ def cmd_trade(args) -> int:
     print(f"  Sharpe:         {d['sharpe_ratio']:.2f}")
     print(f"  Max Drawdown:   {d['max_drawdown_pct']:.2f}%")
     print(f"  Avg Volume:     {d['avg_daily_volume']:,.0f} CNY")
+
+    # Never report success for a session that did not trade.
+    if d.get("failed_cycles", 0) > 0:
+        print(
+            f"Error: {d['failed_cycles']} trading cycle(s) failed; "
+            "the session did not complete cleanly.",
+            file=sys.stderr,
+        )
+        return 1
+    if d["total_orders"] == 0 or d["total_fills"] == 0:
+        print(
+            "Error: no orders filled"
+            + (" (every order was rejected)" if d["total_orders"] else "")
+            + "; refusing to report success.",
+            file=sys.stderr,
+        )
+        return 1
+    if d.get("status") != "completed":
+        print(
+            f"Error: session status is '{d.get('status')}', not completed.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -1887,6 +2252,7 @@ def cmd_gate(args) -> int:
         bt_results = _run_backtest(
             config, signal, prices, returns, benchmark,
             sector_map, fin_unstacked,
+            gates=_execution_gates(metadata),
         )
         backtest_summary = bt_results.get("summary")
     except Exception as exc:
@@ -2020,7 +2386,8 @@ def cmd_strategy(args) -> int:
             prices, returns, financials, metadata, turnover, config=config)
         signal = _generate_signal(config, processed_factors, returns, prices=prices)
         bt_result = _run_backtest(config, signal, prices, returns, benchmark,
-                                   sector_map, financials)
+                                   sector_map, financials,
+                                   gates=_execution_gates(metadata))
 
         # Generate report
         from pathlib import Path
@@ -2116,11 +2483,32 @@ def cmd_walkforward(args) -> int:
         n_folds=args.folds,
     )
 
+    from quant_platform.backtest.cost_model import CostModel
+    from quant_platform.portfolio.constraints import PortfolioConstraints
+
+    # The fold engines must use the same execution model as the headline
+    # backtest. Passing only capital/frequency/benchmark silently ignored
+    # every configured cost, constraint, optimizer and covariance setting,
+    # so OOS numbers were not comparable with the in-sample run (audit B3).
     engine_kwargs = {
         "initial_capital": config.backtest.initial_capital,
         "rebalance_frequency": config.backtest.rebalance_frequency,
         "benchmark": config.backtest.benchmark,
     }
+    cost_model = CostModel(
+        commission=config.costs.commission,
+        stamp_tax=config.costs.stamp_tax,
+        slippage=config.costs.slippage,
+        slippage_model=config.costs.slippage_model,
+    )
+    constraints = PortfolioConstraints(
+        long_only=config.portfolio.constraints.long_only,
+        max_weight=config.portfolio.constraints.max_weight,
+        max_sector_exposure=config.portfolio.constraints.max_sector_exposure,
+        max_turnover=config.portfolio.constraints.max_turnover,
+        lot_size=config.portfolio.constraints.lot_size,
+        risk_aversion=config.portfolio.risk_aversion,
+    )
 
     results = validator.run(
         signal=signal,
@@ -2136,6 +2524,13 @@ def cmd_walkforward(args) -> int:
             "lookback": config.alpha.lookback,
             "min_icir": config.alpha.min_icir,
         },
+        cost_model=cost_model,
+        constraints=constraints,
+        optimizer=config.portfolio.optimizer,
+        covariance_method=config.portfolio.covariance.method,
+        covariance_lookback=config.portfolio.covariance.lookback,
+        covariance_ewma_half_life=config.portfolio.covariance.ewma_half_life,
+        execution_gates=_execution_gates(metadata),
     )
 
     # Print results
@@ -2190,6 +2585,19 @@ def _resolve_qmt_kwargs(config) -> dict:
     return kwargs
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for counts: reject 0/negative at parse time (exit 2)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"expected a positive integer, got {value!r}",
+        ) from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {number}")
+    return number
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="A-Share Multi-Factor Quant Platform",
@@ -2209,6 +2617,9 @@ def main() -> int:
                             help="Disable caching entirely")
     run_parser.add_argument("--cache-dir", type=str, default=".quant_cache",
                             help="Cache directory path")
+    run_parser.add_argument("--allow-synthetic-fallback", action="store_true",
+                            help="Development only: allow a configured real data "
+                                 "provider to fall back to synthetic data")
     run_parser.add_argument("--description", "-d", type=str, default=None,
                             help="Optional description for this run (saved in config version)")
     run_parser.add_argument("--save-factors", action="store_true",
@@ -2217,12 +2628,14 @@ def main() -> int:
     # trade
     trade_parser = subparsers.add_parser("trade", help="Run live trading (Paper or QMT)")
     trade_parser.add_argument("--broker", "-b", type=str, default="simulated",
-                            choices=["simulated", "paper", "qmt", "qmt_sim"],
-                            help="Broker type")
+                            choices=["simulated", "paper", "qmt", "qmt_sim", "qmt_live"],
+                            help="Broker type (qmt_live sets execution.qmt.mode=live)")
+    trade_parser.add_argument("--config", "-c", type=str, default=None,
+                            help="Path to config YAML file (execution.qmt settings)")
     trade_parser.add_argument("--universe", "-u", type=str, default=None,
                             help="Comma-separated stock codes (default: 5 blue chips)")
-    trade_parser.add_argument("--days", "-d", type=int, default=30,
-                            help="Number of days to simulate")
+    trade_parser.add_argument("--days", "-d", type=_positive_int, default=30,
+                            help="Number of exchange sessions to simulate (>= 1)")
     trade_parser.add_argument("--cash", type=float, default=10_000_000,
                             help="Initial capital in CNY")
     trade_parser.add_argument("--seed", "-s", type=int, default=42,
@@ -2266,11 +2679,28 @@ def main() -> int:
 
     # cache
     cache_parser = subparsers.add_parser("cache", help="Manage pipeline cache")
-    cache_sub = cache_parser.add_subparsers(dest="subcommand", help="Cache action")
-    cache_sub.add_parser("list", help="List cached stages")
-    cache_sub.add_parser("clear", help="Clear all cached files")
+    cache_sub = cache_parser.add_subparsers(
+        dest="subcommand", required=True, help="Cache action",
+    )
+    cache_list = cache_sub.add_parser("list", help="List cached stages")
+    cache_list.add_argument("--cache-dir", type=str, default=argparse.SUPPRESS,
+                            help="Cache directory path")
+    cache_clear = cache_sub.add_parser("clear", help="Clear all cached files")
+    cache_clear.add_argument("--cache-dir", type=str, default=argparse.SUPPRESS,
+                             help="Cache directory path")
+    cache_prune = cache_sub.add_parser(
+        "prune", help="Evict expired/undersized cache entries",
+    )
+    cache_prune.add_argument("--cache-dir", type=str, default=argparse.SUPPRESS,
+                             help="Cache directory path")
+    cache_prune.add_argument("--max-age-days", type=float, default=None,
+                             help="Delete entries older than this (default: 30)")
+    cache_prune.add_argument("--max-entries", type=int, default=None,
+                             help="Keep at most this many entries (default: 64)")
+    # Kept for backward compatibility with `cache --cache-dir X list`; the
+    # subparser copies (SUPPRESS default) win when given after the subcommand.
     cache_parser.add_argument("--cache-dir", type=str, default=".quant_cache",
-                              help="Cache directory path")
+                              help="Cache directory path (prefer after the subcommand)")
 
     # runs — research run registry and result validity
     runs_parser = subparsers.add_parser(
@@ -2413,7 +2843,9 @@ def main() -> int:
 
     # config
     config_parser = subparsers.add_parser("config", help="Manage configuration versions")
-    config_sub = config_parser.add_subparsers(dest="subcommand", help="Config action")
+    config_sub = config_parser.add_subparsers(
+        dest="subcommand", required=True, help="Config action",
+    )
 
     config_sub.add_parser("list", help="List all config versions")
     config_show = config_sub.add_parser("show", help="Show config for a version")
@@ -2429,6 +2861,13 @@ def main() -> int:
     config_delete.add_argument("version", type=str, help="Version ID to delete")
     config_delete.add_argument("--force", "-f", action="store_true",
                                 help="Skip confirmation")
+    config_prune = config_sub.add_parser(
+        "prune", help="Delete old config versions by count/age",
+    )
+    config_prune.add_argument("--keep", type=int, default=20,
+                              help="Keep at least this many newest versions")
+    config_prune.add_argument("--max-age-days", type=float, default=None,
+                              help="Also delete versions older than this many days")
 
     # lookahead
     la_parser = subparsers.add_parser("check-lookahead", help="Detect lookahead bias in factor pipeline")
@@ -2456,7 +2895,6 @@ def main() -> int:
     strat_run.add_argument("--name", type=str, default="", help="Strategy name")
     strat_run.add_argument("--version", type=str, default="", help="Version")
     strat_run.add_argument("--file", type=str, default="", help="Path to strategy YAML file (overrides name)")
-    strat_run.add_argument("--force", "-f", action="store_true", help="Bypass cache")
     strat_history = strat_sub.add_parser("history", help="Show strategy run history")
     strat_history.add_argument("--name", type=str, default="", help="Strategy name (optional)")
     strat_sub.add_parser("stats", help="Show registry statistics")
@@ -2469,13 +2907,36 @@ def main() -> int:
     # profile
     profile_parser = subparsers.add_parser("profile", help="Profile pipeline performance")
     profile_parser.add_argument("--config", "-c", type=str, default=None, help="Config path")
-    profile_parser.add_argument("--force", "-f", action="store_true", help="Force recomputation")
 
     args = parser.parse_args()
 
-    # Configure logging once — all child loggers inherit handlers from root
+    # Configure logging once — all child loggers inherit handlers from the
+    # "quant_platform" logger. The level honors QUANT_LOG_LEVEL / LOG_LEVEL.
     setup_logging()
 
+    import yaml
+
+    from quant_platform.utils.config import ConfigValidationError
+
+    try:
+        return _dispatch(parser, args)
+    except FileNotFoundError as exc:
+        # A missing config (or input file) is an operator error, not a crash:
+        # print an actionable message instead of a traceback.
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except ConfigValidationError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 1
+    except DataProviderUnavailableError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except yaml.YAMLError as exc:
+        print(f"Config error (invalid YAML): {exc}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(parser, args) -> int:
     if args.command == "run":
         return cmd_run(args)
     elif args.command == "trade":

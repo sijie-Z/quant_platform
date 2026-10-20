@@ -29,6 +29,7 @@ def test_compute_costs_scalar_input_is_the_two_way_traded_value():
         two_way * 0.0003       # commission, both sides
         + one_sided * 0.001    # stamp tax, sells only
         + two_way * 0.0005     # slippage, both sides
+        + two_way * 0.00001    # transfer fee, both sides (B5)
     )
 
     assert model.compute_costs(two_way) == pytest.approx(expected)
@@ -43,9 +44,13 @@ def test_cost_model_basic():
     turnover = pd.Series([100000, 50000], index=["A", "B"])
     costs = model.compute_costs(turnover)
 
-    # commission + slippage on the full notional, stamp tax on the assumed
-    # sell half of the legacy single-figure path.
-    rate = model.commission + model.slippage + model.stamp_tax / 2
+    # commission + slippage + the both-sides transfer fee on the full
+    # notional, stamp tax on the assumed sell half of the legacy
+    # single-figure path.
+    rate = (
+        model.commission + model.slippage + model.transfer_fee
+        + model.stamp_tax / 2
+    )
     assert costs["A"] == pytest.approx(100000 * rate)
     assert costs["B"] == pytest.approx(50000 * rate)
 
@@ -60,10 +65,10 @@ def test_cost_model_sell():
     costs_buy = model.compute_costs(turnover, is_sell=is_buy)
 
     assert costs_sell.iloc[0] == pytest.approx(
-        100000 * (model.commission + 0.001 + model.slippage),
+        100000 * (model.commission + 0.001 + model.slippage + model.transfer_fee),
     )
     assert costs_buy.iloc[0] == pytest.approx(
-        100000 * (model.commission + model.slippage),
+        100000 * (model.commission + model.slippage + model.transfer_fee),
     )
     assert costs_sell.iloc[0] > costs_buy.iloc[0]
 
@@ -222,8 +227,10 @@ class TestVectorPathAlignsSeriesByLabel:
         cost = model.compute_costs(turnover, daily_volume=volume)
 
         # A: 1e6 / 1e6 = 1 -> full 0.001; B: 1e6 / 1e8 -> sqrt(0.01) = 0.1x.
-        assert cost.loc["A"] == pytest.approx(1_000_000 * 0.001)
-        assert cost.loc["B"] == pytest.approx(1_000_000 * 0.001 * 0.1)
+        # Both sides also pay the B5 transfer fee (0.001%).
+        transfer = 1_000_000 * 0.00001
+        assert cost.loc["A"] == pytest.approx(1_000_000 * 0.001 + transfer)
+        assert cost.loc["B"] == pytest.approx(1_000_000 * 0.001 * 0.1 + transfer)
 
     def test_impact_path_aligns_by_label(self):
         model = CostModel(
@@ -237,8 +244,13 @@ class TestVectorPathAlignsSeriesByLabel:
             turnover, daily_volume=volume, volatility=volatility,
         )
 
-        assert cost.loc["A"] / 1_000_000 == pytest.approx(0.02 * np.sqrt(0.01))
-        assert cost.loc["B"] / 1_000_000 == pytest.approx(0.02 * np.sqrt(0.0001))
+        # The B5 transfer fee is charged on both sides of every trade.
+        assert cost.loc["A"] / 1_000_000 == pytest.approx(
+            0.02 * np.sqrt(0.01) + 0.00001
+        )
+        assert cost.loc["B"] / 1_000_000 == pytest.approx(
+            0.02 * np.sqrt(0.0001) + 0.00001
+        )
 
 
 class TestVectorPathInputShapes:
@@ -251,7 +263,8 @@ class TestVectorPathInputShapes:
 
         cost = model.compute_costs(np.array([1_000_000.0, 2_000_000.0]))
 
-        assert cost.tolist() == pytest.approx([1_000.0, 2_000.0])
+        # commission plus the default both-sides transfer fee (B5).
+        assert cost.tolist() == pytest.approx([1_010.0, 2_020.0])
 
     def test_scalar_trade_against_per_asset_volume_uses_the_vector_rule(self):
         model = CostModel(
@@ -265,9 +278,13 @@ class TestVectorPathInputShapes:
         )
 
         assert isinstance(cost, pd.Series)
-        # A: participation 1e-4; B: participation 1e-2.
-        assert cost.loc["A"] == pytest.approx(1_000_000 * 0.02 * np.sqrt(1e-4))
-        assert cost.loc["B"] == pytest.approx(1_000_000 * 0.02 * np.sqrt(1e-2))
+        # A: participation 1e-4; B: participation 1e-2; plus the transfer fee.
+        assert cost.loc["A"] == pytest.approx(
+            1_000_000 * 0.02 * np.sqrt(1e-4) + 1_000_000 * 0.00001
+        )
+        assert cost.loc["B"] == pytest.approx(
+            1_000_000 * 0.02 * np.sqrt(1e-2) + 1_000_000 * 0.00001
+        )
 
     def test_ndarray_buy_sell_split_is_supported(self):
         model = CostModel(commission=0.001, stamp_tax=0.001, slippage=0.0)
@@ -278,5 +295,130 @@ class TestVectorPathInputShapes:
             sell_turnover=np.array([0.0, 0.5]),
         )
 
-        # Buy: commission only. Sell: commission + full 0.1% stamp tax.
-        assert cost.tolist() == pytest.approx([0.0005, 0.001])
+        # Buy: commission + transfer. Sell: commission + full 0.1% stamp tax
+        # + transfer (B5: the transfer fee is charged on both sides).
+        assert cost.tolist() == pytest.approx([0.000505, 0.001005])
+
+
+class TestMinimumCommission:
+    """B5: the CNY 5 commission floor is per order, not per portfolio.
+
+    The audit probe: a 20,000 CNY account sending ten 2,000 CNY orders paid
+    6.00 CNY proportionally, while a broker charging ``max(notional*rate, 5)``
+    per order would charge 50.00 CNY (25 bp of the account).
+    """
+
+    def test_ten_2000_cny_orders_pay_five_yuan_each(self):
+        model = CostModel(
+            commission=0.0003, stamp_tax=0.0, slippage=0.0,
+            min_commission=5.0, transfer_fee=0.0,
+        )
+        orders = np.full(10, 2_000.0)
+        cost_fraction = model.compute_costs(
+            float(orders.sum()), buy_turnover=orders,
+            portfolio_value=20_000.0,
+        )
+
+        assert float(np.sum(cost_fraction)) == pytest.approx(50.0 / 20_000.0)
+        # Proportional commissioning alone would have charged 6.00 CNY.
+        assert float(orders.sum()) * 0.0003 == pytest.approx(6.0)
+
+    def test_without_a_portfolio_value_the_floor_cannot_be_applied(self):
+        """Documented large-account approximation: the legacy contract does
+        not know the CNY notional, so it must not invent a floor."""
+        model = CostModel(
+            commission=0.0003, stamp_tax=0.0, slippage=0.0,
+            min_commission=5.0, transfer_fee=0.0,
+        )
+        assert model.compute_costs(10_000.0) == pytest.approx(3.0)
+
+
+class TestTransferFee:
+    """B5: the A-share transfer fee is charged on both buys and sells."""
+
+    def test_buy_and_sell_pay_the_same_rate(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, min_commission=0.0,
+        )
+        notional = 1_000_000.0
+
+        buy = model.compute_costs(notional, buy_turnover=notional)
+        sell = model.compute_costs(notional, sell_turnover=notional)
+
+        assert model.transfer_fee == pytest.approx(0.00001)
+        assert buy == pytest.approx(notional * 0.00001)
+        assert sell == pytest.approx(notional * 0.00001)
+
+
+class TestStampTaxSchedule:
+    """B11: 0.1% before 2023-08-28 and 0.05% from that date, sell side only."""
+
+    def test_statutory_rate_cut_takes_effect_on_2023_08_28(self):
+        model = CostModel(
+            commission=0.0, slippage=0.0, transfer_fee=0.0,  # stamp_tax=None
+        )
+        notional = 1_000_000.0
+
+        before = model.compute_costs(
+            notional, sell_turnover=notional, date="2023-08-25",
+        )
+        on_cut = model.compute_costs(
+            notional, sell_turnover=notional, date="2023-08-28",
+        )
+        after = model.compute_costs(
+            notional, sell_turnover=notional, date="2024-06-03",
+        )
+
+        assert before == pytest.approx(1_000.0)   # 0.1%
+        assert on_cut == pytest.approx(500.0)     # 0.05%
+        assert after == pytest.approx(500.0)      # 0.05%
+
+    def test_buy_side_pays_no_stamp_tax(self):
+        model = CostModel(
+            commission=0.0, slippage=0.0, transfer_fee=0.0,
+        )
+        notional = 1_000_000.0
+        assert model.compute_costs(
+            notional, buy_turnover=notional, date="2024-06-03",
+        ) == pytest.approx(0.0)
+
+    def test_explicit_rate_overrides_the_schedule(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.001, slippage=0.0, transfer_fee=0.0,
+        )
+        assert model.compute_costs(
+            1_000_000.0, sell_turnover=1_000_000.0, date="2024-06-03",
+        ) == pytest.approx(1_000.0)
+
+
+class TestCostsAreChargedExactlyOnce:
+    """Decomposition check: commission/slippage/transfer on both sides, stamp
+    tax on the sell notional only, with no component charged twice."""
+
+    def _model(self):
+        return CostModel(
+            commission=0.0003, slippage=0.001, min_commission=0.0,
+            transfer_fee=0.00001,
+        )
+
+    def test_buy_swap_and_sell_costs_decompose_exactly(self):
+        model = self._model()
+        notional = 1_000_000.0
+        common = (
+            model.commission + model.slippage + model.transfer_fee
+        )
+
+        buy = model.compute_costs(
+            notional, buy_turnover=notional, date="2024-06-03",
+        )
+        sell = model.compute_costs(
+            notional, sell_turnover=notional, date="2024-06-03",
+        )
+        swap = model.compute_costs(
+            2 * notional, buy_turnover=notional, sell_turnover=notional,
+            date="2024-06-03",
+        )
+
+        assert buy == pytest.approx(notional * common)
+        assert sell == pytest.approx(notional * (common + 0.0005))
+        assert swap == pytest.approx(buy + sell)

@@ -1,21 +1,149 @@
 """Data pipeline for ETL: clean, align, filter, and prepare data.
 
 Transforms raw data provider output into analysis-ready DataFrames with:
+- Contract validation of every provider output at the boundary
+  (`validate_prices`/`validate_financials`/`validate_metadata` in
+  `data/schema.py`), so provider drift fails with an actionable error that
+  names the provider and the violated column/index instead of a downstream
+  ``KeyError``.
 - Suspension handling (forward-fill, NaN masking, derived from the data)
 - Point-in-time asset-day eligibility mask (ST episodes, listing window,
   mid-sample delisting, suspension), no look-ahead
 - Date alignment across prices, financials, and benchmark
 - Derived fields (daily returns, adjusted prices)
+
+Data policies fixed in this module (regression-tested):
+
+* **Duplicate ``(date, asset)`` rows** are deduplicated deterministically
+  with ``keep="last"`` *before* any ``unstack``.  A warning reports the
+  count and a sample of the offending keys; the counts are exposed as
+  ``duplicate_rows_dropped``.  Previously a provider overlap aborted the run
+  with a raw ``ValueError: Index contains duplicate entries``.
+* **``adj_factor``** must be finite and > 0 wherever the close is present.
+  Invalid/missing factors are forward-filled per asset from the last valid
+  factor with a warning and a count (``adj_factor_repairs``); a factor that
+  cannot be repaired (no earlier valid value for that asset) raises
+  :class:`~quant_platform.data.schema.DataQualityError`.  ``close_adj`` is
+  therefore never ``inf``/``NaN`` because of a zero factor.
+* **Unknown listing dates** (``NaT``) are kept in the universe with a
+  warning and a count, not silently dropped by a ``NaT <= Timestamp``
+  comparison.  A *missing* ``listing_date`` column is a contract error
+  naming the provider.
+* **Delisting inference** from a terminal price gap uses
+  ``delisting_gap_days`` (separate from ``max_suspension_days``, default 60
+  sessions) and logs every inferred date; an end-of-sample suspension shorter
+  than that threshold is not reclassified as a delisting.  Provider-stated
+  ``delisting_date`` metadata always wins.
+* **Suspension detection** treats an unchanged close with no volume/OHLC
+  evidence of a trade as stale (close-only forward-fill detection), instead
+  of booking a fake zero return.
+* **Symbol normalization** for board price-limit rules accepts suffix
+  (``300001.SZ``), prefix (``sz300001``/``sh.688001``) and Beijing
+  (``4``/``8``/``920``) codes.  A shared normalizer is still needed in
+  ``core/instrument.py`` (owned by another wave); this module's local
+  helper is the reference implementation.
 """
 
 from __future__ import annotations
 
+import re
+
+import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import DataProvider
+from quant_platform.data.schema import (
+    DataContractError,
+    DataQualityError,
+    provider_label,
+    validate_financials,
+    validate_metadata,
+    validate_prices,
+)
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Symbol normalization / board price-limit rules
+# ---------------------------------------------------------------------------
+
+_EXCHANGES = ("SH", "SZ", "BJ")
+
+
+def _symbol_code(symbol) -> str | None:
+    """Extract the six-digit A-share code from any accepted symbol format.
+
+    Accepts ``600001.SH``, ``sh600001``, ``SH.600001``, ``sz.300001``,
+    ``bj430001`` and bare ``600001``.  Returns ``None`` when no six-digit
+    code can be found.
+    """
+    match = re.search(r"\d{6}", str(symbol))
+    return match.group(0) if match else None
+
+
+def _infer_exchange(code: str) -> str:
+    """Infer the exchange for a bare six-digit code (best effort)."""
+    if code.startswith("920") or code.startswith(("4", "8")):
+        return "BJ"
+    if code.startswith(("0", "2", "3")):
+        return "SZ"
+    if code.startswith(("6", "9")):
+        return "SH"
+    return "SZ"
+
+
+def normalize_symbol(symbol) -> str:
+    """Return a canonical ``CODE.EXCHANGE`` symbol (e.g. ``300001.SZ``).
+
+    Handles suffix (``300001.SZ``), prefix (``sz300001``), dotted prefix
+    (``sh.688001``) and Beijing codes.  Unrecognised formats are returned
+    upper-cased unchanged so callers can still log them.
+    """
+    s = str(symbol).strip().upper()
+    m = re.fullmatch(r"(\d{6})[.\-_]?(SH|SZ|BJ)", s)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    m = re.fullmatch(r"(SH|SZ|BJ)[.\-_]?(\d{6})", s)
+    if m:
+        return f"{m.group(2)}.{m.group(1)}"
+    m = re.fullmatch(r"(\d{6})", s)
+    if m:
+        return f"{m.group(1)}.{_infer_exchange(m.group(1))}"
+    return s
+
+
+def price_limit_threshold(symbol) -> float:
+    """Daily price-limit threshold for an A-share symbol.
+
+    Board rules: ChiNext/STAR (``300``/``301``/``688``/``689``) 20%, Beijing
+    (``4``/``8``/``920``) 30%, everything else 10%.  The symbol is normalized
+    first, so ``sz300001`` and ``sh.688001`` get the correct board rule
+    instead of falling through ``str.startswith`` on the raw label.
+    Unknown formats default to 10%.
+    """
+    code = _symbol_code(symbol)
+    if code is None:
+        return 0.10
+    if code.startswith(("300", "301", "688", "689")):
+        return 0.20
+    if code.startswith(("4", "8", "920")):
+        return 0.30
+    return 0.10
+
+
+def realized_returns(returns: pd.DataFrame) -> pd.DataFrame:
+    """Shift a forward-return panel into its realized (trailing) view.
+
+    ``DataPipeline.returns[t]`` spans t -> t+1; at the close of t that return
+    has not happened yet.  ``shift(1)[t] = returns[t-1]`` is the return
+    realized from the close of t-1 to the close of t — the only return a
+    signal or risk statistic computed at t may use.  Live-sim consumers
+    (reversal paper trader, regime router/adapter) must use this instead of
+    the raw forward panel; doing otherwise is a one-day look-ahead.
+    """
+    return returns.shift(1)
 
 
 class DataPipeline:
@@ -30,6 +158,7 @@ class DataPipeline:
         exclude_suspended: bool = True,
         max_suspension_days: int = 30,
         benchmark_is_trailing: bool | None = None,
+        delisting_gap_days: int | None = None,
     ):
         self.provider = provider
         self.start_date = pd.Timestamp(start_date)
@@ -37,6 +166,23 @@ class DataPipeline:
         self.exclude_st = exclude_st
         self.exclude_suspended = exclude_suspended
         self.max_suspension_days = max_suspension_days
+
+        # Terminal missing runs longer than this are inferred as delistings
+        # when the provider supplies no ``delisting_date``.  Deliberately
+        # separate from (and larger than) ``max_suspension_days``: a stock
+        # suspended through the end of the sample must not be reclassified as
+        # delisted.  Defaults to 60 trading sessions (~3 months), scaled up
+        # for callers that raised the suspension limit.
+        if delisting_gap_days is None:
+            delisting_gap_days = max(60, 2 * max_suspension_days)
+        if delisting_gap_days <= max_suspension_days:
+            raise ValueError(
+                "delisting_gap_days must be larger than max_suspension_days "
+                f"(got {delisting_gap_days} <= {max_suspension_days}); the "
+                "two thresholds exist to distinguish a long suspension from "
+                "a delisting"
+            )
+        self.delisting_gap_days = int(delisting_gap_days)
 
         # Processed data
         self.prices: pd.DataFrame | None = None
@@ -82,8 +228,23 @@ class DataPipeline:
 
         # Per-asset delisting dates: provider metadata where stated, plus
         # price disappearance for providers that simply stop pricing without
-        # a delisting_date.
+        # a delisting_date.  `_inferred_delistings` records only the latter
+        # (asset -> inferred first missing date) for auditing/reporting.
         self._delisting_dates: pd.Series | None = None
+        self._inferred_delistings: dict = {}
+
+        # Data-quality counters, reset per run().  `duplicate_rows_dropped`
+        # counts deduplicated (date, asset) rows per dataset (keep="last");
+        # `adj_factor_repairs` counts invalid factors repaired by a per-asset
+        # forward-fill; `unknown_listing_assets` counts names kept with a
+        # NaT listing_date.
+        self.duplicate_rows_dropped: dict[str, int] = {}
+        self.adj_factor_repairs: int = 0
+        self.unknown_listing_assets: int = 0
+
+        # True when `financials` carries a publish_date column, i.e. the
+        # panel supports point-in-time queries via get_financials_as_of().
+        self.financials_pit_available: bool = False
 
         # Point-in-time data (populated during run if provider supports it)
         self._st_timeseries: pd.DataFrame | None = None
@@ -104,14 +265,28 @@ class DataPipeline:
         self._sector_panel: pd.DataFrame | None = None
 
     def run(self) -> None:
-        """Execute the full ETL pipeline."""
+        """Execute the full ETL pipeline.
+
+        Every provider output is contract-validated at the boundary
+        (`data/schema.py`): a wrong index, missing column or empty metadata
+        raises a :class:`DataContractError` that names the provider and the
+        violated field instead of failing later inside an ``unstack`` or a
+        factor.
+        """
         logger.info("Running data pipeline: %s to %s",
                      self.start_date.date(), self.end_date.date())
 
-        # Per-run caches; a second run() must not serve the first one's panel.
+        # Per-run caches/counters; a second run() must not serve the first
+        # one's panel or stale quality counts.
         self._sector_panel = None
+        self.duplicate_rows_dropped = {}
+        self.adj_factor_repairs = 0
+        self.unknown_listing_assets = 0
+        self._inferred_delistings = {}
+        self.financials_pit_available = False
 
         self.metadata = self.provider.get_metadata()
+        validate_metadata(self.metadata, provider=self.provider)
         # Ensure date columns are datetime (Baostock returns strings)
         for col in ["listing_date", "delisting_date"]:
             if col in self.metadata.columns:
@@ -124,12 +299,26 @@ class DataPipeline:
 
         self._filter_universe()
 
-        self.prices = self.provider.get_prices(
+        prices = self.provider.get_prices(
             str(self.start_date.date()), str(self.end_date.date())
         )
-        self.financials = self.provider.get_financials(
+        validate_prices(prices, provider=self.provider)
+        # Duplicate (date, asset) rows are a provider overlap, not a reason to
+        # abort the run with pandas' opaque unstack error.  keep="last" is the
+        # documented policy: the later observation supersedes the earlier one.
+        self.prices = self._deduplicate_rows(prices, "prices")
+
+        financials = self.provider.get_financials(
             str(self.start_date.date()), str(self.end_date.date())
         )
+        validate_financials(financials, provider=self.provider)
+        self.financials = self._deduplicate_rows(financials, "financials")
+        self.financials_pit_available = bool(
+            self.financials is not None
+            and not self.financials.empty
+            and "publish_date" in self.financials.columns
+        )
+
         self.benchmark = self.provider.get_benchmark(
             str(self.start_date.date()), str(self.end_date.date())
         )
@@ -158,6 +347,32 @@ class DataPipeline:
     # Universe filtering
     # ------------------------------------------------------------------
 
+    def _deduplicate_rows(
+        self, df: pd.DataFrame | None, dataset: str
+    ) -> pd.DataFrame | None:
+        """Drop duplicate ``(date, asset)`` rows with the documented policy.
+
+        ``keep="last"`` wins: when a provider returns the same key twice, the
+        later row supersedes the earlier one (the common append/overlap bug).
+        The count and a sample of keys are logged at WARNING and exposed via
+        ``self.duplicate_rows_dropped[dataset]``; the pipeline never lets a
+        raw pandas "Index contains duplicate entries" escape from ``unstack``.
+        """
+        if df is None or df.empty:
+            return df
+        duplicated = df.index.duplicated(keep="last")
+        count = int(duplicated.sum())
+        self.duplicate_rows_dropped[dataset] = count
+        if not count:
+            return df
+        sample = list(df.index[duplicated][:5])
+        logger.warning(
+            "%s: dropped %d duplicate (date, asset) rows (keep='last', "
+            "count reset per run): %s",
+            dataset, count, sample,
+        )
+        return df[~duplicated]
+
     def _filter_universe(self) -> None:
         """Filter investable universe to the static (non-time-varying) rules.
 
@@ -176,16 +391,52 @@ class DataPipeline:
         # without an ST timeseries can be excluded at the sample level only;
         # that is what the metadata flag means in that case, and *not*
         # applying it would leave ST names in the universe for every date.
-        if self.exclude_st and not self._has_usable_st_timeseries() and "is_st" in meta.columns:
-            logger.warning(
-                "Provider has no usable ST timeseries — falling back to the "
-                "static is_st flag (excludes the whole history of every "
-                "ever-ST stock)"
-            )
-            meta = meta[~meta["is_st"]]
+        # The flag may be absent or empty (nullable SQL columns): absence
+        # must not be read as "not ST", so say so loudly instead of silently
+        # disabling the screen.
+        if self.exclude_st and not self._has_usable_st_timeseries():
+            if "is_st" in meta.columns:
+                static_st = meta["is_st"]
+                if static_st.notna().any():
+                    logger.warning(
+                        "Provider has no usable ST timeseries — falling back "
+                        "to the static is_st flag (excludes the whole history "
+                        "of every ever-ST stock)"
+                    )
+                    meta = meta[~static_st.fillna(False).astype(bool)]
+                else:
+                    logger.warning(
+                        "Provider supplied an is_st column with no values and "
+                        "no ST timeseries — ST screening is unavailable for "
+                        "this run (missing flags are NOT treated as False)"
+                    )
+            else:
+                logger.warning(
+                    "Provider supplied neither an ST timeseries nor an is_st "
+                    "column — ST screening is unavailable for this run "
+                    "(absence is NOT treated as False)"
+                )
 
-        # Filter stocks not yet listed
-        meta = meta[meta["listing_date"] <= self.end_date]
+        # Filter stocks not yet listed.  `NaT <= Timestamp` is False, so a
+        # raw comparison silently dropped every asset with an unknown listing
+        # date; keep them with a warning and a count instead — the listing
+        # window simply starts at the sample beginning for those names.
+        if "listing_date" not in meta.columns:
+            raise DataContractError(
+                f"{provider_label(self.provider)}: metadata is missing "
+                "'listing_date'; cannot build the listing window"
+            )
+        listing = pd.to_datetime(meta["listing_date"], errors="coerce")
+        unknown_listing = listing.isna()
+        self.unknown_listing_assets = int(unknown_listing.sum())
+        if self.unknown_listing_assets:
+            logger.warning(
+                "Kept %d asset(s) with unknown (NaT) listing_date; their "
+                "listing window starts at the sample beginning: %s",
+                self.unknown_listing_assets,
+                list(meta.index[unknown_listing][:10]),
+            )
+        meta = meta[unknown_listing | (listing <= self.end_date)]
         meta = meta[
             meta["delisting_date"].isna()
             | (meta["delisting_date"] >= self.start_date)
@@ -297,12 +548,15 @@ class DataPipeline:
     def _derive_delisting_dates(self, close: pd.DataFrame) -> pd.Series:
         """Delisting dates from metadata, falling back to price disappearance.
 
-        The stated ``delisting_date`` is authoritative.  When a provider omits
-        it but stops producing prices for good (the common shape of a real
-        delisting), the first date of the trailing missing run is used — but
-        only when that run is longer than ``max_suspension_days``, so an
-        ordinary (possibly long) suspension is not reclassified as a
-        delisting.
+        The stated ``delisting_date`` is authoritative; inference never
+        overrides it.  When a provider omits the date but stops producing
+        prices for good (the common shape of a real delisting), the first
+        date of the trailing missing run is used — but only when that run is
+        longer than ``delisting_gap_days`` (default 60 sessions), a threshold
+        deliberately separate from and larger than ``max_suspension_days``.
+        A stock suspended through the end of the sample is therefore not
+        silently reclassified as delisted, and every inferred date is logged
+        at WARNING.
         """
         dates = pd.DatetimeIndex(close.index).sort_values()
         result = pd.Series(pd.NaT, index=close.columns, dtype="datetime64[ns]")
@@ -317,6 +571,7 @@ class DataPipeline:
         if len(dates) == 0:
             return result
 
+        inferred: dict = {}
         for asset in close.columns:
             if pd.notna(result.loc[asset]):
                 continue
@@ -327,8 +582,19 @@ class DataPipeline:
             if last_seen >= dates[-1]:
                 continue
             trailing_missing = dates[dates > last_seen]
-            if len(trailing_missing) > self.max_suspension_days:
+            if len(trailing_missing) > self.delisting_gap_days:
                 result.loc[asset] = trailing_missing[0]
+                inferred[asset] = trailing_missing[0]
+
+        if inferred:
+            logger.warning(
+                "Inferred delisting for %d asset(s) from terminal price gaps "
+                "longer than %d sessions (provider supplied no delisting_date): %s",
+                len(inferred),
+                self.delisting_gap_days,
+                {a: str(d.date()) for a, d in list(inferred.items())[:10]},
+            )
+        self._inferred_delistings = inferred
         return result
 
     def _derive_suspensions(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -343,9 +609,10 @@ class DataPipeline:
 
         * the close is missing (dropped rows / provider NaN);
         * volume is zero;
-        * the whole OHLC(VWAP) row is identical to the previous row — the
-          signature of a provider forward-fill (a genuinely unchanged close
-          with an identical open/high/low/vwap does not occur in real data);
+        * the close equals the previous close and no intraday evidence
+          contradicts a fill (OHLC/VWAP unchanged or missing, volume
+          unchanged or missing) — this covers both a provider that
+          forward-fills the whole row and one that fills only ``close``;
         * the provider explicitly flags it.
 
         Leading NaNs (pre-listing) and trailing NaNs (delisting) are excluded
@@ -361,13 +628,37 @@ class DataPipeline:
 
         suspended = close.isna()
 
+        # A row is stale when the close is unchanged from the previous row
+        # and nothing contradicts a forward-fill: every present OHLC(VWAP)
+        # value equals the previous row's, and volume is unchanged (or
+        # missing).  Any *changed* intraday value or volume proves a real
+        # trade and keeps the row live.
+        #
+        # The old rule required every OHLC(VWAP) panel to be identical to the
+        # previous row, so a provider that forward-fills only `close` (leaving
+        # OHLC NaN) slipped through and booked a fake zero return followed by
+        # a compounded resume jump.
         stale = close.eq(close.shift(1)) & close.notna()
         for col in ("open", "high", "low", "vwap"):
             if col in df.columns:
                 panel = df[col].unstack("asset").reindex(
                     index=dates, columns=assets
                 )
-                stale &= panel.eq(panel.shift(1))
+                previous = panel.shift(1)
+                changed = panel.notna() & previous.notna() & panel.ne(previous)
+                stale &= ~changed
+
+        if "volume" in df.columns:
+            volume = df["volume"].unstack("asset").reindex(
+                index=dates, columns=assets
+            )
+            previous_volume = volume.shift(1)
+            volume_changed = (
+                volume.notna()
+                & previous_volume.notna()
+                & volume.ne(previous_volume)
+            )
+            stale &= ~volume_changed
         suspended |= stale
 
         if "volume" in df.columns:
@@ -535,27 +826,49 @@ class DataPipeline:
     def get_financials_as_of(self, as_of_date: pd.Timestamp) -> pd.DataFrame:
         """Get financial data available as of a given date (no look-ahead).
 
-        Only includes financials whose publish_date <= as_of_date.
-        For each asset, returns the most recently published record.
+        Only includes financials whose publish_date <= as_of_date, hides
+        pre-listing reports, and drops names already delisted as of the query
+        date.  For each asset, returns the most recently published record.
+
+        Point-in-time semantics require a ``publish_date`` column.  A panel
+        without one has no honest PIT basis, so this accessor raises
+        :class:`~quant_platform.data.schema.DataQualityError` instead of
+        returning the full panel as if it were safe (the old behaviour gave
+        false assurance for Tushare/Baostock/Postgres panels, which had no
+        publication timestamps).
 
         Args:
             as_of_date: The date to filter by (inclusive).
 
         Returns:
-            DataFrame with latest available financials per asset.
+            DataFrame with the latest available financials per asset.
+
+        Raises:
+            DataQualityError: when the provider supplies no ``publish_date``.
         """
-        if self.financials is None:
-            return pd.DataFrame()
+        empty = pd.DataFrame(
+            index=pd.MultiIndex.from_arrays([[], []], names=["date", "asset"])
+        )
+        if self.financials is None or self.financials.empty:
+            return empty
 
         if "publish_date" not in self.financials.columns:
-            # No publish_date column — use all data (legacy provider)
-            logger.warning("Financials missing publish_date — using all data (no PIT filter)")
-            return self.financials
+            raise DataQualityError(
+                f"{provider_label(self.provider)}: financials have no "
+                "'publish_date' column, so no point-in-time view exists. "
+                "Refusing to return the full panel as if it were PIT-safe; "
+                "fix the provider (map reports to their first trading day "
+                "on/after the announcement date) or query the raw panel "
+                "explicitly."
+            )
 
-        # Filter: only records whose publish_date <= as_of_date
-        available = self.financials[self.financials["publish_date"] <= as_of_date]
+        as_of_date = pd.Timestamp(as_of_date)
+        available = self.financials[
+            pd.to_datetime(self.financials["publish_date"], errors="coerce")
+            <= as_of_date
+        ]
         if available.empty:
-            return pd.DataFrame()
+            return empty
 
         # A company has no fundamentals before it lists; reports generated
         # for pre-listing periods (or carried over from a provider) must not
@@ -564,15 +877,31 @@ class DataPipeline:
             listing = pd.to_datetime(self.metadata["listing_date"], errors="coerce")
             listed_by_then = listing[listing <= as_of_date].index
             available = available[
-                available["asset"].isin(listed_by_then)
-                if "asset" in available.columns
-                else available.index.get_level_values("asset").isin(listed_by_then)
+                available.index.get_level_values("asset").isin(listed_by_then)
             ]
             if available.empty:
-                return pd.DataFrame()
+                return empty
+
+        # Delisted names have no tradable cross-section after their delisting
+        # date (provider-stated or inferred from a terminal gap).
+        if self._delisting_dates is not None:
+            delisting = pd.to_datetime(self._delisting_dates, errors="coerce")
+        elif self.metadata is not None and "delisting_date" in self.metadata.columns:
+            delisting = pd.to_datetime(self.metadata["delisting_date"], errors="coerce")
+        else:
+            delisting = None
+        if delisting is not None:
+            delisted_by_then = delisting[
+                delisting.notna() & (delisting <= as_of_date)
+            ].index
+            if len(delisted_by_then):
+                available = available[
+                    ~available.index.get_level_values("asset").isin(delisted_by_then)
+                ]
+                if available.empty:
+                    return empty
 
         # For each asset, take the record with the latest publish_date
-        # Reset index to work with date/asset columns
         available = available.reset_index()
         idx = available.groupby("asset")["publish_date"].idxmax()
         latest = available.loc[idx].set_index(["date", "asset"])
@@ -734,6 +1063,10 @@ class DataPipeline:
         # returns across the fill.
         self._suspended = self._derive_suspensions(df)
 
+        # adj_factor must be finite and > 0 wherever close exists; a zero
+        # factor used to produce inf close_adj and corrupt returns/limit flags.
+        self._repair_adj_factor(df)
+
         # Price adjustment
         df["close_adj"] = df["close"] / df["adj_factor"]
         df["open_adj"] = df["open"] / df["adj_factor"]
@@ -751,11 +1084,12 @@ class DataPipeline:
         change = change.mask(suspended | suspended.shift(1))
         limit_thresholds = pd.DataFrame(0.10, index=close.index, columns=close.columns)
         for col in close.columns:
-            code = str(col)
-            if code.startswith(("300", "301", "688", "689")):
-                limit_thresholds[col] = 0.20
-            elif code.startswith(("8", "4")):
-                limit_thresholds[col] = 0.30
+            # Board rule from the normalized six-digit code, so prefix-style
+            # symbols (`sz300001`, `sh.688001`) and Beijing codes
+            # (`4`/`8`/`920`) do not fall through to the 10% default.
+            threshold = price_limit_threshold(col)
+            if threshold != 0.10:
+                limit_thresholds[col] = threshold
         up = (change >= limit_thresholds - 1e-4) & change.notna()
         down = (change <= -limit_thresholds + 1e-4) & change.notna()
         df["is_limit_up"] = up.stack().reindex(df.index).fillna(False).astype(bool)
@@ -769,6 +1103,59 @@ class DataPipeline:
         )
 
         self.prices = df
+
+    def _repair_adj_factor(self, df: pd.DataFrame) -> None:
+        """Validate ``adj_factor`` and repair missing/invalid values.
+
+        Policy (documented in the module docstring): an invalid or missing
+        factor is forward-filled from the last valid factor of the same asset
+        with a WARNING and a count (``self.adj_factor_repairs``).  A factor
+        that cannot be repaired — no earlier valid value for that asset, e.g.
+        a zero on the asset's first priced day — raises
+        :class:`~quant_platform.data.schema.DataQualityError` naming the
+        provider and the offending keys.  Rows without a close do not need a
+        factor (``close_adj`` is NaN from the missing close itself), so an
+        irreparable factor there is left alone.
+        """
+        factor = df["adj_factor"].astype(float)
+        invalid = ~np.isfinite(factor) | (factor <= 0)
+        if not invalid.any():
+            return
+
+        close = df["close"]
+        needs_repair = invalid & close.notna()
+        if not needs_repair.any():
+            return
+
+        repaired = factor.mask(invalid).groupby(level="asset").ffill()
+        unrepairable = needs_repair & repaired.isna()
+        if unrepairable.any():
+            offending = unrepairable[unrepairable]
+            sample = [
+                f"{asset}@{str(date)[:10]}"
+                for date, asset in offending.index[:5]
+            ]
+            raise DataQualityError(
+                f"{provider_label(self.provider)}: adj_factor must be finite "
+                f"and > 0 wherever close is present; {len(offending)} row(s) "
+                "have no earlier valid factor to forward-fill from "
+                f"(e.g. {sample}). Fix the provider's adjustment-factor data."
+            )
+
+        repaired_count = int((needs_repair & repaired.notna()).sum())
+        if repaired_count:
+            repaired_keys = needs_repair & repaired.notna()
+            sample = [
+                f"{asset}@{str(date)[:10]}"
+                for date, asset in repaired_keys[repaired_keys].index[:5]
+            ]
+            self.adj_factor_repairs = repaired_count
+            logger.warning(
+                "adj_factor: repaired %d invalid/missing row(s) by "
+                "forward-filling the last valid factor per asset (e.g. %s)",
+                repaired_count, sample,
+            )
+        df["adj_factor"] = factor.where(~invalid, repaired)
 
     def _remove_long_suspensions(self, df: pd.DataFrame) -> pd.DataFrame:
         """Drop assets that never trade; keep history around long gaps.
@@ -881,10 +1268,24 @@ class DataPipeline:
                 benchmark = benchmark.sort_index().shift(-1)
             self.benchmark = benchmark.reindex(dates)
 
-        # Align financials
-        self.financials = self.financials[
-            self.financials.index.get_level_values("asset").isin(assets)
-        ]
+        # Align financials.  A provider may legitimately have no fundamentals
+        # (e.g. every Baostock query failed, or the source has no statements):
+        # give the empty frame the documented (date, asset) MultiIndex instead
+        # of calling get_level_values("asset") on a RangeIndex and killing the
+        # whole run.
+        if self.financials is None:
+            self.financials = pd.DataFrame(
+                index=pd.MultiIndex.from_arrays([[], []], names=["date", "asset"])
+            )
+        elif self.financials.empty:
+            self.financials = pd.DataFrame(
+                columns=self.financials.columns,
+                index=pd.MultiIndex.from_arrays([[], []], names=["date", "asset"]),
+            )
+        else:
+            self.financials = self.financials[
+                self.financials.index.get_level_values("asset").isin(assets)
+            ]
 
     # ------------------------------------------------------------------
     # Convenience accessors
@@ -934,6 +1335,54 @@ class DataPipeline:
         """
         return self.tradable_mask
 
+    def get_execution_gates(self) -> dict[str, pd.DataFrame]:
+        """Panels the backtest needs to block untradeable execution days.
+
+        A signal generated at the close of day *d* is filled at the close of
+        *d+1*. Checking ``tradable_mask`` only on *d* let the backtest buy at
+        a limit-up close, buy a suspended name, or sell at limit-down. The
+        engine accepts ``tradable_mask`` / ``limit_up`` / ``limit_down`` and
+        checks them on the execution date; this accessor is the wiring point.
+        Panels are date x asset and empty when the pipeline did not derive
+        them (the engine then treats every day as tradeable, as before).
+        """
+        gates: dict[str, pd.DataFrame] = {}
+        mask = self.tradable_mask
+        if mask is not None and not mask.empty:
+            gates["tradable_mask"] = mask
+        if self.prices is not None:
+            for name in ("is_limit_up", "is_limit_down"):
+                if name not in self.prices.columns:
+                    continue
+                panel = self.prices[name].unstack("asset").astype(bool)
+                gates["limit_up" if name == "is_limit_up" else "limit_down"] = panel
+        return gates
+
+    def get_factor_ohlc(self) -> dict[str, pd.DataFrame]:
+        """Adjusted open/high/low panels for factors that need them.
+
+        Candle factors used to receive no OHLC at all and silently returned
+        all-zero panels; they now declare ``required_inputs`` and refuse to
+        run without them. Rows a factor must not see (suspended or otherwise
+        ineligible) are blanked exactly like ``get_factor_prices()``.
+        """
+        panels: dict[str, pd.DataFrame] = {}
+        if self.prices is None:
+            return panels
+        for field in ("open", "high", "low"):
+            column = f"{field}_adj"
+            if column not in self.prices.columns:
+                continue
+            panel = self.prices[column].unstack("asset")
+            if self._suspended is not None and not self._suspended.empty:
+                panel = panel.mask(
+                    self._suspended.reindex(
+                        index=panel.index, columns=panel.columns, fill_value=False,
+                    )
+                )
+            panels[field] = panel
+        return panels
+
     def _blank_ineligible_rows(self, panel: pd.DataFrame) -> pd.DataFrame:
         """Blank hard-ineligible rows (ST, pre-listing, post-delisting).
 
@@ -969,7 +1418,23 @@ class DataPipeline:
         Blanked before listing, after delisting and while ST: a name has no
         meaningful market cap before it lists, and a fundamental cross-section
         must not include it there.
+
+        A provider with legitimately no fundamentals yields an all-NaN
+        date x asset panel (the documented empty shape) instead of a KeyError.
         """
+        if self.prices is not None and (
+            self.financials is None
+            or self.financials.empty
+            or "market_cap" not in self.financials.columns
+        ):
+            dates = pd.DatetimeIndex(
+                self.prices.index.get_level_values("date").unique()
+            ).sort_values()
+            assets = pd.Index(
+                self.prices.index.get_level_values("asset").unique(), name="asset"
+            )
+            return pd.DataFrame(np.nan, index=dates, columns=assets)
+
         return self._blank_ineligible_rows(
             self.financials["market_cap"].unstack("asset")
         )

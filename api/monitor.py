@@ -13,6 +13,8 @@ All endpoints aggregate existing module data into dashboard-ready JSON.
 
 from __future__ import annotations
 
+import threading
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -20,6 +22,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from quant_platform.utils.logging import get_logger
 
@@ -128,38 +131,60 @@ _core_bus = None
 _core_risk = None
 _run_results_cache: dict[str, Any] = {}
 
+# The getters run from the event loop *and* from `run_in_threadpool` workers.
+# `if x is None: x = ...` without a lock could construct two Stores (each
+# running DDL) or two risk monitors, leaking the first. Construction errors
+# used to be swallowed with `except Exception: pass`, which turned every
+# monitor panel into an unexplained empty payload.
+_singleton_lock = threading.Lock()
+
 
 def _get_store():
     global _core_store
-    if _core_store is None:
-        try:
-            from quant_platform.core.store import Store
-            _core_store = Store()
-        except Exception:
-            pass
-    return _core_store
+    instance = _core_store
+    if instance is None:
+        with _singleton_lock:
+            if _core_store is None:
+                try:
+                    from quant_platform.core.store import Store
+                    _core_store = Store()
+                except Exception:
+                    logger.exception("Monitor store construction failed")
+                    return None
+            instance = _core_store
+    return instance
 
 
 def _get_risk():
     global _core_risk
-    if _core_risk is None:
-        try:
-            from quant_platform.risk.circuit_breaker import get_risk_monitor
-            _core_risk = get_risk_monitor()
-        except Exception:
-            pass
-    return _core_risk
+    instance = _core_risk
+    if instance is None:
+        with _singleton_lock:
+            if _core_risk is None:
+                try:
+                    from quant_platform.risk.circuit_breaker import get_risk_monitor
+                    _core_risk = get_risk_monitor()
+                except Exception:
+                    logger.exception("Monitor risk-monitor lookup failed")
+                    return None
+            instance = _core_risk
+    return instance
 
 
 def _get_bus():
     global _core_bus
-    if _core_bus is None:
-        try:
-            from quant_platform.core.events import get_event_bus
-            _core_bus = get_event_bus()
-        except Exception:
-            pass
-    return _core_bus
+    instance = _core_bus
+    if instance is None:
+        with _singleton_lock:
+            if _core_bus is None:
+                try:
+                    from quant_platform.core.events import get_event_bus
+                    _core_bus = get_event_bus()
+                except Exception:
+                    logger.exception("Monitor event-bus lookup failed")
+                    return None
+            instance = _core_bus
+    return instance
 
 
 # ── Risk Overview ──
@@ -168,6 +193,13 @@ def _get_bus():
 @router.get("/risk-overview", response_model=RiskOverviewResponse)
 async def get_risk_overview():
     """Aggregate risk data: factor exposures, concentration, drawdown, VaR."""
+    # SQLite reads, pandas and the VaR computation are all blocking; run the
+    # whole aggregate in a worker thread so one dashboard poll cannot freeze
+    # every HTTP/WebSocket handler on the event loop.
+    return await run_in_threadpool(_compute_risk_overview)
+
+
+def _compute_risk_overview() -> RiskOverviewResponse:
     result = RiskOverviewResponse(available=False, risk_level="UNKNOWN")
     result.factor_exposures_reason = (
         "no Barra decomposition is cached for the live book; "
@@ -197,8 +229,10 @@ async def get_risk_overview():
                 for k, v in (status.get("limits") or {}).items()
             }
             result.available = True
-        except Exception as e:
-            result.reason = f"risk status unavailable: {e}"
+        except Exception:
+            # Short reason only; the traceback stays in the server log.
+            logger.exception("Risk overview: risk status read failed")
+            result.reason = "risk status unavailable"
 
     # Get positions from store for concentration analysis
     store = _get_store()
@@ -230,12 +264,12 @@ async def get_risk_overview():
                     result.var_95 = round(vs.get("historical_var", 0), 6)
                     result.cvar_95 = round(vs.get("historical_cvar", 0), 6)
                     result.volatility = round(float(returns.std() * np.sqrt(252)), 6)
-        except Exception as e:
-            logger.debug("Risk overview partial: %s", e)
+        except Exception:
+            logger.exception("Risk overview: positions/VaR computation failed")
             if result.available:
-                result.reason = f"positions/VaR unavailable: {e}"
+                result.reason = "positions/VaR unavailable"
             else:
-                result.reason = result.reason or f"risk data unavailable: {e}"
+                result.reason = result.reason or "risk data unavailable"
 
     return result
 
@@ -246,6 +280,10 @@ async def get_risk_overview():
 @router.get("/tca-summary", response_model=TCASummaryResponse)
 async def get_tca_summary():
     """Aggregate TCA data from recent trades."""
+    return await run_in_threadpool(_compute_tca_summary)
+
+
+def _compute_tca_summary() -> TCASummaryResponse:
     result = TCASummaryResponse()
     result.reason = "no trades recorded"
 
@@ -273,8 +311,8 @@ async def get_tca_summary():
             "cannot be computed; execution/tca.py needs quote data"
         )
 
-    except Exception as e:
-        logger.debug("TCA summary partial: %s", e)
+    except Exception:
+        logger.exception("TCA summary computation failed")
 
     return result
 
@@ -285,19 +323,15 @@ async def get_tca_summary():
 @router.get("/factor-status", response_model=FactorStatusResponse)
 async def get_factor_status():
     """Factor IC monitoring, attribution, and decay alerts."""
+    return await run_in_threadpool(_compute_factor_status)
+
+
+def _compute_factor_status() -> FactorStatusResponse:
     result = FactorStatusResponse()
     result.reason = (
         "no rolling IC series is cached; POST /api/ic-monitor/compute to "
         "compute factor statistics"
     )
-
-    # Try to get IC monitor data
-    try:
-        pass
-        # Check for disabled factors in the auto-decay system
-        # In production, this would be a shared instance
-    except Exception:
-        pass
 
     store = _get_store()
     if not store:
@@ -317,13 +351,12 @@ async def get_factor_status():
                         fv = json.loads(fv)
                     except Exception:
                         fv = {}
-                sig.get("strength", 0)
                 for factor_name, value in fv.items():
                     if isinstance(value, (int, float)):
                         factor_ics.setdefault(factor_name, []).append(float(value))
 
-    except Exception as e:
-        logger.debug("Factor status partial: %s", e)
+    except Exception:
+        logger.exception("Factor status computation failed")
 
     return result
 
@@ -334,6 +367,10 @@ async def get_factor_status():
 @router.get("/capacity-gauge", response_model=CapacityGaugeResponse)
 async def get_capacity_gauge():
     """Strategy capacity estimation and usage."""
+    return await run_in_threadpool(_compute_capacity_gauge)
+
+
+def _compute_capacity_gauge() -> CapacityGaugeResponse:
     result = CapacityGaugeResponse()
     result.reason = (
         "capacity curve is not precomputed; run the backtest capacity "
@@ -355,8 +392,8 @@ async def get_capacity_gauge():
         elif positions:
             result.current_aum = sum(p.get("market_value", 0) for p in positions)
 
-    except Exception as e:
-        logger.debug("Capacity gauge partial: %s", e)
+    except Exception:
+        logger.exception("Capacity gauge computation failed")
 
     return result
 
@@ -375,25 +412,34 @@ async def update_monitor_config(req: ConfigUpdateRequest):
     limits = {}
 
     try:
+        # Build the whole new limits object and swap it in with one attribute
+        # assignment. The previous per-field writes left a window in which an
+        # engine thread could observe a half-applied limit set (e.g. a new
+        # position cap with the old drawdown cap), and a failure midway left
+        # the monitor in that torn state.
+        changes: dict[str, Any] = {}
         if req.max_position_pct is not None:
             # The dataclass field is `max_single_position_pct`. Writing
             # `max_position_pct` used to succeed silently on the instance and
             # be read by nothing, so the endpoint reported success while the
             # enforced limit never moved.
-            risk.limits.max_single_position_pct = req.max_position_pct
+            changes["max_single_position_pct"] = req.max_position_pct
             updated.append("max_position_pct")
 
         if req.max_sector_pct is not None:
-            risk.limits.max_sector_pct = req.max_sector_pct
+            changes["max_sector_pct"] = req.max_sector_pct
             updated.append("max_sector_pct")
 
         if req.max_drawdown_pct is not None:
-            risk.limits.max_drawdown_pct = req.max_drawdown_pct
+            changes["max_drawdown_pct"] = req.max_drawdown_pct
             updated.append("max_drawdown_pct")
 
         if req.max_daily_loss_pct is not None:
-            risk.limits.max_daily_loss_pct = req.max_daily_loss_pct
+            changes["max_daily_loss_pct"] = req.max_daily_loss_pct
             updated.append("max_daily_loss_pct")
+
+        if changes:
+            risk.limits = replace(risk.limits, **changes)
 
         # Read back current limits
         status = risk.get_status()
@@ -408,7 +454,12 @@ async def update_monitor_config(req: ConfigUpdateRequest):
             }, source="monitor")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("Monitor config update failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Risk config update failed; see server logs",
+            headers={"X-Error-Code": "monitor_config_update_failed"},
+        ) from e
 
     return ConfigUpdateResponse(updated=updated, limits=limits)
 
@@ -442,7 +493,12 @@ async def monitor_kill_switch(req: KillSwitchRequest):
         return KillSwitchResponse(active=req.activate, message=msg)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("Monitor kill-switch update failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Kill switch update failed; see server logs",
+            headers={"X-Error-Code": "monitor_kill_switch_failed"},
+        ) from e
 
 
 # ── Helpers ──

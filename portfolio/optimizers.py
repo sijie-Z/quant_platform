@@ -16,6 +16,31 @@ from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Annualization convention for the mean-variance objective.
+#
+# The engine hands the optimizer a *daily* covariance matrix (estimated from
+# daily returns) and a rank alpha whose cross-section is scaled to [-0.5, 0.5]
+# by the alpha pipeline (cross-sectional percentile rank minus 0.5).  Mixing a
+# unitless rank with a daily variance makes the risk term ~1e-5 of the alpha
+# term, so at the configured risk_aversion=1 the "mean-variance" optimizer was
+# a constrained alpha ranking that pinned every name at the cap.
+#
+# The objective is now expressed in annual excess-return and annual-variance
+# units:
+#     maximise  ALPHA_ANNUAL_SCALE * (rank alpha)'w
+#               - risk_aversion * w' (252 * Sigma_daily) w
+# ``ALPHA_ANNUAL_SCALE = 0.04`` maps the full rank span [-0.5, 0.5] to
+# +/-2% expected annual excess return, a deliberately modest assumption for a
+# long-only A-share factor portfolio.  With that convention ``risk_aversion``
+# is the coefficient of annual variance (the standard 1/2*gamma convention
+# corresponds to gamma = 2 * risk_aversion); the YAML default of 1.0 is a
+# balanced trade-off.  Changing this constant changes the effective risk
+# aversion one-for-one; it is intentionally a module constant so tests and
+# research code can reference the documented convention.
+TRADING_DAYS_PER_YEAR = 252
+ALPHA_ANNUAL_SCALE = 0.04
+
+
 
 def _limit_turnover(
     weights: pd.Series,
@@ -156,8 +181,21 @@ class EqualWeightOptimizer(PortfolioOptimizer):
 class MeanVarianceOptimizer(PortfolioOptimizer):
     """Mean-variance optimization using cvxpy.
 
-    Maximize: w' * alpha - lambda * w' * Sigma * w
-    Subject to: sum(w) = 1, w >= 0, w <= max_weight, sector constraints.
+    .. math::
+
+        \\max_w \\; s \\, \\alpha' w - \\gamma \\, w' (252 \\Sigma_{daily}) w
+
+    where ``alpha`` is the rank signal in ``[-0.5, 0.5]``, ``s`` is
+    :data:`ALPHA_ANNUAL_SCALE` (0.04, i.e. the full rank span represents a
+    +/-2% annual excess return), ``Sigma_daily`` is the covariance of daily
+    returns supplied by the engine (the factor 252 annualizes it), and
+    ``gamma`` is ``constraints.risk_aversion``.  The risk aversion is therefore
+    expressed in annual-variance units: it equals the standard ``gamma / 2``
+    of the textbook ``mu'w - (gamma/2) w'Sigma w`` objective.  Do not pass an
+    already-annualized covariance matrix; it would be annualized twice.
+
+    Subject to: sum(w) = 1, long-only (unless ``long_only=False``, in which
+    case the solver bound is -0.1), w <= max_weight, sector constraints.
     """
 
     def optimize(
@@ -229,9 +267,14 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
         # Ensure positive semi-definite
         cov = _ensure_psd(cov)
 
+        # Annualize the daily covariance inside the objective and scale the
+        # rank alpha into annual-return units (see the class docstring and
+        # ALPHA_ANNUAL_SCALE). Then both terms are O(1-10%) at the configured
+        # risk_aversion, so doubling the covariance genuinely moves weights.
+        cov_annual = cov * TRADING_DAYS_PER_YEAR
         w = cp.Variable(n)
-        expected_return = alpha_vec @ w
-        risk = cp.quad_form(w, cov)
+        expected_return = ALPHA_ANNUAL_SCALE * (alpha_vec @ w)
+        risk = cp.quad_form(w, cov_annual)
         objective = cp.Maximize(expected_return - self.constraints.risk_aversion * risk)
 
         constraints_list = [
@@ -324,7 +367,11 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
                      used_solver, n, problem.status, w.value.min(), w.value.max())
 
         weights = pd.Series(w.value, index=assets)
-        weights = weights.clip(lower=0)
+        # Shorts are a supported configuration now: the old unconditional
+        # `clip(lower=0)` silently turned every long/short solve into a
+        # long-only book and renormalized away the solver's solution.
+        if self.constraints.long_only:
+            weights = weights.clip(lower=0)
         total = weights.sum()
         if total <= 1e-10:
             return self._equal_weight_fallback(
@@ -333,11 +380,18 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
             )
         weights = weights / total
 
-        # Volatility targeting: scale weights down if portfolio vol exceeds target
+        # Volatility targeting: scale weights down if portfolio vol exceeds
+        # the target. `target_volatility` is annualized while `cov` is daily,
+        # so the daily target is target/sqrt(252). Comparing the annual target
+        # directly with a daily vol made the constraint sqrt(252)x too loose
+        # (a 10-20% annual target never bound a ~1.5% daily-vol portfolio).
         if self.constraints.target_volatility > 0 and cov_matrix is not None:
-            port_vol = np.sqrt(weights[assets] @ cov @ weights[assets])
-            if port_vol > 1e-8:
-                scale = min(1.0, self.constraints.target_volatility / port_vol)
+            port_vol_daily = np.sqrt(weights[assets] @ cov @ weights[assets])
+            target_daily = self.constraints.target_volatility / np.sqrt(
+                TRADING_DAYS_PER_YEAR
+            )
+            if port_vol_daily > 1e-8:
+                scale = min(1.0, target_daily / port_vol_daily)
                 weights = weights * scale
                 # sum(weights) < 1 means remaining weight is cash (0% return)
 
@@ -353,8 +407,20 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
 class RiskParityOptimizer(PortfolioOptimizer):
     """Risk parity: equal risk contribution from each asset.
 
-    Assets contribute equally to portfolio risk.
-    Useful when alpha signal is weak or noisy.
+    Solves the Spinu (2013) log-barrier problem
+
+    .. math::
+
+        \\min_{v>0} \\; \\tfrac12 v' \\Sigma v - \\frac{1}{n}\\sum_i \\log v_i
+
+    without a budget constraint, then normalizes ``w = v / sum(v)``.  The
+    first-order condition ``v_i (Sigma v)_i = 1/n`` makes every asset's risk
+    contribution ``w_i (Sigma w)_i / (w' Sigma w)`` equal to ``1/n``, and the
+    normalized solution is invariant to multiplying ``Sigma`` by a constant.
+    Upper bounds enter in homogeneous form (``v_i <= cap * sum(v)``).  When a
+    covariance matrix is unavailable, or the cap is infeasible for the
+    selected universe, the optimizer falls back to equal weight and records
+    the reason in ``fallback_count`` / ``last_fallback_reason``.
     """
 
     def optimize(
@@ -393,30 +459,39 @@ class RiskParityOptimizer(PortfolioOptimizer):
         cov = _ensure_psd(cov)
 
         n = len(selected)
-        w = cp.Variable(n)
+        v = cp.Variable(n)
 
-        # Convex log-barrier risk-parity formulation:
-        #   min 0.5*w'*Sigma*w - (1/n)*sum(log(w))
-        #   s.t. sum(w)=1, 0 < w <= cap
-        # The old "minimise the variance of risk contributions" objective is
-        # not DCP (cvxpy raised DCPError), and it only tried ECOS, which is
-        # not installed -- so this optimizer silently always fell back to
-        # equal weight.
+        # Spinu (2013) log-barrier risk-parity formulation:
+        #   min 0.5*v'*Sigma*v - (1/n)*sum(log(v)),  v > 0
+        # with NO sum(v) == 1 constraint.  Under a budget constraint the KKT
+        # condition is v_i*(Sigma v)_i = 1/n - lambda*v_i with
+        # lambda = 1 - v'Sigma v ~ 1 for a covariance in daily units, so equal
+        # weights solve it: the old "risk parity" was an expensive equal-weight
+        # optimizer (risk-contribution spread 152% on the default config).
+        # Without the budget constraint lambda = 0 and v_i*(Sigma v)_i is
+        # equal for every i; normalizing v/sum(v) preserves the equal risk
+        # contributions and makes the solution invariant to the scale of
+        # Sigma.
+        #
+        # The per-name cap and sector caps are applied in homogeneous form
+        # (v_i <= cap*sum(v), sum_sector v <= cap*sum(v)).  They are invariant
+        # to the scaling of v, so they constrain the normalized portfolio
+        # exactly while keeping the problem convex.
         objective = cp.Minimize(
-            0.5 * cp.quad_form(w, cov) - cp.sum(cp.log(w)) / n
+            0.5 * cp.quad_form(v, cov) - cp.sum(cp.log(v)) / n
         )
-        constraints_list = [
-            cp.sum(w) == 1.0,
-            w >= 1e-6,
-            w <= self.constraints.max_weight,
-        ]
+        constraints_list = [v >= 1e-9]
+        if self.constraints.max_weight < 1.0:
+            constraints_list.append(
+                v <= self.constraints.max_weight * cp.sum(v)
+            )
         if sector_map is not None and self.constraints.max_sector_exposure < 1.0:
             sectors = sector_map.reindex(selected)
             for sector in sectors.dropna().unique():
                 mask = (sectors == sector).values.astype(float)
                 if mask.sum() > 0:
                     constraints_list.append(
-                        mask @ w <= self.constraints.max_sector_exposure
+                        mask @ v <= self.constraints.max_sector_exposure * cp.sum(v)
                     )
 
         solvers = [
@@ -432,14 +507,28 @@ class RiskParityOptimizer(PortfolioOptimizer):
         solved = False
         last_error = ""
         problem = None
+        # The log-barrier solution is only as precise as the solver tolerance.
+        # CLARABEL's defaults leave a ~1e-4 relative spread in the risk
+        # contributions; tighten the interior-point tolerances so the
+        # equal-risk-contribution identity holds to ~1e-10.
+        solver_kwargs = {
+            "CLARABEL": {
+                "tol_gap_abs": 1e-12, "tol_gap_rel": 1e-12, "tol_feas": 1e-12,
+            },
+            "ECOS": {"abstol": 1e-10, "reltol": 1e-10, "feastol": 1e-10},
+            "SCS": {"eps": 1e-9, "max_iters": 100_000},
+        }
         for solver in solvers:
             try:
                 problem = cp.Problem(objective, constraints_list)
-                problem.solve(solver=solver, verbose=False)
+                problem.solve(
+                    solver=solver, verbose=False,
+                    **solver_kwargs.get(solver, {}),
+                )
                 if (
                     problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
-                    and w.value is not None
-                    and np.all(np.isfinite(w.value))
+                    and v.value is not None
+                    and np.all(np.isfinite(v.value))
                 ):
                     solved = True
                     break
@@ -454,7 +543,7 @@ class RiskParityOptimizer(PortfolioOptimizer):
                 f"risk parity solver failed ({status}): {last_error or 'no optimal solution'}",
             )
 
-        weights = pd.Series(w.value, index=selected)
+        weights = pd.Series(v.value, index=selected)
         weights = weights.clip(lower=0)
         total = weights.sum()
         if total <= 1e-10:
@@ -463,6 +552,15 @@ class RiskParityOptimizer(PortfolioOptimizer):
                 "risk parity returned an all-zero portfolio",
             )
         weights = weights / total
+        if weights.max() > self.constraints.max_weight + 1e-4:
+            # Only reachable when the cap is infeasible for the selected
+            # universe (n * max_weight < 1); equal weight respects the cap by
+            # construction because it selects at most 1/max_weight names.
+            return self._equal_weight_fallback(
+                signal, cov_matrix, prices, prev_weights, sector_map,
+                "risk parity weights exceed max_weight "
+                f"({weights.max():.4f} > {self.constraints.max_weight})",
+            )
         weights = weights.reindex(signal.index, fill_value=0.0)
         return _limit_turnover(
             weights, prev_weights, self.constraints.max_turnover, signal.index,

@@ -29,6 +29,40 @@ class PortfolioConstraints:
     target_volatility: float = 0.0  # Annualized target vol, 0 = disabled
     asset_universe: object | None = None  # AssetUniverse, avoid circular import
 
+    def __post_init__(self) -> None:
+        """Reject constraints that would crash or silently change meaning.
+
+        ``EqualWeightOptimizer`` used to compute ``int(1.0 / max_weight)`` and
+        raised a bare ``ZeroDivisionError`` for ``max_weight=0`` (negative
+        values produced a negative candidate count). Validating the dataclass
+        means every optimizer rejects invalid bounds at construction instead
+        of at an arbitrary later point.
+        """
+        if not (0.0 < float(self.max_weight) <= 1.0):
+            raise ValueError(
+                f"max_weight must be in (0, 1], got {self.max_weight!r}"
+            )
+        if not (0.0 < float(self.max_sector_exposure) <= 1.0):
+            raise ValueError(
+                "max_sector_exposure must be in (0, 1], got "
+                f"{self.max_sector_exposure!r}"
+            )
+        if not (0.0 < float(self.max_turnover) <= 1.0):
+            raise ValueError(
+                f"max_turnover must be in (0, 1], got {self.max_turnover!r}"
+            )
+        if int(self.lot_size) < 1:
+            raise ValueError(f"lot_size must be >= 1, got {self.lot_size!r}")
+        if not (float(self.risk_aversion) > 0.0):
+            raise ValueError(
+                f"risk_aversion must be > 0, got {self.risk_aversion!r}"
+            )
+        if float(self.target_volatility) < 0.0:
+            raise ValueError(
+                "target_volatility must be >= 0 (annualized), got "
+                f"{self.target_volatility!r}"
+            )
+
     def get_lot_size(self, symbol: str) -> int:
         """Get lot size for a specific symbol.
 

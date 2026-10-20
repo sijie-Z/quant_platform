@@ -37,11 +37,17 @@ def factor_attribution(
     model = LinearRegression()
     model.fit(X, y)
 
-    # Standard errors
+    # Standard errors. The model includes an intercept (sklearn
+    # LinearRegression), so the slope covariance is
+    # sigma2 * inv(Xc'Xc) on the *centered* regressors. Using inv(X'X) on the
+    # raw regressors attributed the intercept's uncertainty to the slopes and
+    # inflated the t-stat of any factor with a nonzero mean (a market/carry
+    # factor with mean 0.0099 and sd 0.002 reported t=47 instead of t=8.5).
     residuals = y - model.predict(X)
     n, k = X.shape
     sigma2 = (residuals ** 2).sum() / (n - k - 1)
-    XtX_inv = np.linalg.inv(X.T @ X)
+    X_centered = X - X.mean(axis=0)
+    XtX_inv = np.linalg.inv(X_centered.T @ X_centered)
     se = np.sqrt(sigma2 * np.diag(XtX_inv))
 
     t_stats = model.coef_ / se

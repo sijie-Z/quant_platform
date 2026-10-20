@@ -249,3 +249,330 @@ def test_ml_signal_exits_nonzero_on_an_empty_signal(monkeypatch, capsys):
 
     assert cli.cmd_ml(_ml_args("signal")) == 1
     assert "ML signal is empty" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# CLI lifecycle (S14)
+# ---------------------------------------------------------------------------
+
+def test_cache_and_config_require_a_subcommand(monkeypatch):
+    """`cache`/`config` with no subcommand used to exit 0 doing nothing."""
+    for argv in (["main.py", "cache"], ["main.py", "config"]):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main()
+        assert exc_info.value.code == 2
+
+
+def test_cache_dir_is_accepted_after_the_subcommand(monkeypatch, tmp_path):
+    """`cache clear --cache-dir X` was rejected (option was parent-only)."""
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(sys, "argv", [
+        "main.py", "cache", "clear", "--cache-dir", str(cache_dir),
+    ])
+
+    assert cli.main() == 0
+    assert cache_dir.exists()
+
+
+def test_cache_prune_subcommand_runs(monkeypatch, tmp_path):
+    from quant_platform.utils.cache import PipelineCache
+
+    cache_dir = tmp_path / "cache"
+    PipelineCache(cache_dir).save_stage("data", "k", {"v": 1})
+
+    monkeypatch.setattr(sys, "argv", [
+        "main.py", "cache", "prune", "--cache-dir", str(cache_dir),
+        "--max-entries", "1",
+    ])
+    assert cli.main() == 0
+
+
+def test_missing_config_prints_a_message_not_a_traceback(
+    monkeypatch, capsys, tmp_path,
+):
+    """A missing config printed a full traceback and exit 1."""
+    monkeypatch.setattr(sys, "argv", [
+        "main.py", "run", "--config", str(tmp_path / "missing.yaml"),
+    ])
+
+    assert cli.main() == 1
+    captured = capsys.readouterr()
+    assert "Error:" in captured.err
+    assert "not found" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_invalid_config_prints_an_actionable_error(monkeypatch, capsys, tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("universe:\n  n_stocks: -5\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "main.py", "run", "--config", str(bad), "--no-cache",
+    ])
+
+    assert cli.main() == 1
+    err = capsys.readouterr().err
+    assert "Config error" in err
+    assert "n_stocks" in err
+    assert "Traceback" not in err
+
+
+def test_trade_days_zero_is_a_usage_error(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py", "trade", "--days", "0"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 2
+
+
+def test_trade_parser_accepts_qmt_live(monkeypatch):
+    seen = {}
+
+    def fake_cmd_trade(args):
+        seen["broker"] = args.broker
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_trade", fake_cmd_trade)
+    monkeypatch.setattr(sys, "argv", [
+        "main.py", "trade", "--broker", "qmt_live", "--days", "1",
+    ])
+
+    assert cli.main() == 0
+    assert seen["broker"] == "qmt_live"
+
+
+def _trade_args(**overrides):
+    args = SimpleNamespace(
+        broker="qmt", days=1, universe="600519", cash=10_000_000,
+        no_dual_track=True, seed=42, config=None,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _session_report(**overrides):
+    from quant_platform.trading.live_runner import SessionReport
+
+    values = dict(
+        session_id="s1", start_date="2026-01-01", end_date="2026-01-01",
+        days_traded=1, total_orders=3, total_fills=0, initial_capital=1.0,
+        final_value=1.0, total_return_pct=0.0, annualized_return_pct=0.0,
+        sharpe_ratio=0.0, max_drawdown_pct=0.0, avg_daily_volume=0.0,
+        broker_type="qmt", status="failed",
+    )
+    values.update(overrides)
+    return SessionReport(**values)
+
+
+def test_cmd_trade_fails_when_nothing_fills(monkeypatch, capsys):
+    """S5: a session where every order was rejected still exited 0."""
+    import quant_platform.trading.live_runner as lr
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def set_universe(self, codes):
+            pass
+
+        def run(self, days, seed):
+            return _session_report()
+
+    monkeypatch.setattr(lr, "LiveRunner", FakeRunner)
+
+    assert cli.cmd_trade(_trade_args()) == 1
+    assert "no orders filled" in capsys.readouterr().err
+
+
+def test_cmd_trade_fails_closed_when_the_broker_cannot_connect(
+    monkeypatch, capsys,
+):
+    import quant_platform.trading.live_runner as lr
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            raise RuntimeError("Broker 'qmt' failed to connect")
+
+    monkeypatch.setattr(lr, "LiveRunner", FakeRunner)
+
+    assert cli.cmd_trade(_trade_args()) == 1
+    assert "failed to connect" in capsys.readouterr().err
+
+
+def test_cmd_trade_rejects_non_positive_days(capsys):
+    assert cli.cmd_trade(_trade_args(days=0)) == 2
+    assert "days" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Data provenance (S8)
+# ---------------------------------------------------------------------------
+
+def test_load_data_fails_closed_when_a_real_provider_is_unavailable(monkeypatch):
+    import quant_platform.data.providers.baostock_provider as baostock_module
+    from quant_platform.utils.config import load_config
+
+    def unavailable():
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr(baostock_module, "BaostockDataProvider", unavailable)
+    config = load_config(raw={
+        "universe": {"n_stocks": 5},
+        "data": {"provider": "baostock"},
+    })
+
+    with pytest.raises(cli.DataProviderUnavailableError) as exc_info:
+        cli._load_data(config)
+
+    message = str(exc_info.value)
+    assert "baostock" in message
+    assert "--allow-synthetic-fallback" in message
+
+
+def test_load_data_allows_explicit_fallback_and_records_provenance(monkeypatch):
+    import quant_platform.data.pipeline as pipeline_module
+    import quant_platform.data.providers.baostock_provider as baostock_module
+    import quant_platform.data.providers.synthetic as synthetic_module
+    from quant_platform.utils.config import load_config
+
+    def unavailable():
+        raise RuntimeError("no network")
+
+    class FakeSynthetic:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakePipeline:
+        def __init__(self, **kwargs):
+            self.metadata = None
+            self.returns = None
+            self.benchmark = None
+            self.financials = None
+
+        def run(self):
+            pass
+
+        def get_factor_prices(self):
+            return pd.DataFrame(
+                {"A": [1.0]}, index=pd.DatetimeIndex(["2021-03-31"]),
+            )
+
+        def get_turnover(self):
+            return None
+
+        def get_sector_panel(self):
+            return None
+
+        def has_industry_history(self):
+            return False
+
+    monkeypatch.setattr(baostock_module, "BaostockDataProvider", unavailable)
+    monkeypatch.setattr(synthetic_module, "SyntheticDataProvider", FakeSynthetic)
+    monkeypatch.setattr(pipeline_module, "DataPipeline", FakePipeline)
+    config = load_config(raw={
+        "universe": {"n_stocks": 3},
+        "data": {
+            "provider": "baostock",
+            "allow_synthetic_fallback": True,
+            "start_date": "2021-01-01",
+            "end_date": "2021-03-31",
+        },
+    })
+
+    cli._load_data(config)
+
+    assert cli._LAST_DATA_PROVIDER == "synthetic"
+    provenance = cli._LAST_DATA_PROVENANCE
+    assert provenance["requested_provider"] == "baostock"
+    assert provenance["effective_provider"] == "synthetic"
+    assert provenance["synthetic"] is True
+    assert provenance["data_date"] == "2021-03-31"
+
+
+def test_run_artifacts_record_provenance(tmp_path):
+    """metrics.json and the HTML report must carry the data provenance."""
+    provenance = {
+        "requested_provider": "tushare",
+        "effective_provider": "synthetic",
+        "synthetic": True,
+        "start_date": "2021-01-01",
+        "end_date": "2025-12-31",
+        "data_date": "2025-12-31",
+    }
+    html_path, metrics_path = cli._write_run_artifacts(
+        _fake_results(), _fake_ic_results(), None,
+        _fake_config(tmp_path), provenance=provenance,
+    )
+
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert metrics["provenance"] == provenance
+    html = html_path.read_text(encoding="utf-8")
+    assert "SYNTHETIC" in html
+    assert "tushare" in html
+
+
+# ---------------------------------------------------------------------------
+# Per-run artifacts (S15)
+# ---------------------------------------------------------------------------
+
+def test_run_directories_and_publication_are_consistent(tmp_path):
+    """Two concurrent runs write separate dirs; top-level copies always come
+    from exactly one complete run (never a mix)."""
+    import threading
+
+    from quant_platform.reporting.dashboard import (
+        create_run_dir,
+        publish_run_artifacts,
+        read_manifest,
+        resolve_run_dir,
+        write_manifest,
+    )
+
+    runs = []
+    for tag in ("a", "b"):
+        run_dir = create_run_dir(tmp_path, tag, "cafebabe")
+        (run_dir / "daily_returns.csv").write_text(tag, encoding="utf-8")
+        manifest = {"run_id": tag, "artifacts": ["daily_returns.csv"]}
+        write_manifest(run_dir, manifest)
+        runs.append((tag, run_dir, manifest))
+
+    def publish(item):
+        _tag, run_dir, manifest = item
+        publish_run_artifacts(tmp_path, run_dir, manifest)
+
+    threads = [threading.Thread(target=publish, args=(item,)) for item in runs]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    content = (tmp_path / "daily_returns.csv").read_text(encoding="utf-8")
+    pointer = json.loads(
+        (tmp_path / "latest_manifest.json").read_text(encoding="utf-8")
+    )
+    pointed_dir = tmp_path / pointer["run_dir"]
+    pointed_tag = read_manifest(pointed_dir)["run_id"]
+    # The pointer and the top-level copy describe the same run.
+    assert content == pointed_tag
+    assert resolve_run_dir(tmp_path) == pointed_dir
+
+
+def test_analyze_reads_the_run_manifest(tmp_path, capsys):
+    from quant_platform.reporting.dashboard import create_run_dir, write_manifest
+
+    run_dir = create_run_dir(tmp_path, "run1", "deadbeef")
+    rng = np.random.default_rng(11)
+    index = pd.bdate_range("2024-01-01", periods=60)
+    pd.Series(rng.normal(0, 0.01, 60), index=index).to_csv(
+        run_dir / "daily_returns.csv",
+    )
+    write_manifest(run_dir, {"run_id": "run1", "artifacts": []})
+
+    args = SimpleNamespace(results_dir=str(tmp_path))
+    assert cli.cmd_analyze(args) == 0
+
+    out = capsys.readouterr().out
+    assert "Analyzing run" in out
+    assert run_dir.name in out

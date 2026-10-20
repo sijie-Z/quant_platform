@@ -324,15 +324,20 @@ class TestP2DelistingIsEnforced:
         assert not mask.loc[after, self.ASSET].any()
 
     def test_delisting_is_inferred_when_the_provider_stops_pricing(self):
-        """No delisting_date metadata: a terminal price gap is a delisting.
+        """No delisting_date metadata: a terminal price gap can be a delisting.
 
-        Only a gap longer than ``max_suspension_days`` qualifies, so an
-        ordinary long suspension is not reclassified.
+        Justification for the change: inference now uses
+        ``delisting_gap_days``, a threshold deliberately separate from
+        ``max_suspension_days`` (D31).  This sample's terminal gap is 39
+        sessions; the default 60-session threshold would classify it as an
+        end-of-sample suspension (see the companion test below), so this test
+        opts into a 35-session inference threshold explicitly.  The
+        provider-stated delisting_date path is unchanged and covered above.
         """
         close = _random_close(seed=9)
         close.loc[close.index >= DATES[20], self.ASSET] = np.nan
         provider = FixedProvider(close)  # no delisting_date in metadata
-        pipe = _run_pipeline(provider, exclude_st=False)
+        pipe = _run_pipeline(provider, exclude_st=False, delisting_gap_days=35)
 
         after = DATES[DATES[20] <= DATES]
         assert not pipe.get_tradable_mask().loc[after, self.ASSET].any()
@@ -342,6 +347,26 @@ class TestP2DelistingIsEnforced:
 
         signal = _generate_signal({"momentum_1m": momentum}, pipe.returns, pipe.get_factor_prices())
         assert signal.loc[after, self.ASSET].isna().all()
+
+    def test_end_of_sample_suspension_is_not_inferred_as_delisting(self):
+        """A terminal gap shorter than delisting_gap_days stays a suspension.
+
+        Same 39-session gap as above but with the default thresholds
+        (``max_suspension_days`` 30, ``delisting_gap_days`` 60): the gap
+        exceeds the suspension limit but not the delisting threshold, so the
+        asset must not be silently reclassified as delisted (D31).
+        """
+        close = _random_close(seed=9)
+        close.loc[close.index >= DATES[20], self.ASSET] = np.nan
+        pipe = _run_pipeline(FixedProvider(close), exclude_st=False)
+
+        assert self.ASSET not in pipe._inferred_delistings
+        assert pd.isna(pipe._delisting_dates[self.ASSET])
+        # The missing rows are still untradable — as a suspension, via the
+        # close-is-missing rule — so the distinction is semantic, not a
+        # tradability loophole.
+        after = DATES[DATES[20] <= DATES]
+        assert not pipe.get_tradable_mask().loc[after, self.ASSET].any()
 
 
 class TestP3SuspensionBlocksNewWeights:

@@ -6,11 +6,23 @@
   - 异常自恢复
   - 日终对账
   - 日志轮转
+
+State handling (issue S18):
+  - ``last_run_date`` is persisted next to the Store database in
+    ``daemon_state.json``, so a process restart does not re-pull the same
+    exchange day.
+  - Every exchange day after the engine snapshot's ``last_processed_date`` is
+    replayed (bounded by ``MAX_CATCHUP_DAYS``) so downtime does not leave
+    silent gaps.
+  - All scheduling uses the Asia/Shanghai exchange clock, independent of the
+    host time zone; ``QUANT_DAILY_RUN_HOUR`` overrides the 16:00 run hour.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import sys
 import time
 import traceback
@@ -19,7 +31,6 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import pandas as pd
 from quant_platform.core.exchange_calendar import is_trading_day
 from quant_platform.core.store import Store
 from quant_platform.data.pipeline import DataPipeline
@@ -29,19 +40,24 @@ from quant_platform.trading.live_engine import LiveEngine
 
 logger = logging.getLogger(__name__)
 
-DAYS_OPEN = [0, 1, 2, 3, 4]  # Mon-Fri
-RUN_HOUR = 16  # 16:00 daily (market close), Asia/Shanghai
+RUN_HOUR = max(0, min(23, int(os.environ.get("QUANT_DAILY_RUN_HOUR", "16"))))
 MAX_RESTARTS = 3
 RESTART_WINDOW_HOURS = 24
+#: Upper bound on replayed exchange days after downtime.
+MAX_CATCHUP_DAYS = max(1, int(os.environ.get("QUANT_DAEMON_MAX_CATCHUP_DAYS", "10")))
+
+_STATE_FILENAME = "daemon_state.json"
 
 
 class Daemon:
     """系统守护进程."""
 
     def __init__(self, store: Store | None = None,
-                 strategy_id: str = "live_engine_alpha_v1"):
+                 strategy_id: str = "live_engine_alpha_v1",
+                 state_path: str | Path | None = None,
+                 run_hour: int | None = None):
         self.restart_count = 0
-        self.last_restart = None
+        self.last_restart: datetime | None = None
         self.safety = SafetySystem(SafetyLimits(
             max_drawdown=0.30,
             max_daily_loss=0.05,
@@ -50,7 +66,6 @@ class Daemon:
             min_cash_reserve=10_000,
         ))
         self.engine: LiveEngine | None = None
-        self.last_run_date: str = ""
         # Runtime state lives in the shared Store, so a restart (and a
         # separate process invocation) continues from the last committed day
         # instead of resetting cash to 10M and positions to empty.
@@ -59,32 +74,83 @@ class Daemon:
         # The daemon runs in a container that is usually UTC; 16:00 must be
         # 16:00 in Shanghai.
         self._tz = ZoneInfo("Asia/Shanghai")
+        self._run_hour = RUN_HOUR if run_hour is None else int(run_hour)
+        if state_path is None:
+            db_path = Path(getattr(self.store, "_db_path", "data/trading.db"))
+            state_path = db_path.parent / _STATE_FILENAME
+        self._state_path = Path(state_path)
+        # The watermark survives restarts; the old in-memory value re-ran the
+        # same day's data pull after every crash.
+        self.last_run_date: str = str(
+            self._load_state().get("last_run_date", "") or ""
+        )
+
+    # ── Persisted watermark ──
+
+    def _load_state(self) -> dict:
+        try:
+            with open(self._state_path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Daemon state file unreadable (%s); starting empty", exc)
+            return {}
+
+    def _save_state(self) -> None:
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_run_date": self.last_run_date,
+            "saved_at": datetime.now(self._tz).isoformat(),
+        }
+        tmp = self._state_path.with_name(f"{self._state_path.name}.tmp.{os.getpid()}")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._state_path)
+        except OSError as exc:
+            logger.critical("ALERT: failed to persist daemon state: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def should_run_today(self) -> bool:
         """今天是否应该运行."""
         now = datetime.now(self._tz)
         if not is_trading_day(now.date()):
             return False
-        if now.hour < RUN_HOUR:
+        if now.hour < self._run_hour:
             return False
         today = now.strftime("%Y-%m-%d")
         return today != self.last_run_date
 
     def run_once(self) -> dict[str, Any]:
-        """执行一次完整日流程."""
-        result: dict[str, Any] = {"status": "ok", "alerts": []}
+        """执行一次完整日流程 (含停机期间的补跑)."""
+        result: dict[str, Any] = {"status": "ok", "alerts": [], "days_processed": 0}
 
         # 1. 加载数据
         try:
             provider = BaostockDataProvider(cache_enabled=True)
             pipeline = DataPipeline(provider=provider,
                                      start_date="2018-01-01",
-                                     end_date=datetime.now().strftime("%Y-%m-%d"),
+                                     end_date=datetime.now(self._tz).strftime("%Y-%m-%d"),
                                      exclude_st=True, exclude_suspended=True)
             pipeline.run()
         except Exception as e:
+            # A daily data failure is an operational alert, not a debug line.
+            logger.error("ALERT: daily data load failed: %s", e)
             result["status"] = "data_failed"
             result["alerts"].append(f"Data load failed: {e}")
+            return result
+
+        if pipeline.returns is None or len(pipeline.returns.index) == 0:
+            logger.error("ALERT: data pipeline returned an empty panel")
+            result["status"] = "data_failed"
+            result["alerts"].append("Data pipeline returned an empty panel")
             return result
 
         # 2. 恢复持久化状态并运行策略
@@ -124,27 +190,60 @@ class Daemon:
             result["status"] = "killed"
             return result
 
-        last_date = pipeline.returns.index[-1]
+        # 3. Replay every exchange day since the persisted watermark.
+        pending = self._pending_days(pipeline.returns.index, snapshot)
+        if len(pending) == 0:
+            # Nothing new since the watermark: a successful no-op invocation.
+            # Still consume the day so run_forever does not re-pull the data
+            # every interval when only the engine snapshot knows the date.
+            logger.info("No unprocessed exchange days since the watermark")
+            self.last_run_date = datetime.now(self._tz).strftime("%Y-%m-%d")
+            self._save_state()
+            return result
+        if len(pending) > MAX_CATCHUP_DAYS:
+            logger.warning(
+                "ALERT: %d unprocessed exchange days; catching up the last %d only",
+                len(pending), MAX_CATCHUP_DAYS,
+            )
+            result["alerts"].append(
+                f"Catch-up bounded to {MAX_CATCHUP_DAYS} of {len(pending)} pending day(s)"
+            )
+            pending = pending[-MAX_CATCHUP_DAYS:]
+
         try:
-            self.engine.run_once(last_date)
+            for day in pending:
+                before = (
+                    previous_equity
+                    if previous_equity is not None
+                    else self.engine.state.current_equity
+                )
+                self.engine.run_once(day)
+                result["days_processed"] += 1
 
-            # 3. 安全检查
-            equity = self.engine.state.current_equity
-            peak = self.engine.state.equity_peak
-            cash = self.engine.state.cash
-            # Daily P&L now has real data; it used to be hard-coded 0, which
-            # made the daily-loss breaker unable to fire.
-            daily_pnl = equity - previous_equity if previous_equity is not None else 0.0
+                # 4. 安全检查 (per replayed day)
+                equity = self.engine.state.current_equity
+                peak = self.engine.state.equity_peak
+                cash = self.engine.state.cash
+                daily_pnl = equity - before if before else 0.0
+                previous_equity = equity
 
-            checks = self.safety.check_all(equity, peak, cash, daily_pnl, {})
-            failed = [c for c in checks if not c.passed]
-            if failed:
-                result["alerts"].extend(f"{c.name}: {c.message}" for c in failed)
-                if self.safety.kill_switch_triggered:
-                    result["status"] = "killed"
-                    self.engine._emergency_flat(last_date)
+                checks = self.safety.check_all(equity, peak, cash, daily_pnl, {})
+                failed = [c for c in checks if not c.passed]
+                if failed:
+                    for check in failed:
+                        logger.error(
+                            "ALERT: safety check failed [%s]: %s",
+                            check.name, check.message,
+                        )
+                    result["alerts"].extend(
+                        f"{c.name}: {c.message}" for c in failed
+                    )
+                    if self.safety.kill_switch_triggered:
+                        result["status"] = "killed"
+                        self.engine._emergency_flat(day)
+                        break
         finally:
-            # 4. 持久化：无论成功、异常还是熔断都要落盘。快照包含
+            # 5. 持久化：无论成功、异常还是熔断都要落盘。快照包含
             #    last_processed_date，因此重启后不会重复执行同一天。
             snapshot = self.engine.to_snapshot()
             snapshot["safety"] = {
@@ -161,12 +260,28 @@ class Daemon:
                 result["status"] = "state_save_failed"
                 result["alerts"].append("Failed to persist engine state")
 
-        self.last_run_date = datetime.now().strftime("%Y-%m-%d")
+        self.last_run_date = datetime.now(self._tz).strftime("%Y-%m-%d")
+        self._save_state()
         logger.info(
-            "Run complete: equity=%.2f alerts=%d",
-            self.engine.state.current_equity, len(result["alerts"]),
+            "Run complete: days=%d equity=%.2f alerts=%d",
+            result["days_processed"], self.engine.state.current_equity,
+            len(result["alerts"]),
         )
         return result
+
+    def _pending_days(self, index, snapshot: dict | None) -> list:
+        """Exchange days after the engine's last processed date.
+
+        With no snapshot (first run) only the latest session is processed:
+        replaying the full 2018+ history on first boot would be a very
+        expensive surprise.
+        """
+        last_processed = ""
+        if snapshot is not None:
+            last_processed = str(snapshot.get("last_processed_date") or "")[:10]
+        if not last_processed:
+            return list(index[-1:])
+        return [day for day in index if str(day)[:10] > last_processed]
 
     def run_forever(self, interval_seconds: int = 3600):
         """持续运行."""
@@ -193,24 +308,29 @@ class Daemon:
                 self._handle_crash()
 
     def _handle_crash(self):
-        """崩溃恢复."""
+        """崩溃恢复 (restart budget scoped to RESTART_WINDOW_HOURS)."""
+        now = datetime.now(self._tz)
+        if (
+            self.last_restart is not None
+            and now - self.last_restart > timedelta(hours=RESTART_WINDOW_HOURS)
+        ):
+            # The old count was never reset by time, so three crashes spread
+            # over months still terminated the daemon.
+            self.restart_count = 0
         self.restart_count += 1
-        self.last_restart = datetime.now()
+        self.last_restart = now
         if self.restart_count > MAX_RESTARTS:
-            logger.critical("Too many restarts. Giving up.")
+            logger.critical("Too many restarts in %dh. Giving up.", RESTART_WINDOW_HOURS)
             sys.exit(1)
         logger.info("Restarting in 60s (attempt %d/%d)", self.restart_count, MAX_RESTARTS)
         time.sleep(60)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(name)s | %(message)s",
-        handlers=[
-            logging.FileHandler("results/daemon.log", encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
+    from quant_platform.utils.logging import setup_logging
+
+    # Rotating file handler: an unattended daemon must not grow one log file
+    # without bound.
+    setup_logging(log_file="results/daemon.log")
     daemon = Daemon()
     daemon.run_forever(interval_seconds=3600)

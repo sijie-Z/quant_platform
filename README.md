@@ -222,6 +222,23 @@ quant_platform/
 | QMT 实盘需环境 | 需券商 miniQMT + xtquant 包 + 实盘账号 |
 | Level 2 数据 | 仅回放/模拟，无真实券商 L2 接入 |
 | 生产存储 | 默认 SQLite；生产环境建议切换 PostgreSQL（docker-compose 已包含） |
+| **仅支持单进程部署** | 见下方"部署约束：单 worker" |
+
+### 部署约束：单 worker
+
+运行注册表（run registry）、2 路 pipeline 并发上限、实盘引擎句柄、Kill Switch、
+OMS 账本和 WebSocket 客户端集合**全部是进程内状态**。因此必须以**单个 uvicorn
+worker** 运行：不要给 `uvicorn` / `main.py web` 加 `--workers N` 或 `--reload`
+（`--reload` 也会启动额外进程）。多 worker 会导致：
+
+- `POST /api/run` 的状态/结果在其它 worker 上 404；
+- 并发上限变成 N×2，两个 worker 可能同时启动实盘引擎（同一 broker 上重复下单）；
+- Kill Switch 只作用于收到请求的那个 worker；
+- WebSocket 客户端分散在不同 worker，事件只推送给其中一部分；
+- 多个进程独立写同一个 SQLite 文件（各自持有进程内锁，写入互不知情）。
+
+正确做法：单 worker 部署；如需横向扩展，先把上述状态外置到 Redis/数据库
+（本阶段未实现，仅在此记录约束）。
 
 ---
 

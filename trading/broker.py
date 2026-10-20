@@ -711,8 +711,9 @@ class QMTBroker(BrokerInterface):
         LiveRunner ─> QMTBroker ──TCP──> miniQMT/client ──> 国金券商
                          │
                          ├── _xt_trader (order_stock / cancel / query)
+                         ├── xtdata.get_full_tick (fresh quotes for live runs)
                          ├── Callback → update Order objects → EventBus
-                         └── Fallback → SimulatedBroker on connection failure
+                         └── connect() == False → hard failure (no simulated fallback)
 
     Supported brokers: 国金证券, 华鑫证券, 国盛证券, 东方财富 etc.
     """
@@ -1086,6 +1087,43 @@ class QMTBroker(BrokerInterface):
         }
 
     # ── Internals ──
+
+    def get_quotes(self, codes: list[str]) -> dict[str, float]:
+        """Fetch fresh last prices for ``codes`` from QMT market data.
+
+        This is the quote feed a live run must use. Returns an empty mapping
+        when xtdata is unavailable or the query fails -- the caller must treat
+        that as "no fresh quote" and skip the cycle rather than inventing a
+        price.
+        """
+        if not codes:
+            return {}
+        try:
+            from xtquant import xtdata
+
+            from quant_platform.trading.qmt_utils import to_qmt_code
+
+            qmt_codes = [to_qmt_code(code) for code in codes]
+            ticks = xtdata.get_full_tick(qmt_codes) or {}
+            prices: dict[str, float] = {}
+            for original, qmt_code in zip(codes, qmt_codes, strict=False):
+                tick = ticks.get(qmt_code)
+                if not tick:
+                    continue
+                raw_price = (
+                    tick.get("lastPrice") if isinstance(tick, dict)
+                    else getattr(tick, "lastPrice", None)
+                )
+                try:
+                    price = float(raw_price)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    prices[original] = price
+            return prices
+        except Exception as e:
+            logger.warning("QMT quote query failed: %s", e)
+            return {}
 
     def _on_async_ack(self, response: Any) -> None:
         """Handle the placement ACK.
