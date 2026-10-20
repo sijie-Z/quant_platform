@@ -333,12 +333,17 @@ class HealthCheck:
             local_map = {}
             for row in local or []:
                 code = str(row.get("code") or row.get("ticker") or "")
-                if code:
-                    local_map[code] = int(row.get("quantity", 0) or 0)
-            broker_map = {
-                str(p.code): int(getattr(p, "quantity", 0) or 0)
-                for p in broker_positions
-            }
+                quantity = int(row.get("quantity", 0) or 0)
+                if code and quantity > 0:
+                    local_map[code] = quantity
+            broker_map = {}
+            for p in broker_positions:
+                quantity = int(getattr(p, "quantity", 0) or 0)
+                # Zero-quantity rows are "flat", not a holding: a broker that
+                # reports closed positions alongside open ones must not make
+                # the sync check fail against the Store's quantity>0 rows.
+                if quantity > 0:
+                    broker_map[str(p.code)] = quantity
 
             mismatches = [
                 f"{code}: broker={broker_map.get(code, 0)} local={local_map.get(code, 0)}"

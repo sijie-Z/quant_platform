@@ -168,9 +168,14 @@ class TradingScheduler:
             session.status = "trading_am"
         elif 1130 <= t < 1300:
             session.status = "lunch"
-        elif 1300 <= t < 1457:
+        elif 1300 <= t < 1500:
+            # The closing call auction (14:57-15:00) is part of the trading
+            # session. The old 14:57 cutoff declared the market closed three
+            # minutes before the close and ran EOD reconciliation there.
             session.status = "trading_pm"
-        elif 1457 <= t < 1530:
+        elif 1500 <= t < 1530:
+            # Post-market (and therefore EOD reconciliation) starts only
+            # after the 15:00 close.
             session.status = "post_market"
         else:
             session.status = "closed"

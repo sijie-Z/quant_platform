@@ -36,41 +36,57 @@ _DIST_DIR = _FRONTEND_DIR / "dist"
 
 
 class APITokenMiddleware(BaseHTTPMiddleware):
-    """Require a bearer token for /api routes when QUANT_API_TOKEN is set.
+    """Require a token (or loopback) for every non-health API route.
 
-    When no token is configured, sensitive trading/OMS endpoints are limited
-    to loopback callers. Before this, the default configuration (and the
-    docker-compose file) served order placement, the OMS blotter and the kill
-    switch to any client that could reach the port.
+    When no token is configured, EVERY /api route is loopback-only, not just
+    the trading/OMS subset: the shipped default (`main.py web` binds 0.0.0.0)
+    let remote anonymous clients read orders, trades, signals, audit rows and
+    trigger every compute endpoint. Health stays public for probes.
     """
 
-    SENSITIVE_PREFIXES = (
-        "/api/trading",
-        "/api/oms",
-        "/api/risk",
-        "/api/monitor/config",
-        "/api/monitor/kill-switch",
-        "/api/core/risk",
-        "/api/config",
-        "/api/portfolio/import",
-    )
+    PUBLIC_PATHS = {
+        "/api/health",
+    }
+    DOC_PATHS = {
+        "/docs", "/redoc", "/docs/oauth2-redirect", "/openapi.json",
+        "/api/docs", "/api/redoc",
+    }
     LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
 
     async def dispatch(self, request: Request, call_next):
+        # Let CORS answer preflight; otherwise the browser sees a 401 without
+        # CORS headers and the documented dev flow cannot use a token.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         token = os.environ.get("QUANT_API_TOKEN", "")
         path = request.url.path
-        if token and path.startswith("/api") and path != "/api/health":
-            auth = request.headers.get("Authorization", "")
-            api_key = request.headers.get("X-API-Key", "")
-            if api_key != token and auth != f"Bearer {token}":
-                return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
-        elif not token and path.startswith(self.SENSITIVE_PREFIXES):
-            host = request.client.host if request.client else ""
-            if host not in self.LOOPBACK_HOSTS:
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": "Set QUANT_API_TOKEN to call trading/OMS endpoints remotely"},
-                )
+        protected = (
+            (path.startswith("/api") and path not in self.PUBLIC_PATHS)
+            or path in self.DOC_PATHS
+        )
+        if protected:
+            if token:
+                auth = request.headers.get("Authorization", "")
+                api_key = request.headers.get("X-API-Key", "")
+                if api_key != token and auth != f"Bearer {token}":
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Invalid or missing API token"},
+                    )
+            else:
+                host = request.client.host if request.client else ""
+                if host not in self.LOOPBACK_HOSTS:
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "detail": (
+                                "No QUANT_API_TOKEN configured: all API routes "
+                                "are loopback-only. Set the token to allow "
+                                "remote access."
+                            )
+                        },
+                    )
         return await call_next(request)
 
 
@@ -92,6 +108,19 @@ async def _lifespan(_app: FastAPI):
         await bus.stop()
 
 
+def _json_safe(value):
+    """Replace non-finite floats so Starlette's strict encoder accepts them."""
+    import math
+
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def create_app(serve_frontend: bool = True) -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(
@@ -102,6 +131,18 @@ def create_app(serve_frontend: bool = True) -> FastAPI:
         docs_url="/api/docs" if serve_frontend else "/docs",
         redoc_url="/api/redoc" if serve_frontend else "/redoc",
     )
+
+    # Pydantic's validation detail echoes the offending input. For NaN/Inf
+    # that made the 422 response itself unserialisable, so a bad request
+    # became a 500.
+    from fastapi.exceptions import RequestValidationError
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(_request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": _json_safe(exc.errors())},
+        )
 
     # CORS for frontend dev server
     app.add_middleware(

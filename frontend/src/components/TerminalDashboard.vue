@@ -345,6 +345,7 @@ const runConfig = reactive({
 })
 
 let pollTimer = null
+let runCancelled = false
 let runId = null
 let ws = null
 const generatingReport = ref(false)
@@ -399,6 +400,7 @@ async function startRun() {
     delete params.data_source
     const status = await runPipeline(params)
     runId = status.run_id
+    runCancelled = false
     log('info', `Pipeline ${runId} queued`)
     startPolling()
   } catch (e) {
@@ -420,6 +422,7 @@ function startPolling() {
 
       if (status.status === 'completed') {
         clearInterval(pollTimer)
+        if (runCancelled) return
         running.value = false
         log('success', locale.value === 'zh-CN' ? '流水线完成' : 'Pipeline completed')
 
@@ -453,6 +456,7 @@ function startPolling() {
 
 function cancelRun() {
   if (pollTimer) clearInterval(pollTimer)
+  runCancelled = true
   running.value = false
   loading.value = false
   log('warn', locale.value === 'zh-CN' ? '流水线被用户取消' : 'Pipeline cancelled by user')
@@ -833,6 +837,10 @@ onMounted(() => {
           progress.value = data.progress || 0
           stage.value = data.stage || ''
           if (data.status === 'completed') {
+            if (runCancelled) return
+            // The poller would otherwise fetch and apply the same result a
+            // second time (double render and double toast).
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
             running.value = false
             log('success', 'Pipeline completed (WS)')
             getRunResult(runId).then(result => {

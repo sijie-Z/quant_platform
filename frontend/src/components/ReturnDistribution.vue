@@ -54,7 +54,9 @@ const skewClass = computed(() => {
 const kurtClass = computed(() => {
   const k = props.distribution?.kurtosis
   if (k == null) return ''
-  return k > 3 ? 'rd-warn' : ''
+  // Producer uses pandas `.kurtosis()` = EXCESS kurtosis (normal = 0); the
+  // old `> 3` applied raw-kurtosis semantics and never highlighted fat tails.
+  return k > 1 ? 'rd-warn' : ''
 })
 
 function normalPDF(x, mean, std) {

@@ -10,6 +10,9 @@ services:
       # The LLM analyzers call DeepSeek through the OpenAI-compatible SDK;
       # OPENAI_API_KEY here did nothing because the code reads DEEPSEEK_API_KEY.
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      # Required: without a token every /api route is loopback-only, and a
+      # published container port is not loopback. Set this in .env.
+      - QUANT_API_TOKEN=${QUANT_API_TOKEN:?Set QUANT_API_TOKEN in .env before exposing port 8000}
       - LOG_LEVEL=INFO
       - TZ=Asia/Shanghai
     volumes:

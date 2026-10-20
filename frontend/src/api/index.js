@@ -6,16 +6,27 @@ const api = axios.create({
 })
 
 // Optional bearer token, mirroring the backend's QUANT_API_TOKEN mode.
-// Without this every panel 401s while /api/health (unauthenticated) keeps
-// the header showing "connected".
-const API_TOKEN = import.meta.env.VITE_QUANT_API_TOKEN || ''
-if (API_TOKEN) {
-  api.interceptors.request.use((config) => {
-    config.headers = config.headers || {}
-    config.headers.Authorization = `Bearer ${API_TOKEN}`
-    return config
-  })
+//
+// Read at request time from localStorage, NOT from import.meta.env: a
+// VITE_-prefixed value is inlined into the public bundle, so every visitor
+// to the served UI would receive the long-lived token. Users set it in
+// Settings (stored only in this browser).
+export function getApiToken() {
+  try {
+    return localStorage.getItem('quant_api_token') || ''
+  } catch (_) {
+    return ''
+  }
 }
+
+api.interceptors.request.use((config) => {
+  const token = getApiToken()
+  if (token) {
+    config.headers = config.headers || {}
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
 
 export function importPortfolioHoldings(data) {
   return api.post('/portfolio/import', { data }).then(r => r.data)
@@ -325,7 +336,7 @@ export function triggerMonitorKillSwitch(params) {
 // because browsers cannot set headers on a WebSocket handshake.
 export function createStatusSocket(onMessage, onError) {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const token = import.meta.env.VITE_QUANT_API_TOKEN || ''
+  const token = getApiToken()
   const query = token ? `?token=${encodeURIComponent(token)}` : ''
   let socket = null
   let timer = null

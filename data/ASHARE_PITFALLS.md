@@ -23,12 +23,13 @@ Interviewers WILL ask about these — be ready to explain each one.
 **Problem:** A-share stocks can halt trading for days/weeks (重大事项停牌). NaN prices break factor computation and portfolio rebalancing.
 
 **Our solution:**
-- `DataPipeline._clean_prices()`: Forward-fill NaN prices up to `max_suspension_days` (default 30)
-- Stocks suspended longer than threshold are excluded from the universe for that period
-- At rebalance dates, suspended stocks are excluded from the candidate pool
-- Factor computation uses `.dropna()` guards everywhere
+- `DataPipeline._clean_prices()` derives suspension from the data itself — missing closes, zero volume, or a row whose whole OHLC(VWAP) equals the previous row (a provider forward-fill) — instead of trusting an optional `is_suspended` column. Tushare/Baostock emit no flag.
+- Provider fills short gaps (synthetic ≤30 sessions via `max_suspension_days`, Tushare ≤5); long gaps stay NaN and are never bridged.
+- Returns are NaN on the day before suspension through the last suspended day, so no fake zero return and no compounded "resume" move booked as a one-day return.
+- Suspended asset-days are False in `tradable_mask`; factors, the alpha signal and optimizer candidate sets exclude them, so a suspended stock cannot receive a new target weight. Valuation keeps the stale mark, which equals the last clean adjusted close (the adjustment factor is frozen across the suspension).
+- At rebalance dates, suspended stocks are excluded from the candidate pool; existing holdings are not topped up.
 
-**Interview answer:** "Short suspensions (<5 days) we forward-fill — the stock is illiquid but still part of the portfolio. Long suspensions (>30 days) we remove from investable universe because the price is stale and the fundamental situation likely changed. This is conservative — most real funds would also exclude or cap exposure to recently resumed stocks."
+**Interview answer:** "Short suspensions we forward-fill — the stock is illiquid but still part of the portfolio. Across a suspension we never difference a forward-filled price: returns on both fill boundaries are NaN, and the name is excluded from every cross-section and new target weight while it cannot trade. Long suspensions (>30 sessions) keep their history but the gap stays missing; the name has no factor, signal or weight until it trades again."
 
 ---
 
@@ -38,11 +39,13 @@ Interviewers WILL ask about these — be ready to explain each one.
 
 **Our solution:**
 - `metadata` tracks `listing_date` and `delisting_date` per stock
-- `DataPipeline._filter_universe()` excludes stocks not yet listed AND stocks already delisted
+- `DataPipeline` builds a date-wise listing window: no factor, signal or weight exists before `listing_date`, and none exists from `delisting_date` onward. `_filter_universe()` still drops stocks that list after (or delist before) the sample.
+- When a provider omits `delisting_date` but simply stops pricing, the first date of the terminal missing run (longer than `max_suspension_days`) is used as the delisting date.
+- Frozen-holding behaviour: from the delisting date the name's factors and signal are NaN, so the optimizer cannot open or add to it. A position still marked between rebalances keeps its last value (its return is NaN, which the engine treats as 0 — no fabricated P&L); at the next rebalance the target weight is zero and the holding is liquidated at the last available close.
 - Constituent history tracking (TushareProvider): knows which stocks were in the CSI 300 at each point in time, not just today's constituents
 - The universe shrinks naturally as stocks delist, matching reality
 
-**Interview answer:** "Point-in-time universe construction. We don't use today's CSI 300 list — we fetch historical constituent changes and only trade stocks that were actually in the index on each rebalance date. We also handle delisting: on the delist date, the position is liquidated at the last available close price."
+**Interview answer:** "Point-in-time universe construction. We don't use today's CSI 300 list — we fetch historical constituent changes and only trade stocks that were actually in the index on each rebalance date. Delisting is enforced date-wise: the stock leaves the factor cross-section, the alpha signal and the optimizer's candidate set on its delisting date. An existing holding is frozen at its last mark until the next rebalance, then liquidated at the last available close — no new weight, no fabricated return."
 
 ---
 

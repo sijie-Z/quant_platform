@@ -14,6 +14,7 @@ SimulatedBroker uses a real Limit Order Book (LOB) with:
 
 from __future__ import annotations
 
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -195,8 +196,13 @@ class BrokerInterface(ABC):
         """Cancel a pending order."""
 
     @abstractmethod
-    def get_positions(self) -> list[Position]:
-        """Get current positions."""
+    def get_positions(self) -> list[Position] | None:
+        """Get current positions.
+
+        ``None`` means the query failed and the book state is unknown; an
+        empty list means a confirmed flat account. Callers must not treat an
+        unknown result as "no positions" (D6).
+        """
 
     @abstractmethod
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
@@ -230,6 +236,17 @@ class SimulatedBroker(BrokerInterface):
     """
 
     def __init__(self, initial_cash: float = 1_000_000, asset_universe=None):
+        # D1: `place_order` is a check-then-act sequence over `_cash` and
+        # `_positions` (validate available shares/cash, then mutate). FastAPI
+        # serves sync endpoints on a thread pool and `engine.manual_order`
+        # bypasses the engine's `_cycle_lock`, so two concurrent sells both
+        # passed the availability check and credited cash twice, and two
+        # concurrent first buys of a new symbol overwrote each other's
+        # position (get()-then-assign). Holding an RLock across the whole
+        # check-and-mutate makes fills serialized and atomic. RLock (not
+        # Lock) because account getters may be called from code already
+        # inside a locked section.
+        self._lock = threading.RLock()
         self._cash = initial_cash
         self._initial_cash = initial_cash
         self._positions: dict[str, Position] = {}
@@ -302,7 +319,8 @@ class SimulatedBroker(BrokerInterface):
             book.add_order(bid_order)
 
     def connect(self) -> bool:
-        self._connected = True
+        with self._lock:
+            self._connected = True
         logger.info("SimulatedBroker connected (LOB matching). Cash: %.2f", self._cash)
         return True
 
@@ -362,7 +380,18 @@ class SimulatedBroker(BrokerInterface):
         return 0
 
     def place_order(self, order: Order) -> Order:
-        """Submit order to the real order book for price-time priority matching."""
+        """Submit order to the real order book for price-time priority matching.
+
+        The entire method runs under `self._lock`: the availability checks,
+        the LOB matching and the cash/position mutation must be one atomic
+        step, or concurrent orders act on the same snapshot of the book
+        (D1). Callers therefore never observe a fill whose cash and shares
+        disagree.
+        """
+        with self._lock:
+            return self._place_order_locked(order)
+
+    def _place_order_locked(self, order: Order) -> Order:
         if not self._connected:
             order.status = OrderStatus.REJECTED
             order.error_msg = "Not connected"
@@ -517,6 +546,10 @@ class SimulatedBroker(BrokerInterface):
             pos.update_price(avg_fill_price)
             self._today_bought.add(order.code)
         else:  # SELL
+            # The availability check above and this mutation are inside the
+            # same `_lock`, so the position cannot have been removed by a
+            # concurrent fill in between (the old unlocked code raised
+            # KeyError *after* crediting cash here).
             self._cash += total_value - commission - tax
             pos = self._positions[order.code]
             pos.quantity -= total_filled
@@ -542,38 +575,42 @@ class SimulatedBroker(BrokerInterface):
         return order
 
     def cancel_order(self, order_id: str) -> bool:
-        for o in self._orders:
-            if o.order_id == order_id and o.status == OrderStatus.PENDING:
-                o.status = OrderStatus.CANCELLED
-                # Cancel in the order book too
-                for book in self._order_books.values():
-                    book.cancel_order(order_id)
-                return True
-        return False
+        with self._lock:
+            for o in self._orders:
+                if o.order_id == order_id and o.status == OrderStatus.PENDING:
+                    o.status = OrderStatus.CANCELLED
+                    # Cancel in the order book too
+                    for book in self._order_books.values():
+                        book.cancel_order(order_id)
+                    return True
+            return False
 
     def get_positions(self) -> list[Position]:
-        return list(self._positions.values())
+        with self._lock:
+            return list(self._positions.values())
 
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
-        if status:
-            return [o for o in self._orders if o.status == status]
-        return self._orders
+        with self._lock:
+            if status:
+                return [o for o in self._orders if o.status == status]
+            return list(self._orders)
 
     def get_account(self) -> dict:
-        market_value = sum(p.market_value for p in self._positions.values())
-        total_equity = self._cash + market_value
-        total_pnl = total_equity - self._initial_cash
-        return {
-            "cash": round(self._cash, 2),
-            "market_value": round(market_value, 2),
-            "total_equity": round(total_equity, 2),
-            "initial_cash": self._initial_cash,
-            "total_pnl": round(total_pnl, 2),
-            "total_pnl_pct": round(total_pnl / self._initial_cash, 4),
-            "n_positions": len(self._positions),
-            "connected": self._connected,
-            "broker": "simulated_lob",
-        }
+        with self._lock:
+            market_value = sum(p.market_value for p in self._positions.values())
+            total_equity = self._cash + market_value
+            total_pnl = total_equity - self._initial_cash
+            return {
+                "cash": round(self._cash, 2),
+                "market_value": round(market_value, 2),
+                "total_equity": round(total_equity, 2),
+                "initial_cash": self._initial_cash,
+                "total_pnl": round(total_pnl, 2),
+                "total_pnl_pct": round(total_pnl / self._initial_cash, 4),
+                "n_positions": len(self._positions),
+                "connected": self._connected,
+                "broker": "simulated_lob",
+            }
 
     def get_book_snapshot(self, symbol: str) -> dict | None:
         """Get order book snapshot for a symbol."""
@@ -591,28 +628,69 @@ class SimulatedBroker(BrokerInterface):
 
     def update_market_prices(self, prices: dict[str, float]):
         """Update position prices and refresh synthetic book liquidity."""
-        self._market_prices.update(prices)
-        for code, pos in self._positions.items():
-            if code in prices:
-                pos.update_price(prices[code])
+        with self._lock:
+            self._market_prices.update(prices)
+            for code, pos in self._positions.items():
+                if code in prices:
+                    pos.update_price(prices[code])
 
-        # Re-seed the market-maker quotes around the new reference price.
-        # The book was seeded once, so a limit order at the *new* market price
-        # could fill against stale quotes from the old one (phantom profit).
-        for code, price in prices.items():
-            book = self._order_books.get(code)
-            if book is None or not price or price <= 0:
-                continue
-            for order_id, resting in list(getattr(book, "_orders", {}).items()):
-                if getattr(resting, "source", "") == "market_maker":
-                    book.cancel_order(order_id)
-            self._seed_book(book, code, float(price))
+            # Re-seed the market-maker quotes around the new reference price.
+            # The book was seeded once, so a limit order at the *new* market price
+            # could fill against stale quotes from the old one (phantom profit).
+            for code, price in prices.items():
+                book = self._order_books.get(code)
+                if book is None or not price or price <= 0:
+                    continue
+                for order_id, resting in list(getattr(book, "_orders", {}).items()):
+                    if getattr(resting, "source", "") == "market_maker":
+                        book.cancel_order(order_id)
+                self._seed_book(book, code, float(price))
 
     def new_trading_day(self):
         """Reset T+1 restrictions. Call at start of each trading day."""
-        self._today_bought.clear()
-        for pos in self._positions.values():
-            pos.available = pos.quantity
+        with self._lock:
+            self._today_bought.clear()
+            for pos in self._positions.values():
+                pos.available = pos.quantity
+
+    def restore_positions(self, rows: list[dict], cash: float | None = None) -> None:
+        """Rebuild the in-memory account from persisted rows (D4 restart).
+
+        A paper/SimulatedBroker process restart starts from a fresh book, but
+        the Store still records the open positions and (via engine_state) the
+        cash balance. Without this method the engine's pre-flight position-sync
+        check refused to start on every restart with open positions. Real
+        brokers (QMT/XTP) do not implement this: their account is the source of
+        truth and must never be overwritten from local records.
+
+        `available` is restored as of the last snapshot so a same-day restart
+        keeps today's T+1 lock (the engine separately persists the exchange
+        trading date for D7).
+        """
+        with self._lock:
+            self._positions.clear()
+            for row in rows or []:
+                code = str(row.get("code") or row.get("ticker") or "")
+                quantity = int(row.get("quantity", 0) or 0)
+                if not code or quantity <= 0:
+                    continue
+                available = row.get("available", quantity)
+                try:
+                    available = int(available)
+                except (TypeError, ValueError):
+                    available = quantity
+                pos = Position(
+                    code=code,
+                    name=str(row.get("name", "") or ""),
+                    quantity=quantity,
+                    available=max(0, min(available, quantity)),
+                    avg_cost=float(row.get("avg_cost", 0.0) or 0.0),
+                    realized_pnl=float(row.get("realized_pnl", 0.0) or 0.0),
+                )
+                pos.update_price(float(row.get("current_price", 0.0) or 0.0))
+                self._positions[code] = pos
+            if cash is not None:
+                self._cash = float(cash)
 
 
 class QMTBroker(BrokerInterface):
@@ -911,10 +989,15 @@ class QMTBroker(BrokerInterface):
 
     # ── Queries ──
 
-    def get_positions(self) -> list[Position]:
+    def get_positions(self) -> list[Position] | None:
         """Query current positions from QMT.
 
-        Returns empty list if disconnected or query fails.
+        Returns the cached book when disconnected or when the query raises,
+        and **None** when the terminal answers with no result at all. None
+        means "unknown": `query_stock_positions` returning None used to be
+        converted to `[]`, which the engine and health check read as a flat
+        account -- one transient failure made the engine buy a duplicate
+        stake and prune the persisted book (D6).
         """
         if not self._connected:
             return list(self._positions.values())
@@ -923,21 +1006,23 @@ class QMTBroker(BrokerInterface):
             from quant_platform.trading.qmt_utils import from_qmt_code, qmt_position_to_dict
 
             raw = self._trader.query_stock_positions(self._account)
-            positions: list[Position] = []
+            if raw is None:
+                logger.error("QMT query positions returned no result; reporting UNKNOWN")
+                return None
 
-            if raw is not None:
-                for p in raw:
-                    code = from_qmt_code(qmt_position_to_dict(p).get("code", ""))
-                    d = qmt_position_to_dict(p)
-                    pos = Position(
-                        code=code,
-                        quantity=d.get("volume", 0),
-                        available=d.get("can_use_volume", 0),
-                        avg_cost=d.get("avg_price", 0.0),
-                        market_value=d.get("market_value", 0.0),
-                    )
-                    self._positions[code] = pos
-                    positions.append(pos)
+            positions: list[Position] = []
+            for p in raw:
+                code = from_qmt_code(qmt_position_to_dict(p).get("code", ""))
+                d = qmt_position_to_dict(p)
+                pos = Position(
+                    code=code,
+                    quantity=d.get("volume", 0),
+                    available=d.get("can_use_volume", 0),
+                    avg_cost=d.get("avg_price", 0.0),
+                    market_value=d.get("market_value", 0.0),
+                )
+                self._positions[code] = pos
+                positions.append(pos)
 
             return positions
 
@@ -980,14 +1065,14 @@ class QMTBroker(BrokerInterface):
                     "total_equity": round(total, 2),
                     "initial_cash": self._initial_cash,
                     "total_pnl": round(total - self._initial_cash, 2),
-                    "n_positions": len(self.get_positions()),
+                    "n_positions": len(self.get_positions() or []),
                 }
 
         except Exception as e:
             logger.warning("QMT account query failed: %s", e)
 
         # Fallback
-        positions = self.get_positions()
+        positions = self.get_positions() or []
         mkt_val = sum(p.market_value for p in positions)
         total = self._cash + mkt_val
         return {
@@ -1303,7 +1388,13 @@ class XTPBroker(BrokerInterface):
             logger.error("XTP Cancel failed: %s", e)
             return False
 
-    def get_positions(self) -> list[Position]:
+    def get_positions(self) -> list[Position] | None:
+        """Query positions. Returns None when the query itself failed.
+
+        An exception used to be reported as `[]` ("flat"), which could make a
+        caller size duplicate exposure (D6). Unknown and empty are now
+        distinguishable.
+        """
         if not self._connected:
             return []
         try:
@@ -1331,7 +1422,7 @@ class XTPBroker(BrokerInterface):
             return positions
         except Exception as e:
             logger.error("XTP Query positions failed: %s", e)
-            return []
+            return None
 
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
         if status:

@@ -3,7 +3,7 @@
     <div class="section-header">
       <div>
         <div class="section-title">{{ locale === 'zh-CN' ? '设置' : 'Settings' }}</div>
-        <div class="section-subtitle">{{ locale === 'zh-CN' ? '配置平台参数和偏好设置' : 'Configure platform parameters and preferences' }}</div>
+        <div class="section-subtitle">{{ locale === 'zh-CN' ? '浏览器本地偏好（不会修改服务端配置）' : 'Browser-local preferences (does not change server config)' }}</div>
       </div>
     </div>
 
@@ -23,6 +23,20 @@
             class="form-group"
             style="margin:0;padding:7px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--text-primary);font-size:13px;font-family:var(--font-mono);width:100%;"
             placeholder="/api"
+          />
+        </div>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-label">{{ locale === 'zh-CN' ? 'API Token' : 'API Token' }}</div>
+          <div class="text-xs text-dim mt-1">{{ locale === 'zh-CN' ? '服务端 QUANT_API_TOKEN；仅保存在本浏览器，不会打包进前端' : 'Server QUANT_API_TOKEN; stored only in this browser, never baked into the bundle' }}</div>
+        </div>
+        <div style="min-width:220px;">
+          <input
+            v-model="apiToken"
+            type="password"
+            style="padding:7px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--text-primary);font-size:13px;font-family:var(--font-mono);width:100%;"
+            :placeholder="locale === 'zh-CN' ? '请输入API Token...' : 'Enter API token...'"
           />
         </div>
       </div>
@@ -133,7 +147,7 @@
     <div class="flex-between mt-4">
       <div></div>
       <button class="btn btn-primary" @click="saveSettings">
-        &#10003; {{ locale === 'zh-CN' ? '保存设置' : 'Save Settings' }}
+        &#10003; {{ locale === 'zh-CN' ? '保存本地偏好' : 'Save Local Preferences' }}
       </button>
     </div>
   </div>
@@ -149,6 +163,7 @@ const emit = defineEmits(['toast'])
 
 const apiBase = ref('/api')
 const tushareToken = ref('')
+const apiToken = ref(localStorage.getItem('quant_api_token') || '')
 const defaults = reactive({
   n_stocks: 300,
   optimizer: 'mean_variance',
@@ -163,18 +178,24 @@ onMounted(() => {
       const s = JSON.parse(saved)
       if (s.apiBase) apiBase.value = s.apiBase
       if (s.tushareToken) tushareToken.value = s.tushareToken
+      if (s.apiToken) apiToken.value = s.apiToken
       if (s.defaults) Object.assign(defaults, s.defaults)
     } catch {}
   }
 })
 
 function saveSettings() {
+  // The API token is stored under its own key so the axios/WS clients can
+  // read it at request time; putting it in the Vite env bakes it into the
+  // public bundle.
+  localStorage.setItem('quant_api_token', apiToken.value)
   localStorage.setItem('quant_settings', JSON.stringify({
     apiBase: apiBase.value,
     tushareToken: tushareToken.value,
+    apiToken: apiToken.value,
     defaults: { ...defaults },
   }))
-  emit('toast', { message: locale.value === 'zh-CN' ? '设置已保存' : 'Settings saved', type: 'success' })
+  emit('toast', { message: locale.value === 'zh-CN' ? '已保存到本浏览器（服务端配置未改变）' : 'Saved in this browser (server config unchanged)', type: 'success' })
 }
 
 function exportConfig() {

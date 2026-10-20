@@ -11,6 +11,7 @@ import pytest
 
 from quant_platform.core.state_machine import PortfolioState, PortfolioStateMachine
 from quant_platform.core.store import Store
+from quant_platform.risk.circuit_breaker import RiskMonitor
 from quant_platform.trading.broker import SimulatedBroker
 from quant_platform.trading.engine import LiveTradingEngine
 
@@ -21,6 +22,10 @@ def engine(tmp_path, monkeypatch):
         broker=SimulatedBroker(initial_cash=1_000_000),
         store=Store(str(tmp_path / "engine.db")),
         state_machine=PortfolioStateMachine(),
+        # D13 made the process-wide RiskMonitor the default; inject a fresh
+        # one here so kill switches activated by one test cannot leak into
+        # the next (the singleton persists for the whole pytest process).
+        risk_monitor=RiskMonitor(),
     )
     # No network in tests; prices are not what these assertions are about.
     monkeypatch.setattr(eng, "_fetch_prices", lambda: None)

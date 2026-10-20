@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
-from quant_platform.core.audit import AuditLog
+from quant_platform.core.audit import AuditAction, AuditLog
 from quant_platform.core.events import get_event_bus
 from quant_platform.core.state_machine import PortfolioStateMachine
 from quant_platform.core.store import Store
@@ -155,6 +155,7 @@ class LiveRunner:
         initial_cash: float = 10_000_000,
         dual_track: bool = True,
         risk_monitor: RiskMonitor | None = None,
+        store: Store | None = None,
         **broker_kwargs,
     ):
         self._initial_cash = initial_cash
@@ -185,8 +186,10 @@ class LiveRunner:
                 partial_fill_rate=0.10,
             )
 
-        # Core infrastructure
-        self._store = Store()
+        # Core infrastructure. `store` is injectable so tests (and callers
+        # wanting an isolated ledger) do not have to write to the default
+        # data/trading.db.
+        self._store = store or Store()
         self._bus = get_event_bus()
         self._audit = AuditLog(self._store, self._bus)
         self._sm = PortfolioStateMachine()
@@ -403,8 +406,14 @@ class LiveRunner:
         result = self._broker.place_order(order)
         return result.to_dict()
 
-    def _execute_signal_paper(self, sig: dict):
-        """Execute same signal through PaperBroker for TCA comparison."""
+    def _execute_signal_paper(self, sig: dict, primary: dict | None = None):
+        """Execute same signal through PaperBroker for TCA comparison.
+
+        D10: the PaperBroker's book started empty for every symbol, so no
+        paper order could ever fill and the TCA comparison was always empty.
+        Before placing, seed a deterministic ladder from this cycle's quote,
+        sized by the primary broker's fill so the comparison is meaningful.
+        """
         if not self._paper_broker:
             return None
         code = sig["code"]
@@ -420,6 +429,16 @@ class LiveRunner:
         if qty <= 0:
             return None
 
+        reference_quantity = qty
+        if primary:
+            try:
+                primary_filled = int(primary.get("filled_quantity") or 0)
+            except (TypeError, ValueError):
+                primary_filled = 0
+            if primary_filled > 0:
+                reference_quantity = max(qty, primary_filled)
+        self._seed_paper_liquidity(code, price, reference_quantity)
+
         order = Order(
             code=code,
             side=OrderSide.BUY if sig["side"] == "buy" else OrderSide.SELL,
@@ -428,6 +447,70 @@ class LiveRunner:
             price=price,
         )
         return self._paper_broker.place_order(order)
+
+    def _seed_paper_liquidity(self, symbol: str, price: float,
+                              reference_quantity: int = 0) -> None:
+        """Seed the dual-track PaperBroker's book around the cycle quote.
+
+        `seed_book_from_snapshot` is the public, deterministic entry point of
+        PaperBroker; the seeded levels are passive, so only our order trades
+        against them. Depth scales with the primary fill's quantity.
+        """
+        if self._paper_broker is None or price <= 0:
+            return
+        tick = 0.01
+        base_quantity = max(100, int(reference_quantity or 10_000))
+        bids: list[list] = []
+        asks: list[list] = []
+        for level in range(5):
+            level_quantity = max(100, base_quantity // (level + 1))
+            step = tick * level
+            bids.append([round(max(tick, price - step), 2), level_quantity])
+            asks.append([round(price + step, 2), level_quantity])
+        try:
+            self._paper_broker.seed_book_from_snapshot(
+                symbol, {"bids": bids, "asks": asks},
+            )
+        except Exception as exc:
+            logger.error("Failed to seed paper liquidity for %s: %s", symbol, exc)
+
+    def _record_order_result(self, result: dict, reason: str = "") -> None:
+        """Persist an executed order (and its fill) plus an audit event (D8).
+
+        The runner used to write only P&L and session rows, so a run that
+        executed real broker orders left zero order/trade rows for compliance
+        and reconciliation. A fill is persisted as order+trade atomically
+        with a deterministic trade id before the best-effort audit event.
+        """
+        status = str(result.get("status", "")).lower()
+        filled_quantity = int(result.get("filled_quantity", 0) or 0)
+        filled = status in ("filled", "partial") and filled_quantity > 0
+        try:
+            if filled:
+                self._store.save_order_with_trade(result, {
+                    "trade_id": f"{result['order_id']}:fill",
+                    "order_id": result["order_id"],
+                    "code": result["code"],
+                    "side": result["side"],
+                    "quantity": filled_quantity,
+                    "price": result.get("filled_price") or result.get("price") or 0.0,
+                    "commission": result.get("commission", 0),
+                    "tax": result.get("tax", 0),
+                })
+            else:
+                self._store.save_order(result)
+        except Exception as exc:
+            logger.error("Failed to persist order %s: %s", result.get("order_id"), exc)
+        if filled:
+            action = AuditAction.ORDER_FILLED
+        elif status == "rejected":
+            action = AuditAction.ORDER_REJECTED
+        else:
+            action = AuditAction.ORDER_SUBMITTED
+        try:
+            self._audit.log(action, "broker", details=result, reason=reason)
+        except Exception as exc:
+            logger.error("Audit write failed for order %s: %s", result.get("order_id"), exc)
 
     # ── Main Cycle ──
 
@@ -459,12 +542,26 @@ class LiveRunner:
         total_tax = 0.0
         total_slippage = 0.0
 
+        # D8: every generated signal is persisted (signal row + audit event)
+        # before execution; nothing used to be written.
+        for sig in signals:
+            try:
+                self._audit.log_signal(
+                    sig["code"], sig["side"], float(sig.get("strength", 0) or 0),
+                    strategy="live_runner",
+                    factors={"reason": sig.get("reason", "")},
+                )
+            except Exception as exc:
+                logger.error("Failed to persist signal %s: %s", sig.get("code"), exc)
+
         for sig in sorted(
             signals, key=lambda s: 0 if s["side"] == "sell" else 1,
         ):
             result = self._execute_signal(sig)
             if result:
                 orders.append(result)
+                # D8: order/trade rows + audit for every execution.
+                self._record_order_result(result, reason=sig.get("reason", ""))
                 total_commission += result.get("commission", 0)
                 total_tax += result.get("tax", 0)
                 total_slippage += result.get("slippage", 0)
@@ -472,7 +569,7 @@ class LiveRunner:
                     self._trade_count += 1
 
             if self._dual_track:
-                paper_record = self._execute_signal_paper(sig)
+                paper_record = self._execute_signal_paper(sig, primary=result)
                 if paper_record:
                     paper_records.append(paper_record)
 
@@ -558,18 +655,33 @@ class LiveRunner:
             int(code[0:3]) if code.isdigit() else hash(code) % 1000
             base_prices[code] = 10.0 + rng.uniform(5, 195)
 
-        for d in range(days):
-            date = (datetime.now() - timedelta(days=days - d)).strftime("%Y-%m-%d")
-            prices = {}
-            for code in self._universe:
-                # Random walk with 15% annual vol
-                daily_ret = rng.normal(0.0003, 0.01)
-                base_prices[code] *= (1 + daily_ret)
-                base_prices[code] = max(base_prices[code], 0.5)
-                prices[code] = round(base_prices[code], 2)
-            self.run_once(date=date, prices=prices)
+        # D9: one broker/execution failure used to abort the entire multi-day
+        # run and leave the session `active` with `_running=True` forever.
+        # Failures are now isolated to the affected day and `_end_session()`
+        # always runs.
+        try:
+            for d in range(days):
+                date = (datetime.now() - timedelta(days=days - d)).strftime("%Y-%m-%d")
+                prices = {}
+                for code in self._universe:
+                    # Random walk with 15% annual vol
+                    daily_ret = rng.normal(0.0003, 0.01)
+                    base_prices[code] *= (1 + daily_ret)
+                    base_prices[code] = max(base_prices[code], 0.5)
+                    prices[code] = round(base_prices[code], 2)
+                try:
+                    self.run_once(date=date, prices=prices)
+                except Exception as e:
+                    logger.error(
+                        "Trading day %s aborted: %s", date, e, exc_info=True,
+                    )
+                    self._bus.publish("system.error", {
+                        "error": str(e), "date": date,
+                    }, source="live_runner")
+                    continue
+        finally:
+            self._end_session()
 
-        self._end_session()
         return self.generate_report()
 
     # ── Session Management ──

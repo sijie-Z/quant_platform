@@ -35,7 +35,12 @@ DEFAULT_CACHE_DIR = Path("./.quant_cache")
 # written under an older schema must not be replayed as if identical.
 # 4: benchmarks aligned to the forward-return convention; metadata may carry
 #    a PIT sector panel.
-DATA_SCHEMA_VERSION = 4
+# 5: synthetic panels use the exchange calendar (exchange holidays removed
+#    from prices/benchmark/financial visibility), suspension flags are derived
+#    from the data, and the tradability mask covers listing/delisting/
+#    suspension. Panels cached under 4 are business-day grids and must not be
+#    replayed.
+DATA_SCHEMA_VERSION = 5
 
 # Bump when the key recipe itself changes, so entries written by an older
 # recipe cannot collide with new ones.

@@ -348,3 +348,17 @@
 | 日志/文档 | `get_logger(__name__)` 双重前缀（`quant_platform.quant_platform.*`）修正；HANDOVER 补充本轮记录 |
 
 验证：全量测试 **2074 passed / 3 skipped / 0 failed**（3m20s），ruff 全绿。CLI 实测：30 股票 `run` 得到 19/21 因子有限 IC（N=133–250）、HTML+metrics 落盘；`check-lookahead` 报告 0 偏差并退出 0；`ml train` 训练 3434 样本、`ml signal` 非空；`walkforward --folds 1` 实际执行 1 折。
+
+### 2026-10-20 第九轮（实盘生命周期 / PIT 数据 / 策略-OMS 集成 / 前端契约 / API 安全）
+
+第二轮实测审计：5 个只读 agent 分别覆盖实盘交易、PIT 数据、策略与 OMS 集成、前端契约、API 安全；随后 3 个执行 agent 修复后端缺陷，主线程修复 API/前端契约。全部修复带回归测试。
+
+| 领域 | 修复 |
+|---|---|
+| 实盘交易 | SimulatedBroker 的 check-then-act 无锁：并发卖出双倍入账、并发首次买入互相覆盖，现金/持仓不再原子；加 `RLock` 覆盖下单/账户/盯市/T+1/恢复。部分成交此前不落库、不审计、不计数；现在写 order(partial)+trade+审计并按实际成交量计数。券商成交后审计写失败会永久丢单；改为先原子写 order+trade（确定性 trade_id 防重），审计失败只记日志。重启时恢复/对账 store 持仓与现金（paper broker 重建，QMT/XTP 不覆盖），kill switch/峰值/日基线/交易日/现金/持仓写入 `engine_state` 并恢复；持久化 kill 在显式解除前阻断下单。空持仓查询视为“未知”而非“空仓”，不再重复买入或清空 store。T+1 与日 P&L 基线改用 Asia/Shanghai 交易所日历（不再被宿主午夜/周末解锁），`_trading_day` 持久化。LiveRunner 持久化 signal/order/trade，单日券商异常不再中止全程，`finally` 关闭 session；双轨 PaperBroker 用主券商成交价播种流动性。逐 symbol 行情时间戳，过期报价不用于下单/盯市。`stop()` 等待在途周期、`start()` 拒绝复活旧线程；默认风控后端改为共享 `RiskMonitor` |
+| PIT 数据 | 统一 `tradable_mask`（ST + 上市/退市 + 停牌），同时作用于价格因子、财务因子、volume/turnover、`fin_unstacked`、信号与 `get_financials_as_of`；ST/停牌/退市/上市前不再获得因子值、信号或权重。退市按 `delisting_date` 与价格终止双路径识别。停牌改为从缺失/零成交量/整行 ffill 推导，不依赖可选 `is_suspended` 列；复牌首日收益保留。合成数据日期、基准与财报公告映射改用交易所日历（节假日不再成为交易日，节假日公告映射到下一交易日），`DATA_SCHEMA_VERSION` 4→5。停牌日除权因子冻结，估值标记不再跳变。短样本合成数据不再因 `rng.integers(low>=high)` 崩溃 |
+| 策略/OMS | `PortfolioOrchestrator` 接入真实现金台账、T+1 可用量、成本基础与已实现盈亏；`rebalance()` 对未成交订单做净额投影，重复调用不再重复下单，反向下单会撤单并释放资金锁；`(1+signal)` 目标被压缩到策略资金预算内，买入前校验合并现金，成交时引擎硬拒绝透支。全局先卖后买（创建与成交两阶段）。风控收到 `cash+盯市市值` 的真实权益并在日期推进时重建日基线。策略移除会撤单、按 T+1 可卖量清仓或转移、释放资金并清理台账；未知策略 id 拒绝。资金分配改为绝对比例（省略项归零、和≤1、拒绝负数/未知 id），再分配时重置 P&L 与风险统计，零资金期不记录收益；聚合指标排除 inactive 并改用市值加权组合收益序列。lot_size 真正生效，零数量订单跳过；手续费/印花税进入引擎现金与成本 |
+| 前端契约 | `exposure_report` 返回 `sector_exposure`（扇区面板此前永远为空）。因子散点/归因改用资产级前向收益面板（此前传入组合收益 Series，异常被吞，两个面板永远为空），并去掉第二次 `shift(-1)`。WalkForward 在 `available:false` 时显示原因而非 0 folds；MonitorDashboard 统一风险等级大小写并从后端播种 kill switch/实时限额；WS 完成不再与轮询重复应用、取消后不再拉取结果，失败 run 会广播；DataQuality/MonteCarlo/RiskDecomposition 正确识别错误/不可用；Compare/Sweep 用并集列，首行失败不再隐藏后续成功结果；LivePortfolio 显示 `data_date/stale`，OrderBlotter 拒绝用非当日收盘价成交；Regime 相关性标记不可用、推荐语映射修正；RiskMonitor 圆点/日亏条、超额峰度阈值、压力情景名、命令面板、Vite WS 代理、QMT 服务地址字段、Settings 明确为浏览器本地偏好 |
+| API 安全/资源 | 无 token 时**所有** `/api`（除 health）仅回环可访问，有 token 时全部鉴权；`/docs`、`/openapi.json` 纳入保护；CORS 预检不再被鉴权中间件拦截；默认监听改为 127.0.0.1（容器显式 0.0.0.0 + 必须设置 token）。`/api/screen` 的 config 路径限制在服务端 `config/` 内（路径穿越/配置注入）。OMS `limit_price`、策略 allocation/daily_return、`risk/check-order` 拒绝 NaN/Inf，校验错误响应统一清洗非有限值。运行窗口 ≤10 年且 start<end，sweep/parallel grid/worker/基本面代码数量设上限，Store 的 limit/days 统一钳制。失败 run 不再返回 traceback/绝对路径。前端 API token 改为 localStorage 运行时读取，不再打包进公开 bundle |
+
+验证：全量测试 **2195 passed / 3 skipped / 0 failed**（3m06s），ruff 全绿，前端生产构建通过。CLI 30 股票实测：新交易日历下 run 正常（Total Return 14.29%、Sharpe 0.56），HTML+metrics.json 落盘。已知未处理：多租户隔离（#75 产品定位未定，当前 API 不提供租户隔离）；7 个分析端点仍显式 `available:false`；WS token 仍走查询串（uvicorn 访问日志可见）；回测尚未按执行日可交易性阻断；交易所日历表覆盖至 2026 年。

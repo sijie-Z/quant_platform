@@ -142,7 +142,7 @@ def test_regime_with_short_history_is_409(app_client, monkeypatch):
         routes._run_store.pop("short-run", None)
 
     assert resp.status_code == 409
-    assert "enough data" in resp.json()["detail"]
+    assert "at least 252" in resp.json()["detail"]
 
 
 # ── Screen raw values ──

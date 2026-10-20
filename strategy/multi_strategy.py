@@ -12,7 +12,9 @@ Inspired by multi-pod hedge fund structure (Millennium, Citadel).
 
 from __future__ import annotations
 
+import math
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -71,6 +73,15 @@ class MultiStrategyManager:
         self.strategies: dict[str, StrategyConfig] = {}
         self.states: dict[str, StrategyState] = {}
         self.daily_returns: dict[str, list[float]] = {}
+        # Optional hook invoked before a strategy is removed, so the
+        # orchestrator can cancel open orders, liquidate positions and release
+        # capital. Without it, `remove_strategy()` silently orphaned positions
+        # and pending orders.
+        self._removal_handler: Callable[[str], object] | None = None
+
+    def set_removal_handler(self, handler: Callable[[str], object] | None) -> None:
+        """Register a callback invoked with the strategy id before removal."""
+        self._removal_handler = handler
 
     def add_strategy(self, config: StrategyConfig) -> str:
         """Register a new strategy."""
@@ -93,23 +104,44 @@ class MultiStrategyManager:
         return config.strategy_id
 
     def remove_strategy(self, strategy_id: str):
-        """Remove a strategy."""
+        """Remove a strategy, notifying the registered removal handler first.
+
+        The handler (installed by `PortfolioOrchestrator`) cancels open orders,
+        liquidates/transfers positions and returns proceeds to the pool. The
+        return value of the handler is passed through so callers can report
+        what was cleaned up. Unknown ids are ignored (the API's remove endpoint
+        is idempotent).
+        """
+        handler_result = None
+        if strategy_id in self.states and self._removal_handler is not None:
+            handler_result = self._removal_handler(strategy_id)
         self.strategies.pop(strategy_id, None)
         self.states.pop(strategy_id, None)
         self.daily_returns.pop(strategy_id, None)
+        return handler_result
 
     def update_strategy_pnl(self, strategy_id: str, daily_return: float):
-        """Update a strategy's daily P&L."""
+        """Update a strategy's daily P&L.
+
+        A strategy with no allocated capital records nothing: there is no
+        budget to earn a return on, and the old code computed
+        ``total_pnl = current_value - 0`` (leaking a stale ``current_value``
+        into aggregate P&L) while still appending the return to the Sharpe
+        series. Zero-capital periods therefore do not pollute risk metrics.
+        """
         if strategy_id not in self.states:
             return
 
         state = self.states[strategy_id]
+        if state.capital_allocated <= 0:
+            return
+
         state.daily_pnl = state.capital_allocated * daily_return
         state.current_value += state.daily_pnl
         state.total_pnl = state.current_value - state.capital_allocated
         state.total_return = state.total_pnl / state.capital_allocated if state.capital_allocated > 0 else 0
 
-        self.daily_returns[strategy_id].append(daily_return)
+        self.daily_returns.setdefault(strategy_id, []).append(daily_return)
 
         # Update Sharpe
         rets = self.daily_returns[strategy_id]
@@ -126,28 +158,46 @@ class MultiStrategyManager:
             state.max_drawdown = float(dd)
 
     def get_aggregate_metrics(self) -> dict:
-        """Compute aggregate portfolio metrics across all strategies."""
-        total_value = sum(s.current_value for s in self.states.values())
-        total_pnl = sum(s.total_pnl for s in self.states.values())
-        total_allocated = sum(s.capital_allocated for s in self.states.values())
+        """Compute aggregate portfolio metrics across all strategies.
 
-        # Aggregate daily returns (weighted by allocation)
-        all_returns = []
+        Inclusion policy: inactive strategies are excluded from *every*
+        aggregate field (value, P&L, allocated capital, return, Sharpe and
+        drawdown), but remain listed in ``strategies`` with ``active: false``
+        so the UI can show them. Aggregate Sharpe/DD are computed from a
+        single value-weighted portfolio return series (weights are current
+        values of the included strategies, renormalised to sum to 1), instead
+        of scaling each strategy's own Sharpe by a raw allocation percentage.
+        """
+        active_ids = [
+            sid for sid, config in self.strategies.items()
+            if config.is_active and sid in self.states
+        ]
+
+        total_value = sum(self.states[sid].current_value for sid in active_ids)
+        total_pnl = sum(self.states[sid].total_pnl for sid in active_ids)
+        total_allocated = sum(
+            self.states[sid].capital_allocated for sid in active_ids
+        )
+
+        # Aggregate daily returns from one portfolio series. Weights are
+        # current-value based and sum to 1 over the strategies that have a
+        # return history and a positive value.
+        series = []
         weights = []
-        for sid, config in self.strategies.items():
-            if not config.is_active:
-                continue
+        for sid in active_ids:
             rets = self.daily_returns.get(sid, [])
-            if rets:
-                all_returns.append(rets)
-                weights.append(config.allocation_pct)
+            value = self.states[sid].current_value
+            if rets and value > 0:
+                series.append(rets)
+                weights.append(value)
 
-        # Portfolio return = weighted sum of strategy returns
-        if all_returns and sum(weights) > 0:
-            min_len = min(len(r) for r in all_returns)
+        if series and sum(weights) > 0:
+            norm_weights = np.array(weights, dtype=float)
+            norm_weights /= norm_weights.sum()
+            min_len = min(len(r) for r in series)
             portfolio_rets = np.zeros(min_len)
-            for rets, w in zip(all_returns, weights, strict=False):
-                portfolio_rets += np.array(rets[-min_len:]) * w
+            for rets, weight in zip(series, norm_weights, strict=False):
+                portfolio_rets += np.array(rets[-min_len:]) * weight
 
             agg_sharpe = float(portfolio_rets.mean() / portfolio_rets.std() * np.sqrt(252)) if portfolio_rets.std() > 0 else 0
             cum = np.cumprod(1 + portfolio_rets)
@@ -159,13 +209,15 @@ class MultiStrategyManager:
 
         # Strategy correlation matrix
         corr_matrix = {}
-        active_ids = [sid for sid, c in self.strategies.items() if c.is_active]
-        if len(active_ids) > 1:
-            min_len = min(len(self.daily_returns.get(sid, [])) for sid in active_ids)
+        corr_ids = [
+            sid for sid in active_ids if self.daily_returns.get(sid)
+        ]
+        if len(corr_ids) > 1:
+            min_len = min(len(self.daily_returns[sid]) for sid in corr_ids)
             if min_len > 30:
                 df = pd.DataFrame({
                     sid: self.daily_returns[sid][-min_len:]
-                    for sid in active_ids
+                    for sid in corr_ids
                 })
                 corr = df.corr()
                 corr_matrix = corr.to_dict()
@@ -179,7 +231,7 @@ class MultiStrategyManager:
             "aggregate_sharpe": agg_sharpe,
             "aggregate_max_dd": agg_dd,
             "n_strategies": len(self.strategies),
-            "n_active": sum(1 for c in self.strategies.values() if c.is_active),
+            "n_active": len(active_ids),
             "strategies": [
                 {
                     "id": sid,
@@ -193,33 +245,75 @@ class MultiStrategyManager:
                     "active": config.is_active,
                 }
                 for sid, config in self.strategies.items()
+                if sid in self.states
             ],
             "correlation_matrix": corr_matrix,
         }
 
     def allocate_capital(self, weights: dict[str, float]):
-        """Reallocate capital across strategies.
+        """Reallocate capital across strategies using absolute weights.
 
         Args:
-            weights: dict of strategy_id -> target allocation (should sum to 1.0)
-        """
-        total_weight = sum(weights.values())
-        if abs(total_weight - 1.0) > 0.01:
-            logger.warning("Weights sum to %.3f, normalizing", total_weight)
+            weights: strategy_id -> target fraction of ``total_capital``.
+                Values are absolute (0.4 means 40% of total capital, not 40%
+                of the provided subset). Strategies omitted from the mapping
+                are reduced to zero. The weights must be non-negative and sum
+                to at most 1.0.
 
-        for sid, w in weights.items():
-            if sid in self.strategies:
-                normalized = w / total_weight if total_weight > 0 else 0
-                self.strategies[sid].allocation_pct = normalized
-                state = self.states[sid]
-                state.capital_allocated = self.total_capital * normalized
-                # Reallocation establishes a new P&L baseline. Changing only
-                # `capital_allocated` left `current_value` at the old amount,
-                # so a +1% day after moving a strategy to 100% of a 100M book
-                # reported -99% (-99M).
-                state.current_value = state.capital_allocated
-                logger.info("Strategy %s: allocation=%.1f%%, capital=%s",
-                           sid, normalized * 100, f"{state.capital_allocated:,.0f}")
+        Raises:
+            ValueError: on unknown ids, negative/non-finite weights, or a
+                weight sum above 1.0.
+
+        Reallocation rebases the performance segment: ``current_value`` is
+        reset to the new ``capital_allocated``, ``total_pnl``/``total_return``
+        restart at zero and the return history (Sharpe/max drawdown) is
+        cleared, so all risk statistics are explicitly *since the last
+        reallocation*. Keeping the old history made a strategy that had lost
+        20% report a -20% return against a freshly resized 0-P&L baseline.
+        """
+        if not isinstance(weights, dict):
+            raise ValueError("weights must be a mapping of strategy_id -> weight")
+        unknown = sorted(set(weights) - set(self.strategies))
+        if unknown:
+            raise ValueError(f"Unknown strategy_id(s): {unknown}")
+
+        parsed: dict[str, float] = {}
+        for sid, weight in weights.items():
+            try:
+                value = float(weight)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"weight for {sid!r} is not numeric: {weight!r}"
+                ) from exc
+            if not math.isfinite(value):
+                raise ValueError(f"weight for {sid!r} is not finite: {value!r}")
+            if value < 0:
+                raise ValueError(f"weight for {sid!r} is negative: {value!r}")
+            parsed[sid] = value
+
+        total_weight = sum(parsed.values())
+        if total_weight > 1.0 + 1e-9:
+            raise ValueError(
+                f"weights sum to {total_weight:.6f} > 1.0; weights are "
+                "absolute fractions of total_capital"
+            )
+
+        for sid, config in self.strategies.items():
+            weight = parsed.get(sid, 0.0)
+            config.allocation_pct = weight
+            state = self.states[sid]
+            state.capital_allocated = self.total_capital * weight
+            state.current_value = state.capital_allocated
+            state.daily_pnl = 0.0
+            state.total_pnl = 0.0
+            state.total_return = 0.0
+            state.sharpe_ratio = 0.0
+            state.max_drawdown = 0.0
+            # Segment boundary: returns recorded before this point belonged to
+            # a different capital base and must not leak into Sharpe/DD.
+            self.daily_returns[sid] = []
+            logger.info("Strategy %s: allocation=%.1f%%, capital=%s",
+                       sid, weight * 100, f"{state.capital_allocated:,.0f}")
 
     def get_risk_alerts(self) -> list[dict]:
         """Check all strategies for risk breaches."""

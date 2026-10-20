@@ -55,7 +55,7 @@
       <div v-if="config.broker === 'qmt'" class="lt-config-row">
         <div class="lt-field lt-field-wide">
           <label>{{ locale === 'zh-CN' ? 'QMT路径' : 'QMT Path' }}</label>
-          <input v-model="config.qmt_path" placeholder="C:\国金证券QMT\UserData_mini" />
+          <input v-model="config.server" :placeholder="locale === 'zh-CN' ? 'QMT服务地址 host:port' : 'QMT server host:port'" />
         </div>
         <div class="lt-field">
           <label>{{ locale === 'zh-CN' ? '账户ID' : 'Account ID' }}</label>
@@ -264,7 +264,7 @@
           <div class="lt-stock-change">{{ (s['涨跌幅'] || 0).toFixed(2) }}%</div>
         </div>
       </div>
-      <div v-else class="lt-empty">{{ locale === 'zh-CN' ? '加载行情数据...' : 'Loading market data...' }}</div>
+      <div v-else class="lt-empty">{{ marketError || (locale === 'zh-CN' ? '加载行情数据...' : 'Loading market data...') }}</div>
     </div>
   </div>
 </template>
@@ -294,6 +294,7 @@ const positions = ref([])
 const cycles = ref([])
 const marketStocks = ref([])
 const marketTime = ref('')
+const marketError = ref('')
 const refreshing = ref(false)
 
 // Core architecture data
@@ -310,7 +311,7 @@ const config = reactive({
   initial_cash: 1000000,
   n_stocks: 30,
   rebalance_interval: 300,
-  qmt_path: '',
+  server: '127.0.0.1:58610',
   account_id: '',
 })
 
@@ -404,9 +405,14 @@ async function fetchMarket() {
   try {
     const r = await getMarketSnapshot()
     marketStocks.value = (r.stocks || []).slice(0, 30)
+    marketError.value = ''
     const time = r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : ''
-    marketTime.value = time ? (r.stale ? `⚠ ${time}` : time) : ''
-  } catch (_) {}
+    marketTime.value = time ? (r.stale ? `stale ${time}` : time) : ''
+  } catch (e) {
+    // Previously swallowed: an unavailable feed (503) or server error left
+    // the panel on "Loading market data..." forever.
+    marketError.value = e.response?.data?.detail || e.message || 'Market data unavailable'
+  }
 }
 
 async function fetchState() {

@@ -80,4 +80,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"
 
-CMD ["python", "-m", "quant_platform.main", "web"]
+CMD ["python", "-m", "quant_platform.main", "web", "--host", "0.0.0.0"]

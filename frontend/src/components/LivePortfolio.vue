@@ -7,6 +7,10 @@
         {{ locale === 'zh-CN' ? '实时组合追踪' : 'LIVE PORTFOLIO TRACKER' }}
       </div>
       <div class="lp-actions">
+        <span v-if="portfolio?.data_date" class="lp-price-date" :class="{ stale: portfolio.stale }">
+          {{ locale === 'zh-CN' ? `行情日期 ${portfolio.data_date}` : `Prices ${portfolio.data_date}` }}
+          <template v-if="portfolio.stale">{{ locale === 'zh-CN' ? '（非当日）' : ' (stale)' }}</template>
+        </span>
         <button class="btn btn-sm btn-secondary" @click="$refs.fileInput.click()">
           {{ locale === 'zh-CN' ? '导入CSV' : 'Import CSV' }}
         </button>
@@ -203,7 +207,10 @@ async function refreshPrices() {
     const result = await getLivePortfolio()
     if (result?.error) throw new Error(result.error)
     portfolio.value = result
-    emit('toast', { message: locale.value === 'zh-CN' ? '行情已更新' : 'Prices updated', type: 'success' })
+    const staleNote = result.stale
+      ? (locale.value === 'zh-CN' ? `（数据日期 ${result.data_date}）` : ` (data date ${result.data_date})`)
+      : ''
+    emit('toast', { message: (locale.value === 'zh-CN' ? '行情已更新' : 'Prices updated') + staleNote, type: result.stale ? 'warning' : 'success' })
   } catch (err) {
     emit('toast', { message: locale.value === 'zh-CN' ? `刷新失败: ${err.message}` : `Refresh failed: ${err.message}`, type: 'error' })
   } finally {
@@ -257,6 +264,17 @@ async function refreshPrices() {
 .lp-actions {
   display: flex;
   gap: 8px;
+  align-items: center;
+}
+
+.lp-price-date {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--font-mono, monospace);
+}
+
+.lp-price-date.stale {
+  color: var(--orange, #fb923c);
 }
 
 .lp-summary {

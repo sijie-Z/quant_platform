@@ -1,8 +1,9 @@
 """Data pipeline for ETL: clean, align, filter, and prepare data.
 
 Transforms raw data provider output into analysis-ready DataFrames with:
-- Suspension handling (forward-fill, NaN masking)
-- Point-in-time ST exclusion (per-date tradability mask, no look-ahead)
+- Suspension handling (forward-fill, NaN masking, derived from the data)
+- Point-in-time asset-day eligibility mask (ST episodes, listing window,
+  mid-sample delisting, suspension), no look-ahead
 - Date alignment across prices, financials, and benchmark
 - Derived fields (daily returns, adjusted prices)
 """
@@ -57,6 +58,32 @@ class DataPipeline:
         # announcement date to the end of that ST episode.  Only populated
         # when `exclude_st` is set.
         self.st_eligible: pd.DataFrame | None = None
+
+        # Full asset-day eligibility (date x asset, True = may receive a new
+        # signal/weight on that date): ST, listing window (no pre-listing, no
+        # post-delisting) and suspension days all excluded.  Unlike
+        # `st_eligible` this is always populated; it is the single mask the
+        # factor stage, the volume/turnover accessors and `get_factor_prices`
+        # use.  Suspension rows stay priced (stale mark) in `self.prices` so
+        # valuation is unaffected -- the mask is what keeps them out of
+        # cross-sections and new weights.
+        self.tradable_mask: pd.DataFrame | None = None
+
+        # Hard exclusions only (ST/listing/delisting, not suspension), used by
+        # the volume/turnover/market-cap accessors so a suspension does not
+        # punch a hole in the rolling history (factor output is still blanked
+        # on suspended days by `tradable_mask`).
+        self._hard_eligible: pd.DataFrame | None = None
+
+        # (date x asset) suspension flags derived inside `_clean_prices` from
+        # the data itself (missing/stale/zero-volume rows), not merely from an
+        # optional provider column.
+        self._suspended: pd.DataFrame | None = None
+
+        # Per-asset delisting dates: provider metadata where stated, plus
+        # price disappearance for providers that simply stop pricing without
+        # a delisting_date.
+        self._delisting_dates: pd.Series | None = None
 
         # Point-in-time data (populated during run if provider supports it)
         self._st_timeseries: pd.DataFrame | None = None
@@ -235,28 +262,191 @@ class DataPipeline:
 
         return mask
 
+    def _build_listing_window_mask(self, dates, assets) -> pd.DataFrame:
+        """True where an asset is inside its listed window on a date.
+
+        Pre-listing and post-delisting asset-days are not tradable and must
+        not enter any cross-section.  ``delisting_date`` comes from provider
+        metadata; when the metadata is silent but the provider simply stops
+        pricing, ``_delisting_dates`` carries the first missing date of the
+        terminal gap (see `_derive_delisting_dates`).
+        """
+        mask = pd.DataFrame(True, index=dates, columns=assets)
+        meta = self.metadata.reindex(assets)
+
+        listing = (
+            pd.to_datetime(meta["listing_date"], errors="coerce")
+            if "listing_date" in meta.columns
+            else pd.Series(pd.NaT, index=assets, dtype="datetime64[ns]")
+        )
+        delisting = pd.Series(pd.NaT, index=assets, dtype="datetime64[ns]")
+        if self._delisting_dates is not None:
+            delisting = pd.to_datetime(
+                self._delisting_dates.reindex(assets), errors="coerce"
+            )
+
+        for asset in assets:
+            listed_at = listing.get(asset)
+            if pd.notna(listed_at):
+                mask.loc[dates < listed_at, asset] = False
+            delisted_at = delisting.get(asset)
+            if pd.notna(delisted_at):
+                mask.loc[dates >= delisted_at, asset] = False
+        return mask
+
+    def _derive_delisting_dates(self, close: pd.DataFrame) -> pd.Series:
+        """Delisting dates from metadata, falling back to price disappearance.
+
+        The stated ``delisting_date`` is authoritative.  When a provider omits
+        it but stops producing prices for good (the common shape of a real
+        delisting), the first date of the trailing missing run is used — but
+        only when that run is longer than ``max_suspension_days``, so an
+        ordinary (possibly long) suspension is not reclassified as a
+        delisting.
+        """
+        dates = pd.DatetimeIndex(close.index).sort_values()
+        result = pd.Series(pd.NaT, index=close.columns, dtype="datetime64[ns]")
+
+        if self.metadata is not None and "delisting_date" in self.metadata.columns:
+            stated = pd.to_datetime(
+                self.metadata["delisting_date"].reindex(close.columns),
+                errors="coerce",
+            )
+            result.loc[stated.notna()] = stated[stated.notna()]
+
+        if len(dates) == 0:
+            return result
+
+        for asset in close.columns:
+            if pd.notna(result.loc[asset]):
+                continue
+            observed = close[asset].dropna()
+            if observed.empty:
+                continue
+            last_seen = observed.index[-1]
+            if last_seen >= dates[-1]:
+                continue
+            trailing_missing = dates[dates > last_seen]
+            if len(trailing_missing) > self.max_suspension_days:
+                result.loc[asset] = trailing_missing[0]
+        return result
+
+    def _derive_suspensions(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Derive (date x asset) suspension flags from the price data itself.
+
+        Real providers do not all ship ``is_suspended``: Tushare and Baostock
+        forward-fill short gaps and emit nothing.  Trusting the optional column
+        left those rows in the return panel, where a forward-filled close
+        produced a run of fake zero returns followed by a multi-day "resume"
+        move.  A row is treated as suspended when any of the following holds
+        inside the asset's listed window:
+
+        * the close is missing (dropped rows / provider NaN);
+        * volume is zero;
+        * the whole OHLC(VWAP) row is identical to the previous row — the
+          signature of a provider forward-fill (a genuinely unchanged close
+          with an identical open/high/low/vwap does not occur in real data);
+        * the provider explicitly flags it.
+
+        Leading NaNs (pre-listing) and trailing NaNs (delisting) are excluded
+        by the listed window, so they are not mislabelled as suspensions.
+        """
+        dates = pd.DatetimeIndex(
+            df.index.get_level_values("date").unique()
+        ).sort_values()
+        assets = pd.Index(
+            df.index.get_level_values("asset").unique(), name="asset"
+        )
+        close = df["close"].unstack("asset").reindex(index=dates, columns=assets)
+
+        suspended = close.isna()
+
+        stale = close.eq(close.shift(1)) & close.notna()
+        for col in ("open", "high", "low", "vwap"):
+            if col in df.columns:
+                panel = df[col].unstack("asset").reindex(
+                    index=dates, columns=assets
+                )
+                stale &= panel.eq(panel.shift(1))
+        suspended |= stale
+
+        if "volume" in df.columns:
+            volume = df["volume"].unstack("asset").reindex(
+                index=dates, columns=assets
+            )
+            suspended |= volume.eq(0) & close.notna()
+
+        if "is_suspended" in df.columns:
+            flag = (
+                df["is_suspended"]
+                .unstack("asset")
+                .reindex(index=dates, columns=assets)
+                .fillna(False)
+                .astype(bool)
+            )
+            suspended |= flag
+
+        window = self._build_listing_window_mask(dates, assets)
+        suspended &= window
+        return suspended.fillna(False)
+
     def _apply_pit_tradability_mask(self) -> None:
-        """Blank prices and returns for assets while they are ST.
+        """Blank prices outside the listed window and build the eligibility mask.
 
-        Ineligible asset-days become NaN — the same representation the
-        pipeline already uses for suspensions, so every downstream consumer
-        (factors, alpha, optimizer, backtest) treats them as untradable
-        without needing to know the mask exists.
+        Two different guarantees are needed:
 
-        Note this is deliberately *not* plumbed into the backtest as a
-        separate input: the backtest reads `self.returns` and `self.prices`,
-        and blanking them here is what makes the mask effective.  A consumer
-        that needs the mask itself (e.g. for reporting) can read
-        `self.st_eligible`.
+        * **Hard exclusions** (ST while excluded, pre-listing, post-delisting)
+          are blanked in ``self.prices`` itself.  Every downstream consumer
+          (factors, alpha, optimizer, backtest) already treats a NaN price as
+          untradable, so blanking is what makes the exclusion effective
+          without plumbing a new input through every layer.
+        * **Suspension** keeps its stale price in ``self.prices`` (valuation
+          must show the last clean mark), but is False in ``tradable_mask``
+          and therefore in the ``excluded_mask`` attached by
+          `get_factor_prices`, so factors, signals and new target weights
+          never see a suspended asset-day.
+
+        ``st_eligible`` keeps its original meaning (ST episodes only) for
+        reporting; ``tradable_mask`` is the combined ST/listing/delisting/
+        suspension mask consumed by the factor stage.
+
+        Delisted names: factors and signals are NaN from the delisting date,
+        so the optimizer cannot open a new position.  A position still marked
+        at the next rebalance has a target weight of zero (it is dropped from
+        the signal cross-section) and is liquidated at that rebalance; between
+        rebalances its return is NaN, which the engine's reindex/fillna(0)
+        treats as a frozen mark — documented frozen-holding behaviour rather
+        than a fabricated return.
         """
         prices = self.prices
         if prices is None:
             return
-        if not self.exclude_st:
-            return
 
-        mask = self._build_st_eligibility_mask()
-        flat = mask.stack()
+        dates = pd.DatetimeIndex(
+            prices.index.get_level_values("date").unique()
+        ).sort_values()
+        assets = pd.Index(
+            prices.index.get_level_values("asset").unique(), name="asset"
+        )
+
+        if self.exclude_st:
+            st_mask = self._build_st_eligibility_mask().reindex(
+                index=dates, columns=assets, fill_value=True
+            )
+        else:
+            st_mask = pd.DataFrame(True, index=dates, columns=assets)
+
+        window = self._build_listing_window_mask(dates, assets)
+        hard_eligible = st_mask & window
+
+        suspended = pd.DataFrame(False, index=dates, columns=assets)
+        if self._suspended is not None and not self._suspended.empty:
+            suspended = self._suspended.reindex(
+                index=dates, columns=assets, fill_value=False
+            )
+        tradable = hard_eligible & ~suspended
+
+        flat = hard_eligible.stack()
         flat = flat.reindex(prices.index, fill_value=True).astype(bool)
 
         price_cols = [
@@ -269,20 +459,24 @@ class DataPipeline:
         # survived cleaning and are not excluded on every single date.  Names
         # already dropped by `_remove_long_suspensions` are not in the mask
         # and so disappear from it here too.
-        ever_eligible = mask.any(axis=0)
-        dropped = mask.columns[~ever_eligible]
+        ever_eligible = hard_eligible.any(axis=0)
+        dropped = hard_eligible.columns[~ever_eligible]
         if len(dropped):
             logger.info(
-                "ST mask excludes %d assets for the whole sample: %s",
+                "Tradability mask excludes %d assets for the whole sample: %s",
                 len(dropped), list(dropped[:10]),
             )
-        kept = mask.columns[ever_eligible]
+        kept = hard_eligible.columns[ever_eligible]
         self.valid_assets = pd.Index(kept, name="asset")
         self.metadata = self.metadata.loc[
             self.metadata.index.isin(self.valid_assets)
         ]
 
-        self.st_eligible = mask.loc[:, ever_eligible]
+        self.st_eligible = (
+            st_mask.loc[:, ever_eligible] if self.exclude_st else None
+        )
+        self._hard_eligible = hard_eligible.loc[:, ever_eligible]
+        self.tradable_mask = tradable.loc[:, ever_eligible]
         self.prices = prices
 
     def get_valid_assets(self) -> pd.Index:
@@ -362,6 +556,20 @@ class DataPipeline:
         available = self.financials[self.financials["publish_date"] <= as_of_date]
         if available.empty:
             return pd.DataFrame()
+
+        # A company has no fundamentals before it lists; reports generated
+        # for pre-listing periods (or carried over from a provider) must not
+        # be visible to a cross-section that predates the listing.
+        if self.metadata is not None and "listing_date" in self.metadata.columns:
+            listing = pd.to_datetime(self.metadata["listing_date"], errors="coerce")
+            listed_by_then = listing[listing <= as_of_date].index
+            available = available[
+                available["asset"].isin(listed_by_then)
+                if "asset" in available.columns
+                else available.index.get_level_values("asset").isin(listed_by_then)
+            ]
+            if available.empty:
+                return pd.DataFrame()
 
         # For each asset, take the record with the latest publish_date
         # Reset index to work with date/asset columns
@@ -516,6 +724,16 @@ class DataPipeline:
         if self.exclude_suspended:
             df = self._remove_long_suspensions(df)
 
+        # Delisting dates must be known before suspension derivation: a
+        # terminal NaN run is a delisting, not a suspension.
+        raw_close = df["close"].unstack("asset")
+        self._delisting_dates = self._derive_delisting_dates(raw_close)
+
+        # Suspension flags from the data itself: providers that ffill without
+        # an `is_suspended` column (Tushare/Baostock) must not book fake zero
+        # returns across the fill.
+        self._suspended = self._derive_suspensions(df)
+
         # Price adjustment
         df["close_adj"] = df["close"] / df["adj_factor"]
         df["open_adj"] = df["open"] / df["adj_factor"]
@@ -527,11 +745,10 @@ class DataPipeline:
         change = close.pct_change(fill_method=None)
         # A resume-day jump is a multi-day move, not a limit move: do not
         # label rows whose price spans a forward-filled suspension.
-        if "is_suspended" in df.columns:
-            suspended = (
-                df["is_suspended"].unstack("asset").fillna(False).astype(bool)
-            )
-            change = change.mask(suspended | suspended.shift(1))
+        suspended = self._suspended.reindex(
+            index=close.index, columns=close.columns, fill_value=False
+        )
+        change = change.mask(suspended | suspended.shift(1))
         limit_thresholds = pd.DataFrame(0.10, index=close.index, columns=close.columns)
         for col in close.columns:
             code = str(col)
@@ -543,6 +760,13 @@ class DataPipeline:
         down = (change <= -limit_thresholds + 1e-4) & change.notna()
         df["is_limit_up"] = up.stack().reindex(df.index).fillna(False).astype(bool)
         df["is_limit_down"] = down.stack().reindex(df.index).fillna(False).astype(bool)
+
+        # Materialise the derived flags on the rows that exist.  Rows the
+        # provider dropped entirely cannot carry a column value; consumers
+        # that need the full grid use `self._suspended`.
+        df["is_suspended"] = (
+            self._suspended.stack().reindex(df.index).fillna(False).astype(bool)
+        )
 
         self.prices = df
 
@@ -596,12 +820,18 @@ class DataPipeline:
     def _compute_returns(self) -> None:
         """Compute daily returns from adjusted close prices.
 
-        ST asset-days were already blanked by `_apply_pit_tradability_mask()`,
-        so their returns are NaN and the backtest cannot hold them.  Because
-        `returns[t]` spans t to t+1, the ST window's first day (the
-        announcement date, when the position must be exited) also comes out
-        NaN — the conservative reading, since the ST-day price move is not a
-        return the strategy could have earned.
+        ST/listing/delisting asset-days were already blanked in the price
+        panel by `_apply_pit_tradability_mask()`, so their returns are NaN and
+        the backtest cannot hold them.  Because `returns[t]` spans t to t+1,
+        the ST window's first day (the announcement date, when the position
+        must be exited) also comes out NaN — the conservative reading, since
+        the ST-day price move is not a return the strategy could have earned.
+
+        Suspension days keep their stale mark in `prices` (valuation), so the
+        return series needs the mask explicitly: a forward-filled close would
+        otherwise book a fake zero on every suspended day and a compounded
+        multi-day jump on the resume day.  The mask is derived from the data
+        (`self._suspended`), so providers without `is_suspended` are covered.
         """
         close = self.prices["close_adj"].unstack("asset")
         returns = close.pct_change(fill_method=None).shift(-1)
@@ -611,11 +841,12 @@ class DataPipeline:
         # then becomes a fake zero and `returns[s]` the compounded multi-day
         # move -- adjacent contaminated observations that produce a spurious
         # reversal signal. Neither is a one-day return, so drop both.
-        if "is_suspended" in self.prices.columns:
-            suspended = (
-                self.prices["is_suspended"].unstack("asset").fillna(False).astype(bool)
+        suspended = pd.DataFrame(False, index=returns.index, columns=returns.columns)
+        if self._suspended is not None and not self._suspended.empty:
+            suspended = self._suspended.reindex(
+                index=returns.index, columns=returns.columns, fill_value=False
             )
-            returns = returns.mask(suspended | suspended.shift(-1))
+        returns = returns.mask(suspended | suspended.shift(-1))
 
         self.returns = returns
 
@@ -664,49 +895,81 @@ class DataPipeline:
         return self.prices["close_adj"].unstack("asset")
 
     def get_factor_prices(self) -> pd.DataFrame:
-        """Close prices with forward-filled suspension rows blanked.
+        """Close prices with suspension rows blanked for research inputs.
 
         `get_close()` keeps the stale mark, which is what valuation wants on a
         day a stock could not trade. Research inputs are different: a factor
         that differences across the fill sees a fake zero followed by a
         multi-day move. Blanking those rows makes pandas propagate NaN across
-        both boundaries instead of fabricating a reversal.
+        both boundaries instead of fabricating a reversal.  Suspension is
+        derived from the data (`self._suspended`), not taken on trust from an
+        optional provider column.
 
-        The ST-exclusion mask travels in ``attrs["excluded_mask"]``: factor
-        computation forward-fills the price path for level continuity, and it
-        must re-blank these rows instead of resurrecting ST names.
+        The full asset-day eligibility mask travels in
+        ``attrs["excluded_mask"]``: factor computation forward-fills the price
+        path for level continuity, and it must re-blank these rows instead of
+        resurrecting ST, pre-listing, delisted or suspended names.  It is the
+        same `tradable_mask` used for volume/turnover and, via main.py, for
+        the raw factor panels and the final signal.
         """
         close = self.prices["close_adj"].unstack("asset")
-        if "is_suspended" in self.prices.columns:
-            suspended = (
-                self.prices["is_suspended"].unstack("asset").fillna(False).astype(bool)
+        if self._suspended is not None and not self._suspended.empty:
+            suspended = self._suspended.reindex(
+                index=close.index, columns=close.columns, fill_value=False
             )
             close = close.mask(suspended)
-        if self.st_eligible is not None and not self.st_eligible.empty:
+        if self.tradable_mask is not None and not self.tradable_mask.empty:
             close.attrs["excluded_mask"] = (
-                ~self.st_eligible
+                ~self.tradable_mask
             ).reindex(
-                index=close.index, columns=close.columns, fill_value=False,
+                index=close.index, columns=close.columns, fill_value=True,
             )
         return close
 
-    def _blank_st_rows(self, panel: pd.DataFrame) -> pd.DataFrame:
-        """Apply the PIT ST exclusion to an unstacked panel."""
-        if self.st_eligible is None or self.st_eligible.empty:
+    def get_tradable_mask(self) -> pd.DataFrame | None:
+        """(date x asset) True where a new signal/weight is allowed.
+
+        False on ST days (when `exclude_st`), before listing, from the
+        delisting date onward, and on suspension days.
+        """
+        return self.tradable_mask
+
+    def _blank_ineligible_rows(self, panel: pd.DataFrame) -> pd.DataFrame:
+        """Blank hard-ineligible rows (ST, pre-listing, post-delisting).
+
+        Suspension is deliberately *not* blanked here: a stale volume/turnover
+        observation keeps the rolling history continuous, and the suspended
+        asset-day itself is excluded from factor outputs and the signal by
+        `tradable_mask`.
+        """
+        mask = self._hard_eligible
+        if mask is None or mask.empty:
             return panel
-        excluded = (~self.st_eligible).reindex(
-            index=panel.index, columns=panel.columns, fill_value=False,
+        excluded = (~mask).reindex(
+            index=panel.index, columns=panel.columns, fill_value=True,
         )
         return panel.mask(excluded)
 
     def get_volume(self) -> pd.DataFrame:
-        """Return volume (unstacked: date x asset), ST rows blanked."""
-        return self._blank_st_rows(self.prices["volume"].unstack("asset"))
+        """Return volume (unstacked: date x asset), hard-ineligible rows blanked.
+
+        Blanked outside the listed window (no volume before listing or after
+        delisting) and while ST.  Suspended rows keep the provider's stale
+        observation; `tradable_mask` excludes them from signals/weights.
+        """
+        return self._blank_ineligible_rows(self.prices["volume"].unstack("asset"))
 
     def get_turnover(self) -> pd.DataFrame:
-        """Return turnover rate (unstacked: date x asset), ST rows blanked."""
-        return self._blank_st_rows(self.prices["turnover"].unstack("asset"))
+        """Return turnover rate (unstacked: date x asset), hard-ineligible rows blanked."""
+        return self._blank_ineligible_rows(self.prices["turnover"].unstack("asset"))
 
     def get_market_cap(self) -> pd.DataFrame:
-        """Return market cap from financials (unstacked: date x asset)."""
-        return self.financials["market_cap"].unstack("asset")
+        """Return market cap from financials (unstacked: date x asset).
+
+        Blanked before listing, after delisting and while ST: a name has no
+        meaningful market cap before it lists, and a fundamental cross-section
+        must not include it there.
+        """
+        return self._blank_ineligible_rows(
+            self.financials["market_cap"].unstack("asset")
+        )

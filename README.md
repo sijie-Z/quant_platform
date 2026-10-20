@@ -92,6 +92,8 @@ python -m venv .venv
 # 3. 启动 Web 平台（FastAPI + Vue）
 .venv\Scripts\python main.py web
 # 浏览器打开 http://localhost:8000
+# 默认只监听 127.0.0.1。远程访问请设置 QUANT_API_TOKEN，并在 UI Settings
+# 填入同一 token；未设置 token 时所有 /api（除 /api/health）仅允许回环访问。
 
 # 4. 运行所有测试
 .venv\Scripts\python -m pytest tests/ -q

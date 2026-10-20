@@ -211,6 +211,7 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
     CLI needs the unstandardized panels; everything else consumes the
     processed ones.
     """
+    from quant_platform.factors.base import mask_financials
     from quant_platform.factors.evaluation import ic_summary, rank_ic
     from quant_platform.factors.fundamental import register_all as register_fundamental
     from quant_platform.factors.processing import process_factor
@@ -228,7 +229,16 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
         enabled_factors.update(getattr(config.factors, 'enabled_technicals', ()))
         enabled_factors.update(getattr(config.factors, 'enabled_fundamentals', ()))
 
+    # Point-in-time asset-day eligibility (ST, pre-listing, delisted,
+    # suspended) travels with the factor price panel.  It must reach the
+    # fundamental inputs too: masking only the price columns left financial
+    # factors live for ST / not-yet-listed / delisted names, which then
+    # received a signal and a target weight.
+    excluded = prices.attrs.get("excluded_mask") if prices is not None else None
+
     fin_unstacked = financials.unstack("asset") if financials is not None else None
+    if fin_unstacked is not None and excluded is not None:
+        fin_unstacked = mask_financials(fin_unstacked, excluded)
 
     raw_factors = {}
     factor_params = (
@@ -259,6 +269,21 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
             logger.warning("Failed to compute %s: %s", factor_name, e)
 
     logger.info("Computed %d factors: %s", len(raw_factors), list(raw_factors.keys()))
+
+    # Belt-and-braces for factors that do not go through the price panel's
+    # attrs (or override `compute`): blank every raw factor, whatever its
+    # category, on ineligible asset-days. ST names, pre-listing assets,
+    # delisted names and suspended days must never reach the processed
+    # cross-section, the signal or the optimizer.
+    if excluded is not None:
+        raw_factors = {
+            name: values.mask(
+                excluded.reindex(
+                    index=values.index, columns=values.columns, fill_value=True,
+                )
+            )
+            for name, values in raw_factors.items()
+        }
 
     sector_map = metadata.get("sector", {}) if metadata is not None else {}
     # Point-in-time sector panel attached by `_load_data`; absent when the
@@ -369,7 +394,16 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
 
 
 def _generate_signal(config, processed_factors, returns, prices=None, volume=None):
-    """Generate alpha signal from processed factors."""
+    """Generate alpha signal from processed factors.
+
+    The factor combination fills a missing factor value with 0 (the
+    cross-sectional mean of a z-scored factor) by design, so masking the
+    factor panels alone is not enough: an ST / pre-listing / delisted /
+    suspended name whose factors are all NaN still receives a neutral score
+    and can be selected.  The pipeline's eligibility mask (carried on the
+    price panel's ``attrs``) is therefore re-applied to the final signal, so
+    those names drop out of the optimizer's cross-section entirely.
+    """
     from quant_platform.alpha.pipeline import AlphaPipeline
 
     alpha_pipe = AlphaPipeline(
@@ -379,7 +413,16 @@ def _generate_signal(config, processed_factors, returns, prices=None, volume=Non
         tradability_gate=getattr(config.alpha, 'tradability_gate', False),
         min_tradability=getattr(config.alpha, 'min_tradability', 0.3),
     )
-    return alpha_pipe.run(processed_factors, returns, prices=prices, volume=volume)
+    signal = alpha_pipe.run(processed_factors, returns, prices=prices, volume=volume)
+
+    excluded = prices.attrs.get("excluded_mask") if prices is not None else None
+    if excluded is not None:
+        signal = signal.mask(
+            excluded.reindex(
+                index=signal.index, columns=signal.columns, fill_value=True,
+            )
+        )
+    return signal
 
 
 def _chart_payload(results: dict) -> dict:
@@ -866,7 +909,7 @@ def cmd_compare(args) -> int:
     prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_tushare=False)
     processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
         prices, returns, financials, metadata, turnover, config=config)
-    signal = _generate_signal(config, processed_factors, returns)
+    signal = _generate_signal(config, processed_factors, returns, prices=prices)
 
     results_table = []
 
@@ -942,7 +985,7 @@ def cmd_sweep(args) -> int:
             prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_tushare=False)
             processed_factors, _ic_results, sector_map, fin_unstacked = _compute_factors(
                 prices, returns, financials, metadata, turnover, config=config)
-            signal = _generate_signal(config, processed_factors, returns)
+            signal = _generate_signal(config, processed_factors, returns, prices=prices)
             bt_results = _run_backtest(
                 config, signal, prices, returns, benchmark,
                 sector_map, fin_unstacked,
@@ -1589,7 +1632,7 @@ def cmd_profile(args) -> int:
 
     # Stage 3: Alpha
     t0 = time.perf_counter()
-    signal = _generate_signal(config, processed_factors, returns)
+    signal = _generate_signal(config, processed_factors, returns, prices=prices)
     timings["3_alpha"] = time.perf_counter() - t0
 
     # Stage 4: Backtest
@@ -1840,7 +1883,7 @@ def cmd_gate(args) -> int:
     # SKIPPED. Run the backtest so those gates see real numbers.
     backtest_summary = None
     try:
-        signal = _generate_signal(config, processed_factors, returns)
+        signal = _generate_signal(config, processed_factors, returns, prices=prices)
         bt_results = _run_backtest(
             config, signal, prices, returns, benchmark,
             sector_map, fin_unstacked,
@@ -1975,7 +2018,7 @@ def cmd_strategy(args) -> int:
         prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
         processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
             prices, returns, financials, metadata, turnover, config=config)
-        signal = _generate_signal(config, processed_factors, returns)
+        signal = _generate_signal(config, processed_factors, returns, prices=prices)
         bt_result = _run_backtest(config, signal, prices, returns, benchmark,
                                    sector_map, financials)
 
@@ -2060,7 +2103,7 @@ def cmd_walkforward(args) -> int:
     )
 
     # Generate full-period signal (used as reference)
-    signal = _generate_signal(config, processed_factors, returns)
+    signal = _generate_signal(config, processed_factors, returns, prices=prices)
 
     # Run walk-forward with per-fold signal recomputation
     from quant_platform.backtest.walkforward import WalkForwardValidator
@@ -2217,7 +2260,8 @@ def main() -> int:
     # web
     web_parser = subparsers.add_parser("web", help="Start web server (FastAPI + Vue)")
     web_parser.add_argument("--port", "-p", type=int, default=8000, help="Server port")
-    web_parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
+    web_parser.add_argument("--host", type=str, default="127.0.0.1",
+                           help="Server host (use 0.0.0.0 in a container, with QUANT_API_TOKEN set)")
     web_parser.add_argument("--no-frontend", action="store_true", help="API only mode")
 
     # cache

@@ -15,7 +15,7 @@
           <option value="icir_weighted">{{ locale === 'zh-CN' ? 'ICIR加权Alpha' : 'ICIR Alpha' }}</option>
         </select>
         <input v-model.number="newStrat.allocation_pct" type="number" min="0" max="1" step="0.05"
-          :placeholder="locale === 'zh-CN' ? '分配比例%' : 'Alloc %'" class="ms-input ms-input-sm" />
+          :placeholder="locale === 'zh-CN' ? '比例 0–1' : 'Alloc 0–1'" class="ms-input ms-input-sm" />
         <button class="ms-btn ms-btn-add" @click="addNew">{{ locale === 'zh-CN' ? '+ 添加' : '+ Add' }}</button>
       </div>
     </div>
@@ -137,13 +137,22 @@ const newStrat = reactive({
 })
 
 async function loadAll() {
-  try {
-    const [list, m, a] = await Promise.all([listStrategies(), getStrategyMetrics(), getStrategyAlerts()])
-    strategies.value = list.strategies || []
-    metrics.value = m
-    alerts.value = a.alerts || []
-  } catch (e) {
-    console.error(locale.value === 'zh-CN' ? '加载策略失败' : 'Failed to load strategies', e)
+  // One failing endpoint used to discard the other two successful responses
+  // and leave the table reading "No strategies registered".
+  const [list, m, a] = await Promise.allSettled([
+    listStrategies(), getStrategyMetrics(), getStrategyAlerts(),
+  ])
+  if (list.status === 'fulfilled') strategies.value = list.value.strategies || []
+  if (m.status === 'fulfilled') metrics.value = m.value
+  if (a.status === 'fulfilled') alerts.value = a.value.alerts || []
+  const failed = [list, m, a].filter(result => result.status === 'rejected')
+  if (failed.length) {
+    emit('toast', {
+      message: locale.value === 'zh-CN'
+        ? `部分策略数据加载失败（${failed.length}/3）`
+        : `Some strategy data failed to load (${failed.length}/3)`,
+      type: 'warning',
+    })
   }
 }
 

@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from quant_platform.utils.logging import get_logger
 
@@ -54,6 +54,10 @@ class RiskOverviewResponse(BaseModel):
     portfolio_value: float = Field(0.0)
     daily_pnl: float = Field(0.0)
     n_positions: int = Field(0)
+    kill_switch: bool = Field(False, description="Whether the kill switch is active")
+    limits: dict[str, float] = Field(
+        default_factory=dict, description="Live RiskMonitor limits",
+    )
 
 
 class TCASummaryResponse(BaseModel):
@@ -94,6 +98,8 @@ class CapacityGaugeResponse(BaseModel):
 
 
 class ConfigUpdateRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     max_position_pct: float | None = Field(None, ge=0.01, le=0.20, description="Max single position weight (0.01-0.20)")
     max_sector_pct: float | None = Field(None, ge=0.05, le=0.50, description="Max sector weight (0.05-0.50)")
     max_drawdown_pct: float | None = Field(None, ge=0.01, le=0.30, description="Drawdown halt threshold (0.01-0.30)")
@@ -185,6 +191,11 @@ async def get_risk_overview():
             result.daily_pnl = status.get("daily_pnl", 0)
             result.current_drawdown = abs(status.get("current_drawdown", 0))
             result.n_positions = status.get("n_positions", 0)
+            result.kill_switch = bool(status.get("kill_switch", False))
+            result.limits = {
+                str(k): float(v)
+                for k, v in (status.get("limits") or {}).items()
+            }
             result.available = True
         except Exception as e:
             result.reason = f"risk status unavailable: {e}"

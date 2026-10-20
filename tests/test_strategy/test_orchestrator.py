@@ -45,8 +45,9 @@ class TestPortfolioOrchestrator:
         o.rebalance()
         o.process_fills({"A0001": 100.0})
 
-        # Now signal changes — exit A0001
-        o._targets[sid] = {}
+        # Next session: signal changes — exit A0001. The position was bought
+        # today, so T+1 makes it unsellable until the date advances.
+        o.on_signal("2025-01-02", pd.Series(dtype=float), strategy_id=sid)
         orders = o.rebalance()
         sells = [o for o in orders if o["side"] == "sell"]
         assert len(sells) > 0

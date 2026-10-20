@@ -87,6 +87,77 @@ class TestMarketClock:
         assert session.status == "closed_holiday"
 
 
+class TestClosingAuctionAndEodTiming:
+    """P6: the 14:57-15:00 closing call auction is part of the session.
+
+    The scheduler used to declare `post_market` (and run EOD reconciliation)
+    at 14:57, three minutes before the close, so `is_market_open()` was False
+    while the exchange was still trading.
+    """
+
+    @staticmethod
+    def _at(scheduler, hour, minute):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        return scheduler.get_market_session(
+            now=datetime(2026, 10, 20, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+
+    @pytest.mark.parametrize(("hour", "minute"), [(14, 57), (14, 58), (14, 59)])
+    def test_closing_auction_is_trading_time(self, scheduler, hour, minute):
+        session = self._at(scheduler, hour, minute)
+        assert session.status == "trading_pm"
+        assert session.is_trading_day is True
+
+    @pytest.mark.parametrize(("hour", "minute"), [(15, 0), (15, 15), (15, 29)])
+    def test_post_market_starts_at_1500(self, scheduler, hour, minute):
+        assert self._at(scheduler, hour, minute).status == "post_market"
+
+    def test_after_post_market_window_is_closed(self, scheduler):
+        assert self._at(scheduler, 15, 30).status == "closed"
+
+    @staticmethod
+    def _trading_scheduler(tmp_path):
+        from quant_platform.core.scheduler import TradingScheduler
+        from quant_platform.core.state_machine import (
+            PortfolioState,
+            PortfolioStateMachine,
+        )
+
+        store = Store(str(tmp_path / "eod_timing.db"))
+        sm = PortfolioStateMachine()
+        scheduler = TradingScheduler(state_machine=sm, store=store, bus=EventBus())
+        sm.transition(PortfolioState.READY, "test")
+        sm.transition(PortfolioState.TRADING, "test")
+        return scheduler, store
+
+    def test_eod_reconciliation_does_not_run_during_the_closing_auction(
+        self, tmp_path, monkeypatch,
+    ):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from quant_platform.core.state_machine import PortfolioState
+
+        scheduler, store = self._trading_scheduler(tmp_path)
+        tz = ZoneInfo("Asia/Shanghai")
+        now = [datetime(2026, 10, 20, 14, 58, tzinfo=tz)]
+        monkeypatch.setattr(scheduler, "_now", lambda: now[0])
+
+        scheduler._tick()
+
+        assert store.has_eod_reconciliation("2026-10-20") is False
+        assert scheduler._sm.state == PortfolioState.TRADING
+
+        # One tick after the close: transition and reconcile.
+        now[0] = datetime(2026, 10, 20, 15, 0, tzinfo=tz)
+        scheduler._tick()
+
+        assert scheduler._sm.state == PortfolioState.POST_MARKET
+        assert store.has_eod_reconciliation("2026-10-20") is True
+
+
 class TestEodReconciliationIsIdempotent:
     """`_do_eod_reconciliation` had no marker.
 

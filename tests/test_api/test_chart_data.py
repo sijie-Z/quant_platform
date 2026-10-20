@@ -104,3 +104,36 @@ def test_partial_year_grid_uses_none_instead_of_nan():
     assert not any(
         isinstance(value, float) and math.isnan(value) for value in cells
     )
+
+
+def test_scatter_and_attribution_use_the_asset_return_panel():
+    """Passing the portfolio-return Series made both panels silently empty.
+
+    `_compute_factor_scatter`/`_compute_attribution` need a date x asset
+    forward-return panel; calling `.loc[d]` on a Series raised and was
+    swallowed, so every real run rendered "No scatter/attribution data".
+    """
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2024-01-01", periods=140)
+    assets = [f"S{i:02d}" for i in range(20)]
+    factors = {
+        "f1": pd.DataFrame(rng.normal(size=(140, 20)), index=dates, columns=assets),
+        "f2": pd.DataFrame(rng.normal(size=(140, 20)), index=dates, columns=assets),
+    }
+    returns = pd.DataFrame(rng.normal(0, 0.01, (140, 20)), index=dates, columns=assets)
+    signal = factors["f1"].rank(axis=1, pct=True) - 0.5
+    weights = pd.Series(1.0 / len(assets), index=assets)
+    weights_history = {dates[70]: weights, dates[110]: weights}
+    strategy_returns = returns.mean(axis=1)
+
+    chart = _build_chart_data(
+        strategy_returns,
+        weights_history=weights_history,
+        processed_factors=factors,
+        signal=signal,
+        asset_returns=returns,
+    )
+
+    assert chart.factor_scatter, "factor scatter must not be empty"
+    assert chart.attribution, "attribution must not be empty"
+    assert all(item.factor in factors for item in chart.attribution)

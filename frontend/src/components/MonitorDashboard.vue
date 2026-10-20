@@ -265,6 +265,7 @@ const riskOverview = reactive({
   factor_exposures: {}, sector_concentration: {}, current_drawdown: 0,
   volatility: 0, var_95: 0, cvar_95: 0, risk_level: 'UNKNOWN',
   portfolio_value: 0, daily_pnl: 0, n_positions: 0,
+  kill_switch: false, limits: {},
   factor_exposures_available: null, factor_exposures_reason: '',
 })
 
@@ -354,7 +355,21 @@ async function fetchAll() {
       getMonitorFactorStatus().catch(() => ({})),
       getMonitorCapacityGauge().catch(() => ({})),
     ])
+    // The backend emits lowercase enum values (`green`..`kill`); the colour
+    // map and KPI tags are keyed uppercase, so RED/KILL books used to render
+    // grey. Normalize at the boundary.
+    if (risk.risk_level) risk.risk_level = String(risk.risk_level).toUpperCase()
     Object.assign(riskOverview, risk)
+    // Seed the kill switch and the live limits from the shared RiskMonitor;
+    // otherwise the dashboard always shows ACTIVATE and default limits even
+    // after the engine tripped the switch.
+    if (risk.kill_switch !== undefined) killSwitchActive.value = !!risk.kill_switch
+    if (risk.limits && Object.keys(risk.limits).length) {
+      configForm.max_position_pct = risk.limits.max_single_position ?? configForm.max_position_pct
+      configForm.max_sector_pct = risk.limits.max_sector ?? configForm.max_sector_pct
+      configForm.max_drawdown_pct = risk.limits.max_drawdown ?? configForm.max_drawdown_pct
+      configForm.max_daily_loss_pct = risk.limits.max_daily_loss ?? configForm.max_daily_loss_pct
+    }
     Object.assign(tcaSummary, tca)
     Object.assign(factorStatus, factor)
     Object.assign(capacityGauge, cap)

@@ -15,6 +15,53 @@ from typing import Any
 
 import pandas as pd
 
+#: Financial fields that are metadata, not factor inputs.  Masking them would
+#: turn publish timestamps into NaT for no benefit.
+_FINANCIAL_METADATA_FIELDS = frozenset({"publish_date", "fiscal_period_end"})
+
+
+def mask_financials(
+    financials: pd.DataFrame | dict[str, pd.DataFrame] | None,
+    excluded: pd.DataFrame,
+) -> pd.DataFrame | dict[str, pd.DataFrame] | None:
+    """Apply a (date x asset) exclusion mask to a financials panel.
+
+    Accepts the shapes factors are called with: a dict of (date x asset)
+    panels, a single-level (date x asset) frame, or the pipeline's
+    multi-level (field, asset) frame produced by
+    ``financials.unstack("asset")``.
+    """
+    if financials is None:
+        return None
+
+    def _mask_one(panel: pd.DataFrame) -> pd.DataFrame:
+        mask = excluded.reindex(
+            index=panel.index, columns=panel.columns, fill_value=False,
+        )
+        return panel.mask(mask)
+
+    if isinstance(financials, dict):
+        return {name: _mask_one(panel) for name, panel in financials.items()}
+
+    if not isinstance(financials, pd.DataFrame):
+        return financials
+
+    if isinstance(financials.columns, pd.MultiIndex):
+        fields = list(financials.columns.get_level_values(0).unique())
+        blocks = []
+        for field in fields:
+            block = financials[field]
+            blocks.append(
+                block
+                if field in _FINANCIAL_METADATA_FIELDS
+                else _mask_one(block)
+            )
+        masked = pd.concat(blocks, axis=1, keys=fields)
+        masked.columns.names = financials.columns.names
+        return masked
+
+    return _mask_one(financials)
+
 
 class FactorCategory(Enum):
     TECHNICAL = "technical"
@@ -87,22 +134,29 @@ class BaseFactor(ABC):
         0/85 on real-shaped data). Factor levels therefore use the stale
         forward-filled close; the IC target remains the masked return panel.
 
-        The panel also blanks ST asset-days (the PIT tradability mask). Those
-        rows must stay blank: a blanket `ffill()` used to fill them with a
-        stale close, so ST names re-entered every cross-section. The mask is
-        carried in `attrs["excluded_mask"]` by `DataPipeline.get_factor_prices`.
+        The panel also carries the full asset-day eligibility mask (ST,
+        pre-listing, delisted and suspended rows) in
+        ``attrs["excluded_mask"]``.  Those rows must stay blank: a blanket
+        `ffill()` used to fill them with a stale close, so excluded names
+        re-entered every cross-section.  The same mask is applied to the
+        ``financials`` panel, because fundamental factors derive their values
+        from financial statements rather than prices and previously bypassed
+        the mask entirely (an ST name kept a live ROE/market-cap value while
+        its price factors were correctly NaN).
 
         Set ``fill_suspensions = False`` on a factor that genuinely needs the
         blanks.
         """
+        excluded = prices.attrs.get("excluded_mask")
         if getattr(self, "fill_suspensions", True):
-            excluded = prices.attrs.get("excluded_mask")
             price_panel = prices.ffill()
             if excluded is not None:
                 price_panel = price_panel.mask(excluded)
         else:
             price_panel = prices
         if financials is not None:
+            if excluded is not None:
+                financials = mask_financials(financials, excluded)
             values = self.compute(price_panel, financials=financials, **kwargs)
         else:
             values = self.compute(price_panel, **kwargs)

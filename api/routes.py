@@ -315,6 +315,15 @@ async def run_pipeline(req: RunRequest):
 
     Returns immediately with run_id. Poll /run/{run_id}/status for progress.
     """
+    # The thread pool has two workers; queueing unbounded pipeline runs is a
+    # cheap way to exhaust the server.
+    active_runs = sum(
+        1 for status in _run_status.values() if status.get("status") == "running"
+    )
+    if active_runs >= 2:
+        raise HTTPException(
+            429, "Two pipeline runs are already queued/running; try again later"
+        )
     run_id = uuid.uuid4().hex[:12]
     _run_status[run_id] = {
         "status": "running",
@@ -407,6 +416,7 @@ def _execute_pipeline(run_id: str, req: RunRequest):
             weights_history=weights_history,
             processed_factors=processed_factors,
             signal=signal,
+            asset_returns=returns,
         )
 
         # Risk
@@ -581,15 +591,27 @@ def _execute_pipeline(run_id: str, req: RunRequest):
 
         _update_status(run_id, 100, "done")
 
-    except Exception:
+    except Exception as exc:
+        # Keep the full traceback in the server log; return only the exception
+        # type/message (with the run id for correlation). The status endpoint
+        # previously exposed absolute paths and source lines to any caller.
+        full_traceback = traceback.format_exc()
         _run_status[run_id].update(
             status="failed",
-            # Keep only the tail: a failed run retained the full traceback
-            # (and every frame's locals-by-repr string) for the process life.
-            error=str(traceback.format_exc())[-4000:],
+            error=f"{type(exc).__name__}: {exc}"[:500],
             completed_at=datetime.now().isoformat(),
         )
-        logger.error("Pipeline %s failed: %s", run_id, traceback.format_exc())
+        logger.error("Pipeline %s failed: %s", run_id, full_traceback)
+        # Failures were never broadcast, so the frontend's WS failure branch
+        # was dead and the run only surfaced through the next poll.
+        loop = _main_loop
+        if loop is not None and loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _broadcast_status(run_id, _run_status[run_id]), loop
+                )
+            except RuntimeError:
+                pass
 
     finally:
         _cleanup_old_runs()
@@ -730,7 +752,9 @@ def _compute_turnover(weights_history: dict) -> list[dict]:
                 if change > 0.001:
                     n_trades += 1
             items.append({
-                "date": str(sorted_dates[i]),
+                # Date-only, matching the demo payload and the chart axis;
+                # `str(Timestamp)` included a useless "00:00:00" suffix.
+                "date": str(pd.Timestamp(sorted_dates[i]).date()),
                 "turnover": round(total_change / 2, 4),  # One-way turnover
                 "n_trades": n_trades,
             })
@@ -740,10 +764,17 @@ def _compute_turnover(weights_history: dict) -> list[dict]:
 def _compute_factor_scatter(
     processed_factors: dict,
     signal: pd.DataFrame,
-    returns: pd.Series,
+    returns: pd.DataFrame,
     top_n: int = 6,
 ) -> list[dict]:
-    """Compute factor vs forward return scatter data for top factors."""
+    """Compute factor vs forward return scatter data for top factors.
+
+    `returns` must be the asset-level forward-return panel (t -> t+1), the
+    same convention the factor evaluator uses. It previously received the
+    portfolio-return Series; `returns.shift(-1)` on that Series is also a
+    second shift, i.e. a one-day look-ahead when the panel is already
+    forward-aligned.
+    """
     from scipy import stats
 
     # Get IC ranking from factors
@@ -751,7 +782,7 @@ def _compute_factor_scatter(
     for name, factor_df in processed_factors.items():
         if hasattr(factor_df, 'values'):
             # Compute rank IC with next-period returns
-            fwd_ret = returns.shift(-1)
+            fwd_ret = returns
             common_dates = factor_df.index.intersection(fwd_ret.dropna().index)
             if len(common_dates) > 50:
                 ics = []
@@ -779,7 +810,7 @@ def _compute_factor_scatter(
     result = []
     for name, ic_info in top_factors:
         factor_df = processed_factors[name]
-        fwd_ret = returns.shift(-1)
+        fwd_ret = returns
         common_dates = factor_df.index.intersection(fwd_ret.dropna().index)
 
         # Sample points for scatter (max 500 points)
@@ -816,9 +847,14 @@ def _compute_factor_scatter(
 def _compute_attribution(
     processed_factors: dict,
     weights_history: dict,
-    returns: pd.Series,
+    returns: pd.DataFrame,
 ) -> list[dict]:
-    """Compute P&L attribution by factor contribution."""
+    """Compute P&L attribution by factor contribution.
+
+    `returns` is the asset-level forward-return panel (t -> t+1). The
+    portfolio held at `prev_date` earns that row, so attribution uses
+    `prev_date`, not the execution date and not a reindexed Series.
+    """
     from scipy import stats
 
     if len(weights_history) < 2:
@@ -837,14 +873,14 @@ def _compute_attribution(
                 prev_date = sorted_dates[i - 1]
                 w = weights_history[date]
                 # Factor-weighted return
-                if date in returns.index and hasattr(w, 'index'):
+                if prev_date in returns.index and hasattr(w, 'index'):
                     common = w.index.intersection(factor_df.columns if hasattr(factor_df, 'columns') else factor_df.index)
                     if len(common) > 0:
                         # Factor exposure weighted by portfolio weights
                         if hasattr(factor_df, 'loc') and prev_date in factor_df.index:
                             f_vals = factor_df.loc[prev_date].reindex(common).fillna(0)
                             w_vals = w.reindex(common).fillna(0)
-                            r_vals = returns.reindex(common).fillna(0) if hasattr(returns, 'reindex') else pd.Series(0, index=common)
+                            r_vals = returns.loc[prev_date].reindex(common).fillna(0)
                             # IC contribution
                             ic, _ = stats.spearmanr(f_vals.values, r_vals.values)
                             if not np.isnan(ic):
@@ -862,7 +898,7 @@ def _compute_attribution(
     for name, contrib in sorted(factor_contribs.items(), key=lambda x: abs(x[1]), reverse=True)[:10]:
         # Compute average IC
         try:
-            fwd_ret = returns.shift(-1)
+            fwd_ret = returns
             # `factor_df` here was left over from the loop above, so it held
             # whichever factor that loop happened to end on -- the IC reported
             # for each name was computed from some other factor's dates. Line
@@ -902,8 +938,14 @@ def _build_chart_data(
     weights_history: dict | None = None,
     processed_factors: dict | None = None,
     signal: pd.DataFrame | None = None,
+    asset_returns: pd.DataFrame | None = None,
 ) -> ChartData:
-    """Build chart-ready data from returns series."""
+    """Build chart-ready data from returns series.
+
+    `asset_returns` is the date x asset forward-return panel. Scatter and
+    attribution need cross-sectional returns; passing the portfolio-return
+    Series made both silently produce empty lists on every real run.
+    """
     sr = strategy_returns.dropna()
     equity = (1 + sr).cumprod()
     dates = [str(d.date()) for d in equity.index]
@@ -993,19 +1035,22 @@ def _build_chart_data(
 
     # Factor scatter (top 6 factors by |ICIR|)
     factor_scatter = None
-    if processed_factors and signal is not None:
+    if processed_factors and signal is not None and asset_returns is not None:
         try:
             factor_scatter = _compute_factor_scatter(
-                processed_factors, signal, sr, top_n=6)
+                processed_factors, signal, asset_returns, top_n=6)
         except Exception:
             pass
 
     # P&L attribution
     attribution = None
-    if processed_factors and weights_history and len(weights_history) > 1:
+    if (
+        processed_factors and weights_history and len(weights_history) > 1
+        and asset_returns is not None
+    ):
         try:
             attribution = _compute_attribution(
-                processed_factors, weights_history, sr)
+                processed_factors, weights_history, asset_returns)
         except Exception:
             pass
 
@@ -1633,6 +1678,16 @@ async def create_order(order_req: dict):
     side = order_req.get("side", "buy")
     if side not in ("buy", "sell"):
         raise HTTPException(422, "side must be 'buy' or 'sell'")
+    limit_price = order_req.get("limit_price")
+    if limit_price is not None:
+        try:
+            limit_price = float(limit_price)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(422, "limit_price must be a number") from exc
+        # NaN/Infinity made the OMS store NaN slippage, after which the JSON
+        # blotter and TCA endpoints returned 500 until process restart.
+        if not np.isfinite(limit_price) or limit_price <= 0:
+            raise HTTPException(422, "limit_price must be a finite positive number")
 
     try:
         oms = _get_oms()
@@ -1641,7 +1696,7 @@ async def create_order(order_req: dict):
             side=side,
             quantity=quantity,
             order_type=order_req.get("order_type") or order_req.get("type", "market"),
-            limit_price=order_req.get("limit_price"),
+            limit_price=limit_price,
             strategy=order_req.get("strategy", ""),
         )
         # Auto-submit for market orders
@@ -2107,8 +2162,13 @@ def _detect_regime(result: dict) -> dict:
     equity = chart.get("equity", [])
     dates = chart.get("dates", [])
 
-    if len(equity) < 200:
-        return {"error": "Not enough data for regime detection"}
+    if len(equity) < 252:
+        return {
+            "error": (
+                "Regime detection needs at least 252 daily observations "
+                f"(the volatility lookback); this run has {len(equity)}."
+            )
+        }
 
     equity_arr = np.array(equity)
     returns = pd.Series(np.diff(equity_arr) / equity_arr[:-1])
@@ -2116,6 +2176,18 @@ def _detect_regime(result: dict) -> dict:
 
     detector = CompositeRegimeDetector()
     regime = detector.detect(returns, prices)
+    # A stored run keeps only the portfolio equity curve, not the asset
+    # return panel, so a correlation regime cannot be measured. The detector
+    # otherwise reports a default "normal_correlation" that looks measured.
+    regime["correlation"] = {
+        "regime": "unavailable",
+        "confidence": 0.0,
+        "available": False,
+        "reason": (
+            "the stored run does not keep the asset return panel needed for "
+            "average pairwise correlation"
+        ),
+    }
 
     # Generate regime history (monthly snapshots)
     regime_history = []
@@ -2152,7 +2224,28 @@ def screen_stocks(req: ScreenRequest):
         ScreenRule,
     )
 
-    config = load_config(req.config)
+    # A request-supplied path was passed straight to `open()`, so an
+    # unauthenticated caller could execute an arbitrary local YAML config
+    # (path traversal / config injection). Only files under the server's
+    # config directory are accepted.
+    config_path = req.config
+    if config_path:
+        from pathlib import Path
+
+        config_root = (Path(__file__).resolve().parent.parent / "config").resolve()
+        candidate = Path(config_path)
+        if not candidate.is_absolute():
+            candidate = (config_root.parent / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        if not candidate.is_relative_to(config_root) or not candidate.is_file():
+            raise HTTPException(
+                422,
+                "config must name a YAML file inside the server's config/ directory",
+            )
+        config_path = str(candidate)
+
+    config = load_config(config_path)
 
     n_stocks = getattr(req, 'n_stocks', None)
     if n_stocks is not None:
@@ -2284,6 +2377,18 @@ async def activate_kill_switch(req: dict):
 @router.post("/risk/check-order")
 async def check_order_risk(order: dict):
     """Pre-trade risk check on an order."""
+    # NaN compares false against every limit, so a NaN order was approved
+    # with an empty breach list.
+    for key in ("quantity", "price", "limit_price"):
+        value = order.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(422, f"{key} must be a number") from exc
+        if not np.isfinite(number) or number <= 0:
+            raise HTTPException(422, f"{key} must be a finite positive number")
     monitor = _get_risk_monitor()
     is_approved, breaches = monitor.check_pre_trade(order)
     return {
@@ -2442,21 +2547,53 @@ def _get_multi_strategy_mgr():
     return _multi_strategy_mgr
 
 
+_strategy_orchestrator = None
+
+
+def _get_strategy_orchestrator():
+    """Shared orchestrator that owns per-strategy books and cleanup.
+
+    Constructing it registers the manager's removal handler, so deleting a
+    strategy cancels its open orders, liquidates/transfers its positions and
+    purges its ledgers instead of orphaning capital.
+    """
+    global _strategy_orchestrator
+    if _strategy_orchestrator is None:
+        from quant_platform.strategy.portfolio_orchestrator import PortfolioOrchestrator
+        _strategy_orchestrator = PortfolioOrchestrator(_get_multi_strategy_mgr())
+    return _strategy_orchestrator
+
+
 @router.post("/strategy/add")
 async def strategy_add(req: dict):
     """Add a new strategy to the multi-strategy manager."""
     from quant_platform.strategy.multi_strategy import StrategyConfig
 
     mgr = _get_multi_strategy_mgr()
+    try:
+        allocation_pct = float(req.get("allocation_pct", 0.0))
+        max_drawdown_limit = float(req.get("max_drawdown_limit", 0.15))
+        n_stocks = int(req.get("n_stocks", 300))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "allocation_pct/max_drawdown_limit/n_stocks must be numbers") from exc
+    # NaN passes every comparison and poisoned /strategy/list and /metrics
+    # with a non-JSON-compliant value.
+    if not np.isfinite(allocation_pct) or not 0 <= allocation_pct <= 1:
+        raise HTTPException(422, "allocation_pct must be a finite fraction in [0, 1]")
+    if not np.isfinite(max_drawdown_limit) or not 0 < max_drawdown_limit <= 1:
+        raise HTTPException(422, "max_drawdown_limit must be a finite fraction in (0, 1]")
+    if not 1 <= n_stocks <= 1000:
+        raise HTTPException(422, "n_stocks must be between 1 and 1000")
+
     config = StrategyConfig(
         name=req.get("name", "Unnamed"),
         description=req.get("description", ""),
         optimizer=req.get("optimizer", "mean_variance"),
         alpha_method=req.get("alpha_method", "icir_weighted"),
         rebalance_frequency=req.get("rebalance_frequency", "monthly"),
-        n_stocks=req.get("n_stocks", 300),
-        allocation_pct=req.get("allocation_pct", 0.0),
-        max_drawdown_limit=req.get("max_drawdown_limit", 0.15),
+        n_stocks=n_stocks,
+        allocation_pct=allocation_pct,
+        max_drawdown_limit=max_drawdown_limit,
     )
     sid = mgr.add_strategy(config)
     return {"strategy_id": sid, "name": config.name}
@@ -2464,11 +2601,13 @@ async def strategy_add(req: dict):
 
 @router.post("/strategy/remove")
 async def strategy_remove(req: dict):
-    """Remove a strategy."""
-    mgr = _get_multi_strategy_mgr()
+    """Remove a strategy, cancelling orders and unwinding its book."""
     sid = req.get("strategy_id", "")
-    mgr.remove_strategy(sid)
-    return {"removed": sid}
+    try:
+        cleanup = _get_strategy_orchestrator().remove_strategy(sid)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"removed": sid, "cleanup": cleanup}
 
 
 @router.get("/strategy/list")
@@ -2512,7 +2651,10 @@ async def strategy_allocate(req: dict):
         raise HTTPException(422, "weights must be numeric") from exc
     if any(w < 0 for w in weights.values()):
         raise HTTPException(422, "weights must be non-negative")
-    mgr.allocate_capital(weights)
+    try:
+        mgr.allocate_capital(weights)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     return {"status": "ok", "weights": weights}
 
 
@@ -2535,7 +2677,14 @@ async def strategy_update_pnl(req: dict):
     """Update a strategy's daily P&L."""
     mgr = _get_multi_strategy_mgr()
     sid = req.get("strategy_id", "")
-    daily_return = req.get("daily_return", 0.0)
+    if sid not in mgr.states:
+        raise HTTPException(404, f"Unknown strategy_id: {sid}")
+    try:
+        daily_return = float(req.get("daily_return", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "daily_return must be a number") from exc
+    if not np.isfinite(daily_return) or not -1.0 <= daily_return <= 1.0:
+        raise HTTPException(422, "daily_return must be a finite fraction in [-1, 1]")
     mgr.update_strategy_pnl(sid, daily_return)
     return {"status": "ok"}
 
@@ -3541,6 +3690,10 @@ def get_fundamentals(code: str):
 @router.post("/fundamentals/bulk", response_model=list[FundamentalMetricsResponse])
 def get_fundamentals_bulk(codes: list[str]):
     """Get fundamentals for multiple stocks."""
+    # Each uncached code performs an outbound request with a 0.5s pause; an
+    # unbounded list is both a resource and a quota-abuse vector.
+    if len(codes) > 100:
+        raise HTTPException(422, "at most 100 codes per request")
     provider = _get_fundamental_provider()
     metrics = provider.get_bulk(codes)
     return [FundamentalMetricsResponse(**m.to_dict()) for m in metrics.values()]

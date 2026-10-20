@@ -29,6 +29,7 @@ import pandas as pd
 
 from quant_platform.data.providers.base import DataProvider
 from quant_platform.data.schema import SECTOR_WEIGHTS, SECTORS
+from quant_platform.utils.exchange_calendar import trading_days
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -86,6 +87,8 @@ class SyntheticDataProvider(DataProvider):
         self._assets: list[str] | None = None
         self._sector_map: dict[str, str] | None = None
         self._industry_changes_cache: pd.DataFrame | None = None
+        # asset -> generated corporate-action dates (diagnostics for tests)
+        self._corporate_action_days: dict[str, set[pd.Timestamp]] = {}
 
     # ------------------------------------------------------------------
     # Public interface (DataProvider contract)
@@ -141,7 +144,17 @@ class SyntheticDataProvider(DataProvider):
         logger.info("Generating synthetic A-share data: %d stocks, %s to %s",
                      self.n_stocks, self.start_date.date(), self.end_date.date())
 
-        self._dates = pd.bdate_range(self.start_date, self.end_date, name="date")
+        # Exchange sessions, not business days: ~7.5% of weekdays are
+        # exchange holidays (Spring Festival, National Day, ...). A
+        # business-day grid put prices, the benchmark and financial
+        # visibility dates on days the live scheduler correctly treats as
+        # closed, so research and live disagreed on the trading calendar.
+        self._dates = trading_days(self.start_date, self.end_date)
+        if len(self._dates) == 0:
+            raise ValueError(
+                f"Synthetic sample {self.start_date.date()}..{self.end_date.date()} "
+                "contains no exchange trading days"
+            )
         self._assets = [f"{i:06d}.SH" if i % 3 != 0 else f"{i:06d}.SZ"
                         for i in range(1, self.n_stocks + 1)]
 
@@ -177,12 +190,20 @@ class SyntheticDataProvider(DataProvider):
             p=[0.10, 0.30, 0.60],
         )
 
-        # Listing dates: some stocks list during the period
+        # Listing dates: some stocks list during the period. The offset is
+        # clamped to the sample: `integers(30, n_dates // 2)` raises
+        # `ValueError: low >= high` when a short research window (e.g. one
+        # quarter, ~60 sessions) has fewer than ~60 days.
         listing_dates = pd.Series(self.start_date, index=range(n))
         late_listers = self.rng.choice(n, size=int(n * 0.15), replace=False)
-        for i in late_listers:
-            offset = self.rng.integers(30, len(self._dates) // 2)
-            listing_dates.iloc[i] = self._dates[offset]
+        n_dates = len(self._dates)
+        if n_dates >= 2:
+            offset_low = min(30, max(1, n_dates // 4))
+            offset_high = max(offset_low + 1, n_dates // 2)
+            for i in late_listers:
+                offset = int(self.rng.integers(offset_low, offset_high))
+                offset = min(offset, n_dates - 1)
+                listing_dates.iloc[i] = self._dates[offset]
 
         # ST status (~3% of stocks, random assignment)
         is_st = self.rng.choice([True, False], size=n, p=[0.03, 0.97])
@@ -392,11 +413,18 @@ class SyntheticDataProvider(DataProvider):
 
         # Adj factor (random corporate actions: ~5% of stocks per year)
         adj_factor = np.ones((n_dates, n_assets))
+        # Diagnostic ledger of the generated action dates, keyed by asset.
+        # Used by regression tests that need to know when an action fell on a
+        # suspension day; it does not affect any generated value.
+        self._corporate_action_days = {}
         for i in range(n_assets):
             n_actions = self.rng.poisson(0.05 * n_dates / 252)
             if n_actions > 0:
                 action_dates = self.rng.choice(n_dates, size=n_actions, replace=False)
                 action_dates.sort()
+                self._corporate_action_days[self._assets[i]] = {
+                    self._dates[int(d)] for d in action_dates
+                }
                 factor = 1.0
                 for d in range(n_dates):
                     if d in action_dates:
@@ -444,6 +472,17 @@ class SyntheticDataProvider(DataProvider):
         for col in ["open", "high", "low", "close", "volume", "turnover", "vwap"]:
             df.iloc[flat_idx, df.columns.get_loc(col)] = np.nan
 
+        # The adjustment factor is part of the stale mark: a corporate action
+        # whose ex-date falls on a suspension day must not re-scale a close
+        # that was carried over from the previous session. Leaving the new
+        # factor in place made close_adj jump on the suspension day (e.g.
+        # 65.50 -> 76.56) even though the clean adjusted path was continuous.
+        # Freeze the factor on suspended rows, then forward-fill it without a
+        # limit (it is defined on every non-suspended row) so a long gap
+        # cannot leave it NaN.
+        df.iloc[flat_idx, df.columns.get_loc("adj_factor")] = np.nan
+        df["adj_factor"] = df.groupby("asset")["adj_factor"].ffill()
+
         # Forward-fill suspension gaps (max 30 days)
         df = df.groupby("asset").ffill(limit=30)
 
@@ -479,9 +518,20 @@ class SyntheticDataProvider(DataProvider):
         """
         n_assets = len(self._assets)
 
-        # Find quarter-end dates in our date range
+        # Find quarter-end trading days in our date range. The last exchange
+        # session of each calendar quarter is the report date (the old
+        # business-day grid behaved the same way). Deriving it from
+        # `is_quarter_end` broke once the date index was filtered through the
+        # exchange calendar: pandas' `is_quarter_end` is frequency-aware, and
+        # a filtered index has no business-day frequency, so quarter ends
+        # that fell on a weekend (e.g. 2023-09-30) silently stopped producing
+        # reports.
         all_dates = pd.DatetimeIndex(self._dates)
-        quarter_ends = all_dates[all_dates.is_quarter_end]
+        if len(all_dates):
+            quarter_of = all_dates.to_period("Q")
+            quarter_ends = all_dates[~quarter_of.duplicated(keep="last")]
+        else:
+            quarter_ends = all_dates
         n_quarters = len(quarter_ends)
 
         # Base financial characteristics (cross-sectional)
@@ -632,9 +682,20 @@ class SyntheticDataProvider(DataProvider):
 
             # ST events: 1-2 episodes per ST stock
             n_episodes = self.rng.integers(1, 3)
+            n_dates = len(self._dates)
+            # The trigger draw used to be `integers(60, n_dates - 60)`,
+            # which raises `ValueError: low >= high` on short research
+            # windows (any sample under ~120 sessions). Clamp the window to
+            # the sample; skip ST entirely when there is no room for a
+            # meaningful episode (a one- or two-day sample).
+            if n_dates < 5:
+                continue
+            trigger_low = min(60, max(1, n_dates // 4))
+            trigger_high = max(trigger_low + 1, n_dates - 60)
             for _ in range(n_episodes):
                 # Random trigger date
-                trigger_idx = self.rng.integers(60, len(self._dates) - 60)
+                trigger_idx = int(self.rng.integers(trigger_low, trigger_high))
+                trigger_idx = min(trigger_idx, n_dates - 1)
                 trigger_date = self._dates[trigger_idx]
 
                 # Announcement lag: 1-3 trading days after trigger
@@ -696,8 +757,13 @@ class SyntheticDataProvider(DataProvider):
         rng = np.random.default_rng(self.seed + 101)
         records = []
         all_dates = pd.DatetimeIndex(self._dates)
+        if len(all_dates):
+            quarter_of = all_dates.to_period("Q")
+            quarter_ends = all_dates[~quarter_of.duplicated(keep="last")]
+        else:
+            quarter_ends = all_dates
         # Industry changes happen at semi-annual boundaries
-        semi_annual = all_dates[all_dates.is_quarter_end][::2]  # Every other quarter end
+        semi_annual = quarter_ends[::2]  # Every other quarter end
 
         for i, asset in enumerate(self._assets):
             current_industry = self._sector_map[asset]

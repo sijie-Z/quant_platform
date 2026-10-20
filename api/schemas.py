@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -45,10 +45,20 @@ class RunRequest(BaseModel):
     _validate_start = field_validator("start_date")(classmethod(lambda cls, v: _validate_date(v)))
     _validate_end = field_validator("end_date")(classmethod(lambda cls, v: _validate_date(v)))
 
+    @model_validator(mode="after")
+    def _bound_the_window(self):
+        start = datetime.strptime(self.start_date, "%Y-%m-%d")
+        end = datetime.strptime(self.end_date, "%Y-%m-%d")
+        if start >= end:
+            raise ValueError("start_date must be before end_date")
+        if (end - start).days > 3653:
+            raise ValueError("date span must be at most 10 years")
+        return self
+
 
 class CompareRequest(BaseModel):
     optimizers: list[Literal["equal_weight", "mean_variance", "risk_parity"]] = Field(
-        default=["equal_weight", "mean_variance", "risk_parity"]
+        default=["equal_weight", "mean_variance", "risk_parity"], max_length=3
     )
     n_stocks: int = Field(default=300, ge=50, le=500)
 
@@ -58,9 +68,17 @@ class SweepRequest(BaseModel):
         default=["equal_weight", "mean_variance", "risk_parity"]
     )
     frequencies: list[Literal["daily", "weekly", "monthly"]] = Field(
-        default=["monthly", "weekly"]
+        default=["monthly", "weekly"], max_length=3
     )
-    n_stocks_list: list[int] = Field(default=[200, 300])
+    n_stocks_list: list[int] = Field(default=[200, 300], max_length=5)
+
+    @field_validator("n_stocks_list")
+    @classmethod
+    def _bound_universes(cls, values: list[int]) -> list[int]:
+        for value in values:
+            if not 50 <= value <= 1000:
+                raise ValueError("each universe size must be between 50 and 1000")
+        return values
 
 
 # --- Response schemas ---
@@ -314,6 +332,8 @@ class BarraCovarianceResponse(BaseModel):
 # --- Parallel backtest schemas ---
 
 class ParallelSweepRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     param_grid: dict[str, list] = Field(
         description=(
             "Parameter grid: {name: [values]}. Flat aliases optimizer/"
@@ -324,7 +344,22 @@ class ParallelSweepRequest(BaseModel):
     )
     base_overrides: dict[str, Any] = Field(default_factory=dict, description="Base config overrides")
     metric: str = Field(default="sharpe_ratio", description="Optimization metric")
-    max_workers: int | None = Field(default=None, description="Max parallel workers")
+    max_workers: int | None = Field(
+        default=None, ge=1, le=16, description="Max parallel workers",
+    )
+
+    @model_validator(mode="after")
+    def _bound_the_grid(self):
+        if len(self.param_grid) > 10:
+            raise ValueError("param_grid may have at most 10 parameters")
+        combinations = 1
+        for values in self.param_grid.values():
+            if len(values) > 20:
+                raise ValueError("each parameter may have at most 20 values")
+            combinations *= max(len(values), 1)
+        if combinations > 100:
+            raise ValueError("param_grid expands to more than 100 combinations")
+        return self
 
 
 class ParallelSweepResponse(BaseModel):
@@ -455,7 +490,7 @@ class FundamentalMetricsResponse(BaseModel):
 
 
 class FundamentalScreenRequest(BaseModel):
-    codes: list[str] = Field(description="Stock codes to screen")
+    codes: list[str] = Field(description="Stock codes to screen", max_length=100)
     pe_min: float | None = None
     pe_max: float | None = None
     pb_min: float | None = None
@@ -474,7 +509,7 @@ class FundamentalScreenResponse(BaseModel):
 
 
 class FundamentalRankRequest(BaseModel):
-    codes: list[str] = Field(description="Stock codes to rank")
+    codes: list[str] = Field(description="Stock codes to rank", max_length=100)
     metric: str = Field(default="roe", description="Metric to rank by")
     ascending: bool = Field(default=False)
     top_n: int | None = Field(default=None, ge=1)
@@ -489,6 +524,8 @@ class FundamentalRankResponse(BaseModel):
 
 class ScreenRuleRequest(BaseModel):
     """A single screening rule from the API request."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
     factor: str = Field(..., description="Factor name, e.g. 'pe_ratio'")
     operator: Literal["gt", "gte", "lt", "lte", "eq", "ne", "between"] = Field(
         ..., description="Comparison operator"
@@ -497,12 +534,17 @@ class ScreenRuleRequest(BaseModel):
 
 
 class ScreenRequest(BaseModel):
-    rules: list[ScreenRuleRequest] = Field(..., description="List of screening rules")
+    rules: list[ScreenRuleRequest] = Field(
+        ..., description="List of screening rules", max_length=20,
+    )
     logic: Literal["and", "or"] = Field(default="and", description="Rule combination logic")
     date: str | None = Field(default=None, description="Target date YYYY-MM-DD (latest if None)")
     min_stocks: int = Field(default=5, ge=1, le=500, description="Minimum stocks (auto-relax)")
     max_stocks: int = Field(default=200, ge=1, le=1000, description="Maximum stocks (score cap)")
-    config: str | None = Field(default=None, description="Config file path")
+    config: str | None = Field(
+        default=None,
+        description="Optional config path resolved inside the server config/ directory",
+    )
 
 
 class ScreenStockInfo(BaseModel):

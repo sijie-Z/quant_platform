@@ -178,6 +178,12 @@ def update_position(
 ) -> None:
     """Update a position after a fill using weighted average cost.
 
+    Costs are part of the P&L: buy commission (and any buy-side tax) is
+    capitalised into ``avg_cost`` and sell commission/stamp tax are subtracted
+    from realised P&L. Without this the strategy ledger (which already
+    capitalised costs) and the execution engine (which did not) disagreed by
+    exactly the fee amount on every round trip.
+
     Args:
         position: The position to update.
         order: The source order.
@@ -186,17 +192,24 @@ def update_position(
     if order.side == OrderSide.BUY:
         total_qty = position.quantity + fill.quantity
         total_cost = (position.avg_cost * position.quantity
-                      + fill.price * fill.quantity)
+                      + fill.price * fill.quantity
+                      + fill.commission + fill.tax)
         position.avg_cost = total_cost / total_qty if total_qty > 0 else 0.0
         position.quantity = total_qty
     else:  # SELL
-        # Realized PnL = (sell_price - avg_cost) * qty
-        realized = (fill.price - position.avg_cost) * fill.quantity
+        # Realized PnL = (sell_price - avg_cost) * qty - fees
+        realized = (
+            (fill.price - position.avg_cost) * fill.quantity
+            - fill.commission - fill.tax
+        )
         position.realized_pnl += realized
         position.quantity -= fill.quantity
         if position.quantity <= 0:
             position.quantity = 0
             position.avg_cost = 0.0
+            position.market_value = 0.0
+            position.unrealized_pnl = 0.0
+            position.unrealized_pnl_pct = 0.0
 
     position.last_updated = fill.timestamp or datetime.now().isoformat(timespec="seconds")
 
@@ -223,17 +236,57 @@ class ExecutionEngine:
 
     Same semantics regardless of mode (backtest or live).
 
+    A-share safeguards live here rather than only in the orchestrator:
+
+    - **T+1**: buys increase ``Position.quantity`` but not
+      ``Position.available``; sells are validated against ``available``.
+      ``new_trading_day()`` releases the prior day's purchases.
+    - **Naked sells**: a sell larger than the real holding raises instead of
+      clamping to zero and realising P&L against a zero cost basis.
+    - **Cash ledger**: when ``initial_cash`` is provided (or
+      ``enable_cash_tracking`` is called), every fill debits/credits cash
+      including commission and tax; a buy that would overdraw raises.
+    - **Fee-aware P&L**: cost basis includes buy costs and realised P&L nets
+      sell costs, so the engine summary reconciles with strategy books.
+
     Usage:
-        engine = ExecutionEngine()
+        engine = ExecutionEngine(initial_cash=1_000_000)
         order = engine.create_order(ticker="600519", side=OrderSide.BUY, quantity=100)
         engine.submit_order(order)
-        engine.process_fill(order, Fill(price=150.0, quantity=100))
+        engine.process_fill(order, price=150.0, quantity=100)
     """
 
-    def __init__(self):
+    def __init__(self, initial_cash: float | None = None):
         self._orders: dict[str, Order] = {}
         self._positions: dict[str, Position] = {}
         self._executed_orders: list[Order] = []
+
+        #: Real cash ledger. Only enforced/mutated when tracking is enabled;
+        #: engines constructed without `initial_cash` (and never enabled) keep
+        #: their historical position-only behaviour.
+        self._cash_tracked = initial_cash is not None
+        self._initial_cash = float(initial_cash) if initial_cash is not None else 0.0
+        self.cash: float = self._initial_cash
+
+        #: A-share T+1: 1 means shares bought today are not sellable until
+        #: `new_trading_day()`. 0 disables the lock (buy fills immediately
+        #: become available).
+        self.t_plus: int = 1
+
+    @property
+    def cash_tracking_enabled(self) -> bool:
+        return self._cash_tracked
+
+    def enable_cash_tracking(self, initial_cash: float) -> None:
+        """Start tracking cash from ``initial_cash``.
+
+        Calling this on an engine that already traded positions will not
+        retroactively account for their cost; the normal path is to enable it
+        before the first order (the orchestrator does this in ``__init__``).
+        """
+        self._initial_cash = float(initial_cash)
+        self.cash = self._initial_cash
+        self._cash_tracked = True
 
     @property
     def orders(self) -> list[Order]:
@@ -287,6 +340,9 @@ class ExecutionEngine:
     ) -> Fill:
         """Process a fill for an order.
 
+        Validation happens before any mutation, so a rejected fill leaves the
+        order, position and cash untouched.
+
         Args:
             order: The order being filled.
             price: Fill price.
@@ -297,7 +353,35 @@ class ExecutionEngine:
 
         Returns:
             The Fill object.
+
+        Raises:
+            ValueError: on a naked sell (quantity > holding), a same-day sell
+                of T+1-locked shares, or a buy that would drive tracked cash
+                below zero.
         """
+        if order.side == OrderSide.SELL:
+            position = self._positions.get(order.ticker)
+            held = position.quantity if position else 0
+            if quantity > held:
+                raise ValueError(
+                    f"Naked sell rejected: {order.ticker} holds {held} shares, "
+                    f"order {order.order_id} sells {quantity}"
+                )
+            available = position.available if position else 0
+            if self.t_plus > 0 and quantity > available:
+                raise ValueError(
+                    f"T+1 locked: {order.ticker} has {available} sellable "
+                    f"shares (holding {held}); {held - available} were bought "
+                    f"today"
+                )
+        elif self._cash_tracked:
+            required = price * quantity + commission + tax
+            if required > self.cash + 1e-9:
+                raise ValueError(
+                    f"Insufficient cash: buy of {order.ticker} x{quantity} "
+                    f"requires {required:.2f}, cash balance {self.cash:.2f}"
+                )
+
         fill = Fill(
             price=price,
             quantity=quantity,
@@ -311,7 +395,25 @@ class ExecutionEngine:
         # Update position
         if order.ticker not in self._positions:
             self._positions[order.ticker] = Position(ticker=order.ticker)
-        update_position(self._positions[order.ticker], order, fill)
+        position = self._positions[order.ticker]
+        update_position(position, order, fill)
+
+        # Update the cash ledger and T+1 availability. Buy cost includes
+        # commission (and any buy-side tax); sell proceeds net commission and
+        # stamp tax.
+        if order.side == OrderSide.BUY:
+            if self._cash_tracked:
+                self.cash -= price * quantity + commission + tax
+            if self.t_plus <= 0:
+                position.available += quantity
+        else:
+            if self._cash_tracked:
+                self.cash += price * quantity - commission - tax
+            position.available = max(position.available - quantity, 0)
+
+        # Mark the position at the fill price so risk consumers see a real
+        # market value even before the next snapshot.
+        position.update_price(price)
 
         return fill
 
@@ -325,11 +427,33 @@ class ExecutionEngine:
         if order.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED):
             transition_order(order, OrderStatus.REJECTED)
 
+    def expire_order(self, order: Order) -> None:
+        """Expire an active day order that did not fill."""
+        if order.status in (OrderStatus.SUBMITTED, OrderStatus.PARTIAL):
+            transition_order(order, OrderStatus.EXPIRED)
+
+    def new_trading_day(self) -> None:
+        """Roll T+1: everything held overnight becomes sellable today.
+
+        Must be called once per trading session before orders are placed
+        (the orchestrator does this when the exchange date advances).
+        """
+        for position in self._positions.values():
+            position.available = position.quantity
+
+    def mark_to_market(self, prices: dict[str, float]) -> None:
+        """Mark every position at the given prices (missing prices skipped)."""
+        for position in self._positions.values():
+            price = prices.get(position.ticker, 0.0)
+            if price > 0:
+                position.update_price(price)
+
     def reset(self) -> None:
-        """Clear all orders and positions."""
+        """Clear all orders and positions, restoring the initial cash."""
         self._orders.clear()
         self._positions.clear()
         self._executed_orders.clear()
+        self.cash = self._initial_cash
 
     def portfolio_snapshot(self, prices: dict[str, float]) -> dict:
         """Compute current portfolio snapshot.
@@ -339,11 +463,11 @@ class ExecutionEngine:
 
         Returns:
             Dict with positions_value, n_positions, total_unrealized_pnl,
-            total_realized_pnl and total_pnl.
-
-            Note: there is deliberately no `cash` key. Callers that need cash
-            track their own balance (see PortfolioOrchestrator.cash_available);
-            this engine only owns positions and fills.
+            total_realized_pnl, total_pnl, cash and equity. Realised P&L is
+            reported for closed positions too, so a round trip that ended flat
+            still shows its (negative) fees. ``cash``/``equity`` are only
+            meaningful when cash tracking is enabled; untracked engines report
+            the raw ledger (0.0) and callers should keep their own balance.
         """
         total_upnl = 0.0
         total_rpnl = 0.0
@@ -352,11 +476,12 @@ class ExecutionEngine:
 
         for pos in self._positions.values():
             price = prices.get(pos.ticker, 0.0)
-            if price > 0 and pos.quantity > 0:
+            if price > 0:
                 pos.update_price(price)
+            total_rpnl += pos.realized_pnl
+            if price > 0 and pos.quantity > 0:
                 positions_value += pos.market_value
                 total_upnl += pos.unrealized_pnl
-                total_rpnl += pos.realized_pnl
                 n_positions += 1
 
         return {
@@ -365,4 +490,6 @@ class ExecutionEngine:
             "total_unrealized_pnl": round(total_upnl, 2),
             "total_realized_pnl": round(total_rpnl, 2),
             "total_pnl": round(total_upnl + total_rpnl, 2),
+            "cash": round(self.cash, 2),
+            "equity": round(self.cash + positions_value, 2),
         }

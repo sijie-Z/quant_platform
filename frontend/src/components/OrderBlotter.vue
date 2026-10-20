@@ -296,6 +296,22 @@ async function submitOrder() {
       let price = newOrder.value.limit_price
       if (!price) {
         const quote = await getBaostockStock(newOrder.value.ticker)
+        const now = new Date()
+        const today = [
+          now.getFullYear(),
+          String(now.getMonth() + 1).padStart(2, '0'),
+          String(now.getDate()).padStart(2, '0'),
+        ].join('-')
+        // The quote endpoint falls back to the last available bar (up to a
+        // few days old). Filling a market order at a stale close is worse
+        // than refusing: ask for an explicit limit price instead.
+        if (quote.date && quote.date !== today) {
+          throw new Error(
+            (locale.value === 'zh-CN'
+              ? `行情为 ${quote.date} 收盘，非当日；请填写限价后下单`
+              : `Last bar is ${quote.date}, not today; enter a limit price`),
+          )
+        }
         price = quote.close
       }
       if (!price || price <= 0) {

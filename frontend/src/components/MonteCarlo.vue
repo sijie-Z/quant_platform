@@ -22,7 +22,7 @@
     </div>
 
     <!-- Results Grid -->
-    <div class="mc-grid" v-if="result">
+    <div class="mc-grid" v-if="result && !result.error">
       <!-- Terminal Value -->
       <div class="mc-panel">
         <div class="mc-panel-title">{{ locale === 'zh-CN' ? '终值（1年）' : 'TERMINAL VALUE (1Y)' }}</div>
@@ -121,7 +121,7 @@
     </div>
 
     <!-- Distribution Chart -->
-    <div class="mc-chart-section" v-if="result">
+    <div class="mc-chart-section" v-if="result && !result.error">
       <div ref="distChartRef" class="mc-chart"></div>
     </div>
 
@@ -172,6 +172,10 @@ async function runMC() {
       n_simulations: nSims.value,
       horizon_days: 252,
     })
+    if (result.value?.error) {
+      emit('toast', { message: result.value.error, type: 'error' })
+      return
+    }
     await nextTick()
     renderDistChart()
     emit('toast', { message: locale.value === 'zh-CN' ? `蒙特卡洛：${nSims.value}次模拟已完成` : `Monte Carlo: ${nSims.value} simulations completed`, type: 'success' })

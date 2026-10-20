@@ -34,6 +34,27 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _clamp_limit(limit, default: int = 100, maximum: int = 1000) -> int:
+    """Bound a caller-supplied row limit.
+
+    SQLite treats LIMIT -1 as "no limit", so a negative query parameter could
+    dump a whole table; huge values overflow the int64 bind.
+    """
+    try:
+        value = int(limit)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, min(value, maximum))
+
+
+def _clamp_days(days, default: int = 30, maximum: int = 3650) -> int:
+    try:
+        value = int(days)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(1, min(value, maximum))
+
+
 class Store:
     """Thread-safe SQLite store for all trading state.
 
@@ -370,6 +391,7 @@ class Store:
         afterwards, so a requested historical range could come back empty
         once the book had more rows than the limit.
         """
+        limit = _clamp_limit(limit)
         with self._conn() as conn:
             query = "SELECT * FROM orders WHERE 1=1"
             params: list = []
@@ -491,6 +513,7 @@ class Store:
         `start_date`/`end_date` are ISO dates applied in SQL so a historical
         export is not limited to the newest rows.
         """
+        limit = _clamp_limit(limit)
         with self._conn() as conn:
             query = "SELECT * FROM trades WHERE 1=1"
             params: list = []
@@ -538,6 +561,7 @@ class Store:
         (YYYY-MM-DD) override it, so a compliance export can request a
         period older than the default window.
         """
+        days = _clamp_days(days)
         with self._conn() as conn:
             query = "SELECT * FROM pnl_history WHERE 1=1"
             params: list = []
@@ -601,6 +625,7 @@ class Store:
     def get_signals(self, consumed: int = -1, limit: int = 100,
                     tenant_id: str = "") -> list[dict]:
         """Get signals. consumed=-1 for all, 0 for unconsumed, 1 for consumed."""
+        limit = _clamp_limit(limit)
         with self._conn() as conn:
             query = "SELECT * FROM signals WHERE 1=1"
             params: list = []
@@ -709,6 +734,7 @@ class Store:
     def get_events(self, topic: str = "", limit: int = 100,
                    tenant_id: str = "") -> list[dict]:
         """Get event log, optionally filtered by tenant."""
+        limit = _clamp_limit(limit)
         with self._conn() as conn:
             query = "SELECT * FROM events WHERE 1=1"
             params: list = []
@@ -771,6 +797,7 @@ class Store:
             ))
 
     def get_nav_history(self, days: int = 365 * 3) -> list[dict]:
+        days = _clamp_days(days, default=365 * 3)
         """Get NAV history for the last N days."""
         with self._conn() as conn:
             cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")

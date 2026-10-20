@@ -69,7 +69,7 @@
     <StatusBar :connected="backendAlive" @action="onStatusBarAction" />
 
     <!-- Command Palette -->
-    <CommandPalette v-model="currentView" @action="onPaletteAction" @toast="onToast" />
+    <CommandPalette ref="paletteRef" v-model="currentView" @action="onPaletteAction" @toast="onToast" />
 
     <!-- Toast -->
     <Toast ref="toastRef" />
@@ -114,6 +114,7 @@ const currentView = ref('terminal')
 const backendAlive = ref(false)
 const toastRef = ref(null)
 const terminalRef = ref(null)
+const paletteRef = ref(null)
 let healthTimer = null
 
 function onToast({ message, type }) {
@@ -140,7 +141,8 @@ function onDemo() {
 }
 
 function togglePalette() {
-  onRun()
+  // The header/status-bar palette buttons used to open the Run panel.
+  paletteRef.value?.toggle?.()
 }
 
 function onPaletteAction(action) {
@@ -152,7 +154,7 @@ function onPaletteAction(action) {
 }
 
 function onStatusBarAction(action) {
-  if (action === 'palette') onRun()
+  if (action === 'palette') togglePalette()
 }
 
 async function checkHealth() {

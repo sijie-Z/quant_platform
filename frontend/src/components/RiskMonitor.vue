@@ -2,7 +2,7 @@
   <div class="rm-view">
     <div class="rm-header">
       <div class="rm-title">
-        <span :class="['rm-dot', `rm-${status?.risk_level || 'green'}`]"></span>
+        <span :class="['rm-dot', (status?.risk_level || 'green').toLowerCase()]"></span>
         {{ locale === 'zh-CN' ? '风险监控' : 'RISK MONITOR' }}
       </div>
       <div class="rm-actions">
@@ -138,7 +138,9 @@ function getLimitFill(key, val) {
   const dailyLoss = status.value?.daily_pnl_pct || 0
   if (key === 'kill_drawdown') return Math.min(current / val * 100, 100)
   if (key === 'max_drawdown') return Math.min(current / val * 100, 100)
-  if (key === 'max_daily_loss') return Math.min(Math.abs(dailyLoss) / val * 100, 100)
+  // Only losses consume the daily-loss budget; a +2% day used to fill
+  // the bar because the sign was discarded.
+  if (key === 'max_daily_loss') return Math.min(Math.max(-dailyLoss, 0) / val * 100, 100)
   return 0
 }
 
