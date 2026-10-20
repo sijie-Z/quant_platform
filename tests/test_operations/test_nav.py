@@ -403,7 +403,7 @@ class TestFeeAccrualAcrossDays:
         ]
 
         navs = []
-        for day, (cash, market_value) in zip(dates, values):
+        for day, (cash, market_value) in zip(dates, values, strict=True):
             nav = calc.calculate_daily_nav(
                 date=str(day.date()), cash=cash, market_value=market_value,
             )
