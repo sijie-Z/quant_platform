@@ -396,6 +396,20 @@ class TestIntervalAndRebalance:
         assert state["last_rebalance_at"]
         assert len(events) == 1
 
+    def test_the_first_alert_is_not_swallowed_on_a_fresh_boot(self, tmp_path, monkeypatch):
+        """time.monotonic() is time-since-boot; 0.0 as the "never sent"
+        sentinel suppressed the first alert on a fresh runner/container."""
+        clock = [datetime(2026, 10, 20, 10, 0, tzinfo=TZ)]
+        bus = EventBus()
+        events = _capture(bus, "system.alert")
+        scheduler, _, _ = _scheduler(tmp_path, clock, bus=bus)
+        monkeypatch.setattr(
+            "quant_platform.core.scheduler.time.monotonic", lambda: 5.0,
+        )
+
+        assert scheduler._publish_alert("critical", "fresh boot alert") is True
+        assert len(events) == 1
+
     def test_the_engine_session_id_is_reused(self, tmp_path):
         clock = [datetime(2026, 10, 20, 10, 0, tzinfo=TZ)]
         scheduler, store, _ = _scheduler(tmp_path, clock)

@@ -139,7 +139,9 @@ class TradingScheduler:
         self._rebalance_count = 0
         self._cycle_count = 0
         self._last_tick_at = 0.0
-        self._last_tick_alert = 0.0
+        # -inf, not 0.0: a fresh container's monotonic clock can be below the
+        # 60 s rate limit, which would swallow the first tick-failure alert.
+        self._last_tick_alert = float("-inf")
         self._alert_throttle: dict[str, float] = {}
         # How long stop() waits for the tick loop before reporting it stuck.
         self._stop_join_timeout = 10.0
@@ -180,7 +182,11 @@ class TradingScheduler:
         """
         key = f"{severity}|{message}"
         now = time.monotonic()
-        if now - self._alert_throttle.get(key, 0.0) < ALERT_THROTTLE_SECONDS:
+        # Missing key means "never emitted". Using 0.0 as the sentinel
+        # suppressed the first alert on a freshly booted host or container,
+        # where time.monotonic() can legitimately be below the throttle.
+        last = self._alert_throttle.get(key)
+        if last is not None and now - last < ALERT_THROTTLE_SECONDS:
             return False
         self._alert_throttle[key] = now
         if severity in ("critical", "error"):

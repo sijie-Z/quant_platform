@@ -37,6 +37,21 @@ from tests.test_data.test_tushare_loader_regressions import (
 )
 
 
+def _cache_data_path(provider, key):
+    """The data file the provider actually wrote (parquet, else CSV).
+
+    pyarrow is optional; CI installs without it and the provider correctly
+    falls back to CSV, so tests must not assume the parquet sibling exists.
+    """
+    base = provider._cache_path(key)
+    return base if base.exists() else base.with_suffix(".csv")
+
+
+def _cache_manifest_path(provider, key):
+    base = provider._cache_path(key)
+    return base.with_name(f"{base.name}.manifest.json")
+
+
 def _bump_schema(monkeypatch) -> int:
     bumped = DATA_SCHEMA_VERSION + 1
     monkeypatch.setattr(cache_mod, "DATA_SCHEMA_VERSION", bumped)
@@ -68,8 +83,8 @@ class TestTushareCacheVersioning:
         manifest = read_cache_manifest(cache_file)
         assert manifest is not None
         assert manifest["schema_version"] == DATA_SCHEMA_VERSION
-        assert manifest["adjustment"] == "hfq"
-        assert manifest["cache_version"] == "v3"
+        assert manifest["adjustment"] == "raw"
+        assert manifest["cache_version"] == "v4"
 
         reloaded = tushare_provider(tmp_path)
         reloaded._ts_api = _ExplodingTushareAPI()
@@ -116,7 +131,7 @@ class TestTushareCacheVersioning:
         cache_file = _tushare_cache_file(tmp_path)
         manifest_path = cache_manifest_path(cache_file)
         manifest = read_cache_manifest(cache_file)
-        manifest["adjustment"] = "raw"
+        manifest["adjustment"] = "hfq"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
         api = FakeTushareAPI(ann_date="20240102")
@@ -130,7 +145,8 @@ class TestTushareCacheVersioning:
         prov = tushare_provider(tmp_path)
         identity = prov.cache_identity()
         assert identity["provider"] == "tushare"
-        assert identity["adjustment"] == "hfq"
+        assert identity["adjustment"] == "raw"
+        assert identity["adjusted_price_basis"] == "hfq"
         assert identity["index_code"] == "000300.SH"
 
         prov._ts_api = FakeTushareAPI(ann_date="20240102")
@@ -214,7 +230,7 @@ def _price_frame():
 class TestBaostockCacheVersioning:
     def test_generic_cache_roundtrip_carries_manifest(self, baostock_provider):
         provider, _fake, tmp_path = baostock_provider
-        key = f"daily_v2-s{DATA_SCHEMA_VERSION}_2024-01-01_2024-01-04_1_abc_adj1"
+        key = f"daily_{provider._cache_version()}_2024-01-01_2024-01-04_1_abc_adj1"
         provider._save_cache(key, _price_frame())
 
         path = tmp_path / f"{key}.parquet"
@@ -233,7 +249,7 @@ class TestBaostockCacheVersioning:
         self, baostock_provider, monkeypatch
     ):
         provider, _fake, tmp_path = baostock_provider
-        key = f"daily_v2-s{DATA_SCHEMA_VERSION}_2024-01-01_2024-01-04_1_abc_adj1"
+        key = f"daily_{provider._cache_version()}_2024-01-01_2024-01-04_1_abc_adj1"
         provider._save_cache(key, _price_frame())
 
         _bump_schema(monkeypatch)
@@ -243,7 +259,7 @@ class TestBaostockCacheVersioning:
 
     def test_missing_manifest_invalidates_generic_cache(self, baostock_provider):
         provider, _fake, tmp_path = baostock_provider
-        key = f"daily_v2-s{DATA_SCHEMA_VERSION}_2024-01-01_2024-01-04_1_abc_adj1"
+        key = f"daily_{provider._cache_version()}_2024-01-01_2024-01-04_1_abc_adj1"
         provider._save_cache(key, _price_frame())
         cache_manifest_path(tmp_path / f"{key}.parquet").unlink()
 
@@ -274,15 +290,15 @@ class TestBaostockCacheVersioning:
     ):
         provider, fake, tmp_path = baostock_provider
         provider.get_metadata()
-        old_key = f"metadata_v2-s{DATA_SCHEMA_VERSION}"
-        assert (tmp_path / f"{old_key}.parquet").exists()
-        assert read_cache_manifest(tmp_path / f"{old_key}.parquet") is not None
+        old_key = f"metadata_{provider._cache_version()}"
+        assert _cache_data_path(provider, old_key).exists()
+        assert read_cache_manifest(provider._cache_path(old_key)) is not None
         queries_after_first = fake.basic_query_count
 
         _bump_schema(monkeypatch)
         provider.get_metadata()
-        new_key = f"metadata_v2-s{DATA_SCHEMA_VERSION + 1}"
-        assert (tmp_path / f"{new_key}.parquet").exists()
+        new_key = f"metadata_{provider._cache_version()}"
+        assert _cache_data_path(provider, new_key).exists()
         assert fake.basic_query_count > queries_after_first
 
     def test_stock_universe_json_cache_is_versioned(
@@ -308,19 +324,24 @@ class TestBaostockCacheVersioning:
 
     def test_manifest_is_bound_to_its_cache_key(self, baostock_provider):
         provider, _fake, tmp_path = baostock_provider
-        first = f"daily_v2-s{DATA_SCHEMA_VERSION}_2024-01-01_2024-01-04_1_aaa_adj1"
-        second = f"daily_v2-s{DATA_SCHEMA_VERSION}_2024-01-01_2024-01-04_1_bbb_adj1"
+        first = f"daily_{provider._cache_version()}_2024-01-01_2024-01-04_1_aaa_adj1"
+        second = f"daily_{provider._cache_version()}_2024-01-01_2024-01-04_1_bbb_adj1"
         provider._save_cache(first, _price_frame())
-        shutil.copy(tmp_path / f"{first}.parquet", tmp_path / f"{second}.parquet")
+        first_data = _cache_data_path(provider, first)
+        second_data = provider._cache_path(second)
+        if first_data.suffix == ".csv":
+            second_data = second_data.with_suffix(".csv")
+        shutil.copy(first_data, second_data)
         shutil.copy(
-            tmp_path / f"{first}.parquet.manifest.json",
-            tmp_path / f"{second}.parquet.manifest.json",
+            _cache_manifest_path(provider, first),
+            _cache_manifest_path(provider, second),
         )
 
         # The copied manifest says it belongs to `first`; serving it under
         # `second` would return a different symbol set's data.
         assert provider._load_cache(second) is None
-        assert not (tmp_path / f"{second}.parquet").exists()
+        assert not provider._cache_path(second).exists()
+        assert not provider._cache_path(second).with_suffix(".csv").exists()
 
     def test_cache_universe_matches_the_fetched_price_sample(
         self, baostock_provider
@@ -368,9 +389,9 @@ class TestBaostockCacheVersioning:
         self, baostock_provider, monkeypatch
     ):
         provider, _fake, tmp_path = baostock_provider
-        key = f"daily_v2-s{DATA_SCHEMA_VERSION}_2024-01-01_2024-01-04_1_abc_adj1"
+        key = f"daily_{provider._cache_version()}_2024-01-01_2024-01-04_1_abc_adj1"
         provider._save_cache(key, _price_frame())
-        assert (tmp_path / f"{key}.parquet").exists()
+        assert _cache_data_path(provider, key).exists()
 
         def parquet_unavailable(*args, **kwargs):
             raise RuntimeError("parquet engine unavailable")
@@ -380,8 +401,8 @@ class TestBaostockCacheVersioning:
         newer["close"] = 20.0
         provider._save_cache(key, newer)
 
-        assert not (tmp_path / f"{key}.parquet").exists()
-        assert (tmp_path / f"{key}.csv").exists()
+        assert not provider._cache_path(key).exists()
+        assert provider._cache_path(key).with_suffix(".csv").exists()
         loaded = provider._load_cache(key)
         assert loaded is not None
         assert float(loaded.iloc[0]["close"]) == 20.0
@@ -390,5 +411,6 @@ class TestBaostockCacheVersioning:
         provider, _fake, _tmp_path = baostock_provider
         identity = provider.cache_identity()
         assert identity["provider"] == "baostock"
-        assert identity["adjustment"] == "hfq"
-        assert provider.price_adjustment == "hfq"
+        assert identity["adjustment"] == "raw"
+        assert identity["adjustment_mode"] == "hfq"
+        assert provider.price_adjustment == "raw"
