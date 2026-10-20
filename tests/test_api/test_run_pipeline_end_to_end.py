@@ -78,11 +78,23 @@ class TestThePipelineCompletes:
     def test_every_consumer_of_the_store_runs(self, completed_run):
         record = routes._run_store[completed_run]
 
-        routes._decompose_risk(record)
-        routes._detect_regime(record)
-        routes._run_monte_carlo(record, {})
+        risk = routes._decompose_risk(record)
+        assert risk["available"] is False
+        assert risk.get("reason")
 
-        RunResult(
+        regime = routes._detect_regime(record)
+        assert "error" not in regime, regime.get("error")
+        assert regime["overall_regime"] in {
+            "risk_on", "neutral", "cautious", "risk_off",
+        }
+        assert isinstance(regime["history"], list)
+
+        mc = routes._run_monte_carlo(record, {})
+        assert "error" not in mc, mc.get("error")
+        assert mc["n_simulations"] == 1000
+        assert len(mc["terminal_values"]) > 0
+
+        result = RunResult(
             run_id=completed_run,
             performance=record.get("performance"),
             risk=record.get("risk"),
@@ -91,6 +103,8 @@ class TestThePipelineCompletes:
             exposure=record.get("exposure"),
             chart_data=record.get("chart_data"),
         )
+        assert result.run_id == completed_run
+        assert result.performance is not None
 
 
 class TestRiskDecompositionIsNotInvented:

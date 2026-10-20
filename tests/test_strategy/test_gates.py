@@ -118,12 +118,35 @@ class TestGateStatus:
         runner = GateRunner()
         report = runner.run(
             strategy_name="test",
-            ic_results={"mom": {"mean_ic": 0.05, "icir": 0.8}},
+            ic_results={
+                "mom": {"mean_ic": 0.05, "icir": 0.8},
+                "value": {"mean_ic": 0.03, "icir": 0.5},
+                "quality": {"mean_ic": 0.025, "icir": 0.3},
+            },
             n_factors=5,
             n_params=10,
         )
         assert len(report.gate_results) == 6
         assert report.to_dict()["strategy_name"] == "test"
+
+        by_name = {g.gate_name: g for g in report.gate_results}
+        assert by_name["ic_quality"].status == PASS
+        assert by_name["complexity"].status == PASS
+        assert by_name["walk_forward"].status == SKIPPED
+        assert by_name["data_coverage"].status == SKIPPED
+
+    def test_gate_runner_rejects_a_weak_ic(self):
+        """A `check_ic_quality` that always returns PASS satisfied every
+        previous assertion, because none of them inspected a gate status."""
+        report = GateRunner().run(
+            strategy_name="weak",
+            ic_results={"mom": {"mean_ic": 0.001, "icir": 0.01}},
+            n_factors=5,
+            n_params=10,
+        )
+
+        gate = next(g for g in report.gate_results if g.gate_name == "ic_quality")
+        assert gate.status == FAIL
 
     def test_unknown_universe_is_skipped_not_faked(self):
         """`run_from_backtest_results` used to pass `len(first_weights)` as

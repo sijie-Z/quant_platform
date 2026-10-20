@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pickle
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -106,19 +108,39 @@ class PipelineCache:
                 return data
             except Exception as e:
                 logger.debug("Failed to load cache %s: %s", stage, e)
-                path.unlink(missing_ok=True)
+                # Another writer may hold the file on Windows; a failed
+                # cleanup must not escape as PermissionError.
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         return None
 
     def save_stage(self, stage: str, cache_key: str, data: Any) -> None:
-        """Save a stage to cache."""
+        """Save a stage to cache atomically.
+
+        Writing the target in place let a concurrent reader deserialize a
+        half-written pickle (or hit a Windows sharing violation). Write to a
+        unique temp file, fsync, then os.replace.
+        """
         path = self._make_path(stage, cache_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(
+            f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
         try:
-            with open(path, "wb") as f:
+            with open(tmp, "wb") as f:
                 pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
             logger.info("Cached: %s (%s)", stage, cache_key)
         except Exception as e:
             logger.debug("Failed to save cache %s: %s", stage, e)
-            path.unlink(missing_ok=True)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def clear(self) -> int:
         """Clear all cached files. Returns number of files removed."""

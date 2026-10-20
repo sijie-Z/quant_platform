@@ -112,8 +112,13 @@ class TestCalculateDailyNav:
             date=_D2, cash=5_000_000, market_value=5_000_000,
         )
         assert nav.date == _D2
-        assert nav.nav_per_unit > 0
         assert nav.total_units == 10_000_000
+        # Exact arithmetic, not just "positive": the only deduction on the
+        # first day is the management fee.
+        assert nav.nav_total == pytest.approx(10_000_000 - nav.mgmt_fee, rel=1e-9)
+        assert nav.nav_per_unit == pytest.approx(
+            nav.nav_total / nav.total_units, rel=1e-12,
+        )
 
     def test_mgmt_fee_positive(self, calc):
         nav = calc.calculate_daily_nav(
@@ -146,8 +151,10 @@ class TestCalculateDailyNav:
         nav = calc.calculate_daily_nav(
             date=_D2, cash=5_000_000, market_value=5_000_000,
         )
-        gross = nav.cash + nav.market_value - nav.mgmt_fee
-        assert nav.nav_total <= gross
+        assert nav.nav_total == pytest.approx(
+            10_000_000 - nav.accrued_mgmt_fee - nav.accrued_perf_fee, rel=1e-9,
+        )
+        assert nav.nav_total <= nav.cash + nav.market_value
 
     def test_hwm_updates(self, store):
         calc = NAVCalculator(store, annual_mgmt_fee=0.0, perf_fee_rate=0.0)
@@ -177,8 +184,10 @@ class TestCalculateDailyNav:
         nav = calc.calculate_daily_nav(
             date=_D2, cash=5_000_000, market_value=5_000_000,
         )
-        # With mgmt fee, cumulative return is slightly negative
-        assert isinstance(nav.cumulative_return, float)
+        assert nav.cumulative_return == pytest.approx(
+            nav.nav_per_unit / 1.0 - 1.0, rel=1e-12,
+        )
+        assert nav.cumulative_return < 0  # management fee on day one
 
 
 # ── Save and Restore ──
@@ -376,3 +385,64 @@ class TestFeeAccrualAcrossDays:
         total_perf = nav2.perf_fee + nav3.perf_fee
         gross_gain = (nav3.cash + nav3.market_value) - 10_000_000
         assert total_perf == pytest.approx(0.20 * gross_gain, rel=1e-6)
+
+    def test_nav_total_equals_assets_minus_every_accrued_fee(self, store):
+        """Exact accounting identity on every day.
+
+        Checking only `nav_total <= gross` lets a regression that subtracts
+        just the current day's performance fee -- adding every earlier fee
+        liability back to NAV -- pass. This asserts the full equation.
+        """
+        calc = NAVCalculator(store, annual_mgmt_fee=0.02, perf_fee_rate=0.20)
+        dates = pd.bdate_range(end=_TODAY.strftime("%Y-%m-%d"), periods=4)
+        values = [
+            (5_000_000, 5_000_000),
+            (5_000_000, 5_400_000),
+            (5_000_000, 5_600_000),
+            (5_000_000, 5_300_000),
+        ]
+
+        navs = []
+        for day, (cash, market_value) in zip(dates, values):
+            nav = calc.calculate_daily_nav(
+                date=str(day.date()), cash=cash, market_value=market_value,
+            )
+            calc.save_nav(nav)
+            navs.append(nav)
+
+            assert nav.nav_total == pytest.approx(
+                cash + market_value - nav.accrued_mgmt_fee - nav.accrued_perf_fee,
+                rel=1e-9,
+            )
+            assert nav.nav_per_unit == pytest.approx(
+                nav.nav_total / nav.total_units, rel=1e-12,
+            )
+            assert nav.accrued_perf_fee == pytest.approx(
+                sum(n.perf_fee for n in navs), rel=1e-9,
+            )
+
+    def test_a_second_new_high_is_charged_only_on_the_increment(self, store):
+        calc = NAVCalculator(store, annual_mgmt_fee=0.0, perf_fee_rate=0.20)
+        dates = pd.bdate_range(end=_TODAY.strftime("%Y-%m-%d"), periods=4)
+
+        nav1 = calc.calculate_daily_nav(
+            date=str(dates[0].date()), cash=5_000_000, market_value=5_000_000,
+        )
+        calc.save_nav(nav1)
+        nav2 = calc.calculate_daily_nav(
+            date=str(dates[1].date()), cash=5_000_000, market_value=5_600_000,
+        )
+        calc.save_nav(nav2)
+        nav3 = calc.calculate_daily_nav(
+            date=str(dates[2].date()), cash=5_000_000, market_value=5_800_000,
+        )
+        calc.save_nav(nav3)
+        nav4 = calc.calculate_daily_nav(
+            date=str(dates[3].date()), cash=5_000_000, market_value=5_700_000,
+        )
+
+        assert nav1.perf_fee == 0.0
+        assert nav2.perf_fee == pytest.approx(0.20 * 600_000, rel=1e-9)
+        assert nav3.perf_fee == pytest.approx(0.20 * 200_000, rel=1e-9)
+        assert nav4.perf_fee == 0.0
+        assert nav4.nav_total == pytest.approx(5_700_000 + 5_000_000 - 160_000, rel=1e-9)

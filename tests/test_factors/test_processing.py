@@ -61,30 +61,48 @@ def test_standardize_rank():
 
 def test_neutralize_reduces_sector_bias():
     factor = _make_factor()
-    # Create a sector map where one sector has consistently higher values
+    # One sector carries a large constant premium.
     n_assets = factor.shape[1]
     sectors = pd.Series(
         ["A"] * (n_assets // 2) + ["B"] * (n_assets - n_assets // 2),
         index=factor.columns,
     )
-    result = neutralize(factor, sector_map=sectors)
+    biased = factor.copy()
+    biased.loc[:, sectors == "B"] += 3.0
 
-    # Neutralized factor should have reduced correlation with the original
+    result = neutralize(biased, sector_map=sectors)
+
     assert result.shape == factor.shape
+    # A residual regression on sector dummies has zero group mean by
+    # construction. Checking only the shape would pass an identity return.
+    for date in result.index[:10]:
+        row = result.loc[date]
+        assert abs(row[sectors == "A"].mean()) < 1e-8
+        assert abs(row[sectors == "B"].mean()) < 1e-8
+    assert not np.allclose(result.to_numpy(), biased.to_numpy())
 
 
 def test_process_pipeline():
     factor = _make_factor()
+    sectors = pd.Series(
+        ["A"] * (factor.shape[1] // 2)
+        + ["B"] * (factor.shape[1] - factor.shape[1] // 2),
+        index=factor.columns,
+    )
     result = process_factor(
         factor,
         winsorize_enabled=True,
         standardize_enabled=True,
         neutralize_enabled=True,
-        sector_map=None,
+        sector_map=sectors,
         market_cap=None,
     )
     assert result.shape == factor.shape
     assert not result.isnull().all().all()
+    # The pipeline output is winsorized (the +-10 outliers are clipped) and
+    # standardized, so it must no longer contain the raw values.
+    assert not np.allclose(result.to_numpy(), factor.to_numpy())
+    assert result.abs().to_numpy().max() < 6.0
 
 
 def test_winsorize_preserves_a_sparse_binary_factor():

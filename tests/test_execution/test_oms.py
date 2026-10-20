@@ -422,3 +422,51 @@ class TestBookConsistency:
 
         assert "600519" not in om.positions
         assert om.cash > 0
+
+    def test_a_second_partial_fill_cannot_spend_the_same_cash(self):
+        """Cash validation must run on every fill, not only the first.
+
+        A 200-share buy with only 15,000 in cash can pay for one 100-share
+        fill at 100. The next 100 shares need another ~10,000; without a
+        per-fill check the second fill goes through and cash turns negative.
+        """
+        om = OrderManager(initial_cash=15_000)
+        order = om.create_order("600519", "buy", 200)
+        om.submit_order(order.order_id)
+
+        first = om.fill_order(order.order_id, price=100.0, quantity=100)
+        assert first.status == OrderStatus.PARTIAL
+        cash_after_first = om.cash
+        assert cash_after_first >= 0
+
+        with pytest.raises(ValueError, match="Insufficient cash"):
+            om.fill_order(order.order_id, price=100.0, quantity=100)
+
+        assert om.cash == pytest.approx(cash_after_first)
+        assert om.positions["600519"].quantity == 100
+
+    def test_sequential_partial_fills_cannot_exceed_the_order(self):
+        om = OrderManager(initial_cash=1_000_000)
+        order = om.create_order("600519", "buy", 300)
+        om.submit_order(order.order_id)
+
+        for _ in range(3):
+            om.fill_order(order.order_id, price=10.0, quantity=100)
+        with pytest.raises(ValueError):
+            om.fill_order(order.order_id, price=10.0, quantity=100)
+
+        assert om.positions["600519"].quantity == 300
+
+    def test_repeated_buys_never_drive_cash_negative(self):
+        om = OrderManager(initial_cash=100_000)
+        rejected = 0
+        for _ in range(200):
+            order = om.create_order("600000", "buy", 100)
+            om.submit_order(order.order_id)
+            try:
+                om.fill_order(order.order_id, price=10.0)
+            except ValueError:
+                rejected += 1
+            assert om.cash >= 0
+
+        assert rejected > 0  # the scenario actually exhausted the cash

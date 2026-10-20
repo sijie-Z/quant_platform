@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -55,6 +56,10 @@ class OrderManager:
         self.positions: dict[str, Position] = {}
         self.blotter: list[Order] = []
         self.snapshots: list[PortfolioSnapshot] = []
+        # `fill_order` validates remaining quantity and cash and then mutates
+        # both. Two concurrent fills could both pass validation: a 100-share
+        # order accepted 60 + 60 and cash went negative.
+        self._lock = threading.RLock()
 
     # ── Order Lifecycle ──
 
@@ -128,6 +133,17 @@ class OrderManager:
         return order
 
     def fill_order(
+        self,
+        order_id: str,
+        price: float,
+        quantity: int | None = None,
+        commission: float | None = None,
+    ) -> Order:
+        """Process a fill atomically."""
+        with self._lock:
+            return self._fill_order(order_id, price, quantity, commission)
+
+    def _fill_order(
         self,
         order_id: str,
         price: float,

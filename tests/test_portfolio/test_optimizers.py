@@ -31,7 +31,12 @@ def test_equal_weight_basic():
     constraints = PortfolioConstraints(max_weight=0.10)
     optimizer = EqualWeightOptimizer(constraints)
     weights = optimizer.optimize(signal, cov)
-    assert weights.sum() > 0
+
+    # 10 names at the 10% cap: the optimum is exactly the top-10 by signal.
+    top = signal.nlargest(10).index
+    assert weights.sum() == pytest.approx(1.0, rel=1e-9)
+    assert set(weights[weights > 0].index) == set(top)
+    assert np.allclose(weights[top].to_numpy(), 0.10)
     assert weights.max() <= constraints.max_weight + 1e-6
 
 
@@ -40,8 +45,8 @@ def test_equal_weight_sums_to_one():
     constraints = PortfolioConstraints()
     optimizer = EqualWeightOptimizer(constraints)
     weights = optimizer.optimize(signal, cov)
-    # Weights should sum to approximately 1
-    assert 0.95 <= weights.sum() <= 1.05
+    assert weights.sum() == pytest.approx(1.0, rel=1e-9)
+    assert (weights > 0).sum() == 20  # 1 / 5% cap
 
 
 def test_mean_variance_basic():
@@ -155,14 +160,30 @@ def test_risk_parity_basic():
 
 def test_optimizer_with_prev_weights():
     signal, cov = _make_signal_and_cov()
-    constraints = PortfolioConstraints(max_turnover=0.30)
+    constraints = PortfolioConstraints(max_weight=0.10, max_turnover=0.30)
     optimizer = EqualWeightOptimizer(constraints)
 
+    # The desired portfolio is the top-10. Hold ten *other* names so the
+    # unconstrained target would be a complete swap (turnover 100%).
+    target = EqualWeightOptimizer(
+        PortfolioConstraints(max_weight=0.10, max_turnover=1.0)
+    ).optimize(signal, cov)
+    outside = signal.index.difference(target[target > 0].index)[:10]
     prev = pd.Series(0.0, index=signal.index)
-    prev.iloc[:10] = 0.1
+    prev.loc[outside] = 0.10
 
     weights = optimizer.optimize(signal, cov, prev_weights=prev)
-    assert weights.sum() > 0
+
+    index = weights.index.union(prev.index)
+    turnover = (
+        weights.reindex(index, fill_value=0.0) - prev.reindex(index, fill_value=0.0)
+    ).abs().sum() / 2
+    assert turnover == pytest.approx(0.30, abs=1e-9)
+    # And the clamp actually moved the target rather than being ignored.
+    assert not np.allclose(
+        weights.reindex(signal.index, fill_value=0.0).to_numpy(),
+        target.reindex(signal.index, fill_value=0.0).to_numpy(),
+    )
 
 
 def test_turnover_counts_names_entering_and_leaving_the_portfolio():
@@ -181,6 +202,34 @@ def test_turnover_counts_names_entering_and_leaving_the_portfolio():
         weights.reindex(index, fill_value=0.0) - prev.reindex(index, fill_value=0.0)
     ).abs().sum() / 2
     assert turnover <= 0.20 + 1e-9, f"turnover {turnover:.3f} exceeded the cap"
+
+
+@pytest.mark.parametrize(
+    "optimizer_cls", [MeanVarianceOptimizer, RiskParityOptimizer],
+)
+def test_the_turnover_cap_holds_for_optimizers_with_prev_weights(optimizer_cls):
+    """Only the equal-weight clamp used to be tested.
+
+    Both convex optimizers select a different portfolio than the one held, so
+    removing `_limit_turnover` must show up as an over-budget final weight
+    vector, not merely as a solver warning.
+    """
+    signal, cov = _make_signal_and_cov(40)
+    constraints = PortfolioConstraints(
+        max_weight=0.10, max_turnover=0.10, risk_aversion=1.0,
+    )
+    prev = pd.Series(0.0, index=signal.index)
+    prev.loc[signal.nsmallest(10).index] = 0.10  # names both want to drop
+
+    optimizer = optimizer_cls(constraints)
+    weights = optimizer.optimize(signal, cov, prev_weights=prev)
+
+    index = weights.index.union(prev.index)
+    turnover = (
+        weights.reindex(index, fill_value=0.0) - prev.reindex(index, fill_value=0.0)
+    ).abs().sum() / 2
+    assert turnover <= 0.10 + 1e-9, f"turnover {turnover:.3f} exceeded the cap"
+    assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
 
 
 def test_equal_weight_never_scales_above_max_weight():

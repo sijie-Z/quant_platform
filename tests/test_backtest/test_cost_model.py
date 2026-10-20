@@ -42,8 +42,12 @@ def test_cost_model_basic():
     model = CostModel()
     turnover = pd.Series([100000, 50000], index=["A", "B"])
     costs = model.compute_costs(turnover)
-    assert len(costs) == 2
-    assert (costs > 0).all()
+
+    # commission + slippage on the full notional, stamp tax on the assumed
+    # sell half of the legacy single-figure path.
+    rate = model.commission + model.slippage + model.stamp_tax / 2
+    assert costs["A"] == pytest.approx(100000 * rate)
+    assert costs["B"] == pytest.approx(50000 * rate)
 
 
 def test_cost_model_sell():
@@ -55,7 +59,12 @@ def test_cost_model_sell():
     is_buy = pd.Series([False], index=["A"])
     costs_buy = model.compute_costs(turnover, is_sell=is_buy)
 
-    # Sell should cost more due to stamp tax
+    assert costs_sell.iloc[0] == pytest.approx(
+        100000 * (model.commission + 0.001 + model.slippage),
+    )
+    assert costs_buy.iloc[0] == pytest.approx(
+        100000 * (model.commission + model.slippage),
+    )
     assert costs_sell.iloc[0] > costs_buy.iloc[0]
 
 

@@ -103,6 +103,7 @@ class RiskMonitor:
         self.sector_map: dict[str, str] = {}
         self._last_state_breach = ""
         self._state_risk_level = RiskLevel.GREEN
+        self._active_breach_signatures: set[str] = set()
 
         # Kill switch
         self.kill_switch_active = False
@@ -225,7 +226,20 @@ class RiskMonitor:
                                b.severity.value, b.breach_type.value, b.message,
                                b.current_value, b.limit_value)
 
-        self.breaches.extend(breaches)
+        # Record only breaches that were not already active. A persistent
+        # breach state appended one identical row per pre-trade check (800
+        # checks -> 800 rows); a breach that clears and later reappears is
+        # logged again.
+        active_signatures = {b.message for b in breaches}
+        new_breaches = [
+            b for b in breaches
+            if b.message not in self._active_breach_signatures
+        ]
+        self._active_breach_signatures = active_signatures
+        self.breaches.extend(new_breaches)
+        # Hard bound as a last resort for rapidly changing messages.
+        if len(self.breaches) > 1_000:
+            self.breaches = self.breaches[-500:]
         return is_approved, breaches
 
     def _check_order_rate(self) -> RiskBreach | None:
