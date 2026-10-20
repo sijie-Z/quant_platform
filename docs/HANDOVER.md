@@ -332,3 +332,19 @@
 验证：全量测试 **2019 passed / 4 skipped / 0 failed**（2m55s），ruff 全绿。
 
 历史 `results/*.csv` 中的 RQ5/RQ6/RQ7 与 run_factor 报告需要用修正后的脚本在真实数据上重跑后才能引用；docstring/注释已注明口径。
+
+### 2026-10-20 第八轮（并发一致性 / 测试有效性 / CLI 与端点契约）
+
+这一轮以“实测”为主：并发一致性压测、变异检验（mutation testing）、CLI 全命令冒烟、99 个 API 端点全扫。所有修复带回归测试。
+
+| 领域 | 修复 |
+|---|---|
+| 并发 | `OrderManager.fill_order` 无锁：两笔 60 股成交同时通过 100 股订单的校验，最终成交 120 股且现金为负；加 `RLock` 并把校验/记账放进同一临界区。`RiskMonitor` 在持续违约时每次检查都追加同一条 breach（800 条重复且无上限）；只记录新签名，上限 1000/保留 500。`PipelineCache` 直接写目标文件，Windows 上并发读者会读到半写 pickle 或 `PermissionError`；改为临时文件 + fsync + `os.replace`，读取失败清理不抛异常 |
+| 测试有效性 | 变异审计（8 个变异，7 killed）发现默认 Ledoit-Wolf 协方差被换成单位阵仍全绿；新增非单位阵/量纲/PSD/numba+sklearn 双路径断言。补强 NAV 费用负债精确等式、OMS 每次成交现金校验与部分成交、MVO/RP 换手上限、成本与印花税精确值、中性化行业残差、门禁状态。7 个空转测试改为真实读回/契约断言（PostgreSQL fallback 写后读回、WS 无客户端、run consumer 输出），删除 skip 占位 |
+| IC 评估 | 硬编码“每个截面至少 30 个有效资产”使 30 股票池 21/21 因子 IC 全 NaN（n_obs 0–3），门禁误报“弱 ICIR”；改为 `min(30, max(10, panel_width // 2))` 并接入 numba 与 pandas 两条路径，宽度不足时输出明确 warning；全部因子无观测时门禁 SKIPPED 并说明观测不足。30 股票池现在 19/21 因子可评估（N=133–250），门禁 FAIL 是真实的弱 ICIR |
+| ML | 260 天样本下 `ml train` / `ml signal` 曾以退出码 0 输出零样本与空信号；现在短历史自适应首个训练折（≥30 日期、≥60 样本、≥2 特征），样本不足抛 `InsufficientTrainingData`，CLI 退出 1、API 返回 422；全 NaN 特征显式丢弃，训练失败不落模型与 sidecar |
+| CLI | `check-lookahead` 已注册但 dispatch 缺失（只打印 help 并退出 1）；接入并新增“所有注册命令均有 dispatch”的静态守卫。`run` 从不生成 HTML 与 metrics.json，`research report` 因无生产者而死路；现在 `run` 写出自包含 HTML 与 metrics.json，`research report` 可回退读取 daily_returns.csv。`walkforward --folds` 只打印不生效；校验器新增 `n_folds` 并截断。`screen` 把 z-score 当 PE 阈值；CLI 与 API 均改用原始因子面板，未知因子返回 422。前视检测器在 Windows GBK 控制台因 ⚠/✓ 字符崩溃，输出改为 ASCII；排名对 1e-14 求和噪声敏感导致同一日期信号随面板长度变化（检测器把自己的因果信号判为有偏），排名前统一 `round(12)` |
+| API | 端点全扫（98 HTTP + 1 WS）确认 12 条缺陷。P0：已完成 run 因 `exposure.top_holdings.pnl_pct` 与不可评估因子统计为 NaN，`GET /result`、`/factors` 返回 500；pnl 只在两个价格都有限时计算、跳过不可评估因子，并在入库前用 `json.dumps(allow_nan=False)` 守卫。Barra 横截面回归未剔除停牌 NaN 收益，1236/1236 个因子收益全 NaN、协方差 100/100 NaN，两个端点每次 500；过滤非有限行并对协方差 `nan_to_num`。再分配资金不重置 `current_value`，1 亿 +1% 被算成 -99%；重置基线并拒绝未知策略。`trading/stop` 后 `run-once` / `order` 仍执行，检查 `_running`。OMS 与 smart-route 接受空 ticker，改 422。parallel sweep 非法参数 500→422；regime 数据不足 200+error→409；`portfolio/live` 回退最近 7 天并返回 `data_date/stale`；`data/quality` 标注 `source/synthetic/data_date_range`；QMT 不可用与缺 akshare 返回 503 |
+| 日志/文档 | `get_logger(__name__)` 双重前缀（`quant_platform.quant_platform.*`）修正；HANDOVER 补充本轮记录 |
+
+验证：全量测试 **2074 passed / 3 skipped / 0 failed**（3m20s），ruff 全绿。CLI 实测：30 股票 `run` 得到 19/21 因子有限 IC（N=133–250）、HTML+metrics 落盘；`check-lookahead` 报告 0 偏差并退出 0；`ml train` 训练 3434 样本、`ml signal` 非空；`walkforward --folds 1` 实际执行 1 折。

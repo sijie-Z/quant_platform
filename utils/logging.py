@@ -49,7 +49,15 @@ def setup_logging(
 
 
 def get_logger(name: str | None = None) -> logging.Logger:
-    """Get a logger for a specific module."""
+    """Get a logger for a specific module.
+
+    Modules pass `__name__`, which is already ``quant_platform.<module>``;
+    prefixing it unconditionally produced ``quant_platform.quant_platform.
+    data.providers`` in every log line and made logger-name filtering
+    unusable.
+    """
     if name:
+        if name == "quant_platform" or name.startswith("quant_platform."):
+            return logging.getLogger(name)
         return logging.getLogger(f"quant_platform.{name}")
     return logging.getLogger("quant_platform")

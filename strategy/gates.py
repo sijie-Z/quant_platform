@@ -19,6 +19,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from quant_platform.factors.evaluation import MIN_IC_OBSERVATIONS
+
 # ── Status Constants ──
 
 PASS = "PASS"
@@ -211,6 +213,43 @@ def check_ic_quality(
         )
 
     n_factors = len(ic_results)
+
+    # No evidence is not evidence of a bad factor. When every factor reports
+    # fewer than `MIN_IC_OBSERVATIONS` evaluable cross-sections (the 30-stock
+    # universe used to yield n_obs=0 for every factor), `ic_summary` returns
+    # NaN metrics; judging those against ICIR=0.2 reported a misleading
+    # weak-IC FAIL. Only trigger this when every entry carries `n_obs`, so
+    # legacy result dicts without observation counts keep the old behaviour.
+    n_obs_values = []
+    for stats in ic_results.values():
+        try:
+            value = stats.get("n_obs")
+            n_obs_values.append(None if value is None else int(value))
+        except (AttributeError, TypeError, ValueError):
+            n_obs_values.append(None)
+
+    if n_obs_values and all(
+        value is not None and value < MIN_IC_OBSERVATIONS
+        for value in n_obs_values
+    ):
+        best_n_obs = max(n_obs_values)
+        return GateResult(
+            gate_name="ic_quality",
+            status=SKIPPED,
+            message=(
+                "Insufficient observations to evaluate IC: no factor has "
+                f"at least {MIN_IC_OBSERVATIONS} evaluable cross-sections "
+                f"(best n_obs={best_n_obs})"
+            ),
+            details={
+                "n_factors": n_factors,
+                "max_n_obs": best_n_obs,
+                "minimum_observations": MIN_IC_OBSERVATIONS,
+            },
+            current_value=best_n_obs,
+            threshold=MIN_IC_OBSERVATIONS,
+        )
+
     icir_enabled = config.minimum_icir > 0
 
     n_above_ic = sum(

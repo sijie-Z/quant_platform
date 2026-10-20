@@ -211,9 +211,15 @@ class MultiStrategyManager:
             if sid in self.strategies:
                 normalized = w / total_weight if total_weight > 0 else 0
                 self.strategies[sid].allocation_pct = normalized
-                self.states[sid].capital_allocated = self.total_capital * normalized
+                state = self.states[sid]
+                state.capital_allocated = self.total_capital * normalized
+                # Reallocation establishes a new P&L baseline. Changing only
+                # `capital_allocated` left `current_value` at the old amount,
+                # so a +1% day after moving a strategy to 100% of a 100M book
+                # reported -99% (-99M).
+                state.current_value = state.capital_allocated
                 logger.info("Strategy %s: allocation=%.1f%%, capital=%s",
-                           sid, normalized * 100, f"{self.states[sid].capital_allocated:,.0f}")
+                           sid, normalized * 100, f"{state.capital_allocated:,.0f}")
 
     def get_risk_alerts(self) -> list[dict]:
         """Check all strategies for risk breaches."""

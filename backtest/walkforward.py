@@ -45,11 +45,15 @@ class WalkForwardValidator:
         test_period: int = 126,    # ~6 months
         step_size: int = 126,      # Step forward by test_period
         mode: str = "rolling",     # "rolling" or "expanding"
+        n_folds: int | None = None,
     ):
         self.train_period = train_period
         self.test_period = test_period
         self.step_size = step_size
         self.mode = mode
+        if n_folds is not None and n_folds < 1:
+            raise ValueError(f"n_folds must be >= 1, got {n_folds}")
+        self.n_folds = n_folds
 
     def run(
         self,
@@ -125,6 +129,12 @@ class WalkForwardValidator:
 
             if test_end >= n_dates:
                 break
+
+        if self.n_folds is not None:
+            # The CLI exposes --folds; previously it only printed the value
+            # while the loop decided the count, so a request for one fold ran
+            # every fold the data allowed.
+            folds = folds[:self.n_folds]
 
         logger.info("Walk-forward: %d folds (%s mode, train=%d, test=%d, step=%d, recomputed=%s)",
                      len(folds), self.mode, self.train_period, self.test_period, self.step_size,

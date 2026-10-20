@@ -48,6 +48,27 @@ except ImportError:
     HAS_SHAP = False
 
 
+# Documented minimums for an honest walk-forward model. Below either bound the
+# generator raises InsufficientTrainingData instead of returning a zero-IC
+# performance record (old `train()`) or an all-NaN signal (old `generate()`):
+# both used to look like a successful run with no edge.
+MIN_TRAIN_SAMPLES = 60   # flattened (date, asset) observations with a label
+MIN_TRAIN_FEATURES = 2   # feature columns with >= 1 finite value in the window
+MIN_TRAIN_DATES = 30     # labeled dates in the first walk-forward training fold
+
+
+class InsufficientTrainingData(RuntimeError):  # noqa: N818 -- public API name
+    """Raised when the sample cannot support a real walk-forward model.
+
+    The message always reports the available sample count, the usable feature
+    count and the minimums enforced by this module (``MIN_TRAIN_SAMPLES``,
+    ``MIN_TRAIN_FEATURES``, ``MIN_TRAIN_DATES``). Callers (CLI, API) should
+    surface this as an explicit failure and exit/return non-zero: the
+    generator does not fabricate a zero-IC performance record or an all-NaN
+    signal in its place.
+    """
+
+
 @dataclass
 class MLSignalConfig:
     """Configuration for ML signal generation."""
@@ -357,16 +378,62 @@ class MLSignalGenerator:
         Flattens all dates and assets into a single feature matrix.
         Each row = (date, asset) pair.
 
+        Feature columns with no finite observation anywhere in
+        ``[start_idx, end_idx)`` are dropped (and logged): keeping them would
+        make the per-row ``valid_mask`` below reject every row, which is how a
+        short history used to end up with zero samples and a fake zero-IC
+        result. Fewer than ``MIN_TRAIN_FEATURES`` surviving columns is an
+        explicit ``InsufficientTrainingData`` failure, never a silent
+        "no data" result.
+
         Returns:
             (X, y, feature_names, row_dates) -- `row_dates` carries the date of
             each row, so a splitter can divide on the date axis instead of
             counting rows. Row counts per date vary (NaN assets are dropped),
             so this cannot be reconstructed by the caller.
         """
-        feature_names = sorted(factors.keys())[:self.config.top_n_features]
-        first_factor = factors[feature_names[0]]
+        candidate_names = sorted(factors.keys())[:self.config.top_n_features]
+        if not candidate_names:
+            raise InsufficientTrainingData(
+                f"Insufficient training data: 0 samples and 0 usable features "
+                f"available; at least {MIN_TRAIN_SAMPLES} samples and "
+                f"{MIN_TRAIN_FEATURES} features are required."
+            )
+        first_factor = factors[candidate_names[0]]
         dates = first_factor.index[start_idx:end_idx]
         assets = first_factor.columns
+
+        # Drop columns with no finite observation in this window. A single
+        # all-NaN column used to poison the AND-ed valid_mask below and leave
+        # zero training rows while the caller reported zeros instead of an
+        # error.
+        feature_names: list[str] = []
+        dropped: list[str] = []
+        for name in candidate_names:
+            window = factors[name].iloc[start_idx:end_idx]
+            if np.isfinite(window.to_numpy(dtype=float)).any():
+                feature_names.append(name)
+            else:
+                dropped.append(name)
+                logger.warning(
+                    "Dropping feature '%s': no finite observations in the "
+                    "training window (%d dates); keeping it would invalidate "
+                    "every training row.",
+                    name, len(window),
+                )
+
+        if len(feature_names) < MIN_TRAIN_FEATURES:
+            n_labeled_rows = 0
+            for date in dates:
+                if date in forward_returns.index:
+                    fwd = forward_returns.loc[date].to_numpy(dtype=float)
+                    n_labeled_rows += int(np.isfinite(fwd).sum())
+            raise InsufficientTrainingData(
+                f"Insufficient training data: {n_labeled_rows} labeled samples "
+                f"and {len(feature_names)} usable feature(s) after dropping "
+                f"{dropped}; at least {MIN_TRAIN_SAMPLES} samples and "
+                f"{MIN_TRAIN_FEATURES} features are required."
+            )
 
         X_list = []
         y_list = []
@@ -409,6 +476,24 @@ class MLSignalGenerator:
             pd.Index(dates_list),
         )
 
+    @staticmethod
+    def _require_min_training_data(
+        n_samples: int, n_features: int, context: str
+    ) -> None:
+        """Raise InsufficientTrainingData below the documented minimums.
+
+        The message always carries the available sample count, the usable
+        feature count and the required minimums, so an operator can tell
+        whether the history is too short, the factors too sparse, or both.
+        """
+        if n_samples < MIN_TRAIN_SAMPLES or n_features < MIN_TRAIN_FEATURES:
+            raise InsufficientTrainingData(
+                f"Insufficient training data for {context}: {n_samples} samples "
+                f"and {n_features} features available; at least "
+                f"{MIN_TRAIN_SAMPLES} samples and {MIN_TRAIN_FEATURES} features "
+                f"are required."
+            )
+
     def train(
         self,
         factors: dict[str, pd.DataFrame],
@@ -416,13 +501,40 @@ class MLSignalGenerator:
     ) -> ModelPerformance:
         """Train the ML model with time-series cross-validation.
 
+        The first walk-forward fold is adaptive. With a long history
+        (enough labeled dates that the full ``train_window`` still leaves a
+        63-date test window) it trains on exactly ``train_window`` dates,
+        unchanged from before. With a shorter history it shrinks the first
+        training window just enough to keep at least one out-of-sample fold,
+        down to ``MIN_TRAIN_DATES``. A sample that cannot support that raises
+        ``InsufficientTrainingData`` -- it never returns a zero-IC
+        ``ModelPerformance`` for a model that was not fitted.
+
         Args:
             factors: dict of factor_name -> (date x asset) processed factor values
             forward_returns: (date x asset) forward returns
 
         Returns:
             ModelPerformance with CV results
+
+        Raises:
+            InsufficientTrainingData: when fewer than ``MIN_TRAIN_SAMPLES``
+                usable rows or ``MIN_TRAIN_FEATURES`` usable features exist,
+                or the labeled date axis cannot hold ``MIN_TRAIN_DATES``
+                training dates plus the purge gap plus one test date.
         """
+        # Clear any previously fitted state first: a failed training run must
+        # not leave a model (or metadata) behind that `save_model` could
+        # persist.
+        self.model = None
+        self._feature_names = None
+        self._train_end_date = None
+        self._last_train_date = None
+        self.feature_importance = {}
+
+        if not factors:
+            self._require_min_training_data(0, 0, context="train()")
+
         first_factor = list(factors.values())[0]
         n_dates = len(first_factor.index)
 
@@ -430,17 +542,45 @@ class MLSignalGenerator:
         X_full, y_full, feature_names, row_dates = self._prepare_dataset(
             factors, forward_returns, 0, n_dates
         )
+        self._require_min_training_data(
+            len(X_full), len(feature_names), context="train()"
+        )
 
-        if len(X_full) < 100:
-            logger.warning("Not enough data for ML training: %d samples", len(X_full))
-            return ModelPerformance(date=str(first_factor.index[-1]), model_type=self.config.model_type)
+        # The splitter divides the *labeled* date axis, so fold bounds must be
+        # expressed in labeled dates (the last date often has no observable
+        # forward return and is absent from `row_dates`).
+        n_obs_dates = int(len(pd.Index(pd.unique(row_dates))))
+        gap = self.config.purge_gap
+        test_window = 63  # the walk-forward test window this CV always used
+        max_train_end = n_obs_dates - gap - 1
+        if max_train_end < MIN_TRAIN_DATES:
+            raise InsufficientTrainingData(
+                f"Insufficient training data for walk-forward CV: "
+                f"{n_obs_dates} labeled dates, {len(X_full)} samples and "
+                f"{len(feature_names)} features available; at least "
+                f"{MIN_TRAIN_DATES} training dates + {gap}-date purge gap + "
+                f"1 test date ({MIN_TRAIN_DATES + gap + 1} labeled dates), "
+                f"{MIN_TRAIN_SAMPLES} samples and {MIN_TRAIN_FEATURES} features "
+                f"are required."
+            )
+
+        # Adaptive first fold. min() keeps three invariants: never train on
+        # more than `train_window` (long histories unchanged at 504),
+        # never train on fewer than MIN_TRAIN_DATES, and always leave at
+        # least one labeled test date after the purge gap.
+        first_train_end = min(
+            self.config.train_window,
+            max(MIN_TRAIN_DATES, n_obs_dates - test_window),
+            max_train_end,
+        )
+        test_size = min(test_window, n_obs_dates - gap - first_train_end)
 
         # Time-series CV with purge gap
         cv = TimeSeriesCV(
             n_splits=self.config.n_splits,
-            train_size=self.config.train_window,
-            test_size=63,
-            gap=self.config.purge_gap,
+            train_size=first_train_end,
+            test_size=test_size,
+            gap=gap,
             embargo=self.config.embargo,
         )
 
@@ -485,11 +625,27 @@ class MLSignalGenerator:
             logger.info("  Fold %d: train_IC=%.4f, test_IC=%.4f (n_train=%d, n_test=%d)",
                         fold, train_ic, test_ic, len(train_idx), len(test_idx))
 
-        # Train final model on all data
-        self.model = self._create_model()
+        if not cv_results:
+            # The adaptive split above should always yield a fold; if a
+            # degenerate date axis slips through, fail explicitly instead of
+            # averaging over an empty list.
+            raise InsufficientTrainingData(
+                f"Insufficient training data for walk-forward CV: no fold "
+                f"produced from {n_obs_dates} labeled dates, {len(X_full)} "
+                f"samples and {len(feature_names)} features "
+                f"(first fold: train_size={first_train_end}, gap={gap}, "
+                f"test_size={test_size}); at least {MIN_TRAIN_SAMPLES} samples "
+                f"and {MIN_TRAIN_FEATURES} features are required."
+            )
+
+        # Train final model on all data. Fit into a local first so a failed
+        # fit never leaves an unfitted estimator on `self.model` that
+        # `save_model` could try to persist.
+        final_model = self._create_model()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self.model.fit(X_full, y_full)
+            final_model.fit(X_full, y_full)
+        self.model = final_model
 
         # Remember which dates the fitted model has seen, so that `predict`
         # does not hand back in-sample predictions as if they were signals.
@@ -527,8 +683,12 @@ class MLSignalGenerator:
         self.performance_history.append(perf)
         self._last_train_date = first_factor.index[-1]
 
-        logger.info("ML model trained: type=%s, test_IC=%.4f, test_ICIR=%.4f, features=%d",
-                     self.config.model_type, mean_test_ic, test_icir, len(feature_names))
+        logger.info(
+            "ML model trained: type=%s, test_IC=%.4f, test_ICIR=%.4f, "
+            "features=%d, first_fold_train_dates=%d",
+            self.config.model_type, mean_test_ic, test_icir,
+            len(feature_names), first_train_end,
+        )
 
         return perf
 
@@ -721,42 +881,92 @@ class MLSignalGenerator:
         3. Retrain every retrain_frequency dates
 
         This is the ONLY correct way to use ML in backtesting.
+
+        The first training fold is adaptive. Long histories keep the old
+        behaviour (start at ``train_window``); short histories keep
+        ``MIN_TRAIN_DATES`` training dates and hold out the rest, so a
+        260-day sample produces real out-of-sample signals instead of an
+        all-NaN frame.
+
+        Raises:
+            InsufficientTrainingData: when no walk-forward fold can be
+                trained. The old code returned an all-NaN signal in that case,
+                which a caller could not distinguish from "the model has
+                nothing out-of-sample to say".
         """
+        if not factors:
+            self._require_min_training_data(0, 0, context="generate()")
+
         first_factor = list(factors.values())[0]
         dates = first_factor.index
         assets = first_factor.columns
-        feature_names = sorted(factors.keys())[:self.config.top_n_features]
         n_dates = len(dates)
+
+        # Adaptive first fold: `min(train_window, max(MIN_TRAIN_DATES,
+        # n_dates - test_window))`, clamped so at least one date remains to
+        # predict. For long histories this is exactly `train_window`.
+        test_window = 63
+        if n_dates < MIN_TRAIN_DATES + 1:
+            raise InsufficientTrainingData(
+                f"Insufficient training data for generate(): {n_dates} dates "
+                f"available; at least {MIN_TRAIN_DATES} training dates + 1 "
+                f"out-of-sample date ({MIN_TRAIN_DATES + 1} dates) are required, "
+                f"plus {MIN_TRAIN_SAMPLES} samples and {MIN_TRAIN_FEATURES} "
+                f"features."
+            )
+        first_train_end = min(
+            self.config.train_window,
+            max(MIN_TRAIN_DATES, n_dates - test_window),
+            n_dates - 1,
+        )
 
         signal_data = np.full((n_dates, len(assets)), np.nan)
         model = None
+        feature_names = sorted(factors.keys())[:self.config.top_n_features]
         last_train_idx = -self.config.retrain_frequency  # force first train
         perf_log = []
 
-        for i in range(max(self.config.train_window, 60), n_dates):
+        for i in range(first_train_end, n_dates):
             # Check if we need to retrain
-            if i - last_train_idx >= self.config.retrain_frequency or model is None:
+            if model is None or i - last_train_idx >= self.config.retrain_frequency:
                 # Prepare training data: all dates before i
                 train_start = max(0, i - self.config.train_window)
-                X_train, y_train, feat_names, _ = self._prepare_dataset(
+                X_train, y_train, fold_features, _ = self._prepare_dataset(
                     factors, forward_returns, train_start, i
                 )
 
-                if len(X_train) < 100:
-                    continue
+                try:
+                    self._require_min_training_data(
+                        len(X_train), len(fold_features),
+                        context=f"generate() retrain at {str(dates[i])[:10]}",
+                    )
+                except InsufficientTrainingData:
+                    if model is None:
+                        # No model at all: an all-NaN frame would be a silent
+                        # failure. Propagate.
+                        raise
+                    # A later retrain window is too thin; keep the existing
+                    # model rather than replacing it with noise, and say so.
+                    logger.warning(
+                        "generate(): keeping the model trained at %s; retrain "
+                        "at %s has only %d samples (%d required).",
+                        str(dates[last_train_idx])[:10] if last_train_idx >= 0 else "n/a",
+                        str(dates[i])[:10], len(X_train), MIN_TRAIN_SAMPLES,
+                    )
+                else:
+                    model = self._create_model()
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        model.fit(X_train, y_train)
 
-                model = self._create_model()
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    model.fit(X_train, y_train)
+                    feature_names = fold_features
+                    last_train_idx = i
 
-                last_train_idx = i
-
-                # Quick in-sample IC check
-                train_pred = model.predict(X_train)
-                train_ic = float(np.corrcoef(y_train, train_pred)[0, 1]) if len(y_train) > 10 else 0
-                perf_log.append({'idx': i, 'date': str(dates[i])[:10], 'train_ic': train_ic,
-                                 'n_train': len(X_train)})
+                    # Quick in-sample IC check
+                    train_pred = model.predict(X_train)
+                    train_ic = float(np.corrcoef(y_train, train_pred)[0, 1]) if len(y_train) > 10 else 0
+                    perf_log.append({'idx': i, 'date': str(dates[i])[:10], 'train_ic': train_ic,
+                                     'n_train': len(X_train)})
 
             if model is None:
                 continue
@@ -781,6 +991,18 @@ class MLSignalGenerator:
 
             pred = model.predict(X_valid)
             signal_data[i][valid_mask] = pred
+
+        if model is None:
+            # Unreachable while `first_train_end < n_dates`: the first loop
+            # iteration either fits a model or raises. Kept as the documented
+            # no-model contract: never return an all-NaN frame that looks like
+            # a signal.
+            raise InsufficientTrainingData(
+                f"Insufficient training data for generate(): no walk-forward "
+                f"fold produced a model from {n_dates} dates "
+                f"({MIN_TRAIN_SAMPLES} samples and {MIN_TRAIN_FEATURES} "
+                f"features required)."
+            )
 
         signal = pd.DataFrame(signal_data, index=dates, columns=assets)
         # Cross-sectional rank normalization

@@ -1,5 +1,7 @@
 """Tests for factor evaluation."""
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -8,6 +10,7 @@ from quant_platform.factors.evaluation import (
     factor_turnover,
     ic_decay,
     ic_summary,
+    min_assets_for_ic,
     pearson_ic,
     quantile_returns,
     rank_ic,
@@ -159,3 +162,95 @@ def test_ic_summary_reports_the_number_of_observations():
 
     many = ic_summary(pd.Series(np.linspace(-0.05, 0.05, 20)))
     assert many["n_obs"] == 20
+
+
+def _make_sparse_panel(n_dates, n_assets, n_valid_per_row, seed=123):
+    """Factor/return panels where each row has exactly ``n_valid_per_row``
+    names (the rest are suspended/NaN, as in a real A-share universe)."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2023-01-02", periods=n_dates)
+    assets = [f"{i:06d}.SH" for i in range(n_assets)]
+    factor = pd.DataFrame(
+        rng.normal(size=(n_dates, n_assets)), index=dates, columns=assets
+    )
+    fwd_ret = pd.DataFrame(
+        rng.normal(0, 0.02, (n_dates, n_assets)), index=dates, columns=assets
+    )
+    for i in range(n_dates):
+        missing = rng.choice(
+            n_assets, size=n_assets - n_valid_per_row, replace=False
+        )
+        factor.iloc[i, missing] = np.nan
+        fwd_ret.iloc[i, missing] = np.nan
+    return factor, fwd_ret
+
+
+class TestCrossSectionBreadthRule:
+    """A fixed 30-asset floor made every IC NaN in a 30-stock universe.
+
+    The shared rule is ``min(30, max(10, panel_width // 2))``: a 30-asset
+    panel with ~27 live names is evaluable, a 5-asset panel is not, and a
+    sparse slice of a 500-asset panel is still held to 30.
+    """
+
+    def test_threshold_scales_with_the_panel_but_keeps_a_floor(self):
+        assert min_assets_for_ic(30) == 15
+        assert min_assets_for_ic(500) == 30
+        assert min_assets_for_ic(5) == 10
+        assert min_assets_for_ic(0) == 10
+        assert min_assets_for_ic(60) == 30
+        assert min_assets_for_ic(19) == 10
+
+    def test_30_asset_universe_with_27_live_names_is_evaluable(self):
+        factor, fwd_ret = _make_sparse_panel(260, 30, 27)
+
+        ic = rank_ic(factor, fwd_ret)
+        summary = ic_summary(ic)
+
+        assert len(ic) > 100
+        assert np.isfinite(ic).all()
+        assert summary["n_obs"] > 100
+        assert np.isfinite(summary["mean_ic"])
+
+        p_ic = pearson_ic(factor, fwd_ret)
+        assert len(p_ic) > 100
+        assert np.isfinite(p_ic).all()
+
+    def test_5_asset_universe_has_no_ic_and_warns(self, caplog):
+        factor, fwd_ret = _make_factor_and_returns(n_dates=60, n_assets=5)
+
+        with caplog.at_level(
+            logging.WARNING, logger="quant_platform.factors.evaluation"
+        ):
+            ic = rank_ic(factor, fwd_ret, name="five_name_panel")
+
+        assert len(ic) == 0
+        assert np.isnan(ic_summary(ic)["mean_ic"])
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert any(
+            "five_name_panel" in message
+            and "no cross-section has enough assets for IC" in message
+            and "best N=5" in message
+            and "required=10" in message
+            for message in messages
+        )
+
+    def test_sparse_500_asset_universe_is_not_gamed_by_12_names(self, caplog):
+        factor, fwd_ret = _make_sparse_panel(40, 500, 12)
+
+        with caplog.at_level(
+            logging.WARNING, logger="quant_platform.factors.evaluation"
+        ):
+            ic = rank_ic(factor, fwd_ret)
+
+        assert len(ic) == 0
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "best N=12, required=30" in message for message in messages
+        )

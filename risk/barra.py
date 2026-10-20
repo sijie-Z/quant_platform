@@ -335,8 +335,22 @@ class BarraModel:
                 n_assets=len(common),
             )
 
-        y = returns.loc[common].values
-        X = exposures.loc[common].values
+        # A suspended stock has a NaN return but a valid exposure row. Passing
+        # it to lstsq made every factor return NaN for that day; with routine
+        # A-share suspensions that meant the entire factor covariance was NaN
+        # (100/100 entries) and both Barra endpoints returned 500.
+        y_full = returns.loc[common].to_numpy(dtype=float)
+        X_full = exposures.loc[common].to_numpy(dtype=float)
+        valid = np.isfinite(y_full) & np.all(np.isfinite(X_full), axis=1)
+        common = common[valid]
+        if len(common) < 30:
+            return BarraFactorReturn(
+                date=str(returns.name) if hasattr(returns, 'name') else "",
+                factor_returns={f: 0.0 for f in self.factor_names},
+                n_assets=len(common),
+            )
+        y = y_full[valid]
+        X = X_full[valid]
 
         # Add intercept
         X_with_intercept = np.column_stack([np.ones(len(X)), X])
@@ -460,6 +474,9 @@ class BarraModel:
         for i, fr in enumerate(self.factor_returns_history):
             for j, name in enumerate(self.factor_names):
                 returns_matrix[i, j] = fr.factor_returns.get(name, 0)
+        # Older/odd regressions may have produced non-finite factor returns;
+        # one NaN poisons the weighted mean and every covariance entry.
+        returns_matrix = np.nan_to_num(returns_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Weighted covariance
         weighted_mean = np.average(returns_matrix, weights=weights, axis=0)
@@ -576,10 +593,10 @@ class BarraModel:
         else:
             specific_var = 0
 
-        total_var = factor_var + specific_var
+        total_var = max(factor_var + specific_var, 0.0)
         total_risk = np.sqrt(total_var) * np.sqrt(252)  # Annualized
-        factor_risk = np.sqrt(factor_var) * np.sqrt(252)
-        specific_risk_ann = np.sqrt(specific_var) * np.sqrt(252)
+        factor_risk = np.sqrt(max(factor_var, 0.0)) * np.sqrt(252)
+        specific_risk_ann = np.sqrt(max(specific_var, 0.0)) * np.sqrt(252)
 
         # Factor contributions
         if self.factor_covariance is not None:

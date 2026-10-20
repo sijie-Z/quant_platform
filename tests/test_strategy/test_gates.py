@@ -64,6 +64,33 @@ class TestGateStatus:
         result = check_ic_quality(ic, GateConfig())
         assert result.status == FAIL
 
+    def test_all_factors_without_evaluable_observations_are_skipped(self):
+        """No evidence is not evidence of a bad factor.
+
+        A 30-stock universe used to yield NaN ICs for every factor; the gate
+        compared the NaN metrics against ICIR=0.2 and reported a misleading
+        weak-factor FAIL instead of saying the data was never evaluable.
+        """
+        ic = {
+            "momentum": {"mean_ic": float("nan"), "icir": float("nan"), "n_obs": 0},
+            "value": {"mean_ic": float("nan"), "icir": float("nan"), "n_obs": 3},
+        }
+        result = check_ic_quality(ic, GateConfig())
+
+        assert result.status == SKIPPED
+        assert "insufficient observations" in result.message.lower()
+        assert "best n_obs=3" in result.message
+        assert result.details["max_n_obs"] == 3
+
+    def test_weak_factor_with_enough_observations_still_fails(self):
+        """The observation-shortage escape hatch must not excuse a factor
+        that has plenty of observations and a genuinely weak ICIR."""
+        ic = {"weak": {"mean_ic": 0.001, "icir": 0.01, "n_obs": 200}}
+        result = check_ic_quality(ic, GateConfig())
+
+        assert result.status == FAIL
+        assert "ICIR" in result.message
+
     def test_drawdown_pass(self):
         summary = {"max_drawdown": 0.10, "sharpe_ratio": 0.5}
         config = GateConfig(maximum_drawdown=0.25)

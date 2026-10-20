@@ -8,7 +8,7 @@ import os
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -458,12 +458,22 @@ def _execute_pipeline(run_id: str, req: RunRequest):
                             if sector_map_meta is not None
                             else ""
                         )
-                        # Estimate P&L from price changes over holding period
+                        # Latest daily move as a P&L proxy (the run record
+                        # does not persist per-position entry prices).
                         pnl = None
                         if str(ticker) in prices.columns:
                             p = prices[str(ticker)]
                             if len(p) > 1:
-                                pnl = float((p.iloc[-1] / p.iloc[-2] - 1) * 100)
+                                last = float(p.iloc[-1])
+                                prev = float(p.iloc[-2])
+                                # A suspension leaves NaN in the panel; NaN is
+                                # not JSON-compliant and made the entire
+                                # /result endpoint return 500.
+                                if (
+                                    np.isfinite(last) and np.isfinite(prev)
+                                    and prev > 0
+                                ):
+                                    pnl = float((last / prev - 1) * 100)
                         top_holdings.append(HoldingItem(
                             ticker=str(ticker),
                             weight=round(float(w), 5),
@@ -489,13 +499,27 @@ def _execute_pipeline(run_id: str, req: RunRequest):
         # Factor IC
         factor_items = []
         for name, ic_sum in (ic_results or {}).items():
-            factor_items.append(FactorICItem(
-                name=name,
-                mean_ic=ic_sum.get("mean_ic", 0) or 0,
-                std_ic=ic_sum.get("std_ic", 0) or 0,
-                icir=ic_sum.get("icir", 0) or 0,
-                ic_positive_ratio=ic_sum.get("ic_positive_ratio", 0) or 0,
-            ))
+            try:
+                stats = {
+                    "mean_ic": float(ic_sum.get("mean_ic")),
+                    "std_ic": float(ic_sum.get("std_ic")),
+                    "icir": float(ic_sum.get("icir")),
+                    "ic_positive_ratio": float(ic_sum.get("ic_positive_ratio")),
+                }
+            except (TypeError, ValueError):
+                stats = {}
+            if not stats or not all(np.isfinite(v) for v in stats.values()):
+                # Factors with too few evaluable cross-sections carry NaN
+                # statistics. Including them made the whole run record
+                # unserialisable (GET /result and /factors returned 500);
+                # omitting them is honest -- there is no measured IC.
+                logger.warning(
+                    "Skipping factor %s from the run record: IC statistics "
+                    "are not finite (n_obs=%s)",
+                    name, ic_sum.get("n_obs"),
+                )
+                continue
+            factor_items.append(FactorICItem(name=name, **stats))
         factor_items.sort(key=lambda x: abs(x.icir), reverse=True)
 
         # Store plain dicts, not the Pydantic models.
@@ -506,7 +530,7 @@ def _execute_pipeline(run_id: str, req: RunRequest):
         # factor list in the HTML report. Storing models made each of those an
         # `AttributeError: 'ChartData' object has no attribute 'get'`, so the
         # endpoints returned 500 whenever a run had actually succeeded.
-        _run_store[run_id] = {
+        record = {
             "performance": PerformanceMetrics(
                 total_return=summary.get("total_return", 0),
                 annual_return=summary.get("annual_return", 0),
@@ -542,6 +566,18 @@ def _execute_pipeline(run_id: str, req: RunRequest):
             "exposure": exposure_info.model_dump(),
             "chart_data": chart_data.model_dump(),
         }
+
+        # Starlette's JSON encoder rejects NaN/Inf; a completed run holding
+        # one made GET /result and /factors return 500 forever. Fail the run
+        # at creation instead of storing an unservable record.
+        try:
+            json.dumps(record, allow_nan=False)
+        except ValueError as exc:
+            raise ValueError(
+                "Run produced non-JSON-compliant numbers (NaN/Inf); "
+                "marking the run failed instead of storing it."
+            ) from exc
+        _run_store[run_id] = record
 
         _update_status(run_id, 100, "done")
 
@@ -1435,6 +1471,8 @@ async def import_holdings(file_content: dict):
             "total_shares": int(df["hold_vol"].sum()),
             "sample": df.head(5).to_dict(orient="records"),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, str(e)) from e
 
@@ -1470,7 +1508,13 @@ def get_live_portfolio():
 
         prices = {}
         preclose_prices = {}
+        price_dates = {}
         today = datetime.now().strftime("%Y-%m-%d")
+        # Daily bars for *today* are not available until after the close
+        # (baostock returned nothing intraday, so this endpoint answered 503
+        # even though the single-stock endpoint served yesterday's close).
+        # Ask for a short window and keep the latest bar, reporting its date.
+        lookback = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
         for code in codes[:100]:  # Limit to 100 stocks for speed
             bs_code = _to_bs_code(code)
@@ -1478,17 +1522,19 @@ def get_live_portfolio():
                 rs = bs.query_history_k_data_plus(
                     bs_code,
                     "date,close,preclose",
-                    start_date=today, end_date=today,
+                    start_date=lookback, end_date=today,
                     frequency="d", adjustflag="3",
                 )
-                if rs.error_code == "0" and rs.next():
-                    row = rs.get_row_data()
-                    if len(row) >= 3:
-                        close = float(row[1]) if row[1] else 0
-                        preclose = float(row[2]) if row[2] else 0
-                        if close > 0:
-                            prices[code] = close
-                            preclose_prices[code] = preclose
+                last_row = None
+                while rs.error_code == "0" and rs.next():
+                    last_row = rs.get_row_data()
+                if last_row and len(last_row) >= 3:
+                    close = float(last_row[1]) if last_row[1] else 0
+                    preclose = float(last_row[2]) if last_row[2] else 0
+                    if close > 0:
+                        prices[code] = close
+                        preclose_prices[code] = preclose
+                        price_dates[code] = last_row[0]
             except Exception:
                 continue
 
@@ -1518,6 +1564,7 @@ def get_live_portfolio():
 
         # Top holdings by market value
         top = valid.nlargest(20, "market_value")
+        data_date = max(price_dates.values()) if price_dates else None
 
         return {
             "total_value": round(float(total_value), 2),
@@ -1526,6 +1573,8 @@ def get_live_portfolio():
             "n_positions": len(valid),
             "n_with_price": len(prices),
             "n_no_price": len(codes) - len(prices),
+            "data_date": data_date,
+            "stale": data_date != today,
             "holdings": top[["code", "hold_vol", "close", "preclose",
                              "market_value", "pnl", "pnl_pct"]].to_dict(orient="records"),
             "timestamp": datetime.now().isoformat(),
@@ -1569,12 +1618,28 @@ def _get_rt_market():
 @router.post("/oms/order")
 async def create_order(order_req: dict):
     """Create a new order."""
+    # Validate before the broad `except Exception`: a missing ticker used to
+    # create and submit an order with ticker "", which could then be filled
+    # and turn into a position with no instrument.
+    ticker = str(order_req.get("ticker", "") or "").strip()
+    if not ticker:
+        raise HTTPException(422, "ticker is required")
+    try:
+        quantity = int(order_req.get("quantity", 100))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "quantity must be an integer") from exc
+    if quantity <= 0:
+        raise HTTPException(422, "quantity must be positive")
+    side = order_req.get("side", "buy")
+    if side not in ("buy", "sell"):
+        raise HTTPException(422, "side must be 'buy' or 'sell'")
+
     try:
         oms = _get_oms()
         order = oms.create_order(
-            ticker=order_req.get("ticker", ""),
-            side=order_req.get("side", "buy"),
-            quantity=int(order_req.get("quantity", 100)),
+            ticker=ticker,
+            side=side,
+            quantity=quantity,
             order_type=order_req.get("order_type") or order_req.get("type", "market"),
             limit_price=order_req.get("limit_price"),
             strategy=order_req.get("strategy", ""),
@@ -2027,7 +2092,11 @@ async def detect_regime(req: dict):
 
     result = _run_store[run_id]
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _detect_regime, result)
+    regime = await loop.run_in_executor(_executor, _detect_regime, result)
+    if isinstance(regime, dict) and "error" in regime:
+        # 200 + {"error": ...} reads as a successful empty result to clients.
+        raise HTTPException(409, regime["error"])
+    return regime
 
 
 def _detect_regime(result: dict) -> dict:
@@ -2098,15 +2167,30 @@ def screen_stocks(req: ScreenRequest):
         raise HTTPException(status_code=503, detail=f"Data load failed: {e}") from e
 
     try:
-        processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+        _processed_factors, ic_results, sector_map, fin_unstacked, raw_factors = _compute_factors(
             prices, returns, financials, metadata, turnover, config=config,
+            return_raw=True,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Factor computation failed: {e}") from e
 
+    if not req.rules:
+        raise HTTPException(422, "at least one screen rule is required")
+    unknown = sorted({r.factor for r in req.rules} - set(raw_factors))
+    if unknown:
+        raise HTTPException(
+            422,
+            f"unknown factor(s): {unknown}; available: {sorted(raw_factors)}",
+        )
+
     rules = []
     for r in req.rules:
         rules.append(ScreenRule(factor=r.factor, operator=r.operator, value=r.value))
+
+    # Screen raw economic values, not the standardized/neutralized panels:
+    # `pe_ratio < 30` means a PE of 30, while the processed panel is a
+    # cross-sectional z-score (~-3..3) that passes nearly every stock.
+    screen_panel = raw_factors
 
     screener = FactorScreener({
         "enabled": True,
@@ -2116,15 +2200,15 @@ def screen_stocks(req: ScreenRequest):
         "min_stocks": req.min_stocks,
         "max_stocks": req.max_stocks,
     })
-    qualifiers = screener.screen(processed_factors, rules, date=req.date)
+    qualifiers = screener.screen(screen_panel, rules, date=req.date)
 
-    target_date = req.date or str(next(iter(processed_factors.values())).index[-1])
+    target_date = req.date or str(next(iter(screen_panel.values())).index[-1])
     results = []
     for asset in qualifiers:
         factor_vals = {}
         for r in rules:
-            if r.factor in processed_factors:
-                df = processed_factors[r.factor]
+            if r.factor in screen_panel:
+                df = screen_panel[r.factor]
                 try:
                     val = float(df.loc[pd.Timestamp(target_date), asset])
                     factor_vals[r.factor] = round(val, 6)
@@ -2136,7 +2220,7 @@ def screen_stocks(req: ScreenRequest):
         date=target_date,
         logic=req.logic,
         num_rules=len(rules),
-        total_stocks=len(next(iter(processed_factors.values())).columns),
+        total_stocks=len(next(iter(screen_panel.values())).columns),
         qualifying_stocks=len(qualifiers),
         rules=[f"{r.factor} {r.operator} {r.value}" for r in rules],
         results=results,
@@ -2232,11 +2316,23 @@ def smart_route_order(req: dict):
     from quant_platform.execution.algorithms import PlanExecutor, SmartRouter
     from quant_platform.execution.models import Order, OrderSide
 
-    ticker = req.get("ticker", "")
+    ticker = str(req.get("ticker", "") or "").strip()
     side = req.get("side", "buy")
     quantity = req.get("quantity", 1000)
     adv = req.get("avg_daily_volume", 1_000_000)
     urgency = req.get("urgency", "normal")
+
+    if not ticker:
+        raise HTTPException(422, "ticker is required")
+    try:
+        quantity = int(quantity)
+        adv = float(adv)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "quantity and avg_daily_volume must be numbers") from exc
+    if quantity <= 0:
+        raise HTTPException(422, "quantity must be positive")
+    if adv <= 0:
+        raise HTTPException(422, "avg_daily_volume must be positive")
 
     try:
         order_side = OrderSide(side)
@@ -2405,6 +2501,17 @@ async def strategy_allocate(req: dict):
     """Allocate capital across strategies."""
     mgr = _get_multi_strategy_mgr()
     weights = req.get("weights", {})
+    if not isinstance(weights, dict) or not weights:
+        raise HTTPException(422, "weights must be a non-empty mapping of strategy_id -> weight")
+    unknown = sorted(set(weights) - set(mgr.strategies))
+    if unknown:
+        raise HTTPException(400, f"Unknown strategy_id(s): {unknown}")
+    try:
+        weights = {sid: float(w) for sid, w in weights.items()}
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "weights must be numeric") from exc
+    if any(w < 0 for w in weights.values()):
+        raise HTTPException(422, "weights must be non-negative")
     mgr.allocate_capital(weights)
     return {"status": "ok", "weights": weights}
 
@@ -2470,12 +2577,17 @@ def data_quality_check(req: dict):
 
     if result and "data_quality" in result:
         # Computed when the run executed, while the price panel was in memory.
-        return result["data_quality"]
+        report = dict(result["data_quality"])
+        report["source"] = "run"
+        report["synthetic"] = False
+        report["run_id"] = run_id
+        return report
     if result and "prices" in result:
         prices = result["prices"]
         if isinstance(prices, pd.DataFrame):
             monitor.check_prices(prices)
             monitor.check_returns(_returns_from_quality_prices(prices))
+        source = "run_prices"
     elif run_id:
         # The run record does not retain its price panel. Checking an unrelated
         # synthetic sample and presenting it as this run's quality was worse
@@ -2493,8 +2605,23 @@ def data_quality_check(req: dict):
         if isinstance(prices, pd.DataFrame):
             monitor.check_prices(prices)
             monitor.check_returns(_returns_from_quality_prices(prices))
+        source = "synthetic_demo"
 
-    report = monitor.get_report()
+    report = dict(monitor.get_report())
+    # Without a provenance marker this report looked like the quality of the
+    # live data feed; callers can now tell a demo sample from run data.
+    report["source"] = source
+    report["synthetic"] = source == "synthetic_demo"
+    if run_id:
+        report["run_id"] = run_id
+    if isinstance(prices, pd.DataFrame) and len(prices.index) > 0:
+        try:
+            report["data_date_range"] = [
+                str(pd.Timestamp(prices.index.min()).date()),
+                str(pd.Timestamp(prices.index.max()).date()),
+            ]
+        except (TypeError, ValueError):
+            pass
     return report
 
 
@@ -2577,12 +2704,17 @@ def trading_start(req: dict):
         # selecting the QMT broker raised TypeError and the endpoint returned
         # 500 on every attempt -- the live-trading path could not be started
         # through the API at all.
-        broker = QMTBroker(
-            account=req.get("account_id", ""),
-            server=req.get("server", "localhost:58610"),
-            password=req.get("password", "") or os.environ.get("QMT_PASSWORD", ""),
-            mode=req.get("mode", "sim"),
-        )
+        try:
+            broker = QMTBroker(
+                account=req.get("account_id", ""),
+                server=req.get("server", "localhost:58610"),
+                password=req.get("password", "") or os.environ.get("QMT_PASSWORD", ""),
+                mode=req.get("mode", "sim"),
+            )
+        except Exception as e:
+            # Missing xtquant / unreachable terminal is an availability
+            # problem, not an internal fault; 500 hid the actionable message.
+            raise HTTPException(503, f"QMT broker unavailable: {e}") from e
 
     # Fresh state machine per engine start, but NOT a fresh risk monitor:
     # risk state must survive an engine restart, and the Monitor dashboard's
@@ -2631,7 +2763,10 @@ def trading_start(req: dict):
             '002475', '600048', '601601', '000725', '002352',
         ])
 
-    engine.start()
+    try:
+        engine.start()
+    except Exception as e:
+        raise HTTPException(503, f"Trading engine failed to start: {e}") from e
     _live_engine = engine
 
     return {"status": "started", "broker": broker_type, "n_stocks": n_stocks}
@@ -2687,7 +2822,7 @@ def trading_cycles():
 def trading_manual_order(req: dict):
     """Place a manual order."""
     engine = _get_live_engine()
-    if not engine:
+    if not engine or not getattr(engine, "_running", False):
         raise HTTPException(400, "Engine not running")
     return engine.manual_order(
         code=req.get("code", ""),
@@ -2701,7 +2836,10 @@ def trading_manual_order(req: dict):
 def trading_run_once():
     """Run a single trading cycle manually."""
     engine = _get_live_engine()
-    if not engine:
+    # A stopped engine stays in the global slot so status/positions remain
+    # inspectable. Checking only `engine is None` let run-once and manual
+    # orders keep executing after POST /trading/stop.
+    if not engine or not getattr(engine, "_running", False):
         raise HTTPException(400, "Engine not running")
     cycle = engine.run_once()
     return cycle.to_dict()
@@ -2730,6 +2868,8 @@ def market_snapshot():
             "data_timestamp": data_timestamp,
             "stale": rt.snapshot_is_stale,
         }
+    except ImportError as e:
+        raise HTTPException(503, str(e)) from e
     except Exception as e:
         raise HTTPException(500, str(e)) from e
 
@@ -2742,6 +2882,8 @@ def market_gainers():
         rt = _get_rt_market()
         df = rt.get_top_gainers(20)
         return {"stocks": df.to_dict('records')}
+    except ImportError as e:
+        raise HTTPException(503, str(e)) from e
     except Exception as e:
         raise HTTPException(500, str(e)) from e
 
@@ -2754,6 +2896,8 @@ def market_losers():
         rt = _get_rt_market()
         df = rt.get_top_losers(20)
         return {"stocks": df.to_dict('records')}
+    except ImportError as e:
+        raise HTTPException(503, str(e)) from e
     except Exception as e:
         raise HTTPException(500, str(e)) from e
 
@@ -2767,6 +2911,8 @@ def market_sectors():
         df = rt.get_sector_data()
         records = df.head(30).to_dict('records')
         return {"sectors": records}
+    except ImportError as e:
+        raise HTTPException(503, str(e)) from e
     except Exception as e:
         raise HTTPException(500, str(e)) from e
 
@@ -2864,7 +3010,11 @@ async def core_risk_kill_switch(req: dict):
 def ml_train(req: MLTrainRequest):
     """Train ML model for alpha signal generation."""
     try:
-        from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
+        from quant_platform.alpha.ml_signal import (
+            InsufficientTrainingData,
+            MLSignalConfig,
+            MLSignalGenerator,
+        )
         config = load_config()
 
         prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
@@ -2889,6 +3039,10 @@ def ml_train(req: MLTrainRequest):
             n_train_samples=perf.n_train_samples,
             date=perf.date,
         )
+    except InsufficientTrainingData as e:
+        # The sample is too short for an honest model: a client-input problem,
+        # not an internal failure.
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
         logger.error("ML train failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -2898,7 +3052,11 @@ def ml_train(req: MLTrainRequest):
 def ml_predict(req: MLTrainRequest):
     """Generate ML-based alpha signals."""
     try:
-        from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
+        from quant_platform.alpha.ml_signal import (
+            InsufficientTrainingData,
+            MLSignalConfig,
+            MLSignalGenerator,
+        )
         config = load_config()
 
         prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
@@ -2923,6 +3081,8 @@ def ml_predict(req: MLTrainRequest):
         ]
 
         return MLSignalResponse(dates=dates, assets=assets, signal=signal_data)
+    except InsufficientTrainingData as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
         logger.error("ML predict failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -3130,6 +3290,9 @@ def parallel_sweep(req: ParallelSweepRequest):
             n_success=sweep.n_success,
             n_failed=sweep.n_failed,
         )
+    except ValueError as e:
+        # Invalid parameter keys/values are client errors, not server faults.
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
         logger.error("Parallel sweep failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e

@@ -73,7 +73,9 @@ class TestThePipelineCompletes:
                 yield path, type(obj).__name__
 
         assert list(offenders(record)) == [], "the run store holds model objects"
-        json.dumps(record)  # must be serialisable without a custom encoder
+        # allow_nan=False mirrors Starlette's strict JSON encoder: a single
+        # NaN in the record turned GET /result and GET /factors into 500.
+        json.dumps(record, allow_nan=False)
 
     def test_every_consumer_of_the_store_runs(self, completed_run):
         record = routes._run_store[completed_run]

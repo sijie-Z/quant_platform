@@ -17,11 +17,83 @@ from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# ── Cross-section breadth rule ──
+# A rank correlation computed from a handful of names is noise, but the old
+# hardcoded floor of 30 silently disabled IC evaluation for smaller universes:
+# a 30-stock watchlist with ~27 names trading on a given day produced an empty
+# IC series for every factor, which downstream read as "no factor works"
+# instead of "the cross-section was never evaluated".
+MIN_IC_ASSETS = 10
+MAX_IC_ASSETS = 30
+# `ic_summary` refuses to report a mean/std from fewer observations than this.
+MIN_IC_OBSERVATIONS = 10
+
+
+def min_assets_for_ic(n_assets_in_panel: int) -> int:
+    """Minimum valid assets a cross-section needs before it counts for IC.
+
+    The rule is ``min(30, max(10, n_assets_in_panel // 2))``, where
+    ``n_assets_in_panel`` is the number of assets covered by that date's
+    intersected factor / forward-return panel (the row width, including names
+    whose factor value is NaN, e.g. suspended stocks).
+
+    Using the panel width rather than the count of valid values keeps the rule
+    from being gamed by a thin slice of a wide universe: 12 live names in a
+    500-asset panel still need 30 (``min(30, max(10, 250))``), while 27 live
+    names in a 30-asset panel only need 15 (``min(30, max(10, 15))``). Panels
+    narrower than 20 assets never clear the absolute floor of 10.
+
+    The same rule is applied by the pandas fallbacks and by the numba kernel
+    (which receives the threshold as an argument via ``rank_ic_numba``).
+    """
+    return min(MAX_IC_ASSETS, max(MIN_IC_ASSETS, int(n_assets_in_panel) // 2))
+
+
+def _factor_label(factor: pd.DataFrame, name: str | None) -> str:
+    """Best-effort factor name for diagnostics (frames have no `.name`)."""
+    label = name or factor.attrs.get("name")
+    return str(label) if label else "unnamed"
+
+
+def _warn_if_insufficient_breadth(
+    factor: pd.DataFrame,
+    target: pd.DataFrame,
+    name: str | None = None,
+    min_assets: int | None = None,
+) -> None:
+    """Log once why an IC series came back empty: the panel is too narrow.
+
+    Called only when the result has no observations, so it never adds work to
+    the normal path. If the panel is wide enough, an empty series has another
+    cause (e.g. a constant cross-section) and no breadth warning is emitted.
+    """
+    assets = factor.columns.intersection(target.columns)
+    if min_assets is None:
+        min_assets = min_assets_for_ic(len(assets))
+    dates = factor.index.intersection(target.index)
+    if len(assets) == 0 or len(dates) == 0:
+        best_n = 0
+    else:
+        valid = (
+            factor.reindex(index=dates, columns=assets).notna()
+            & target.reindex(index=dates, columns=assets).notna()
+        )
+        best_n = int(valid.sum(axis=1).max())
+    if best_n >= min_assets:
+        return
+    logger.warning(
+        "factor %s: no cross-section has enough assets for IC "
+        "(best N=%d, required=%d)",
+        _factor_label(factor, name), best_n, min_assets,
+    )
+
 
 def rank_ic(
     factor: pd.DataFrame,
     forward_returns: pd.DataFrame,
     period: int = 1,
+    *,
+    name: str | None = None,
 ) -> pd.Series:
     """Compute Rank IC (Spearman correlation) between factor and forward returns.
 
@@ -31,9 +103,11 @@ def rank_ic(
         factor: (date x asset) factor values.
         forward_returns: (date x asset) forward 1-day returns (return[t] = r_{t→t+1}).
         period: Return horizon (1 = next day, 5 = next week, 21 = next month).
+        name: Optional factor name used in diagnostic warnings.
 
     Returns:
-        Series of cross-sectional Rank ICs per date.
+        Series of cross-sectional Rank ICs per date. Cross-sections narrower
+        than :func:`min_assets_for_ic` are skipped.
     """
     from quant_platform.utils.numba_accelerator import HAS_NUMBA, rank_ic_numba
 
@@ -50,20 +124,28 @@ def rank_ic(
     if HAS_NUMBA:
         # rank_ic_numba intersects dates and columns itself; passing the raw
         # panels is what keeps the two axes from being correlated positionally.
-        return rank_ic_numba(factor, target)
+        ic = rank_ic_numba(factor, target)
+        if ic.empty:
+            _warn_if_insufficient_breadth(factor, target, name)
+        return ic
 
     # Pure Pandas fallback
+    assets = factor.columns.intersection(target.columns)
+    min_assets = min_assets_for_ic(len(assets))
     ic_series = []
     for date in factor.index.intersection(target.index):
         f = factor.loc[date]
         r = target.loc[date]
         common = f.dropna().index.intersection(r.dropna().index)
-        if len(common) < 30:
+        if len(common) < min_assets:
             continue
         ic = f[common].rank().corr(r[common].rank(), method="pearson")
         ic_series.append((date, ic))
 
     if not ic_series:
+        _warn_if_insufficient_breadth(
+            factor, target, name, min_assets=min_assets
+        )
         return pd.Series(dtype=float)
 
     dates, values = zip(*ic_series, strict=False)
@@ -74,8 +156,14 @@ def pearson_ic(
     factor: pd.DataFrame,
     forward_returns: pd.DataFrame,
     period: int = 1,
+    *,
+    name: str | None = None,
 ) -> pd.Series:
-    """Compute Pearson IC between factor and forward returns."""
+    """Compute Pearson IC between factor and forward returns.
+
+    Cross-sections narrower than :func:`min_assets_for_ic` are skipped, the
+    same breadth rule as :func:`rank_ic`.
+    """
     # forward_returns[t] is already r_{t→t+1} (shifted in pipeline).
     if period == 1:
         target = forward_returns
@@ -84,17 +172,22 @@ def pearson_ic(
             lambda x: x.prod() - 1, raw=True
         ).shift(-(period - 1))
 
+    assets = factor.columns.intersection(target.columns)
+    min_assets = min_assets_for_ic(len(assets))
     ic_series = []
     for date in factor.index.intersection(target.index):
         f = factor.loc[date]
         r = target.loc[date]
         common = f.dropna().index.intersection(r.dropna().index)
-        if len(common) < 30:
+        if len(common) < min_assets:
             continue
         ic = f[common].corr(r[common], method="pearson")
         ic_series.append((date, ic))
 
     if not ic_series:
+        _warn_if_insufficient_breadth(
+            factor, target, name, min_assets=min_assets
+        )
         return pd.Series(dtype=float)
 
     dates, values = zip(*ic_series, strict=False)
@@ -109,9 +202,12 @@ def ic_summary(ic_series: pd.Series) -> dict:
         std_ic: Standard deviation of IC
         icir: Information Coefficient IR = mean / std
         ic_positive_ratio: Proportion of periods with positive IC
+        n_obs: Number of finite IC observations. Statistics stay NaN until
+            there are at least ``MIN_IC_OBSERVATIONS`` of them; a missing
+            observation is never replaced with IC=0.
     """
     valid = ic_series.dropna()
-    if len(valid) < 10:
+    if len(valid) < MIN_IC_OBSERVATIONS:
         return {
             "mean_ic": np.nan, "std_ic": np.nan, "icir": np.nan,
             "ic_positive_ratio": np.nan, "n_obs": int(len(valid)),
@@ -218,8 +314,14 @@ def factor_correlation(factors: dict[str, pd.DataFrame]) -> pd.DataFrame:
             continue
 
         df = pd.DataFrame(data)
+        if df.empty:
+            continue
+        # Breadth is the panel width before dropping incomplete rows: a
+        # fully-valid corner of a wide universe must not pass the small-panel
+        # rule (see `min_assets_for_ic`).
+        n_assets = len(df)
         df = df.dropna()
-        if len(df) < 30:
+        if len(df) < min_assets_for_ic(n_assets):
             continue
 
         corr_stack.append(df.corr().values)
@@ -247,7 +349,7 @@ def factor_turnover(factor: pd.DataFrame) -> pd.Series:
         prev = ranks.loc[dates[i - 1]]
         curr = ranks.loc[dates[i]]
         common = prev.dropna().index.intersection(curr.dropna().index)
-        if len(common) < 30:
+        if len(common) < min_assets_for_ic(len(prev)):
             continue
         rho = prev[common].corr(curr[common], method="spearman")
         turnover_series.append((dates[i], 1 - rho))

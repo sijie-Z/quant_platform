@@ -1,5 +1,7 @@
 """Tests for ML-based alpha signal generation."""
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -7,6 +9,9 @@ from quant_platform.alpha.ml_signal import (
     HAS_LGB,
     HAS_SHAP,
     HAS_XGB,
+    MIN_TRAIN_FEATURES,
+    MIN_TRAIN_SAMPLES,
+    InsufficientTrainingData,
     MLSignalConfig,
     MLSignalGenerator,
     ModelPerformance,
@@ -46,6 +51,33 @@ def sample_forward_returns(sample_factors):
     assets = first.columns
     data = np.random.randn(n_dates, n_assets) * 0.02
     return pd.DataFrame(data, index=dates, columns=assets)
+
+
+@pytest.fixture
+def short_history_panel():
+    """260 trading days x 30 assets -- the verified failing sample.
+
+    `train()` used to bail out with a default zero-IC ModelPerformance when an
+    all-NaN feature left zero usable rows, and `generate()` started its
+    walk-forward at max(train_window=504, 60), so 260 days never trained a
+    fold and produced an all-NaN signal.
+    """
+    rng = np.random.default_rng(7)
+    n_dates, n_assets = 260, 30
+    dates = pd.bdate_range("2023-01-02", periods=n_dates)
+    assets = [f"stock_{i:03d}" for i in range(n_assets)]
+    factors = {
+        name: pd.DataFrame(
+            rng.normal(size=(n_dates, n_assets)), index=dates, columns=assets,
+        )
+        for name in ["momentum", "volatility", "value", "quality", "growth"]
+    }
+    forward_returns = pd.DataFrame(
+        rng.normal(scale=0.02, size=(n_dates, n_assets)),
+        index=dates,
+        columns=assets,
+    )
+    return factors, forward_returns
 
 
 class TestTimeSeriesCV:
@@ -456,3 +488,169 @@ def test_shap_values_do_not_require_forward_returns(
     assert "error" not in result, result
     assert result["mean_abs_shap"]
     assert set(result["feature_names"]) <= set(sample_factors)
+
+
+class TestShortHistoryTraining:
+    """`python main.py ml train|signal` used to exit 0 with zeros on a
+    260-day history: `train()` returned a default zero-IC ModelPerformance and
+    `generate()` returned an all-NaN signal. A short history must now train a
+    genuine model or fail explicitly."""
+
+    @pytest.mark.skipif(not HAS_LGB, reason="lightgbm not installed")
+    def test_short_history_trains_a_real_model(self, short_history_panel, monkeypatch):
+        import quant_platform.alpha.ml_signal as ml
+
+        captured = {}
+
+        class RecordingCV(ml.TimeSeriesCV):
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                super().__init__(**kwargs)
+
+        monkeypatch.setattr(ml, "TimeSeriesCV", RecordingCV)
+
+        factors, forward_returns = short_history_panel
+        gen = MLSignalGenerator(config=MLSignalConfig(model_type="lightgbm", n_splits=2))
+        perf = gen.train(factors, forward_returns)
+
+        assert gen.model is not None, "a model must actually be fitted"
+        assert perf.n_train_samples == 260 * 30
+        assert np.isfinite(perf.test_ic), "IC must be a real number, not a placeholder"
+        assert np.isfinite(perf.train_ic)
+        assert perf.feature_importance, "a fitted model must report feature importance"
+        # 260 labeled dates: the adaptive first fold trains on 260 - 63 = 197
+        # dates (below train_window=504) and keeps the 53 dates left after the
+        # 10-date purge gap as its test window.
+        assert captured["train_size"] == 197
+        assert captured["test_size"] == 53
+        assert captured["gap"] == 10
+
+    @pytest.mark.skipif(not HAS_LGB, reason="lightgbm not installed")
+    def test_short_history_generates_a_non_empty_final_signal(self, short_history_panel):
+        factors, forward_returns = short_history_panel
+        gen = MLSignalGenerator(config=MLSignalConfig(model_type="lightgbm", n_splits=2))
+        signal = gen.generate(factors, forward_returns)
+
+        n_assets = factors["momentum"].shape[1]
+        assert signal.iloc[-1].notna().sum() == n_assets, (
+            "the final date has no signal"
+        )
+        # Walk-forward starts at 197, so the last 63 dates are out of sample.
+        assert int(signal.notna().any(axis=1).sum()) == 63
+        assert signal.notna().to_numpy().any(), "signal is entirely NaN"
+
+
+class TestMinimumTrainingData:
+    """Below the documented minimum the old code returned zeros / an all-NaN
+    signal; it now raises InsufficientTrainingData so the CLI can exit
+    non-zero instead of reporting a model that was never fitted."""
+
+    @pytest.fixture
+    def twenty_row_panel(self):
+        rng = np.random.default_rng(0)
+        n_dates, n_assets = 20, 1
+        dates = pd.bdate_range("2024-01-01", periods=n_dates)
+        assets = ["stock_000"]
+        factors = {
+            name: pd.DataFrame(
+                rng.normal(size=(n_dates, n_assets)), index=dates, columns=assets,
+            )
+            for name in ["momentum", "value"]
+        }
+        forward_returns = pd.DataFrame(
+            rng.normal(size=(n_dates, n_assets)), index=dates, columns=assets,
+        )
+        return factors, forward_returns
+
+    def test_twenty_row_sample_raises(self, twenty_row_panel):
+        factors, forward_returns = twenty_row_panel
+
+        with pytest.raises(InsufficientTrainingData) as excinfo:
+            MLSignalGenerator().train(factors, forward_returns)
+
+        message = str(excinfo.value)
+        assert "20 samples" in message
+        assert f"{MIN_TRAIN_SAMPLES} samples" in message
+        assert f"{MIN_TRAIN_FEATURES} features" in message
+
+    def test_twenty_row_sample_raises_from_generate_too(self, twenty_row_panel):
+        factors, forward_returns = twenty_row_panel
+
+        with pytest.raises(InsufficientTrainingData):
+            MLSignalGenerator().generate(factors, forward_returns)
+
+    def test_failed_training_leaves_no_model_or_sidecar(
+        self, twenty_row_panel, tmp_path,
+    ):
+        factors, forward_returns = twenty_row_panel
+        gen = MLSignalGenerator()
+
+        with pytest.raises(InsufficientTrainingData):
+            gen.train(factors, forward_returns)
+
+        assert gen.model is None, "a failed training run left a model behind"
+        with pytest.raises(RuntimeError, match="not trained"):
+            gen.save_model(str(tmp_path / "model.lgb"))
+        assert not (tmp_path / "model.lgb").exists()
+        assert not (tmp_path / "model.lgb.meta.json").exists()
+
+
+class TestAllNaNFeatureDropping:
+    """A feature column that is entirely NaN in the sample used to survive
+    into the AND-ed `valid_mask`, reject every training row, and turn a short
+    history into a fake "0 samples" success."""
+
+    @pytest.mark.skipif(not HAS_LGB, reason="lightgbm not installed")
+    def test_all_nan_features_are_dropped_and_logged(
+        self, short_history_panel, caplog,
+    ):
+        factors, forward_returns = short_history_panel
+        factors["quality"].iloc[:, :] = np.nan
+        factors["growth"].iloc[:, :] = np.nan
+
+        caplog.set_level(logging.WARNING, logger="quant_platform.alpha.ml_signal")
+        gen = MLSignalGenerator(config=MLSignalConfig(model_type="lightgbm", n_splits=2))
+        perf = gen.train(factors, forward_returns)
+
+        assert gen._feature_names == ["momentum", "value", "volatility"]
+        assert len(perf.feature_importance) == 3
+        assert "Dropping feature 'quality'" in caplog.text
+        assert "Dropping feature 'growth'" in caplog.text
+        assert "no finite observations" in caplog.text
+
+    def test_fewer_than_two_usable_features_raises(self, short_history_panel):
+        factors, forward_returns = short_history_panel
+        for name in ["volatility", "value", "quality", "growth"]:
+            factors[name].iloc[:, :] = np.nan
+
+        gen = MLSignalGenerator()
+        with pytest.raises(InsufficientTrainingData, match="1 usable feature"):
+            gen.train(factors, forward_returns)
+
+
+class TestLongHistoryWalkForwardUnchanged:
+    """The adaptive first fold must not change long histories: with enough
+    dates the first fold still trains on the full `train_window`."""
+
+    @pytest.mark.skipif(not HAS_LGB, reason="lightgbm not installed")
+    def test_first_fold_still_trains_on_the_full_train_window(
+        self, sample_factors, sample_forward_returns, monkeypatch,
+    ):
+        import quant_platform.alpha.ml_signal as ml
+
+        captured = {}
+
+        class RecordingCV(ml.TimeSeriesCV):
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                super().__init__(**kwargs)
+
+        monkeypatch.setattr(ml, "TimeSeriesCV", RecordingCV)
+
+        gen = MLSignalGenerator(config=MLSignalConfig(model_type="lightgbm", n_splits=2))
+        gen.train(sample_factors, sample_forward_returns)
+
+        assert captured["train_size"] == MLSignalConfig().train_window
+        assert captured["train_size"] == 504
+        assert captured["test_size"] == 63
+        assert captured["gap"] == 10

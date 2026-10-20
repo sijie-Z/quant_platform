@@ -31,6 +31,26 @@ class TestWalkForwardValidator:
         with pytest.raises(ValueError, match="Not enough data"):
             validator.run(short_signal, short_prices, short_returns, benchmark, sector_map)
 
+    def test_n_folds_caps_the_generated_folds(self):
+        """`walkforward --folds 1` printed 1 but ran every fold the data allowed."""
+        signal, prices, ret, bench, sector_map, _ = _panel()
+        validator = WalkForwardValidator(
+            train_period=252, test_period=63, step_size=63, n_folds=1,
+        )
+
+        result = validator.run(
+            signal=signal, prices=prices, returns=ret,
+            benchmark_returns=bench, sector_map=sector_map,
+            engine_kwargs={"initial_capital": 10_000_000},
+        )
+
+        assert result["n_folds"] == 1
+        assert len(result["fold_metrics"]) == 1
+
+    def test_n_folds_must_be_positive(self):
+        with pytest.raises(ValueError, match="n_folds"):
+            WalkForwardValidator(n_folds=0)
+
 
 def _panel(n_dates=900, n_assets=30, seed=0):
     np.random.seed(seed)

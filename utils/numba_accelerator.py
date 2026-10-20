@@ -259,12 +259,20 @@ def _average_rank(values: np.ndarray) -> np.ndarray:
 
 
 @jit(nopython=True, cache=True)
-def _spearman_rank_ic(factor_row: np.ndarray, ret_row: np.ndarray) -> float:
-    """Numba JIT: Spearman rank correlation for one cross-section."""
+def _spearman_rank_ic(
+    factor_row: np.ndarray, ret_row: np.ndarray, min_assets: int,
+) -> float:
+    """Numba JIT: Spearman rank correlation for one cross-section.
+
+    ``min_assets`` is the cross-section breadth floor for this panel, supplied
+    by the caller from the shared rule in
+    :func:`quant_platform.factors.evaluation.min_assets_for_ic`. The kernel
+    only sees the aligned arrays, so the rule must not be hardcoded here.
+    """
     # Find valid pairs
     mask = ~(np.isnan(factor_row) | np.isnan(ret_row))
     n_valid = mask.sum()
-    if n_valid < 30:
+    if n_valid < min_assets:
         return np.nan
 
     f = factor_row[mask]
@@ -307,10 +315,15 @@ def rank_ic_numba(
         from quant_platform.factors.evaluation import rank_ic
         return rank_ic(factor, forward_returns)
 
+    from quant_platform.factors.evaluation import min_assets_for_ic
+
     dates = factor.index.intersection(forward_returns.index)
     assets = factor.columns.intersection(forward_returns.columns)
     factor = factor.reindex(index=dates, columns=assets)
     forward_returns = forward_returns.reindex(index=dates, columns=assets)
+    # Shared breadth rule (imported lazily like the pandas fallback above, so
+    # `factors.evaluation` and this module never import each other at load).
+    min_assets = min_assets_for_ic(len(assets))
 
     f_arr = factor.values.astype(np.float64)
     r_arr = forward_returns.values.astype(np.float64)
@@ -319,7 +332,7 @@ def rank_ic_numba(
     results = []
     dates = []
     for i in range(n_rows):
-        ic = _spearman_rank_ic(f_arr[i], r_arr[i])
+        ic = _spearman_rank_ic(f_arr[i], r_arr[i], min_assets)
         if not np.isnan(ic):
             results.append(ic)
             dates.append(factor.index[i])

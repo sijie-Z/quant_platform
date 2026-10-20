@@ -345,3 +345,29 @@ class TestBarraExposureBuilder:
         specific = model.specific_risk.reindex(returns.columns)
         assert specific.notna().all()
         assert specific.std() > 0, "every asset got the same specific risk"
+
+    def test_suspended_assets_do_not_poison_the_factor_covariance(
+        self, sample_barra_data, portfolio_weights,
+    ):
+        """NaN returns from suspensions used to make every factor return NaN.
+
+        `_cross_sectional_regression` fed the raw return row to lstsq; one
+        suspended stock produced 100/100 NaN covariance entries and both
+        Barra API endpoints returned 500 for every request.
+        """
+        factor_exposures, returns = sample_barra_data
+        returns = returns.copy()
+        for i, asset in enumerate(returns.columns):
+            returns.iloc[i::7, i] = np.nan
+
+        model = BarraModel()
+        model.fit(factor_exposures, returns)
+
+        assert model.factor_covariance is not None
+        assert np.isfinite(model.factor_covariance).all()
+
+        result = model.decompose_risk(portfolio_weights, factor_exposures)
+        assert np.isfinite(result.total_risk)
+        assert np.isfinite(result.factor_risk)
+        assert np.isfinite(result.specific_risk)
+        assert all(np.isfinite(v) for v in result.factor_contributions.values())

@@ -201,8 +201,16 @@ def _load_data(config, use_tushare: bool = False, use_baostock: bool = False):
     )
 
 
-def _compute_factors(prices, returns, financials, metadata, turnover=None, config=None):
-    """Compute and process all registered factors. Returns (processed_factors, ic_results, sector_map, fin_unstacked)."""
+def _compute_factors(prices, returns, financials, metadata, turnover=None, config=None,
+                     return_raw: bool = False):
+    """Compute and process all registered factors.
+
+    Returns ``(processed_factors, ic_results, sector_map, fin_unstacked)``, or
+    a fifth element ``raw_factors`` when ``return_raw`` is true. Screening
+    rules are written against raw economic units (``pe_ratio < 30``), so the
+    CLI needs the unstandardized panels; everything else consumes the
+    processed ones.
+    """
     from quant_platform.factors.evaluation import ic_summary, rank_ic
     from quant_platform.factors.fundamental import register_all as register_fundamental
     from quant_platform.factors.processing import process_factor
@@ -300,7 +308,7 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
 
     ic_results = {}
     for name, factor in processed_factors.items():
-        ic = rank_ic(factor, returns)
+        ic = rank_ic(factor, returns, name=name)
         summary = ic_summary(ic)
         ic_results[name] = summary
         if summary.get("n_obs", 0) < 10:
@@ -313,6 +321,8 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
                 name, summary.get("n_obs", 0),
             )
 
+    if return_raw:
+        return processed_factors, ic_results, sector_map, fin_unstacked, raw_factors
     return processed_factors, ic_results, sector_map, fin_unstacked
 
 
@@ -370,6 +380,207 @@ def _generate_signal(config, processed_factors, returns, prices=None, volume=Non
         min_tradability=getattr(config.alpha, 'min_tradability', 0.3),
     )
     return alpha_pipe.run(processed_factors, returns, prices=prices, volume=volume)
+
+
+def _chart_payload(results: dict) -> dict:
+    """Chart data for the standalone HTML report (CLI path).
+
+    Mirrors the subset `reporting.html_report` reads. The API builds a richer
+    ChartData model for the dashboard; the CLI only needs the time series.
+    """
+    import numpy as np
+    import pandas as pd
+
+    strategy_returns = results["daily_returns"].dropna()
+    equity = (1 + strategy_returns).cumprod()
+    dates = [str(d.date()) for d in equity.index]
+
+    benchmark_returns = results.get("benchmark_returns")
+    bench_equity = None
+    if benchmark_returns is not None:
+        br = benchmark_returns.reindex(strategy_returns.index).dropna()
+        bench_equity = (1 + br).cumprod().tolist()
+
+    wealth = np.concatenate([[1.0], equity.to_numpy()])
+    running_max = np.maximum.accumulate(wealth)
+    drawdown = (wealth / running_max - 1)[1:].tolist()
+
+    rolling_sharpe = None
+    if len(strategy_returns) >= 252:
+        from quant_platform.backtest.metrics import TRADING_DAYS_PER_YEAR
+
+        rolling_ret = strategy_returns.rolling(252).mean() * TRADING_DAYS_PER_YEAR
+        rolling_vol = (
+            strategy_returns.rolling(252).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+        )
+        rs = (rolling_ret / rolling_vol.replace(0, np.nan)).dropna()
+        rolling_sharpe = rs.tolist()
+
+    monthly = None
+    if len(strategy_returns) >= 21:
+        monthly_ret = strategy_returns.resample(
+            pd.offsets.MonthEnd()
+        ).apply(lambda x: (1 + x).prod() - 1)
+        monthly_ret.index = monthly_ret.index.to_period("M")
+        mdf = monthly_ret.groupby(
+            [monthly_ret.index.year, monthly_ret.index.month]
+        ).first().unstack()
+        mdf = mdf.reindex(columns=range(1, 13))
+        if not mdf.empty:
+            monthly = {
+                "years": [str(y) for y in mdf.index.tolist()],
+                "months": list(range(1, 13)),
+                "data": [
+                    [None if pd.isna(value) else round(float(value), 6)
+                     for value in row]
+                    for row in mdf.values.tolist()
+                ],
+            }
+
+    return {
+        "dates": dates,
+        "equity": equity.tolist(),
+        "benchmark": bench_equity,
+        "drawdown": drawdown,
+        "rolling_sharpe": rolling_sharpe,
+        "monthly_returns": monthly or {},
+    }
+
+
+def _exposure_payload(results: dict, metadata) -> dict:
+    """Latest-weights exposure for the HTML report."""
+    weights_history = results.get("weights_history") or {}
+    if not weights_history:
+        return {"sectors": {}, "n_assets": 0}
+    latest_weights = weights_history[max(weights_history)]
+    sector_map = metadata.get("sector", {}) if metadata is not None else {}
+    try:
+        from quant_platform.risk.exposure import exposure_report
+
+        exp = exposure_report(latest_weights, sector_map)
+    except Exception as exc:  # exposure is presentation-only
+        logger.warning("Exposure report unavailable: %s", exc)
+        return {"sectors": {}, "n_assets": 0}
+    sectors = exp.get("sector_exposure", {})
+    if hasattr(sectors, "to_dict"):
+        sectors = sectors.to_dict()
+    return {
+        "sectors": {str(k): float(v) for k, v in dict(sectors).items()},
+        "n_assets": exp.get("n_assets", 0),
+        "effective_n": exp.get("effective_n", 0),
+        "top5_concentration": exp.get("top5_concentration", 0),
+        "top10_concentration": exp.get("top10_concentration", 0),
+    }
+
+
+def _json_safe(value):
+    """Recursively replace non-finite floats and numpy scalars for strict JSON."""
+    import math
+
+    import numpy as np
+
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _write_run_artifacts(results: dict, ic_results: dict, metadata, config) -> tuple[Path, Path]:
+    """Write the standalone HTML report and metrics.json for a CLI run.
+
+    Both were promised by the docs but never produced: `run` only wrote CSVs
+    and PNGs, and `research report` required a metrics.json nobody generated.
+    """
+    import json
+    from datetime import datetime
+
+    from quant_platform.reporting.html_report import generate_html_report
+
+    output_dir = Path(config.output.results_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    strategy_returns = results["daily_returns"].dropna()
+    summary = results.get("summary", {})
+
+    risk = {}
+    try:
+        from quant_platform.risk.var import var_summary
+
+        risk = var_summary(
+            strategy_returns,
+            confidence=config.risk.var.confidence,
+            horizon=config.risk.var.horizon,
+        )
+    except Exception as exc:
+        logger.warning("Risk summary unavailable for the report: %s", exc)
+
+    stress_rows = []
+    try:
+        from quant_platform.risk.stress import run_all_stress_tests
+
+        stress_df = run_all_stress_tests(strategy_returns)
+        stress_rows = [
+            {
+                "scenario": str(row.name),
+                "cumulative_return": float(row["estimated_cumulative_return"]),
+                "max_drawdown": float(row["estimated_max_drawdown"]),
+            }
+            for _, row in stress_df.iterrows()
+        ]
+    except Exception as exc:
+        logger.warning("Stress tests unavailable for the report: %s", exc)
+
+    factors = [
+        {
+            "name": name,
+            "mean_ic": summary_row.get("mean_ic", 0.0),
+            "std_ic": summary_row.get("std_ic", 0.0),
+            "icir": summary_row.get("icir", 0.0),
+            "ic_positive_ratio": summary_row.get("ic_positive_ratio", 0.0),
+            "n_obs": summary_row.get("n_obs", 0),
+        }
+        for name, summary_row in (ic_results or {}).items()
+    ]
+
+    payload = {
+        "performance": summary,
+        "risk": risk,
+        "factors": factors,
+        "chart_data": _chart_payload(results),
+        "exposure": _exposure_payload(results, metadata),
+        "stress_tests": stress_rows,
+    }
+    html_path = Path(generate_html_report(
+        payload,
+        output_path=str(output_dir / "backtest_report.html"),
+    ))
+
+    metrics = {
+        "schema_version": 1,
+        "generated_at": datetime.now().isoformat(),
+        "performance": summary,
+        "risk": risk,
+        "factors": factors,
+        "stress_tests": stress_rows,
+        "daily_returns": [float(x) for x in strategy_returns.to_numpy()],
+        "daily_return_dates": [str(d.date()) for d in strategy_returns.index],
+        # A stored backtest keeps no factor-return regressions, so genuine
+        # factor attribution cannot be produced here. An empty mapping tells
+        # `research report` to print the measured metrics instead of inventing
+        # contributions.
+        "factor_contributions": {},
+    }
+    metrics_path = output_dir / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(_json_safe(metrics), indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+    return html_path, metrics_path
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +764,15 @@ def cmd_run(args) -> int:
     )
 
     print(report)
+    try:
+        html_path, metrics_path = _write_run_artifacts(
+            results, ic_results, metadata, config,
+        )
+    except Exception as exc:
+        logger.error("Failed to write the HTML report / metrics.json: %s", exc)
+        return 1
+    logger.info("HTML report: %s", html_path)
+    logger.info("Metrics: %s", metrics_path)
     logger.info("Results saved to: %s", config.output.results_dir)
     logger.info("Pipeline complete.")
     return 0
@@ -865,7 +1085,11 @@ def cmd_ml(args) -> int:
     config = load_config(_resolve_config_path(args.config))
 
     if args.subcommand == "train":
-        from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
+        from quant_platform.alpha.ml_signal import (
+            InsufficientTrainingData,
+            MLSignalConfig,
+            MLSignalGenerator,
+        )
 
         prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
         processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
@@ -876,7 +1100,18 @@ def cmd_ml(args) -> int:
             n_splits=args.splits,
         )
         gen = MLSignalGenerator(config=ml_config)
-        perf = gen.train(processed_factors, returns)
+        try:
+            perf = gen.train(processed_factors, returns)
+        except InsufficientTrainingData as exc:
+            print(f"ML training failed: {exc}")
+            return 1
+
+        if perf.n_train_samples <= 0:
+            print(
+                "ML training produced no samples; refusing to report a "
+                "zero-IC model as a success."
+            )
+            return 1
 
         print("=" * 60)
         print(f"  ML MODEL TRAINING — {args.model.upper()}")
@@ -894,7 +1129,11 @@ def cmd_ml(args) -> int:
         return 0
 
     elif args.subcommand == "signal":
-        from quant_platform.alpha.ml_signal import MLSignalConfig, MLSignalGenerator
+        from quant_platform.alpha.ml_signal import (
+            InsufficientTrainingData,
+            MLSignalConfig,
+            MLSignalGenerator,
+        )
 
         prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
         processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
@@ -902,10 +1141,20 @@ def cmd_ml(args) -> int:
 
         ml_config = MLSignalConfig(model_type=args.model)
         gen = MLSignalGenerator(config=ml_config)
-        signal = gen.generate(processed_factors, returns)
+        try:
+            signal = gen.generate(processed_factors, returns)
+        except InsufficientTrainingData as exc:
+            print(f"ML signal failed: {exc}")
+            return 1
 
         # Show top/bottom 10 stocks by signal
         last_signal = signal.iloc[-1].dropna().sort_values()
+        if last_signal.empty:
+            print(
+                "ML signal is empty on the last date; refusing to print an "
+                "empty Top/Bottom list as a success."
+            )
+            return 1
         print("=" * 60)
         print(f"  ML SIGNAL — {args.model.upper()} (last date)")
         print("=" * 60)
@@ -962,13 +1211,37 @@ def cmd_research(args) -> int:
             print(f"Results directory not found: {results_dir}")
             return 1
 
-        # Try to load backtest results
+        # Try to load backtest results. `run` writes metrics.json; older
+        # result directories only have the CSV, so fall back to the measured
+        # daily returns instead of dead-ending.
         metrics_file = results_dir / "metrics.json"
-        if not metrics_file.exists():
-            print("No metrics.json found. Run 'python main.py run' first.")
-            return 1
+        if metrics_file.exists():
+            metrics = json.loads(metrics_file.read_text())
+        else:
+            returns_file = results_dir / "daily_returns.csv"
+            if not returns_file.exists():
+                print(
+                    "No metrics.json or daily_returns.csv found. "
+                    "Run 'python main.py run' first."
+                )
+                return 1
+            import pandas as pd
 
-        metrics = json.loads(metrics_file.read_text())
+            from quant_platform.backtest.metrics import all_metrics
+
+            frame = pd.read_csv(returns_file, index_col=0)
+            frame.index = pd.to_datetime(frame.index)
+            daily = frame.iloc[:, 0].astype(float)
+            metrics = {
+                "performance": all_metrics(daily),
+                "daily_returns": daily.tolist(),
+                "factor_contributions": {},
+            }
+            print(
+                "metrics.json not found; computed performance from "
+                "daily_returns.csv (factor attribution needs a full run)."
+            )
+
         agent = ResearchAgent(mode="keyword")
 
         # Generate attribution summary
@@ -980,10 +1253,17 @@ def cmd_research(args) -> int:
             summary = agent.summarize_attribution(factor_contrib, daily_returns)
             print(summary)
         else:
-            print("No factor contributions in results. Full metrics:")
-            for k, v in metrics.items():
-                if isinstance(v, (int, float)):
+            performance = metrics.get("performance") or {}
+            print("No factor contributions in results. Measured performance:")
+            printed = False
+            for k, v in performance.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
                     print(f"  {k}: {v}")
+                    printed = True
+            if not printed:
+                for k, v in metrics.items():
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        print(f"  {k}: {v}")
 
         return 0
 
@@ -1035,6 +1315,11 @@ def cmd_screen(args) -> int:
                 logger.warning("Invalid rule format (expected factor=op:val): %s", rule_str)
     else:
         # Use config rules
+        if not config.screener.enabled:
+            print(
+                "  Note: screener.enabled=false in the config; 'screen' was "
+                "invoked explicitly, so the configured rules are used."
+            )
         for r in config.screener.rules:
             rules.append(ScreenRule(factor=r.factor, operator=r.operator, value=r.value))
 
@@ -1050,9 +1335,16 @@ def cmd_screen(args) -> int:
     print(f"  Data: {len(prices)} days, {len(prices.columns)} assets")
 
     print("Computing factors...")
-    processed_factors, ic_results, sector_map, fin_unstacked = _compute_factors(
+    _processed_factors, ic_results, sector_map, fin_unstacked, raw_factors = _compute_factors(
         prices, returns, financials, metadata, turnover, config=config,
+        return_raw=True,
     )
+
+    # Screen on raw factor values, not the standardized/neutralized panels:
+    # `pe_ratio < 30` means a PE of 30, while the processed panel is a
+    # cross-sectional z-score (roughly -3..3) that passes every stock.
+    screen_factors = raw_factors
+    print("  Screen values: raw factor units (before winsorize/standardize)")
 
     # Run screener
     screener = FactorScreener({
@@ -1063,18 +1355,18 @@ def cmd_screen(args) -> int:
         "min_stocks": args.min_stocks or config.screener.min_stocks,
         "max_stocks": args.max_stocks or config.screener.max_stocks,
     })
-    qualifiers = screener.screen(processed_factors, rules)
+    qualifiers = screener.screen(screen_factors, rules)
 
     # Build output table
     if qualifiers:
         # Get latest factor values for qualifying stocks
-        last_date = next(iter(processed_factors.values())).index[-1]
+        last_date = next(iter(screen_factors.values())).index[-1]
         print(f"\n{'='*80}")
         print(f"  SCREENER RESULTS — {last_date}")
         print(f"{'='*80}")
         print(f"  Rules: {', '.join(str(r.factor) + ' ' + r.operator + ' ' + str(r.value) for r in rules)}")
         print(f"  Logic: {args.logic or config.screener.logic}")
-        print(f"  Passing: {len(qualifiers)} / {len(next(iter(processed_factors.values())).columns)} stocks")
+        print(f"  Passing: {len(qualifiers)} / {len(next(iter(screen_factors.values())).columns)} stocks")
         print(f"{'='*80}\n")
 
         # Build detail DataFrame
@@ -1082,8 +1374,8 @@ def cmd_screen(args) -> int:
         for asset in qualifiers:
             row = {"code": asset}
             for r in rules:
-                if r.factor in processed_factors:
-                    df = processed_factors[r.factor]
+                if r.factor in screen_factors:
+                    df = screen_factors[r.factor]
                     if last_date in df.index:
                         row[r.factor] = round(df.loc[last_date, asset], 4)
             detail_rows.append(row)
@@ -1105,8 +1397,8 @@ def cmd_screen(args) -> int:
         print(f"\n  {'─'*60}")
         print(f"  Total qualifying stocks: {len(qualifiers)}")
         for r in rules:
-            if r.factor in processed_factors:
-                df = processed_factors[r.factor]
+            if r.factor in screen_factors:
+                df = screen_factors[r.factor]
                 if last_date in df.index:
                     vals = df.loc[last_date, qualifiers].dropna()
                     print(f"  {r.factor}: mean={vals.mean():.4f}  "
@@ -1778,6 +2070,7 @@ def cmd_walkforward(args) -> int:
         test_period=args.test_days,
         step_size=args.test_days,
         mode=args.method,
+        n_folds=args.folds,
     )
 
     engine_kwargs = {
@@ -1807,6 +2100,7 @@ def cmd_walkforward(args) -> int:
     print("\n" + "=" * 70)
     print("  WALK-FORWARD RESULTS (OOS)")
     print("=" * 70)
+    print(f"  Requested folds: {args.folds}; executed: {len(fold_metrics)}")
 
     for i, m in enumerate(fold_metrics):
         print(f"\n  Fold {i+1}:")
@@ -2060,7 +2354,8 @@ def main() -> int:
     screen_parser.add_argument("--config", "-c", type=str, default=None,
                                help="Path to config YAML file")
     screen_parser.add_argument("--rules", "-r", type=str, default=None,
-                               help='Rules: "factor=op:value,factor=op:value" e.g. "pe_ratio=lt:30,roe=gt:0.15"')
+                               help='Rules on RAW factor values: "factor=op:value,..." '
+                                    'e.g. "pe_ratio=lt:30,roe=gt:0.15"')
     screen_parser.add_argument("--logic", "-l", type=str, default=None,
                                choices=["and", "or"], help="Rule combination logic")
     screen_parser.add_argument("--output", "-o", type=str, default=None,
@@ -2173,6 +2468,8 @@ def main() -> int:
         return cmd_profile(args)
     elif args.command == "gate":
         return cmd_gate(args)
+    elif args.command == "check-lookahead":
+        return cmd_check_lookahead(args)
     elif args.command == "strategy":
         return cmd_strategy(args)
     else:
