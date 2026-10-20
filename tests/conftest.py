@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import logging
+import sys
+from pathlib import Path
 
 import pytest
 
-from quant_platform.data.pipeline import DataPipeline
-from quant_platform.data.providers.synthetic import SyntheticDataProvider
+# CI runs the `pytest` console script, which does not put the repo root on
+# sys.path (unlike `python -m pytest`). Tests that import sibling helpers as
+# `tests.test_data...` then fail during collection under importmode=importlib.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from quant_platform.data.pipeline import DataPipeline  # noqa: E402
+from quant_platform.data.providers.synthetic import SyntheticDataProvider  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
