@@ -27,6 +27,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
+import pandas as pd
 
 from quant_platform.core.audit import AuditAction, AuditLog
 from quant_platform.core.events import EventBus, get_event_bus
@@ -51,6 +52,12 @@ from quant_platform.trading.broker import (
     SimulatedBroker,
 )
 from quant_platform.trading.signal_generator import LiveSignalGenerator
+from quant_platform.trading.signals import (
+    DEFAULT_MIN_SIGNAL_SCORE,
+    SIGNAL_HISTORY_SESSIONS,
+    composite_signal,
+    rank_symbols,
+)
 from quant_platform.utils.logging import get_logger
 from quant_platform.utils.metrics import get_metrics
 
@@ -146,7 +153,7 @@ class LiveTradingEngine:
         rebalance_interval: int = 300,
         n_stocks: int = 50,
         min_trade_value: float = 1000,
-        min_signal_score: float = 0.3,
+        min_signal_score: float = DEFAULT_MIN_SIGNAL_SCORE,
         tenant_id: str = "default",
     ):
         self._broker = broker
@@ -186,7 +193,11 @@ class LiveTradingEngine:
                 )
             except Exception as exc:
                 logger.error("Risk-state persistence setup failed: %s", exc)
-        self._signal_generator = signal_generator or LiveSignalGenerator()
+        # The default signal path is the shared `trading.signals.composite_signal`
+        # -- the same causal 7-factor equal-weight score the CLI LiveRunner
+        # uses.  An injected generator (tests or an alternative alpha model
+        # exposing update_prices()/generate()) still takes precedence.
+        self._signal_generator = signal_generator
         self._rebalance_interval = rebalance_interval
         self._n_stocks = n_stocks
         self._min_trade_value = min_trade_value
@@ -1729,8 +1740,15 @@ class LiveTradingEngine:
                 if q.code not in self._price_history:
                     self._price_history[q.code] = []
                 self._price_history[q.code].append(price)
-                if len(self._price_history[q.code]) > 60:
-                    self._price_history[q.code] = self._price_history[q.code][-60:]
+                # One shared signal lookback window.  Each entry is one quote
+                # fetch (the web engine's input is a quote buffer, not a
+                # daily-close history); with a daily close feed this is the
+                # same 127 sessions the CLI runner preloads.  The window must
+                # reach 126 returns for six-month momentum.
+                if len(self._price_history[q.code]) > SIGNAL_HISTORY_SESSIONS:
+                    self._price_history[q.code] = self._price_history[q.code][
+                        -SIGNAL_HISTORY_SESSIONS:
+                    ]
 
                 # Publish tick event
                 self._bus.publish("market.tick", {
@@ -1764,18 +1782,38 @@ class LiveTradingEngine:
         except Exception as e:
             logger.warning("Price fetch failed: %s", e)
 
-    def _generate_signals(self, positions: list | None = None) -> list[TradeSignal]:
-        """Generate signals using the same alpha pipeline as backtest research.
+    def _score_prices(self, price_df) -> pd.Series:
+        """Score a ``(dates x symbols)`` price panel with the shared composite.
 
-        Uses LiveSignalGenerator which reuses factor classes from factors/technical.py
-        and AlphaPipeline from alpha/pipeline.py — identical to the research pipeline.
+        This is the same causal 7-factor equal-weight function the CLI
+        ``LiveRunner`` calls (``trading/signals.py``), so a paper run and the
+        live engine produce identical scores for identical price history.
+        An injected ``signal_generator`` (tests, alternative alpha models)
+        still takes precedence.
+
+        Symbols without enough history come back as NaN.
+        """
+        if self._signal_generator is not None:
+            self._signal_generator.update_prices(price_df)
+            return pd.Series(
+                self._signal_generator.generate() or {}, dtype=float,
+            )
+        return composite_signal(price_df)
+
+    def _generate_signals(self, positions: list | None = None) -> list[TradeSignal]:
+        """Generate signals from the shared causal multi-factor composite.
+
+        Scores come from :func:`quant_platform.trading.signals.composite_signal`
+        -- the same 1/3/6-month momentum + 20/60-day volatility + RSI + MACD
+        equal-weight composite the CLI ``LiveRunner`` uses, on a [0, 1]
+        percentile scale.  An injected ``signal_generator`` overrides it.
 
         `positions` is the cycle's position snapshot (D6). Passing it in keeps
         signal sizing on the same book the engine validated as *known*, and
         only symbols with a fresh quote may generate a signal (D11).
         """
         signals = []
-        if len(self._price_history) < 20:
+        if not self._price_history:
             return signals
 
         if positions is None:
@@ -1787,31 +1825,35 @@ class LiveTradingEngine:
                 return signals
 
         # Build rolling price DataFrame from the price history buffer
-        import pandas as pd
-
         codes_with_data = [c for c, p in self._price_history.items() if len(p) >= 20]
         if not codes_with_data:
             return signals
 
-        # Align all price histories to the same length
-        min_len = min(len(self._price_history[c]) for c in codes_with_data)
-        price_df = pd.DataFrame(
-            {c: self._price_history[c][-min_len:] for c in codes_with_data}
-        )
+        # Align all price histories onto one row axis, left-padded with NaN so
+        # each symbol keeps its full trailing history (the same shape the
+        # runner's history mapping produces).
+        max_len = max(len(self._price_history[c]) for c in codes_with_data)
+        price_df = pd.DataFrame({
+            c: [np.nan] * (max_len - len(self._price_history[c]))
+            + list(self._price_history[c])
+            for c in codes_with_data
+        })
 
-        # Feed into the shared signal generator
-        self._signal_generator.update_prices(price_df)
-        signal_scores = self._signal_generator.generate()
+        # Score with the shared causal composite (same function as the CLI
+        # runner); symbols without enough history are NaN and excluded.
+        signal_scores = self._score_prices(price_df).dropna().to_dict()
 
         if not signal_scores:
             return signals
 
-        # Sort by signal score descending, take top N
-        sorted_codes = sorted(signal_scores, key=signal_scores.get, reverse=True)
-        target_codes = set(
-            c for c in sorted_codes[:self._n_stocks]
-            if signal_scores[c] >= self._min_signal_score
+        # Rank by score descending, keep top N above the entry threshold.
+        # Ties break on the symbol inside rank_symbols, deterministically.
+        ranked = rank_symbols(
+            signal_scores,
+            limit=self._n_stocks,
+            min_score=self._min_signal_score,
         )
+        target_codes = {code for code, _score in ranked}
 
         if not target_codes:
             return signals
@@ -1821,18 +1863,20 @@ class LiveTradingEngine:
         current_codes = set(position_map)
         equity = max(self._broker.get_account().get("total_equity", 1), 1)
 
-        # Buy new targets
-        for code in target_codes - current_codes:
+        # Buy new targets (ranked order is deterministic)
+        for code, score in ranked:
+            if code in current_codes:
+                continue
             if self._quote_is_fresh(code):
                 signals.append(TradeSignal(
                     code=code, side=OrderSide.BUY,
                     target_weight=target_weight, current_weight=0,
-                    signal_strength=float(signal_scores.get(code, 0)),
-                    reason=f"signal_score={signal_scores.get(code, 0):.3f}",
+                    signal_strength=float(score),
+                    reason=f"signal_score={score:.3f}",
                 ))
 
         # Sell removed positions
-        for code in current_codes - target_codes:
+        for code in sorted(current_codes - target_codes):
             if self._quote_is_fresh(code):
                 pos = position_map[code]
                 signals.append(TradeSignal(
@@ -1843,7 +1887,7 @@ class LiveTradingEngine:
                 ))
 
         # Rebalance existing positions (drift > 2%)
-        for code in target_codes & current_codes:
+        for code in sorted(target_codes & current_codes):
             if self._quote_is_fresh(code):
                 pos = position_map[code]
                 current_weight = pos.market_value / equity

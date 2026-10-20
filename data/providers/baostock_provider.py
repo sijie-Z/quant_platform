@@ -43,10 +43,25 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import (
+    INCREMENTAL_OVERLAP_SESSIONS,
     DataFetchIncompleteError,
     DataProvider,
     cache_manifest_matches,
+    canonicalize_panel_index,
+    complete_panel_marker,
+    deduplicate_panel,
+    exchange_sessions,
+    incremental_fetch_start,
+    incremental_marker_extra,
+    last_day_missing_symbols,
+    panel_last_date,
+    provider_cache_lock,
+    read_cache_manifest,
+    read_incremental_status,
+    sessions_after,
+    symbols_on_date,
     write_cache_manifest,
+    write_incremental_status,
 )
 from quant_platform.utils.logging import get_logger
 
@@ -284,6 +299,9 @@ class BaostockDataProvider(DataProvider):
 
     price_adjustment = _PRICE_ADJUSTMENT
     adjusted_price_basis = _ADJUSTED_PRICE_BASIS
+    #: Sessions can be appended to the parquet/CSV daily cache via
+    #: :meth:`update`; universe/range changes fall back to a full fetch.
+    supports_incremental = True
 
     def __init__(self, cache_enabled: bool = True, max_retries: int = 2,
                  retry_backoff: float = 0.5, adjustment: str = "hfq"):
@@ -311,6 +329,15 @@ class BaostockDataProvider(DataProvider):
         self._pinned_range: tuple[str, str] | None = None
         self._pinned_price_codes: list[str] | None = None
         self._pinned_financial_codes: list[str] | None = None
+        #: Completion marker/provenance of the loaded panel (D32).
+        self._data_status: dict = {}
+        #: Panel kept when an incremental update is incomplete: the pipeline
+        #: continues on the last complete data (reported as stale) instead of
+        #: re-issuing the same partial full-range fetch.
+        self._fallback_panel: pd.DataFrame | None = None
+        self._fallback_range: tuple[str, str] | None = None
+        #: Sidecar of the latest incremental attempt (for data_status).
+        self._last_status_path: Path | None = None
 
     # ------------------------------------------------------------------
     # Cache identity / versioning (D12/D13)
@@ -336,6 +363,27 @@ class BaostockDataProvider(DataProvider):
             "cache_enabled": bool(self._cache_enabled),
             "synthetic": False,
         }
+
+    def data_status(self) -> dict:
+        """Completion marker of the loaded daily panel (D32).
+
+        A partial incremental attempt never touches the data file or its
+        manifest; its ``incomplete`` flag lives in a sidecar, surfaced here
+        when it refers to the same completion marker.
+        """
+        status = dict(self._data_status)
+        if self._last_status_path is not None:
+            sidecar = read_incremental_status(self._last_status_path)
+            if (
+                sidecar
+                and sidecar.get("incomplete")
+                and str(sidecar.get("last_complete_date"))
+                == str(status.get("last_complete_date"))
+            ):
+                status["incomplete"] = True
+                status["reason"] = sidecar.get("reason")
+                status["last_incremental_attempt"] = sidecar
+        return status
 
     @staticmethod
     def _normalise_range(
@@ -393,6 +441,16 @@ class BaostockDataProvider(DataProvider):
         if financial:
             return self._pinned_financial_codes
         return self._pinned_price_codes
+
+    def _fallback_for(
+        self, start_date: str, end_date: str,
+    ) -> pd.DataFrame | None:
+        """The last complete panel kept after an incomplete update, if any."""
+        if self._fallback_panel is None or self._fallback_range is None:
+            return None
+        if self._fallback_range != self._normalise_range(start_date, end_date):
+            return None
+        return self._fallback_panel
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -463,13 +521,16 @@ class BaostockDataProvider(DataProvider):
             key=key,
         )
 
-    def _write_manifest(self, key: str) -> None:
+    def _write_manifest(self, key: str, extra: dict | None = None) -> None:
+        payload = {"key": key}
+        if extra:
+            payload.update(extra)
         write_cache_manifest(
             self._cache_path(key),
             provider="baostock",
             adjustment=self._key_adjustment(key),
             cache_version=self._cache_version(),
-            extra={"key": key},
+            extra=payload,
         )
 
     def _discard_cache(self, key: str) -> None:
@@ -511,12 +572,35 @@ class BaostockDataProvider(DataProvider):
                 source = path
         try:
             if source == csv_path:
-                return pd.read_csv(source, index_col=[0, 1], parse_dates=[0])
+                # The asset column must stay a zero-filled string: pandas
+                # would otherwise infer ``000001`` as integer ``1``, and every
+                # incremental merge / hfq reindex compares labels exactly.
+                return pd.read_csv(
+                    source,
+                    index_col=[0, 1],
+                    parse_dates=[0],
+                    dtype={1: str},
+                )
             return pd.read_parquet(source)
         except Exception:
             return None
 
-    def _save_cache(self, key: str, df: pd.DataFrame):
+    def _save_cache(
+        self,
+        key: str,
+        df: pd.DataFrame,
+        extra: dict | None = None,
+        *,
+        raise_errors: bool = False,
+    ):
+        """Atomically publish a cache panel + manifest.
+
+        Publication happens under the cross-process provider lock; the data
+        file is replaced first and the manifest afterwards, so a crash can
+        never leave new rows advertised under an old completion marker. With
+        ``raise_errors`` (the incremental path) a publication failure
+        propagates so the caller does not report a marker advance.
+        """
         if not self._cache_enabled:
             return
         base = self._cache_path(key)
@@ -525,10 +609,18 @@ class BaostockDataProvider(DataProvider):
         try:
             try:
                 df.to_parquet(tmp, index=True)
-                os.replace(tmp, base)
-                # The parquet file is authoritative; drop a stale CSV twin so
-                # a later parquet failure cannot resurrect older values.
-                csv_path.unlink(missing_ok=True)
+                with provider_cache_lock(base.parent) as locked:
+                    if not locked:
+                        raise TimeoutError(
+                            f"timed out acquiring the provider cache lock "
+                            f"for {base}"
+                        ) from None
+                    os.replace(tmp, base)
+                    # The parquet file is authoritative; drop a stale CSV
+                    # twin so a later parquet failure cannot resurrect older
+                    # values.
+                    csv_path.unlink(missing_ok=True)
+                    self._write_manifest(key, extra=extra)
             except Exception:
                 # Fallback to CSV if parquet fails. Write atomically too, and
                 # remove the stale parquet (see MINOR 7 / reviewer finding).
@@ -537,9 +629,15 @@ class BaostockDataProvider(DataProvider):
                     f"{csv_path.name}.tmp.{os.getpid()}"
                 )
                 df.to_csv(csv_tmp, index=True)
-                os.replace(csv_tmp, csv_path)
-                base.unlink(missing_ok=True)
-            self._write_manifest(key)
+                with provider_cache_lock(base.parent) as locked:
+                    if not locked:
+                        raise TimeoutError(
+                            f"timed out acquiring the provider cache lock "
+                            f"for {csv_path}"
+                        ) from None
+                    os.replace(csv_tmp, csv_path)
+                    base.unlink(missing_ok=True)
+                    self._write_manifest(key, extra=extra)
         except Exception as exc:  # a cache failure must not fail the research run
             logger.warning(
                 "Could not cache baostock panel %s: %s", key, exc,
@@ -549,6 +647,8 @@ class BaostockDataProvider(DataProvider):
                     leftover.unlink(missing_ok=True)
                 except OSError:
                     pass
+            if raise_errors:
+                raise
 
     # ------------------------------------------------------------------
     # Daily prices
@@ -584,33 +684,57 @@ class BaostockDataProvider(DataProvider):
             )
         return rows
 
+    @staticmethod
+    def _code_digest(codes: list[str]) -> str:
+        return hashlib.md5(
+            ",".join(sorted(str(code).zfill(6) for code in codes)).encode()
+        ).hexdigest()[:8]
+
+    def _daily_cache_key(
+        self, codes: list[str], start_date: str, end_date: str, adjustflag: str,
+    ) -> str:
+        """Cache key for one (universe, range, adjustment) daily panel.
+
+        The full sorted code list is hashed (not just its length), so any two
+        same-sized universes cannot share an entry, and ``adjustflag`` is part
+        of the key because hfq and raw panels must not collide.
+        """
+        codes_digest = self._code_digest(codes)
+        return (
+            f"daily_{self._cache_version()}_{start_date}_{end_date}_"
+            f"{len(codes)}_{codes_digest}_adj{adjustflag}"
+        )
+
     def _fetch_daily_data(
         self,
         codes: list[str],
         start_date: str,
         end_date: str,
         adjustflag: str = "1",
+        *,
+        use_cache: bool = True,
     ) -> pd.DataFrame:
         """Fetch daily OHLCV for multiple stocks from baostock.
 
         Every failed symbol is retried; if any still fails the fetch raises
         :class:`DataFetchIncompleteError` and the cache is not written, so a
         truncated panel can never be replayed as complete.
+
+        ``use_cache=False`` is used for incremental *windows*: a window
+        response is only a candidate append until the completeness checks in
+        :meth:`update` pass, and caching it would make a retry for a fixed end
+        date reuse the same partial window forever.
         """
-        # Hash the full sorted code list: keying on len(codes) alone made any
-        # two same-sized universes share one cache entry.  adjustflag is part
-        # of the key because hfq and raw panels must not collide.
-        codes_digest = hashlib.md5(
-            ",".join(sorted(str(code).zfill(6) for code in codes)).encode()
-        ).hexdigest()[:8]
-        cache_key = (
-            f"daily_{self._cache_version()}_{start_date}_{end_date}_"
-            f"{len(codes)}_{codes_digest}_adj{adjustflag}"
+        # The full sorted code list is hashed (not just its length) and the
+        # adjustment flag is part of the key; see `_daily_cache_key`.
+        cache_key = self._daily_cache_key(
+            codes, start_date, end_date, adjustflag,
         )
-        cached = self._load_cache(cache_key)
-        if cached is not None and len(cached) > 0:
-            logger.info("Cache hit: %s (%d rows)", cache_key, len(cached))
-            return cached
+        if use_cache:
+            cached = self._load_cache(cache_key)
+            if cached is not None and len(cached) > 0:
+                logger.info("Cache hit: %s (%d rows)", cache_key, len(cached))
+                return cached
 
         self._login()
         bs = self._bs
@@ -676,11 +800,13 @@ class BaostockDataProvider(DataProvider):
         df = df.set_index(["date", "code"]).sort_index()
         df.index.names = ["date", "asset"]
         df = df[df["close"] > 0]
+        df = canonicalize_panel_index(df)
 
         if df.empty:
             return _empty_prices()
 
-        self._save_cache(cache_key, df)
+        if use_cache:
+            self._save_cache(cache_key, df)
         return df
 
     # ------------------------------------------------------------------
@@ -990,9 +1116,15 @@ class BaostockDataProvider(DataProvider):
             codes = self._get_major_stocks_list(
                 start_date=start_date, end_date=end_date,
             )
-        raw = self._fetch_daily_data(
-            codes, start_date, end_date, adjustflag="3",
-        )
+        fallback = self._fallback_for(start_date, end_date)
+        if fallback is not None:
+            raw = fallback.loc[
+                pd.Timestamp(start_date):pd.Timestamp(end_date)
+            ].copy()
+        else:
+            raw = self._fetch_daily_data(
+                codes, start_date, end_date, adjustflag="3",
+            )
 
         if raw.empty:
             empty = self._project_price_fields(raw, fields)
@@ -1000,11 +1132,43 @@ class BaostockDataProvider(DataProvider):
             df = raw.copy()
             df["adj_factor"] = 1.0
             empty = None
-        else:
-            hfq = self._fetch_daily_data(
-                codes, start_date, end_date, adjustflag="1",
+        elif "adj_factor" in raw.columns and raw["adj_factor"].notna().any():
+            # An incrementally published panel already carries the divisor;
+            # refetching the whole hfq history would defeat the append.
+            df = raw.copy()
+            df["adj_factor"] = (
+                pd.to_numeric(df["adj_factor"], errors="coerce")
+                .groupby(level="asset").ffill()
             )
-            df = self._merge_adjustment_divisor(raw, hfq)
+            missing_factor = df["close"].notna() & df["adj_factor"].isna()
+            if bool(missing_factor.any()):
+                raise DataFetchIncompleteError(
+                    "Baostock cached panel is missing adjustment divisors "
+                    f"for {int(missing_factor.sum())} priced row(s); "
+                    "refusing to guess adj_factor=1.0"
+                )
+            empty = None
+        else:
+            hfq_end = end_date
+            if fallback is not None:
+                # Never issue a network fetch past the complete cached range.
+                last = panel_last_date(raw)
+                hfq_end = str(last.date()) if last is not None else end_date
+            hfq_key = self._daily_cache_key(
+                codes, start_date, hfq_end, "1",
+            )
+            hfq = self._fetch_daily_data(
+                codes, start_date, hfq_end, adjustflag="1",
+            )
+            try:
+                df = self._merge_adjustment_divisor(raw, hfq)
+            except DataFetchIncompleteError:
+                # The hfq panel was persisted before validation; a panel that
+                # cannot produce a divisor for every raw close is unusable and
+                # must not be replayed on retries (it would wedge the append
+                # path too, which derives cached-range divisors from it).
+                self._discard_cache(hfq_key)
+                raise
             empty = None
 
         if empty is not None:
@@ -1014,6 +1178,51 @@ class BaostockDataProvider(DataProvider):
                 "adjustment_factor_available": False,
             })
             return empty
+
+        # Completion marker (D32): a full fetch that published a new raw
+        # cache records ``last_complete_date`` so the *next* run can append
+        # instead of refetching. A legacy cache without a marker is left
+        # alone here; `update()` rejects it and performs a full refetch.
+        if fallback is None and not raw.empty:
+            key3 = self._daily_cache_key(codes, start_date, end_date, "3")
+            manifest = read_cache_manifest(self._cache_path(key3)) or {}
+            marker = manifest.get("last_complete_date")
+            if not marker:
+                panel_end = panel_last_date(raw)
+                marker, incomplete = complete_panel_marker(
+                    raw,
+                    delisted=self._delisted_from_records(
+                        self._get_universe_records(), panel_end,
+                    ),
+                )
+                extra = incremental_marker_extra(
+                    last_complete_date=marker,
+                    requested_end=end_date,
+                    incomplete=incomplete,
+                    source="full_fetch",
+                )
+                self._write_marker(key3, extra)
+                manifest = {**manifest, **extra}
+                marker = extra["last_complete_date"]
+            self._data_status = {
+                "last_complete_date": marker,
+                "requested_end": manifest.get("end_date") or end_date,
+                "updated_at": manifest.get("updated_at"),
+                "data_age_days": manifest.get("data_age_days"),
+                "incomplete": bool(manifest.get("incomplete", False)),
+                "source": "cache_manifest",
+            }
+            # A failed append attempt leaves its flag in a sidecar; surface
+            # it when it refers to the same marker (restarted processes).
+            sidecar = read_incremental_status(self._cache_path(key3))
+            if (
+                sidecar
+                and sidecar.get("incomplete")
+                and str(sidecar.get("last_complete_date")) == str(marker)
+            ):
+                self._data_status["incomplete"] = True
+                self._data_status["reason"] = sidecar.get("reason")
+                self._last_status_path = self._cache_path(key3)
 
         df = self._project_price_fields(df, fields)
         df.attrs.update({
@@ -1173,11 +1382,29 @@ class BaostockDataProvider(DataProvider):
         if cached is not None and len(cached) > 0:
             return cached
 
+        if self._fallback_for(start_date, end_date) is not None:
+            # An incomplete incremental update keeps the last complete
+            # financial panel rather than re-issuing a fetch that may fail
+            # the same way the price update did.
+            fallback_fin = self._load_fallback_financials(
+                codes, start_date, end_date,
+            )
+            if fallback_fin is not None:
+                return fallback_fin
+
         # Raw (unadjusted) prices supply the price leg of market cap and the
-        # trading calendar used to map publication dates.
-        raw_prices = self._fetch_daily_data(
-            codes, start_date, end_date, adjustflag="3",
-        )
+        # trading calendar used to map publication dates. After an incomplete
+        # incremental update the last complete panel is used instead of
+        # re-issuing the same partial full-range fetch.
+        fallback = self._fallback_for(start_date, end_date)
+        if fallback is not None:
+            raw_prices = fallback.loc[
+                pd.Timestamp(start_date):pd.Timestamp(end_date)
+            ].copy()
+        else:
+            raw_prices = self._fetch_daily_data(
+                codes, start_date, end_date, adjustflag="3",
+            )
         if raw_prices.empty:
             return _empty_financials()
         raw_close = raw_prices["close"].unstack("asset")
@@ -1345,6 +1572,11 @@ class BaostockDataProvider(DataProvider):
             series.name = "benchmark"
             return series
 
+        if self._fallback_for(start_date, end_date) is not None:
+            fallback = self._load_fallback_benchmark(start_date, end_date)
+            if fallback is not None:
+                return fallback
+
         self._login()
         bs = self._bs
 
@@ -1385,6 +1617,634 @@ class BaostockDataProvider(DataProvider):
         if rs.error_code != "0":
             raise RuntimeError(f"benchmark query failed mid-stream: {rs.error_code}")
         return rows
+
+    # ------------------------------------------------------------------
+    # Incremental updates (D32)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _payload(**overrides) -> dict:
+        status = {
+            "supported": True,
+            "performed": False,
+            "full_refetch": False,
+            "new_sessions": 0,
+            "requested_end": None,
+            "last_complete_date": None,
+            "previous_last_complete_date": None,
+            "updated_at": None,
+            "data_age_days": None,
+            "incomplete": False,
+            "missing_symbols": [],
+            "reason": "",
+        }
+        status.update(overrides)
+        return status
+
+    def _remember_status(self, status: dict, *, source: str) -> dict:
+        self._data_status = {
+            "last_complete_date": status.get("last_complete_date"),
+            "requested_end": status.get("requested_end"),
+            "updated_at": status.get("updated_at"),
+            "data_age_days": status.get("data_age_days"),
+            "incomplete": bool(status.get("incomplete")),
+            "source": source,
+        }
+        return status
+
+    def _candidate_daily_caches(
+        self, codes: list[str], start_date: str,
+    ) -> list[tuple]:
+        """Valid cached raw (``adj3``) panels for this universe + start."""
+        prefix = f"daily_{self._cache_version()}_{start_date}_"
+        suffix = f"_{len(codes)}_{self._code_digest(codes)}_adj3"
+        keys: dict[str, pd.Timestamp] = {}
+        for pattern in (f"{prefix}*{suffix}.parquet", f"{prefix}*{suffix}.csv"):
+            for path in CACHE_DIR.glob(pattern):
+                name = path.name
+                if ".tmp." in name:
+                    continue
+                key = name.rsplit(".", 1)[0]
+                if key in keys:
+                    continue
+                end_str = key[len(prefix):-len(suffix)]
+                try:
+                    end_ts = pd.Timestamp(end_str).normalize()
+                except (TypeError, ValueError):
+                    continue
+                if not self._manifest_valid(key):
+                    continue
+                keys[key] = end_ts
+        return sorted(
+            ((end_ts, key) for key, end_ts in keys.items()),
+            key=lambda item: item[0],
+        )
+
+    @staticmethod
+    def _manifest_marker(key_path: Path) -> dict:
+        return read_cache_manifest(key_path) or {}
+
+    @staticmethod
+    def _delisted_from_records(
+        records: list[dict] | None, before,
+    ) -> set[str]:
+        """Codes whose baostock ``outDate`` is <= ``before``."""
+        cutoff = pd.Timestamp(before).normalize()
+        exempt: set[str] = set()
+        for record in records or []:
+            out = _as_date(record.get("outDate"))
+            if pd.notna(out) and pd.Timestamp(out).normalize() <= cutoff:
+                exempt.add(str(record["code"]).zfill(6))
+        return exempt
+
+    def _write_marker(self, key: str, extra: dict) -> None:
+        """Attach the completion marker after the data file was published."""
+        base = self._cache_path(key)
+        if not base.exists() and not base.with_suffix(".csv").exists():
+            # The panel was never published (cache disabled or a save
+            # failure); a marker without data would make the next append read
+            # an unknown boundary, so leave it unwritten.
+            logger.warning(
+                "Not writing a completion marker for %s: no cached data file",
+                key,
+            )
+            return
+        try:
+            with provider_cache_lock(base.parent) as locked:
+                if not locked:
+                    raise TimeoutError(
+                        f"timed out acquiring the provider cache lock for {key}"
+                    )
+                self._write_manifest(key, extra=extra)
+        except Exception as exc:  # marker is best effort; missing => refetch
+            logger.warning(
+                "Could not write the incremental completion marker for %s: %s",
+                key, exc,
+            )
+
+    def _full_refetch_status(
+        self,
+        codes: list[str],
+        start_date: str,
+        end_date: str,
+        reason: str,
+        previous_marker=None,
+    ) -> dict:
+        """Fetch the requested range from scratch and mark it complete."""
+        logger.warning(
+            "Incremental update fell back to a full refetch: %s", reason,
+        )
+        self._fallback_panel = None
+        self._fallback_range = None
+        # A full refetch must not replay the cache that triggered it (a
+        # corrupt/partial panel or a panel/marker race).
+        raw = self._fetch_daily_data(
+            codes, start_date, end_date, adjustflag="3", use_cache=False,
+        )
+        if raw.empty:
+            status = self._payload(
+                requested_end=end_date,
+                reason=f"{reason} (provider returned no rows)",
+            )
+            return self._remember_status(status, source="full_refetch")
+        if self.adjustment_mode == "hfq":
+            hfq = self._fetch_daily_data(
+                codes, start_date, end_date, adjustflag="1",
+                use_cache=False,
+            )
+            self._merge_adjustment_divisor(raw, hfq)
+        panel_end = panel_last_date(raw)
+        marker, incomplete = complete_panel_marker(
+            raw,
+            delisted=self._delisted_from_records(
+                self._get_universe_records(), panel_end,
+            ),
+        )
+        extra = incremental_marker_extra(
+            last_complete_date=marker,
+            requested_end=end_date,
+            previous_last_complete_date=previous_marker,
+            new_sessions=0,
+            incomplete=incomplete,
+            source="full_refetch",
+        )
+        key = self._daily_cache_key(codes, start_date, end_date, "3")
+        # Publish the freshly fetched panel (the cache that triggered this
+        # fallback is deliberately not replayed) with its completion marker.
+        self._save_cache(key, raw, extra=extra, raise_errors=True)
+        status = self._payload(
+            requested_end=end_date,
+            last_complete_date=extra["last_complete_date"],
+            previous_last_complete_date=extra["previous_last_complete_date"],
+            updated_at=extra["updated_at"],
+            data_age_days=extra["data_age_days"],
+            full_refetch=True,
+            incomplete=incomplete,
+            reason=reason,
+        )
+        self._last_status_path = self._cache_path(key)
+        write_incremental_status(self._last_status_path, status)
+        return self._remember_status(status, source="full_refetch")
+
+    def _incomplete_status(
+        self,
+        old_panel: pd.DataFrame,
+        codes: list[str],
+        start_date: str,
+        end_date: str,
+        reason: str,
+        *,
+        marker,
+        missing: set[str] | None = None,
+    ) -> dict:
+        """Partial response: keep the old cache/panel, marker unchanged."""
+        logger.warning(
+            "Incremental update incomplete (%s); keeping the cached panel "
+            "through %s and not advancing the completion marker",
+            reason, marker,
+        )
+        self._fallback_panel = old_panel
+        self._fallback_range = self._normalise_range(start_date, end_date)
+        status = self._payload(
+            requested_end=end_date,
+            last_complete_date=(
+                pd.Timestamp(marker).date().isoformat()
+                if marker is not None else None
+            ),
+            incomplete=True,
+            missing_symbols=sorted(str(code) for code in (missing or set()))[:20],
+            reason=reason,
+        )
+        key = self._daily_cache_key(codes, start_date, end_date, "3")
+        self._last_status_path = self._cache_path(key)
+        write_incremental_status(self._last_status_path, status)
+        return self._remember_status(status, source="cache_manifest")
+
+    def _load_fallback_financials(
+        self, codes: list[str], start_date: str, end_date: str,
+    ) -> pd.DataFrame | None:
+        """Financial panel from the last complete cache after a partial update."""
+        prefix = f"fin_{self._cache_version()}_{start_date}_"
+        suffix = f"_{len(codes)}_{self._code_digest(codes)}_adj3"
+        requested_end = pd.Timestamp(end_date).normalize()
+        best: tuple[pd.Timestamp, str] | None = None
+        for pattern in (f"{prefix}*{suffix}.parquet", f"{prefix}*{suffix}.csv"):
+            for path in CACHE_DIR.glob(pattern):
+                name = path.name
+                if ".tmp." in name:
+                    continue
+                key = name.rsplit(".", 1)[0]
+                end_str = key[len(prefix):-len(suffix)]
+                try:
+                    end_ts = pd.Timestamp(end_str).normalize()
+                except (TypeError, ValueError):
+                    continue
+                if end_ts > requested_end or not self._manifest_valid(key):
+                    continue
+                if best is None or end_ts > best[0]:
+                    best = (end_ts, key)
+        if best is None:
+            return None
+        cached = self._load_cache(best[1])
+        if cached is None or cached.empty:
+            return None
+        return cached.loc[
+            pd.Timestamp(start_date):pd.Timestamp(end_date)
+        ]
+
+    def _load_fallback_benchmark(
+        self, start_date: str, end_date: str,
+    ) -> pd.Series | None:
+        """Benchmark from the last complete cache when an update was partial."""
+        prefix = f"bench_{self._cache_version()}_{start_date}_"
+        best: tuple[pd.Timestamp, str] | None = None
+        for pattern in (f"{prefix}*_adj1.parquet", f"{prefix}*_adj1.csv"):
+            for path in CACHE_DIR.glob(pattern):
+                name = path.name
+                if ".tmp." in name:
+                    continue
+                key = name.rsplit(".", 1)[0]
+                end_str = key[len(prefix):-len("_adj1")]
+                try:
+                    end_ts = pd.Timestamp(end_str).normalize()
+                except (TypeError, ValueError):
+                    continue
+                if end_ts > pd.Timestamp(end_date).normalize():
+                    continue
+                if not self._manifest_valid(key):
+                    continue
+                if best is None or end_ts > best[0]:
+                    best = (end_ts, key)
+        if best is None:
+            return None
+        cached = self._load_cache(best[1])
+        if cached is None or cached.empty:
+            return None
+        series = cached.iloc[:, 0]
+        series.name = "benchmark"
+        return series.loc[
+            pd.Timestamp(start_date):pd.Timestamp(end_date)
+        ]
+
+    def update(self, start_date: str = None, end_date: str = None) -> dict:
+        """Append new exchange sessions to the cached raw panel (D32).
+
+        Baostock's raw (``adjustflag=3``) panel is cached per
+        ``(universe, range)``. The update locates the newest compatible cache
+        for the same universe and an earlier end date, reads its completion
+        marker, fetches ``marker + 1 session`` (plus one overlap session)
+        through the requested end for both raw and hfq series, derives the
+        divisor for the new rows, merges with ``keep="last"`` and publishes
+        atomically. If the pinned universe or the adjustment basis changed --
+        the cache key no longer matches -- a full fetch is performed instead.
+
+        A partial response keeps the old cache and returns
+        ``incomplete=True``; the completion marker only advances after a
+        complete publish.
+        """
+        if start_date is None and self._pinned_range is not None:
+            start_date = self._pinned_range[0]
+        if end_date is None and self._pinned_range is not None:
+            end_date = self._pinned_range[1]
+        if start_date is None or end_date is None:
+            raise ValueError("update() requires an explicit start and end date")
+        start_s = str(pd.Timestamp(start_date).date())
+        end_s = str(pd.Timestamp(end_date).date())
+        requested_end = pd.Timestamp(end_s).normalize()
+
+        codes = self._pinned_codes(start_s, end_s, financial=False)
+        if codes is None:
+            codes = self._get_major_stocks_list(
+                start_date=start_s, end_date=end_s,
+            )
+        if not codes:
+            return self._remember_status(
+                self._payload(
+                    requested_end=end_s,
+                    reason="empty stock universe; nothing to append",
+                ),
+                source="full_refetch",
+            )
+        if not self._cache_enabled:
+            return self._remember_status(
+                self._payload(
+                    requested_end=end_s,
+                    full_refetch=True,
+                    reason="provider cache disabled; performing a full fetch",
+                ),
+                source="full_refetch",
+            )
+
+        candidates = self._candidate_daily_caches(codes, start_s)
+        covering = [item for item in candidates if item[0] <= requested_end]
+        if not covering:
+            return self._full_refetch_status(
+                codes, start_s, end_s,
+                "no compatible cached panel for this universe/start range",
+            )
+        end_ts, key = covering[-1]
+        cached_end_s = str(end_ts.date())
+        old_panel = self._load_cache(key)
+        if old_panel is None or old_panel.empty:
+            return self._full_refetch_status(
+                codes, start_s, end_s,
+                f"cached panel {key} could not be loaded",
+            )
+        manifest = self._manifest_marker(self._cache_path(key))
+        marker_raw = manifest.get("last_complete_date")
+        if not marker_raw or manifest.get("incomplete"):
+            return self._full_refetch_status(
+                codes, start_s, end_s,
+                "cached panel has no trustworthy completion marker",
+                previous_marker=marker_raw,
+            )
+        marker = pd.Timestamp(marker_raw).normalize()
+        panel_end = panel_last_date(old_panel)
+        if panel_end is None or pd.Timestamp(panel_end).normalize() < marker:
+            # The panel and its manifest were read without a lock; a
+            # concurrent publish can leave the data file older than the
+            # marker. Appending from that base could skip sessions between
+            # the panel end and the marker, so refetch in full instead.
+            return self._full_refetch_status(
+                codes, start_s, end_s,
+                "cached panel ends before its completion marker "
+                "(concurrent writer or corrupt cache)",
+                previous_marker=marker_raw,
+            )
+        if requested_end <= marker:
+            status = self._payload(
+                requested_end=end_s,
+                performed=True,
+                last_complete_date=marker.date().isoformat(),
+                updated_at=manifest.get("updated_at"),
+                data_age_days=manifest.get("data_age_days"),
+                reason="completion marker already covers the requested end",
+            )
+            return self._remember_status(status, source="cache_manifest")
+
+        # A full-fetch raw cache carries no divisor (it is derived from the
+        # hfq series on demand). The append needs the cached rows' factors to
+        # compute the overlap correction and to publish a self-contained
+        # panel, so derive them here (the hfq fetch normally hits the cache
+        # written by the run that populated the panel). In raw mode the factor
+        # is the placeholder 1.0 -- no hfq call is needed at all.
+        if "adj_factor" not in old_panel.columns:
+            if self.adjustment_mode == "raw":
+                old_panel = old_panel.copy()
+                old_panel["adj_factor"] = 1.0
+            else:
+                try:
+                    hfq_key = self._daily_cache_key(
+                        codes, start_s, cached_end_s, "1",
+                    )
+                    hfq_old = self._fetch_daily_data(
+                        codes, start_s, cached_end_s, adjustflag="1",
+                    )
+                    try:
+                        old_panel = self._merge_adjustment_divisor(
+                            old_panel, hfq_old,
+                        )
+                    except DataFetchIncompleteError:
+                        # Never replay an hfq panel that failed validation.
+                        self._discard_cache(hfq_key)
+                        raise
+                except DataFetchIncompleteError as exc:
+                    return self._incomplete_status(
+                        old_panel, codes, start_s, end_s,
+                        f"cached-range adjustment divisor unavailable: {exc}",
+                        marker=marker,
+                    )
+
+        window_start = incremental_fetch_start(
+            marker, requested_end, overlap=INCREMENTAL_OVERLAP_SESSIONS,
+        )
+        if window_start is None:
+            status = self._payload(
+                requested_end=end_s,
+                performed=True,
+                last_complete_date=marker.date().isoformat(),
+                updated_at=manifest.get("updated_at"),
+                reason="no exchange session between the marker and the end",
+            )
+            return self._remember_status(status, source="cache_manifest")
+        window_start_s = str(pd.Timestamp(window_start).date())
+
+        try:
+            # Windows are fetched *without* the cache: a window response is
+            # only a candidate append until the completeness checks below
+            # pass. Caching it would make a retry for the same end date reuse
+            # the same partial window forever.
+            raw_window = self._fetch_daily_data(
+                codes, window_start_s, end_s, adjustflag="3",
+                use_cache=False,
+            )
+        except DataFetchIncompleteError as exc:
+            return self._incomplete_status(
+                old_panel, codes, start_s, end_s, str(exc), marker=marker,
+            )
+        if raw_window.empty:
+            logger.warning(
+                "Incremental fetch for %s..%s returned no rows; keeping the "
+                "cached panel (reported as incomplete/stale, not fresh)",
+                window_start_s, end_s,
+            )
+            # Serve the last complete panel for the requested range instead
+            # of re-issuing a full-range fetch that would return the same
+            # rows (or fail on a genuinely partial provider).
+            self._fallback_panel = old_panel
+            self._fallback_range = self._normalise_range(start_s, end_s)
+            status = self._payload(
+                requested_end=end_s,
+                performed=True,
+                last_complete_date=marker.date().isoformat(),
+                updated_at=manifest.get("updated_at"),
+                incomplete=True,
+                reason="provider returned no rows for the new sessions",
+            )
+            self._last_status_path = self._cache_path(
+                self._daily_cache_key(codes, start_s, end_s, "3")
+            )
+            write_incremental_status(self._last_status_path, status)
+            return self._remember_status(status, source="cache_manifest")
+
+        try:
+            if self.adjustment_mode == "raw":
+                new_panel = raw_window.copy()
+                new_panel["adj_factor"] = 1.0
+            else:
+                hfq_window = self._fetch_daily_data(
+                    codes, window_start_s, end_s, adjustflag="1",
+                    use_cache=False,
+                )
+                new_panel = self._merge_adjustment_divisor(
+                    raw_window, hfq_window,
+                )
+        except DataFetchIncompleteError as exc:
+            return self._incomplete_status(
+                old_panel, codes, start_s, end_s,
+                f"hfq/adjustment fetch failed: {exc}", marker=marker,
+            )
+
+        boundary_symbols = symbols_on_date(old_panel, marker)
+        delisted = self._delisted_from_records(
+            self._get_universe_records(), window_start,
+        )
+        new_dates = [
+            day for day in pd.DatetimeIndex(
+                new_panel.index.get_level_values("date").unique()
+            ).normalize() if day > marker
+        ]
+        if not new_dates:
+            logger.warning(
+                "Incremental fetch for %s..%s returned only overlap rows; "
+                "keeping the cached panel (reported as incomplete/stale)",
+                window_start_s, end_s,
+            )
+            return self._incomplete_status(
+                old_panel, codes, start_s, end_s,
+                "provider returned no rows after the completion marker",
+                marker=marker,
+            )
+        window_symbols = {
+            str(code) for code in new_panel.index[
+                new_panel.index.get_level_values("date").isin(new_dates)
+            ].get_level_values("asset")
+        }
+        missing_window = boundary_symbols - window_symbols - delisted
+        if missing_window:
+            return self._incomplete_status(
+                old_panel, codes, start_s, end_s,
+                "provider response is missing symbols that traded on the "
+                "completion marker",
+                marker=marker, missing=missing_window,
+            )
+
+        # A corporate action changes the hfq basis. If the overlap ratio
+        # drifted, rescale cached divisors so adjusted history stays on the
+        # same basis as the appended rows (defensive: hfq normally leaves
+        # pre-action history untouched, but a vendor revision must not split
+        # the series).
+        merged_old = old_panel
+        overlap = old_panel.index.intersection(new_panel.index)
+        if len(overlap):
+            old_factor = pd.to_numeric(
+                old_panel.loc[overlap, "adj_factor"], errors="coerce",
+            )
+            new_factor = pd.to_numeric(
+                new_panel.loc[overlap, "adj_factor"], errors="coerce",
+            )
+            ratio = (new_factor / old_factor).replace(
+                [np.inf, -np.inf], np.nan,
+            ).dropna()
+            ratio = ratio[ratio > 0]
+            if len(ratio):
+                median = float(ratio.median())
+                if abs(median - 1.0) > 1e-9:
+                    merged_old = old_panel.copy()
+                    values = merged_old["adj_factor"].copy()
+                    before = (
+                        merged_old.index.get_level_values("date")
+                        < pd.Timestamp(window_start)
+                    )
+                    values.loc[before] = values.loc[before] * median
+                    merged_old["adj_factor"] = values
+                    logger.info(
+                        "Incremental update rescaled cached adjustment "
+                        "factors by %.8f to match the provider's new basis",
+                        median,
+                    )
+
+        merged = pd.concat([merged_old, new_panel]).sort_index()
+        merged = deduplicate_panel(merged, "prices")
+
+        merged_dates = pd.DatetimeIndex(
+            merged.index.get_level_values("date").unique()
+        ).sort_values()
+        previous_symbols = (
+            symbols_on_date(merged, merged_dates[-2])
+            if len(merged_dates) >= 2 else set()
+        )
+        delisted_on_last = self._delisted_from_records(
+            self._get_universe_records(), panel_last_date(merged),
+        )
+        missing_last = last_day_missing_symbols(
+            merged, delisted=delisted_on_last,
+        )
+        # Zero tolerance on the last session: without a suspension feed a
+        # truncated last day is indistinguishable from a suspended name,
+        # and the marker must never advance past a partial cross-section.
+        if missing_last:
+            return self._incomplete_status(
+                old_panel, codes, start_s, end_s,
+                "last session of the provider response is missing symbols "
+                f"present on the previous session ({len(missing_last)} of "
+                f"{len(previous_symbols)})",
+                marker=marker, missing=missing_last,
+            )
+
+        merged_date_set = set(merged_dates.normalize())
+        expected_sessions = exchange_sessions(
+            marker + pd.Timedelta(days=1), panel_last_date(merged),
+        )
+        missing_dates = [
+            day for day in expected_sessions if day not in merged_date_set
+        ]
+        if missing_dates:
+            return self._incomplete_status(
+                old_panel, codes, start_s, end_s,
+                "provider response is missing exchange sessions: "
+                + ", ".join(str(day.date()) for day in missing_dates[:5]),
+                marker=marker,
+            )
+
+        new_marker = panel_last_date(merged)
+        new_sessions = sessions_after(marker, new_marker)
+        extra = incremental_marker_extra(
+            last_complete_date=new_marker,
+            requested_end=end_s,
+            previous_last_complete_date=marker,
+            new_sessions=new_sessions,
+            incomplete=False,
+            source="incremental",
+        )
+        key_new = self._daily_cache_key(codes, start_s, end_s, "3")
+        self._last_status_path = self._cache_path(key_new)
+        try:
+            self._save_cache(key_new, merged, extra=extra, raise_errors=True)
+        except Exception as exc:
+            # Publication failed: the old cache and marker remain intact.
+            self._fallback_panel = old_panel
+            self._fallback_range = self._normalise_range(start_s, end_s)
+            status = self._payload(
+                requested_end=end_s,
+                last_complete_date=marker.date().isoformat(),
+                incomplete=True,
+                reason=f"atomic publish failed: {exc}",
+            )
+            write_incremental_status(self._cache_path(key_new), status)
+            return self._remember_status(status, source="cache_manifest")
+
+        self._fallback_panel = None
+        self._fallback_range = None
+        status = self._payload(
+            requested_end=end_s,
+            performed=True,
+            new_sessions=new_sessions,
+            last_complete_date=extra["last_complete_date"],
+            previous_last_complete_date=extra["previous_last_complete_date"],
+            updated_at=extra["updated_at"],
+            data_age_days=extra["data_age_days"],
+            reason=(
+                f"appended {new_sessions} session(s) from "
+                f"{window_start_s}..{end_s}"
+            ),
+        )
+        write_incremental_status(self._cache_path(key_new), status)
+        logger.info(
+            "Incremental update appended %d session(s); completion marker %s",
+            new_sessions, extra["last_complete_date"],
+        )
+        return self._remember_status(status, source="incremental")
 
     def close(self):
         """Logout from baostock."""

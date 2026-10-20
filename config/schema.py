@@ -30,6 +30,11 @@ class DataConfig:
     # feed indistinguishable from production output. Set this (or pass
     # `--allow-synthetic-fallback`) only for development.
     allow_synthetic_fallback: bool = False
+    # Freshness gate (D32): a panel whose completion marker is more than this
+    # many *exchange sessions* behind the requested end is stale. Research
+    # runs warn; live/decisive runs fail closed. 3 sessions tolerates a
+    # weekend plus a T+1 publication lag.
+    max_staleness_days: int = 3
 
 
 @dataclass

@@ -2,7 +2,7 @@
 
 > **一句话**：A股多因子量化研究+交易平台，从数据到回测到执行的完整流水线。面向量化开发面试，展示架构设计、性能优化、真实市场处理、LLM增强选股、ML信号、图网络因子、Barra风险模型、Prometheus监控、机构级风控和执行。
 
-**最终状态（2026-10-21 实测）**：2,502 个测试函数（2,776 条用例；2026-10-21 全量 2773 passed / 3 skipped；基线 8f8caec 为 2709 passed / 3 skipped）。约 230 个非测试 Python 文件 + 201 个测试文件 + 37 个 Vue 组件。约 75,000 行非测试 Python + 约 11,000 行 Vue。6 个 Numba JIT 内核加速。**99 个 HTTP 端点 + 1 个 WebSocket**。**事件驱动核心架构 + 实时风控熔断 + 多因子信号 + WebSocket实时推送 + 实时A股行情 + Level 2盘口 + 实时基本面 + PostgreSQL存储 + Paper Trading(延迟/部分成交/撤单失败/L2回放) + QMT/XTP实盘接口 + 合规导出 + 基金运营(NAV/投资者门户) + 跨资产接口(股票/ETF/期货/期权)**。**企业级就绪度评估：A（生产级研究+交易平台）**——详见[企业级就绪度评估](#企业级就绪度评估)。
+**最终状态（2026-10-21 实测）**：2,572 个测试函数（2,846 条用例；2026-10-21 全量 2843 passed / 3 skipped；基线 8f8caec 为 2709 passed / 3 skipped）。约 231 个非测试 Python 文件 + 205 个测试文件 + 37 个 Vue 组件。约 75,000 行非测试 Python + 约 11,000 行 Vue。6 个 Numba JIT 内核加速。**99 个 HTTP 端点 + 1 个 WebSocket**。**事件驱动核心架构 + 实时风控熔断 + 多因子信号 + WebSocket实时推送 + 实时A股行情 + Level 2盘口 + 实时基本面 + PostgreSQL存储 + Paper Trading(延迟/部分成交/撤单失败/L2回放) + QMT/XTP实盘接口 + 合规导出 + 基金运营(NAV/投资者门户) + 跨资产接口(股票/ETF/期货/期权)**。**企业级就绪度评估：A（生产级研究+交易平台）**——详见[企业级就绪度评估](#企业级就绪度评估)。
 
 ---
 
@@ -277,7 +277,7 @@ quant_platform/
 │   ├── package.json
 │   └── vite.config.js
 │
-├── tests/                      # 201个测试文件, 2,502个测试函数（2,776条用例）
+├── tests/                      # 205个测试文件, 2,572个测试函数（2,846条用例）
 │   ├── conftest.py             # 共享fixtures
 │   ├── test_data/              # 合成数据(9) + pipeline(5) + 质量(7) + 连接池(11) + PostgreSQL(10) + WebSocket(18) + Level2(22) + 基本面(23) = 105
 │   ├── test_factors/           # 技术(6) + 基本面(5) + 处理(5) + 评估(7) + IC监控(12) + 网络(17) + 正交化(18) + 择时(25) = 95
@@ -567,7 +567,7 @@ AKShare实时行情 → 多因子信号(动量+波动率+RSI+MACD) → 目标组
 
 **风控集成**：每笔下单前经过RiskMonitor.check_pre_trade()——仓位限额(5%)、行业集中度(30%)、日亏损限额(3%)、回撤熔断(15%警告/25%Kill Switch)、订单频率限制(50/min)。Kill Switch激活后自动阻断所有订单。
 
-**多因子信号**：`LiveTradingEngine`（Web API 启动）使用 7 因子等权复合——1/3/6个月动量 + 20/60日波动率 + RSI + MACD；因子引擎默认启用21个因子（注册27个）。CLI `main.py trade` 的 `LiveRunner` 仍使用独立的加权 4 因子复合（0.35/0.25/0.20/0.20，阈值 0.005），与 7 因子路径**尚未统一**。
+**多因子信号**：`LiveTradingEngine`（Web API 启动）使用 7 因子等权复合——1/3/6个月动量 + 20/60日波动率 + RSI + MACD；因子引擎默认启用21个因子（注册27个）。CLI `main.py trade` 的 `LiveRunner` 与 Web 引擎共用 `trading/signals.py` 的同一 7 因子复合（横截面百分位 [0,1]，阈值 0.3），同一段历史得到逐点相同的分数与排名。
 
 **WebSocket实时推送**：EventBus事件(order.filled/portfolio.snapshot/risk.status等)自动桥接到WebSocket，前端实时接收交易事件流，无需轮询。
 
@@ -1052,7 +1052,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 6. **LLM Agent 集成** — 财经新闻情感因子，Strategy 模式可插拔 DeepSeek（OpenAI 兼容接口），JSON 缓存
 7. **向量化回测** — 横截面运算向量化（回测按交易日/调仓日推进，非逐股票循环），月频调仓+日频漂移，完整成本模型
 8. **未来函数防范** — Point-in-time IC加权(严格因果) + IC计算无shift链条 + Walk-Forward折内重算信号 + 合成数据真实IC水平，5项显式防护
-9. **数据时间点快照** — PIT 掩码已覆盖因子/信号阶段（publish_date 财务、ST 公告日、行业生效日），回测执行日已按 `tradable_mask`/涨跌停阻断成交；价格基准已统一（provider 交付 raw OHLCV + 复权因子，`get_raw_close()` 用于成交/估值、`get_adjusted_close()` 用于研究），残余缺口是数据源相关的 ST 历史（Tushare/Baostock 不提供，仅合成数据有）、Postgres/Adata 未声明价格基准与增量更新。详见 `docs/HANDOVER.md` 第十轮
+9. **数据时间点快照** — PIT 掩码已覆盖因子/信号阶段（publish_date 财务、ST 公告日、行业生效日），回测执行日已按 `tradable_mask`/涨跌停阻断成交；价格基准已统一（provider 交付 raw OHLCV + 复权因子，`get_raw_close()` 用于成交/估值、`get_adjusted_close()` 用于研究），增量更新已实现（`--incremental`，边界去重/复权刷新/完成标记/新鲜度门禁）。残余缺口是数据源相关的 ST 历史（Tushare/Baostock 不提供，仅合成数据有）与 Postgres/Adata 未声明价格基准。详见 `docs/HANDOVER.md` 第十一轮
 10. **IC自动降权** — FactorICAutoDecay: 滚动IC监控 → 连续低IC自动禁用 → IC回升自动恢复 → 权重归零+重归一化
 11. **开盘前系统自检** — HealthCheck 5项检查(数据连接/资金余额/持仓核对/订单路由/风控限额) → 任一失败阻断发单
 12. **跨资产接口** — InstrumentType/Instrument/AssetUniverse统一抽象，消除lot_size=100/multiplier=1硬编码，支持股票/ETF/期货/期权，per-instrument成本/保证金/T+1规则，向后兼容
@@ -1091,7 +1091,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 32. **FastAPI + Vue 3 Web 界面** — REST API 99端点 + Bloomberg Terminal风格暗色仪表盘 + 10个视图
 33. **ABC抽象接口** — DataProvider / BaseFactor / PortfolioOptimizer 全部可插拔，注册表模式
 34. **配置驱动** — YAML参数化，零硬编码，类型化dataclass验证
-35. **2,502个测试函数（2,776条用例；2773 passed / 3 skipped）** — 覆盖全模块：数据/因子/Alpha/组合/回测/风险/LLM/报告/工具/核心架构/执行/交易/策略/ML/IC/Barra/指标/并行/Agent/连接池/图因子/PostgreSQL/WebSocket/Level2/基本面/合规导出/基金运营/监控API/跨资产/Paper Broker/XTP Broker/Live Runner/QMT Broker
+35. **2,572个测试函数（2,846条用例；2843 passed / 3 skipped）** — 覆盖全模块：数据/因子/Alpha/组合/回测/风险/LLM/报告/工具/核心架构/执行/交易/策略/ML/IC/Barra/指标/并行/Agent/连接池/图因子/PostgreSQL/WebSocket/Level2/基本面/合规导出/基金运营/监控API/跨资产/Paper Broker/XTP Broker/Live Runner/QMT Broker
 36. **Pipeline 缓存** — 基于 config hash 的自动缓存，支持 `--force` `--no-cache`
 
 ---
@@ -1111,9 +1111,9 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 | **状态管理** | 8状态有限状态机，合法转换强制校验，entry/exit hooks | A |
 | **合规审计** | 订单/成交/信号三路输出；状态转换与 OMS/API 下单未全部接入审计 | B+ |
 | **实时风控** | RiskMonitor集成到交易引擎，下单前自动检查，Kill Switch一键熔断，前端实时风险面板 | A |
-| **多因子信号** | Web API 引擎 7 因子等权复合（1/3/6月动量+20/60日波动+RSI+MACD）；CLI LiveRunner 仍为 4 因子加权（未统一），默认启用21个因子 | B+ |
+| **多因子信号** | Web 引擎与 CLI LiveRunner 共用同一 7 因子等权复合（1/3/6月动量+20/60日波动+RSI+MACD，百分位分数 [0,1]），默认启用21个因子 | B+ |
 | **实时推送** | EventBus→WebSocket桥接，交易事件(order/fill/risk/portfolio)实时推送到前端 | A |
-| **可测试性** | 2,502个测试函数（2,776条用例；2773 passed / 3 skipped），fixture共享，覆盖全模块 | A |
+| **可测试性** | 2,572个测试函数（2,846条用例；2843 passed / 3 skipped），fixture共享，覆盖全模块 | A |
 | **可扩展性** | ABC抽象接口，注册表模式，Strategy模式，插件式因子/优化器/数据源 | A |
 | **配置管理** | YAML驱动，零硬编码，类型化dataclass验证，环境变量覆盖 | A- |
 | **性能优化** | 6个Numba JIT内核，prange并行化，Pipeline缓存，向量化回测 | A- |
@@ -1142,7 +1142,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 **如果面试官问"你这个平台到企业级别了吗？"**
 
 推荐回答：
-> "这是一个面向研究+交易的量化平台，架构参考了Jane Street/Citadel的事件驱动设计——EventBus解耦运行时核心组件并桥接WebSocket实时推送，SQLite WAL模式持久化全部状态，有限状态机管理交易生命周期，合规审计记录每个决策。交易引擎集成RiskMonitor做下单前风控检查，5级风险等级+Kill Switch熔断，信号生成用7因子复合(1/3/6月动量+20/60日波动+RSI+MACD，Web API 引擎；CLI LiveRunner 仍为独立的 4 因子加权)。数据层支持PostgreSQL/asyncpg异步存储、WebSocket实时行情推送、Level 2盘口数据、实时基本面获取。Web层有99个API端点和Bloomberg风格仪表盘，实时展示状态机、风控、审计、事件流。如果要在生产环境跑，我会优先加CI/CD自动测试门禁和Docker容器化——这些是工程化问题，不是算法问题，给我一周可以补齐。"
+> "这是一个面向研究+交易的量化平台，架构参考了Jane Street/Citadel的事件驱动设计——EventBus解耦运行时核心组件并桥接WebSocket实时推送，SQLite WAL模式持久化全部状态，有限状态机管理交易生命周期，合规审计记录每个决策。交易引擎集成RiskMonitor做下单前风控检查，5级风险等级+Kill Switch熔断，信号生成用同一份 7 因子复合实现(1/3/6月动量+20/60日波动+RSI+MACD，Web 引擎与 CLI 共用)。数据层支持PostgreSQL/asyncpg异步存储、WebSocket实时行情推送、Level 2盘口数据、实时基本面获取。Web层有99个API端点和Bloomberg风格仪表盘，实时展示状态机、风控、审计、事件流。如果要在生产环境跑，我会优先加CI/CD自动测试门禁和Docker容器化——这些是工程化问题，不是算法问题，给我一周可以补齐。"
 
 ---
 

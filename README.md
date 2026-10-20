@@ -210,7 +210,7 @@ quant_platform/
 ├── tools/                  # 研究工具：common_runner / sanity_check / attribution
 │
 ├── docs/                   # 文档：架构 / 里程碑 / 研究报告 / 协议
-├── tests/                  # 单元测试（201 个测试文件，2,776 条用例，覆盖全部模块）
+├── tests/                  # 单元测试（205 个测试文件，2,846 条用例，覆盖全部模块）
 ├── config/                 # YAML 配置（零硬编码）
 └── requirements.txt        # Python 依赖（版本锁定；adata 例外见下文）
 ```
@@ -230,7 +230,7 @@ quant_platform/
 | ML CV 按 (日期, 股票) 拍平、训练/测试共享日期（BUG-23） | 已修复：按日期切分 + purge/embargo | `alpha/ml_signal.py` |
 | 成本模型系统性减半（BUG-03） | 已修复：印花税仅卖出、按资产拆分买卖名义额 | `backtest/cost_model.py`、`backtest/engine.py` |
 
-当前仍然存在的限制（不属于上述历史缺陷）：多租户隔离（#75 产品定位未定）、7 个分析/监控端点返回 `available:false`（见「已知限制」）、WebSocket token 的旧版查询串回退、PostgreSQL/Adata provider 尚未声明价格基准（货币路径会 fail closed）、无增量数据更新路径。
+当前仍然存在的限制（不属于上述历史缺陷）：多租户隔离（#75 产品定位未定）、7 个分析/监控端点返回 `available:false`（见「已知限制」）、WebSocket token 的旧版查询串回退、PostgreSQL/Adata provider 尚未声明价格基准（货币路径会 fail closed）、增量更新仅对支持 `update()` 的真实数据源生效（合成数据源会回退全量）。
 
 > `docs/VALIDATION_REPORT.md` 是 2026-06-20 的历史报告，数字早于上述修复，已标注 SUPERSEDED，不应作为当前证据引用。当前状态以 `docs/HANDOVER.md` 的第十轮记录为准。
 
@@ -265,7 +265,7 @@ quant_platform/
 | 7 个端点不可用 | `/api/walkforward`、`/api/risk/decompose`、`/api/analysis/ic-decay`、`/api/analysis/correlation`、`/api/monitor/tca-summary`、`/api/monitor/factor-status`、`/api/monitor/capacity-gauge` 从存储 run 无法计算，返回 `available:false` 及原因；替代路径见 HANDOVER |
 | WebSocket token 回退 | 当前前端用 `bearer.<token>` 子协议；`?token=` 仅为旧客户端保留 |
 | 价格基准 | 已统一：provider 交付 raw OHLCV + 复权因子（Tushare/Baostock 同一约定），`get_raw_close()` 供成交/估值，`get_adjusted_close()` 供研究；仅 Postgres/Adata 尚未声明基准，货币路径 fail closed |
-| 数据更新 | 无增量 append 路径，每次按区间重新拉取 |
+| 数据更新 | `run --incremental` / `cache refresh --incremental` 增量追加（边界去重、复权因子全量刷新、完成标记与新鲜度门禁）；Tushare/Baostock 支持，合成数据源回退全量 |
 | 交易所日历 | 内置休市表覆盖至 2026 年；2027 年休市日需通过 `QUANT_EXCHANGE_HOLIDAYS` 追加 |
 | 回测交易性 | 执行日已按 `tradable_mask` / 涨跌停阻断成交；整手约束在执行层生效，向量化回测仍为权重层面 |
 | 可选依赖 | `adata` 为 `>=1.0.0`（其余依赖精确锁定）。仅当 `data.validated: true` 时作为第二数据源做跨源校验；不可用时记录警告并跳过校验（不阻断主数据源） |

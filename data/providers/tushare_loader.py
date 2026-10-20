@@ -31,11 +31,25 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import (
+    INCREMENTAL_OVERLAP_SESSIONS,
     DataFetchIncompleteError,
     DataProvider,
     cache_manifest_matches,
+    canonicalize_panel_index,
+    complete_panel_marker,
+    deduplicate_panel,
+    exchange_sessions,
+    incremental_fetch_start,
+    incremental_marker_extra,
+    last_day_missing_symbols,
+    panel_last_date,
+    provider_cache_lock,
     read_cache_manifest,
+    read_incremental_status,
+    sessions_after,
+    symbols_on_date,
     write_cache_manifest,
+    write_incremental_status,
 )
 from quant_platform.utils.logging import get_logger
 
@@ -84,6 +98,9 @@ class TushareProvider(DataProvider):
     price_adjustment = _PRICE_ADJUSTMENT
     adjusted_price_basis = _ADJUSTED_PRICE_BASIS
     adjustment_factor_available = True
+    #: Sessions appended from an existing cache via :meth:`update`; a full
+    #: fetch is always available as the fallback.
+    supports_incremental = True
 
     def __init__(
         self,
@@ -109,6 +126,9 @@ class TushareProvider(DataProvider):
         self._benchmark: pd.Series | None = None
         self._metadata: pd.DataFrame | None = None
         self._constituent_history: pd.DataFrame | None = None
+        #: Completion marker/provenance of the loaded panel (D32). Populated
+        #: from the cache manifest on load and after every successful fetch.
+        self._data_status: dict = {}
 
         # No point-in-time ST history is available from this source.
         self.st_available = False
@@ -242,6 +262,27 @@ class TushareProvider(DataProvider):
             self._load_or_fetch_all()
         return self._metadata
 
+    def data_status(self) -> dict:
+        """Completion marker of the loaded panel (D32).
+
+        A failed incremental attempt leaves the data file and its manifest
+        untouched, so its ``incomplete`` flag lives in a sidecar. It is
+        surfaced here when it refers to the same completion marker, making a
+        restarted process aware that the last append attempt was partial.
+        """
+        status = dict(self._data_status)
+        sidecar = read_incremental_status(self._cache_file())
+        if (
+            sidecar
+            and sidecar.get("incomplete")
+            and str(sidecar.get("last_complete_date"))
+            == str(status.get("last_complete_date"))
+        ):
+            status["incomplete"] = True
+            status["reason"] = sidecar.get("reason")
+            status["last_incremental_attempt"] = sidecar
+        return status
+
     def get_st_timeseries(self) -> pd.DataFrame:
         """Explicitly expose that no ST history is available.
 
@@ -308,7 +349,9 @@ class TushareProvider(DataProvider):
             f"tushare_{self.index_code}_{self.start_date}_{self.end_date}.h5"
         )
 
-    def _cache_manifest_valid(self, cache_file: Path) -> bool:
+    def _cache_manifest_valid(
+        self, cache_file: Path, *, expected_end: str | None = None,
+    ) -> bool:
         """Whether the HDF5 file was written under the current semantics."""
         if not cache_manifest_matches(
             cache_file,
@@ -319,26 +362,32 @@ class TushareProvider(DataProvider):
         # A file copied/renamed from another index or date range must not be
         # served: the sidecar records the selection it was fetched for.
         manifest = read_cache_manifest(cache_file) or {}
+        expected_end = self.end_date if expected_end is None else expected_end
         return (
             str(manifest.get("index_code")) == str(self.index_code)
             and str(manifest.get("start_date")) == str(self.start_date)
-            and str(manifest.get("end_date")) == str(self.end_date)
+            and str(manifest.get("end_date")) == str(expected_end)
         )
 
-    def _write_cache_manifest(self, cache_file: Path) -> None:
+    def _write_cache_manifest(
+        self, cache_file: Path, extra: dict | None = None,
+    ) -> None:
+        payload = {
+            "index_code": self.index_code,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "benchmark_source": self.benchmark_source,
+            "adjusted_price_basis": _ADJUSTED_PRICE_BASIS,
+            "adj_factor_role": "divisor",
+        }
+        if extra:
+            payload.update(extra)
         write_cache_manifest(
             cache_file,
             provider="tushare",
             adjustment=_PRICE_ADJUSTMENT,
             cache_version=_PROVIDER_CACHE_VERSION,
-            extra={
-                "index_code": self.index_code,
-                "start_date": self.start_date,
-                "end_date": self.end_date,
-                "benchmark_source": self.benchmark_source,
-                "adjusted_price_basis": _ADJUSTED_PRICE_BASIS,
-                "adj_factor_role": "divisor",
-            },
+            extra=payload,
         )
 
     def _discard_cache(self, cache_file: Path) -> None:
@@ -474,8 +523,28 @@ class TushareProvider(DataProvider):
 
         logger.info("Fetching real data from Tushare (this takes ~30s first time)...")
         self._fetch_all_from_tushare()
+        panel_end = panel_last_date(self._prices)
+        delisted = self._delisted_symbols(self._metadata, panel_end)
+        marker, incomplete = complete_panel_marker(
+            self._prices, delisted=delisted,
+        )
+        marker_extra = incremental_marker_extra(
+            last_complete_date=marker,
+            requested_end=self.end_date,
+            new_sessions=0,
+            incomplete=incomplete,
+            source="full_fetch",
+        )
+        self._data_status = {
+            "last_complete_date": marker_extra["last_complete_date"],
+            "requested_end": marker_extra["requested_end"],
+            "updated_at": marker_extra["updated_at"],
+            "data_age_days": marker_extra["data_age_days"],
+            "incomplete": bool(incomplete),
+            "source": "full_fetch",
+        }
         try:
-            self._save_to_cache(cache_file)
+            self._save_to_cache(cache_file, extra=marker_extra)
         except Exception as exc:  # a cache failure must not fail the research run
             logger.warning(
                 "Data fetched but could not be cached to %s: %s",
@@ -484,13 +553,18 @@ class TushareProvider(DataProvider):
         else:
             logger.info("Data cached to: %s", cache_file)
 
-    def _load_from_cache(self, cache_file: Path) -> None:
+    def _load_from_cache(
+        self, cache_file: Path, *, expected_end: str | None = None,
+    ) -> None:
         """Reload all data from HDF5 cache.
 
         Refuses a file whose version manifest is missing or stale, so direct
         callers get the same protection as :meth:`_load_or_fetch_all` (D13).
+        ``expected_end`` validates a candidate written for an earlier end
+        date during the incremental-update scan; the default validates the
+        provider's current request.
         """
-        if not self._cache_manifest_valid(cache_file):
+        if not self._cache_manifest_valid(cache_file, expected_end=expected_end):
             raise ValueError(
                 "cache version manifest missing or does not match the current "
                 "schema/adjustment versions"
@@ -499,6 +573,14 @@ class TushareProvider(DataProvider):
         self.benchmark_source = str(
             manifest.get("benchmark_source", "unknown")
         )
+        self._data_status = {
+            "last_complete_date": manifest.get("last_complete_date"),
+            "requested_end": manifest.get("end_date"),
+            "updated_at": manifest.get("updated_at"),
+            "data_age_days": manifest.get("data_age_days"),
+            "incomplete": bool(manifest.get("incomplete", False)),
+            "source": "cache_manifest",
+        }
         if self.benchmark_source == "equal_weight_fallback":
             logger.warning(
                 "Cached Tushare benchmark is an equal-weight fallback, not "
@@ -533,12 +615,14 @@ class TushareProvider(DataProvider):
         logger.info("Loaded from cache: %d assets, %d price rows",
                      len(self._metadata), len(self._prices))
 
-    def _save_to_cache(self, cache_file: Path) -> None:
+    def _save_to_cache(self, cache_file: Path, extra: dict | None = None) -> None:
         """Persist all data to HDF5 atomically (temp file + ``os.replace``).
 
-        The version manifest is written right after the data file. A crash
-        between the two leaves a cache without a valid manifest, which the
-        loader treats as stale and refetches -- never as current data.
+        Publication (data file + version/completion manifest) happens under a
+        cross-process lock. The data file is replaced first and the manifest
+        only afterwards, so a crash between the two leaves either the old
+        entry or an unversioned file that the loader rejects -- never new data
+        advertised under an old completion marker.
         """
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = cache_file.with_name(
@@ -552,14 +636,14 @@ class TushareProvider(DataProvider):
                 store["metadata"] = self._metadata
                 if self._constituent_history is not None:
                     store["constituents"] = self._constituent_history
-            os.replace(tmp_file, cache_file)
-            try:
-                self._write_cache_manifest(cache_file)
-            except Exception as exc:  # cache metadata is best effort
-                logger.warning(
-                    "Could not write cache version manifest for %s: %s",
-                    cache_file, exc,
-                )
+            with provider_cache_lock(cache_file.parent) as locked:
+                if not locked:
+                    raise TimeoutError(
+                        f"timed out acquiring the provider cache lock for "
+                        f"{cache_file}"
+                    )
+                os.replace(tmp_file, cache_file)
+                self._write_cache_manifest(cache_file, extra=extra)
         finally:
             if tmp_file.exists():
                 try:
@@ -593,7 +677,9 @@ class TushareProvider(DataProvider):
                 len(self._constituent_history) > 0
             )
         constituents = self._constituent_history
-        all_codes = list(constituents["ts_code"].unique())
+        # Sorted so a full fetch and an incremental update describe the same
+        # panel in the same level order (byte-identical output).
+        all_codes = sorted(constituents["ts_code"].astype(str).unique())
         logger.info("  Got %d unique constituent stocks", len(all_codes))
 
         # 2. Get stock basic info (metadata; includes delisted names)
@@ -795,76 +881,122 @@ class TushareProvider(DataProvider):
     # Daily prices
     # ------------------------------------------------------------------
 
-    def _fetch_batch_daily(self, api, batch: list[str]) -> pd.DataFrame:
-        """Fetch one daily batch; raise if any requested symbol is absent."""
+    def _fetch_batch_daily(
+        self,
+        api,
+        batch: list[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+        *,
+        strict: bool = True,
+    ) -> pd.DataFrame:
+        """Fetch one daily batch.
+
+        ``strict`` is the full-fetch contract: any requested symbol absent
+        from the response makes the batch unusable. Incremental windows relax
+        it because a symbol suspended for the whole window legitimately has no
+        rows; :meth:`update` then applies its own completion rules.
+        """
         ts_codes = ",".join(batch)
+        start = (start_date or self.start_date).replace("-", "")
+        end = (end_date or self.end_date).replace("-", "")
         df = api.daily(
             ts_code=ts_codes,
-            start_date=self.start_date.replace("-", ""),
-            end_date=self.end_date.replace("-", ""),
+            start_date=start,
+            end_date=end,
             fields="ts_code,trade_date,open,high,low,close,vol,amount,turnover_rate",
         )
         if df is None or len(df) == 0:
-            raise ValueError("daily returned no rows")
+            if strict:
+                raise ValueError("daily returned no rows")
+            return pd.DataFrame(columns=[
+                "ts_code", "trade_date", "open", "high", "low", "close",
+                "vol", "amount", "turnover_rate",
+            ])
         missing = set(batch) - set(df["ts_code"].astype(str).unique())
-        if missing:
+        if missing and strict:
             raise ValueError(f"daily response missing symbols: {sorted(missing)}")
         return df
 
-    def _fetch_batch_adj(self, api, batch: list[str]) -> pd.DataFrame:
-        """Fetch one adj_factor batch; raise if any requested symbol is absent."""
+    def _fetch_batch_adj(
+        self,
+        api,
+        batch: list[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+        *,
+        strict: bool = True,
+    ) -> pd.DataFrame:
+        """Fetch one adj_factor batch.
+
+        ``strict`` mirrors :meth:`_fetch_batch_daily`; the incremental path
+        additionally verifies a factor for every returned price row, so a
+        missing symbol here can only mean "no rows in the window".
+        """
         ts_codes = ",".join(batch)
+        start = (start_date or self.start_date).replace("-", "")
+        end = (end_date or self.end_date).replace("-", "")
         adj_df = api.adj_factor(
             ts_code=ts_codes,
-            start_date=self.start_date.replace("-", ""),
-            end_date=self.end_date.replace("-", ""),
+            start_date=start,
+            end_date=end,
         )
         if adj_df is None or len(adj_df) == 0:
-            raise ValueError("adj_factor returned no rows")
+            if strict:
+                raise ValueError("adj_factor returned no rows")
+            return pd.DataFrame(columns=["ts_code", "trade_date", "adj_factor"])
         missing = set(batch) - set(adj_df["ts_code"].astype(str).unique())
-        if missing:
+        if missing and strict:
             raise ValueError(f"adj_factor response missing symbols: {sorted(missing)}")
         return adj_df[["ts_code", "trade_date", "adj_factor"]]
 
-    def _fetch_daily_prices(self, api, codes: list[str]) -> pd.DataFrame:
-        """Fetch daily OHLCV as **raw** prices plus the adjustment divisor.
+    def _fetch_price_frames(
+        self,
+        api,
+        codes: list[str],
+        start_date: str,
+        end_date: str,
+        *,
+        strict: bool,
+    ) -> tuple[list[pd.DataFrame], list[pd.DataFrame], set[str]]:
+        """Fetch raw daily + adj_factor batches for one date window.
 
-        Tushare reports raw prices and a cumulative multiplier
-        ``native_factor`` (``hfq = raw * native_factor``).  The shared
-        provider contract is raw ``close`` plus a *divisor*
-        ``adj_factor = 1 / native_factor``, so the pipeline's
-        ``close_adj = close / adj_factor`` reproduces the same hfq levels
-        that this module used to pre-multiply into ``close`` while the stored
-        price is now the tradeable CNY price (D15/D18).  The adjustment is
-        applied exactly once, by the pipeline.
-
-        Every batch is retried with exponential backoff.  If any batch (daily
-        or adj_factor) still fails, the whole fetch raises
-        :class:`DataFetchIncompleteError` — a partially adjusted panel (raw prices
-        next to adjusted prices) must never be returned or cached.
+        Returns ``(daily_frames, adj_frames, missing_symbols)``. API failures
+        after retries raise :class:`DataFetchIncompleteError` (the whole
+        update is incomplete); with ``strict=False`` symbols absent from a
+        successful response are reported instead of raising.
         """
         all_frames: list[pd.DataFrame] = []
         adj_frames: list[pd.DataFrame] = []
         failed_symbols: set[str] = set()
+        missing: set[str] = set()
         batch_size = 50  # Tushare API limit
 
         for i in range(0, len(codes), batch_size):
             batch = list(codes[i:i + batch_size])
 
             try:
-                all_frames.append(
-                    self._call_with_retries(
-                        f"daily batch {i // batch_size}", self._fetch_batch_daily, api, batch
-                    )
+                df = self._call_with_retries(
+                    f"daily batch {i // batch_size}",
+                    self._fetch_batch_daily, api, batch,
+                    start_date, end_date, strict=strict,
                 )
             except DataFetchIncompleteError as exc:
                 logger.error("%s", exc)
                 failed_symbols.update(batch)
+            else:
+                all_frames.append(df)
+                if df is not None:
+                    missing |= set(batch) - set(
+                        df["ts_code"].astype(str).unique()
+                    )
 
             try:
                 adj_frames.append(
                     self._call_with_retries(
-                        f"adj_factor batch {i // batch_size}", self._fetch_batch_adj, api, batch
+                        f"adj_factor batch {i // batch_size}",
+                        self._fetch_batch_adj, api, batch,
+                        start_date, end_date, strict=strict,
                     )
                 )
             except DataFetchIncompleteError as exc:
@@ -877,10 +1009,25 @@ class TushareProvider(DataProvider):
                 f"{len(failed_symbols)} symbol(s) failed after retries "
                 f"(e.g. {sorted(failed_symbols)[:10]})"
             )
-        if not all_frames or not adj_frames:
-            raise DataFetchIncompleteError("Tushare price fetch returned no data")
+        return all_frames, adj_frames, missing
 
-        df = pd.concat(all_frames, ignore_index=True)
+    @staticmethod
+    def _assemble_price_frames(
+        all_frames: list[pd.DataFrame],
+        adj_frames: list[pd.DataFrame],
+    ) -> pd.DataFrame:
+        """Merge daily + adjustment batches into a raw price panel.
+
+        Raw OHLCV is kept untouched; the returned ``adj_factor`` column is the
+        divisor ``1 / native_factor`` the pipeline divides by (D15/D18).
+        Suspension fill and row dropping happen in
+        :meth:`_finalize_daily_prices`, so an incremental merge can finalise
+        the concatenation of cached and fresh rows exactly like a full fetch.
+        """
+        frames = [frame for frame in all_frames if frame is not None and len(frame)]
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
 
         # Process
         df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
@@ -902,7 +1049,10 @@ class TushareProvider(DataProvider):
         df["vwap"] = df["amount"] / df["volume"]
         df["vwap"] = df["vwap"].where(np.isfinite(df["vwap"]), df["close"])
 
-        adj = pd.concat(adj_frames, ignore_index=True)
+        adj_list = [frame for frame in adj_frames if frame is not None and len(frame)]
+        if not adj_list:
+            raise DataFetchIncompleteError("Tushare adj_factor fetch returned no data")
+        adj = pd.concat(adj_list, ignore_index=True)
         adj["trade_date"] = pd.to_datetime(adj["trade_date"], format="%Y%m%d")
         adj = adj.rename(columns={
             "ts_code": "asset", "trade_date": "date", "adj_factor": "native_factor",
@@ -931,20 +1081,55 @@ class TushareProvider(DataProvider):
 
         # Set MultiIndex
         df = df.set_index(["date", "asset"]).sort_index()
+        return df
 
-        # Handle suspensions: volume=0 means suspended
+    @staticmethod
+    def _finalize_daily_prices(df: pd.DataFrame) -> pd.DataFrame:
+        """Suspension fill + row dropping, identical for full and incremental.
+
+        Applying this to the *concatenated* panel (cached rows + fresh overlap
+        rows) makes an append produce the same frame a full fetch would:
+        suspension rows are blanked, short gaps are forward-filled (limit 5)
+        and rows still lacking a close are dropped.
+        """
+        if df is None or df.empty:
+            return df
         suspended = df["volume"].isna() | (df["volume"] <= 0)
         df.loc[suspended, ["open", "high", "low", "close", "vwap"]] = np.nan
-
-        # Forward-fill suspension gaps (max 5 days for real data).  The
-        # divisor is a corporate-action property and is carried across the
-        # fill as well.
         df = df.groupby("asset").ffill(limit=5)
-
-        # Drop rows where close is still NaN after ffill
         df = df.dropna(subset=["close"])
+        return canonicalize_panel_index(df)
 
-        return df
+    def _fetch_daily_prices(self, api, codes: list[str]) -> pd.DataFrame:
+        """Fetch daily OHLCV as **raw** prices plus the adjustment divisor.
+
+        Tushare reports raw prices and a cumulative multiplier
+        ``native_factor`` (``hfq = raw * native_factor``).  The shared
+        provider contract is raw ``close`` plus a *divisor*
+        ``adj_factor = 1 / native_factor``, so the pipeline's
+        ``close_adj = close / adj_factor`` reproduces the same hfq levels
+        that this module used to pre-multiply into ``close`` while the stored
+        price is now the tradeable CNY price (D15/D18).  The adjustment is
+        applied exactly once, by the pipeline.
+
+        Every batch is retried with exponential backoff.  If any batch (daily
+        or adj_factor) still fails, the whole fetch raises
+        :class:`DataFetchIncompleteError` — a partially adjusted panel (raw prices
+        next to adjusted prices) must never be returned or cached.
+        """
+        all_frames, adj_frames, missing = self._fetch_price_frames(
+            api, codes, self.start_date, self.end_date, strict=True,
+        )
+        if missing:
+            raise DataFetchIncompleteError(
+                "Tushare price fetch incomplete: "
+                f"{len(missing)} symbol(s) missing from the response "
+                f"(e.g. {sorted(missing)[:10]})"
+            )
+        df = self._assemble_price_frames(all_frames, adj_frames)
+        if df.empty:
+            raise DataFetchIncompleteError("Tushare price fetch returned no data")
+        return self._finalize_daily_prices(df)
 
     # ------------------------------------------------------------------
     # Financials (PIT)
@@ -1094,7 +1279,7 @@ class TushareProvider(DataProvider):
         df_full = df.reindex(full_idx)
         df_full = df_full.groupby("asset").ffill()
 
-        return df_full
+        return canonicalize_panel_index(df_full)
 
     def _fetch_index_daily(self, api) -> pd.Series:
         """Fetch CSI 300 index daily data (trailing returns convention)."""
@@ -1129,3 +1314,529 @@ class TushareProvider(DataProvider):
         daily_ret = close.pct_change(fill_method=None).mean(axis=1)
         daily_ret.name = "benchmark"
         return daily_ret.fillna(0)
+
+    # ------------------------------------------------------------------
+    # Incremental updates (D32)
+    # ------------------------------------------------------------------
+
+    def _incremental_cache_candidates(self) -> list[tuple]:
+        """Valid cached panels for this index/start, oldest end date first.
+
+        A candidate is trusted only when its sidecar manifest matches the
+        current schema/cache/adjustment versions *and* the index/start/end
+        recorded for its own file name. Legacy files without a completion
+        marker are still listed here; :meth:`update` rejects them and does a
+        full refetch (never an append with an unknown boundary).
+        """
+        prefix = f"tushare_{self.index_code}_{self.start_date}_"
+        candidates: list[tuple] = []
+        for path in self.cache_dir.glob(
+            f"tushare_{self.index_code}_{self.start_date}_*.h5"
+        ):
+            name = path.name
+            if not (name.startswith(prefix) and name.endswith(".h5")):
+                continue
+            end_str = name[len(prefix):-len(".h5")]
+            try:
+                end_ts = pd.Timestamp(end_str).normalize()
+            except (TypeError, ValueError):
+                continue
+            if not self._cache_manifest_valid(path, expected_end=end_str):
+                continue
+            manifest = read_cache_manifest(path) or {}
+            candidates.append((end_ts, end_str, path, manifest))
+        candidates.sort(key=lambda item: item[0])
+        return candidates
+
+    @staticmethod
+    def _delisted_symbols(metadata: pd.DataFrame | None, before) -> set[str]:
+        """Symbols whose provider-stated delisting date is <= ``before``."""
+        if metadata is None or "delisting_date" not in metadata.columns:
+            return set()
+        dates = pd.to_datetime(metadata["delisting_date"], errors="coerce")
+        cutoff = pd.Timestamp(before).normalize()
+        return {
+            str(asset) for asset, value in dates.items()
+            if pd.notna(value) and pd.Timestamp(value).normalize() <= cutoff
+        }
+
+    def _fetch_adj_map(
+        self, api, codes: list[str], start_date: str, end_date: str,
+    ) -> tuple[pd.Series, set[str]]:
+        """Cumulative native factors for the whole cached range.
+
+        Corporate actions rescale adjusted history and vendors revise
+        factors; an append that only fetches factors for the new window can
+        therefore leave the stored adjusted series inconsistent with a full
+        fetch. Tushare's adj_factor endpoint is cheap, so every incremental
+        update refreshes it for the full cached range (D32 requirement 3).
+
+        Returns ``(factors, missing_symbols)``; the caller treats any missing
+        symbol as an incomplete update rather than silently keeping old
+        factors for part of the panel (a mixed adjustment basis).
+        """
+        frames: list[pd.DataFrame] = []
+        failed: set[str] = set()
+        missing: set[str] = set()
+        batch_size = 50
+        for i in range(0, len(codes), batch_size):
+            batch = list(codes[i:i + batch_size])
+            try:
+                frame = self._call_with_retries(
+                    f"adj_factor refresh batch {i // batch_size}",
+                    self._fetch_batch_adj, api, batch,
+                    start_date, end_date, strict=False,
+                )
+            except DataFetchIncompleteError as exc:
+                logger.error("%s", exc)
+                failed.update(batch)
+                continue
+            frames.append(frame)
+            if frame is not None:
+                missing |= set(batch) - set(
+                    frame["ts_code"].astype(str).unique()
+                )
+        if failed:
+            raise DataFetchIncompleteError(
+                "Tushare adj_factor refresh incomplete: "
+                f"{len(failed)} symbol(s) failed after retries "
+                f"(e.g. {sorted(failed)[:10]})"
+            )
+        frames = [frame for frame in frames if frame is not None and len(frame)]
+        if not frames:
+            raise DataFetchIncompleteError("Tushare adj_factor refresh returned no data")
+        adj = pd.concat(frames, ignore_index=True)
+        adj["trade_date"] = pd.to_datetime(adj["trade_date"], format="%Y%m%d")
+        adj = adj.rename(columns={
+            "ts_code": "asset", "trade_date": "date", "adj_factor": "native_factor",
+        })
+        adj["native_factor"] = pd.to_numeric(adj["native_factor"], errors="coerce")
+        valid = np.isfinite(adj["native_factor"]) & (adj["native_factor"] > 0)
+        adj = adj.loc[valid]
+        factors = 1.0 / adj["native_factor"]
+        factors.index = pd.MultiIndex.from_arrays(
+            [adj["date"], adj["asset"]], names=["date", "asset"],
+        )
+        factors = factors[~factors.index.duplicated(keep="last")].sort_index()
+        factors.name = "adj_factor"
+        return factors, missing
+
+    def _status_payload(self, **overrides) -> dict:
+        status = {
+            "supported": True,
+            "performed": False,
+            "full_refetch": False,
+            "new_sessions": 0,
+            "requested_end": str(self.end_date),
+            "last_complete_date": None,
+            "previous_last_complete_date": None,
+            "updated_at": None,
+            "data_age_days": None,
+            "incomplete": False,
+            "missing_symbols": [],
+            "reason": "",
+        }
+        status.update(overrides)
+        return status
+
+    def _remember_status(self, status: dict, *, source: str) -> dict:
+        """Expose the marker through :meth:`data_status` for provenance."""
+        self._data_status = {
+            "last_complete_date": status.get("last_complete_date"),
+            "requested_end": status.get("requested_end"),
+            "updated_at": status.get("updated_at"),
+            "data_age_days": status.get("data_age_days"),
+            "incomplete": bool(status.get("incomplete")),
+            "source": source,
+        }
+        return status
+
+    def _full_refetch_status(self, reason: str, previous_marker=None) -> dict:
+        """Fallback: fetch the requested range from scratch and publish it."""
+        logger.warning(
+            "Incremental update fell back to a full refetch: %s", reason,
+        )
+        # A fallback exists precisely because the cached selection may be
+        # stale or unreadable; resolve the constituent universe afresh rather
+        # than reusing whatever the old cache left in memory.
+        self._constituent_history = None
+        self._fetch_all_from_tushare()
+        panel_end = panel_last_date(self._prices)
+        marker, incomplete = complete_panel_marker(
+            self._prices,
+            delisted=self._delisted_symbols(self._metadata, panel_end),
+        )
+        extra = incremental_marker_extra(
+            last_complete_date=marker,
+            requested_end=self.end_date,
+            previous_last_complete_date=previous_marker,
+            new_sessions=0,
+            incomplete=incomplete,
+            source="full_refetch",
+        )
+        self._save_to_cache(self._cache_file(), extra=extra)
+        status = self._status_payload(
+            performed=False,
+            full_refetch=True,
+            last_complete_date=extra["last_complete_date"],
+            previous_last_complete_date=extra["previous_last_complete_date"],
+            updated_at=extra["updated_at"],
+            data_age_days=extra["data_age_days"],
+            incomplete=incomplete,
+            reason=reason,
+        )
+        write_incremental_status(self._cache_file(), status)
+        return self._remember_status(status, source="full_refetch")
+
+    def _incomplete_status(
+        self, reason: str, *, marker, missing: set[str] | None = None,
+    ) -> dict:
+        """Partial response: keep the old cache and do not advance the marker."""
+        logger.warning(
+            "Incremental update incomplete (%s); keeping the cached panel "
+            "through %s and not advancing the completion marker",
+            reason, marker,
+        )
+        status = self._status_payload(
+            performed=False,
+            last_complete_date=(
+                pd.Timestamp(marker).date().isoformat()
+                if marker is not None else None
+            ),
+            incomplete=True,
+            missing_symbols=sorted(str(code) for code in (missing or set()))[:20],
+            reason=reason,
+        )
+        write_incremental_status(self._cache_file(), status)
+        return self._remember_status(status, source="cache_manifest")
+
+    def update(self, start_date: str = None, end_date: str = None) -> dict:
+        """Append new exchange sessions to the cached panel (D32).
+
+        Steps: locate the newest compatible cache for this index and
+        (start, earlier end); read its completion marker (never the last row
+        alone); fetch ``marker + 1 session`` through the requested end with one
+        overlap session; verify the constituent universe is unchanged (a
+        change forces a full refetch); merge with ``keep="last"``; refresh
+        ``adj_factor`` for the whole cached range; refetch financials,
+        metadata and benchmark for the requested range; and publish
+        data+manifest atomically under the provider cache lock.
+
+        Any partial response returns ``incomplete=True`` with the old cache
+        untouched -- the marker only advances after a complete publish.
+        """
+        if start_date:
+            self.start_date = str(start_date)
+        if end_date:
+            self.end_date = str(end_date)
+        requested_end = pd.Timestamp(self.end_date).normalize()
+
+        candidates = self._incremental_cache_candidates()
+        if not candidates:
+            return self._full_refetch_status(
+                "no compatible cached panel for this index/start range"
+            )
+
+        # Coverage is judged by the completion marker, never by the cache file
+        # name: a cache fetched for a longer range can still have a marker
+        # behind the requested end (the last day was partial or the provider
+        # lagged). A longer file is a usable *base*, not proof of coverage.
+        covering = [item for item in candidates if item[0] <= requested_end]
+        end_ts, end_str, path, manifest = (
+            covering[-1] if covering else candidates[-1]
+        )
+        try:
+            self._load_from_cache(path, expected_end=end_str)
+        except Exception as exc:
+            return self._full_refetch_status(
+                f"cached panel could not be loaded: {exc}"
+            )
+
+        marker_raw = manifest.get("last_complete_date")
+        if not marker_raw or manifest.get("incomplete"):
+            return self._full_refetch_status(
+                "cached panel has no trustworthy completion marker"
+            )
+        marker = pd.Timestamp(marker_raw).normalize()
+        panel_end = panel_last_date(self._prices)
+        if panel_end is None or pd.Timestamp(panel_end).normalize() < marker:
+            # The data file is older than its marker (concurrent publish or a
+            # corrupt pair). Appending from this base could create a hole, so
+            # refetch instead.
+            return self._full_refetch_status(
+                "cached panel ends before its completion marker "
+                "(concurrent writer or corrupt cache)"
+            )
+        if requested_end <= marker:
+            status = self._status_payload(
+                performed=True,
+                last_complete_date=marker.date().isoformat(),
+                updated_at=manifest.get("updated_at"),
+                data_age_days=manifest.get("data_age_days"),
+                reason="completion marker already covers the requested end",
+            )
+            return self._remember_status(status, source="cache_manifest")
+        if end_ts > requested_end:
+            # The loaded panel runs past the requested end but its marker does
+            # not: use the rows up to the request as the append base and
+            # publish a requested-end cache.
+            self._prices = self._prices.loc[:pd.Timestamp(requested_end)]
+            logger.info(
+                "Newest cache %s extends past the requested end %s but its "
+                "marker is %s; appending up to the requested end",
+                end_str, self.end_date, marker.date(),
+            )
+
+        api = self.ts_api
+        if api is None:
+            raise RuntimeError("Tushare API not available")
+
+        # Universe/adjustment-basis guard: an index rebalance changes the
+        # panel beyond an append; refetch in full instead of mixing universes.
+        cached_codes: set[str] = set()
+        if self._constituent_history is not None and len(self._constituent_history):
+            cached_codes = {
+                str(code) for code in
+                self._constituent_history["ts_code"].dropna().unique()
+            }
+        fresh = self._fetch_constituents(api)
+        fresh_codes = {
+            str(code) for code in fresh["ts_code"].dropna().unique()
+        } if fresh is not None and len(fresh) else set()
+        if not fresh_codes:
+            return self._full_refetch_status(
+                "constituent universe could not be verified"
+            )
+        if not cached_codes:
+            return self._full_refetch_status(
+                "cached panel has no constituent history to append to"
+            )
+        if fresh_codes != cached_codes:
+            return self._full_refetch_status(
+                "constituent universe changed "
+                f"({len(cached_codes)} -> {len(fresh_codes)} symbols)"
+            )
+        self._constituent_history = fresh
+        codes = sorted(fresh_codes)
+        try:
+            self._metadata = self._fetch_stock_basic(api, codes)
+        except DataFetchIncompleteError as exc:
+            return self._incomplete_status(
+                f"metadata refetch failed: {exc}", marker=marker,
+            )
+
+        window_start = incremental_fetch_start(
+            marker, requested_end, overlap=INCREMENTAL_OVERLAP_SESSIONS,
+        )
+        if window_start is None:
+            status = self._status_payload(
+                performed=True,
+                last_complete_date=marker.date().isoformat(),
+                updated_at=manifest.get("updated_at"),
+                reason="no exchange session between the marker and the end",
+            )
+            return self._remember_status(status, source="cache_manifest")
+
+        try:
+            frames, adj_frames, _missing_daily = self._fetch_price_frames(
+                api, codes, str(window_start.date()), str(requested_end.date()),
+                strict=False,
+            )
+            new_prices = self._assemble_price_frames(frames, adj_frames)
+        except DataFetchIncompleteError as exc:
+            return self._incomplete_status(str(exc), marker=marker)
+
+        window_label = (
+            f"{pd.Timestamp(window_start).date()}..{requested_end.date()}"
+        )
+        if new_prices is None or new_prices.empty:
+            logger.warning(
+                "Incremental fetch for %s returned no rows; keeping the "
+                "cached panel (reported as incomplete/stale, not fresh)",
+                window_label,
+            )
+            status = self._status_payload(
+                performed=True,
+                last_complete_date=marker.date().isoformat(),
+                updated_at=manifest.get("updated_at"),
+                incomplete=True,
+                reason="provider returned no rows for the new sessions",
+            )
+            write_incremental_status(self._cache_file(), status)
+            return self._remember_status(status, source="cache_manifest")
+
+        boundary_symbols = symbols_on_date(self._prices, marker)
+        delisted_before_window = self._delisted_symbols(
+            self._metadata, window_start,
+        )
+        new_dates = [
+            day for day in pd.DatetimeIndex(
+                new_prices.index.get_level_values("date").unique()
+            ).normalize() if day > marker
+        ]
+        if not new_dates:
+            logger.warning(
+                "Incremental fetch for %s returned only overlap rows; "
+                "keeping the cached panel (reported as incomplete/stale)",
+                window_label,
+            )
+            status = self._status_payload(
+                performed=True,
+                last_complete_date=marker.date().isoformat(),
+                updated_at=manifest.get("updated_at"),
+                incomplete=True,
+                reason="provider returned no rows after the completion marker",
+            )
+            write_incremental_status(self._cache_file(), status)
+            return self._remember_status(status, source="cache_manifest")
+        window_symbols = {
+            str(code) for code in new_prices.index[
+                new_prices.index.get_level_values("date").isin(new_dates)
+            ].get_level_values("asset")
+        }
+        missing_window = (
+            boundary_symbols - window_symbols - delisted_before_window
+        )
+        if missing_window:
+            return self._incomplete_status(
+                "provider response is missing symbols that traded on the "
+                "completion marker",
+                marker=marker,
+                missing=missing_window,
+            )
+
+        merged = pd.concat([self._prices, new_prices]).sort_index()
+        merged = deduplicate_panel(merged, "prices")
+
+        # Refresh the divisor over the whole cached range (D32 req. 3): a
+        # corporate action / factor revision must never leave old rows on a
+        # different adjustment basis than the rows appended after it.
+        try:
+            factor_map, missing_refresh = self._fetch_adj_map(
+                api, codes,
+                str(merged.index.get_level_values("date").min().date()),
+                str(requested_end.date()),
+            )
+        except DataFetchIncompleteError as exc:
+            return self._incomplete_status(
+                f"adjustment-factor refresh failed: {exc}", marker=marker,
+            )
+        priced_assets = {
+            str(asset) for asset in merged.index.get_level_values("asset")
+        }
+        factor_assets = {
+            str(asset)
+            for asset in factor_map.index.get_level_values("asset")
+        }
+        uncovered = priced_assets - factor_assets
+        if missing_refresh or uncovered:
+            return self._incomplete_status(
+                "adjustment-factor refresh did not cover every priced symbol "
+                f"({len(missing_refresh | uncovered)} uncovered)",
+                marker=marker,
+                missing=missing_refresh | uncovered,
+            )
+        refreshed = factor_map.reindex(merged.index)
+        refreshed_mask = refreshed.notna() & np.isfinite(refreshed)
+        merged = merged.copy()
+        merged.loc[refreshed_mask, "adj_factor"] = refreshed[refreshed_mask]
+        # New rows must have received a refreshed factor; cached suspension
+        # fills may legitimately have no factor row on a suspended date and
+        # keep the factor carried from the last action.
+        appended_rows = (
+            merged.index.get_level_values("date") > marker
+        ) & merged["close"].notna()
+        unprotected = appended_rows & ~refreshed_mask
+        if bool(unprotected.any()) or bool(
+            (merged["close"].notna() & merged["adj_factor"].isna()).any()
+        ):
+            return self._incomplete_status(
+                "adjustment factors could not be refreshed for every priced "
+                "row", marker=marker,
+            )
+
+        merged = self._finalize_daily_prices(merged)
+
+        # A truncated last day must not advance the marker. Zero
+        # tolerance: without a suspension feed a missing name cannot be
+        # distinguished from truncation.
+        merged_dates = pd.DatetimeIndex(
+            merged.index.get_level_values("date").unique()
+        ).sort_values()
+        previous_symbols = (
+            symbols_on_date(merged, merged_dates[-2])
+            if len(merged_dates) >= 2 else set()
+        )
+        delisted_on_last = self._delisted_symbols(
+            self._metadata, panel_last_date(merged),
+        )
+        missing_last = last_day_missing_symbols(
+            merged, delisted=delisted_on_last,
+        )
+        if missing_last:
+            return self._incomplete_status(
+                "last session of the provider response is missing symbols "
+                f"present on the previous session ({len(missing_last)} of "
+                f"{len(previous_symbols)})",
+                marker=marker,
+                missing=missing_last,
+            )
+
+        merged_date_set = set(merged_dates.normalize())
+        expected_sessions = exchange_sessions(
+            marker + pd.Timedelta(days=1), panel_last_date(merged),
+        )
+        missing_dates = [
+            day for day in expected_sessions if day not in merged_date_set
+        ]
+        if missing_dates:
+            return self._incomplete_status(
+                "provider response is missing exchange sessions: "
+                + ", ".join(str(day.date()) for day in missing_dates[:5]),
+                marker=marker,
+            )
+
+        new_marker = panel_last_date(merged)
+        new_sessions = sessions_after(marker, new_marker)
+        old_prices = self._prices
+        self._prices = merged
+
+        # Financials/benchmark are date-range products, not per-session
+        # appends: refetch them against the extended range so the incremental
+        # dataset equals a full fetch byte-for-byte. A failure here keeps the
+        # old cache/marker intact and must not abort the research run.
+        try:
+            financials = self._fetch_financials(api, codes)
+            benchmark = self._fetch_index_daily(api)
+        except DataFetchIncompleteError as exc:
+            self._prices = old_prices
+            return self._incomplete_status(
+                f"financials/benchmark refetch failed: {exc}", marker=marker,
+            )
+        self._financials = financials
+        self._benchmark = benchmark
+
+        extra = incremental_marker_extra(
+            last_complete_date=new_marker,
+            requested_end=self.end_date,
+            previous_last_complete_date=marker,
+            new_sessions=new_sessions,
+            incomplete=False,
+            source="incremental",
+        )
+        self._save_to_cache(self._cache_file(), extra=extra)
+        status = self._status_payload(
+            performed=True,
+            new_sessions=new_sessions,
+            last_complete_date=extra["last_complete_date"],
+            previous_last_complete_date=extra["previous_last_complete_date"],
+            updated_at=extra["updated_at"],
+            data_age_days=extra["data_age_days"],
+            reason=f"appended {new_sessions} session(s) from {window_label}",
+        )
+        write_incremental_status(self._cache_file(), status)
+        logger.info(
+            "Incremental update appended %d session(s); completion marker %s",
+            new_sessions, extra["last_complete_date"],
+        )
+        return self._remember_status(status, source="incremental")

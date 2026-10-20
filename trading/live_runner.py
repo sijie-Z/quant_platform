@@ -2,7 +2,8 @@
 
 Orchestrates the complete daily trading workflow:
 1. Morning health check (data, cash, positions, risk limits)
-2. Multi-factor signal generation (momentum + volatility + RSI + MACD)
+2. Multi-factor signal generation (shared 7-factor equal-weight composite:
+   1/3/6-month momentum + 20/60-day volatility + RSI + MACD)
 3. Pre-trade risk validation (RiskMonitor)
 4. Order execution via broker (QMT sim or Paper)
 5. Parallel Paper Broker execution for TCA calibration
@@ -52,6 +53,12 @@ from quant_platform.trading.broker import (
     create_broker,
 )
 from quant_platform.trading.live_engine import ensure_raw_price_basis
+from quant_platform.trading.signals import (
+    DEFAULT_MIN_SIGNAL_SCORE,
+    SIGNAL_HISTORY_SESSIONS,
+    composite_signal,
+    rank_symbols,
+)
 from quant_platform.utils.exchange_calendar import is_trading_day, trading_days
 from quant_platform.utils.logging import get_logger
 
@@ -184,12 +191,21 @@ class LiveRunner:
         risk_monitor: RiskMonitor | None = None,
         store: Store | None = None,
         broker: Any | None = None,
+        min_signal_score: float = DEFAULT_MIN_SIGNAL_SCORE,
+        max_positions: int = 50,
         **broker_kwargs,
     ):
         self._initial_cash = initial_cash
         self._dual_track = dual_track
         self._session_id = ""
         self._broker_type_name = broker_type
+        # Entry threshold on the shared composite's [0, 1] percentile scale
+        # (the same default the web LiveTradingEngine uses).
+        self._min_signal_score = float(min_signal_score)
+        # Cap on how many top-ranked names are targeted (the engine's
+        # `n_stocks`). Selection count is configuration; the scores and their
+        # order come from the shared `rank_symbols`.
+        self._max_positions = max(int(max_positions), 0)
         # A real broker never falls back to the simulated book: a QMT outage
         # that silently becomes paper trading is indistinguishable from a
         # successful live run. connect() returning False is a hard failure.
@@ -219,6 +235,11 @@ class LiveRunner:
         # Market-data feed for real brokers. It must return fresh quotes;
         # synthetic random-walk prices are only allowed for the paper broker.
         self._price_provider: Callable[[list[str]], dict[str, float]] | None = None
+        # Historical daily closes for real brokers, used to warm up the
+        # shared composite (>= 127 sessions so 3/6-month momentum is live).
+        self._history_provider: (
+            Callable[[list[str], int], dict[str, list[float]]] | None
+        ) = None
 
         # Paper broker (for TCA comparison)
         self._paper_broker: PaperBroker | None = None
@@ -303,6 +324,63 @@ class LiveRunner:
         """
         self._price_provider = provider
 
+    def set_history_provider(
+        self,
+        provider: Callable[[list[str], int], dict[str, list[float]]],
+    ):
+        """Set the historical daily-close feed used to warm up the signal.
+
+        ``provider(codes, sessions)`` must return ``{code: [close, ...]}``
+        with trailing daily closes (oldest first), ending at the session
+        before the one being traded: the current cycle's quote is appended by
+        :meth:`set_prices`, so including it here would count it twice. The
+        runner requests ``SIGNAL_HISTORY_SESSIONS`` (127) sessions so the full
+        seven-factor composite -- including 3/6-month momentum -- is
+        computable on the first live cycle, matching the web engine's window.
+        A live broker without this feed falls back to whatever quotes its
+        cycles accumulate and logs a warning that the long-horizon factors
+        are unavailable.
+        """
+        self._history_provider = provider
+
+    def set_price_history(
+        self,
+        history: dict[str, list[float]],
+        price_basis: str = "raw",
+    ):
+        """Preload trailing daily closes used by the shared composite signal.
+
+        Replaces the stored history for each supplied symbol (later
+        :meth:`set_prices` calls keep appending to it). Only the trailing
+        ``SIGNAL_HISTORY_SESSIONS`` rows are kept, the same window the web
+        engine scores. Values must be raw traded prices. Do not include the
+        session that :meth:`set_prices` will also append, or that close is
+        counted twice.
+        """
+        basis = ensure_raw_price_basis(
+            price_basis, context="LiveRunner signal history",
+        )
+        self._price_basis = basis if basis != "unknown" else "raw"
+        for code, values in history.items():
+            cleaned: list[float] = []
+            for value in values:
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(price) and price > 0:
+                    cleaned.append(price)
+            if not cleaned:
+                continue
+            normalized = normalize_symbol(code)
+            self._price_history[normalized] = cleaned[-SIGNAL_HISTORY_SESSIONS:]
+            if len(cleaned) < SIGNAL_HISTORY_SESSIONS:
+                logger.info(
+                    "Signal history for %s has %d sessions (< %d); the "
+                    "3/6-month factors will be NaN for it",
+                    normalized, len(cleaned), SIGNAL_HISTORY_SESSIONS,
+                )
+
     def set_prices(
         self, prices: dict[str, float], price_basis: str = "raw",
     ):
@@ -317,75 +395,70 @@ class LiveRunner:
         )
         self._price_basis = basis if basis != "unknown" else "raw"
         normalized: dict[str, float] = {}
-        for code, price in prices.items():
+        for code, raw_price in prices.items():
+            try:
+                price = float(raw_price)
+            except (TypeError, ValueError):
+                logger.warning("Dropping non-numeric price for %s: %r", code, raw_price)
+                continue
+            # Same gate as the web engine's quote fetch: a NaN/inf/zero price
+            # would poison equity and every trailing factor window.
+            if not np.isfinite(price) or price <= 0:
+                logger.warning("Dropping invalid price for %s: %r", code, raw_price)
+                continue
             normalized[normalize_symbol(code)] = price
         self._current_prices.update(normalized)
         for code, price in normalized.items():
-            if code not in self._price_history:
-                self._price_history[code] = []
-            self._price_history[code].append(price)
+            history = self._price_history.setdefault(code, [])
+            history.append(price)
+            # Keep the same trailing window the web engine scores.
+            if len(history) > SIGNAL_HISTORY_SESSIONS:
+                del history[:-SIGNAL_HISTORY_SESSIONS]
 
     # ── Signal Generation ──
+
+    def _score_prices(self, price_history=None):
+        """Score the price history with the shared causal composite signal.
+
+        Defaults to the runner's accumulated ``_price_history`` for the
+        current universe; a ``(dates x symbols)`` DataFrame or
+        ``{symbol: prices}`` mapping may be passed explicitly (tests and
+        callers sharing one history with the web engine).
+
+        Returns a ``pd.Series`` on the [0, 1] percentile scale, NaN for
+        symbols without enough history.
+        """
+        if price_history is None:
+            price_history = {
+                code: self._price_history.get(code, [])
+                for code in self._universe
+            }
+        return composite_signal(price_history)
 
     def _generate_signals(self) -> list[dict]:
         """Generate multi-factor trading signals.
 
-        Uses 4-factor composite: momentum + volatility + RSI + MACD.
-        Returns list of {code, side, target_pct, strength, reason}.
+        Scores come from :func:`quant_platform.trading.signals.composite_signal`
+        -- the same causal 7-factor equal-weight composite the web
+        ``LiveTradingEngine`` uses (1/3/6-month momentum + 20/60-day
+        volatility + RSI + MACD), on a [0, 1] cross-sectional percentile
+        scale. Symbols without enough history are excluded (no synthetic
+        fallback: an invented score is not a signal).
+
+        Returns list of {code, side, target_value|quantity, strength, reason}.
         """
         signals = []
         if not self._universe or not self._current_prices:
             return signals
 
-        # Compute factor scores for each stock
-        scores = {}
-        rng = np.random.default_rng(42 + self._cycle_count)
-
-        for code in self._universe:
-            prices = self._price_history.get(code, [])
-            if len(prices) < 20:
-                # Use synthetic score for stocks with insufficient history
-                scores[code] = float(rng.normal(0.02, 0.08))
-                continue
-
-            arr = np.array(prices[-60:], dtype=np.float64)
-            current = arr[-1]
-
-            # Momentum (12-month, skip last month) — weight 0.35
-            if len(arr) >= 42:
-                mom = (arr[-21] - arr[0]) / max(arr[0], 1e-8)
-            else:
-                mom = 0.0
-
-            # Volatility (low vol premium) — weight 0.25
-            rets = np.diff(arr[-21:]) / arr[-21:-1]
-            vol = float(np.std(rets)) if len(rets) > 0 else 0.0
-            vol_score = -vol  # prefer low vol
-
-            # RSI reversal — weight 0.20
-            gains = np.maximum(np.diff(arr[-14:]), 0)
-            losses = -np.minimum(np.diff(arr[-14:]), 0)
-            avg_gain = float(np.mean(gains)) if len(gains) > 0 else 0
-            avg_loss = float(np.mean(losses)) if len(losses) > 0 else 1e-8
-            rs = avg_gain / max(avg_loss, 1e-8)
-            rsi = 100 - 100 / (1 + rs)
-            rsi_score = (50 - rsi) / 50  # prefer low RSI (reversal)
-
-            # MACD — weight 0.20
-            if len(arr) >= 26:
-                ema12 = self._ema(arr, 12)
-                ema26 = self._ema(arr, 26)
-                macd = float(ema12 - ema26)
-                macd_score = np.tanh(macd / max(current, 1e-8) * 100)
-            else:
-                macd_score = 0.0
-
-            composite = 0.35 * mom + 0.25 * vol_score + 0.20 * rsi_score + 0.20 * macd_score
-            scores[code] = float(composite)
-
-        # Rank and select top N long / bottom N short (if not long-only)
-        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
-        top_n = min(50, len(sorted_scores))
+        scores = self._score_prices()
+        ranked = rank_symbols(
+            scores,
+            limit=self._max_positions,
+            min_score=self._min_signal_score,
+        )
+        if not ranked:
+            return signals
 
         current_equity = self._get_equity()
         target_value_per_stock = current_equity * 0.04  # 4% per position
@@ -400,7 +473,7 @@ class LiveRunner:
         held = {
             normalize_symbol(p.code): p for p in self._broker.get_positions()
         }
-        wanted = {code for code, score in sorted_scores[:top_n] if score > 0.005}
+        wanted = {code for code, _score in ranked}
 
         # Exit anything that has dropped out of the target set.
         for ticker, pos in held.items():
@@ -415,9 +488,7 @@ class LiveRunner:
             })
 
         # Buy only the shortfall on names we want, not the whole target again.
-        for code, score in sorted_scores[:top_n]:
-            if score <= 0.005:  # threshold
-                continue
+        for code, score in ranked:
             price = self._current_prices.get(code, 0)
             if price <= 0:
                 continue
@@ -435,15 +506,6 @@ class LiveRunner:
             })
 
         return signals
-
-    @staticmethod
-    def _ema(arr: np.ndarray, period: int) -> np.ndarray:
-        alpha = 2.0 / (period + 1)
-        result = np.zeros_like(arr)
-        result[0] = arr[0]
-        for i in range(1, len(arr)):
-            result[i] = alpha * arr[i] + (1 - alpha) * result[i - 1]
-        return result[-1]
 
     # ── Execution ──
 
@@ -789,6 +851,14 @@ class LiveRunner:
         for code in self._universe:
             base_prices[code] = 10.0 + rng.uniform(5, 195)
 
+        # Warm up the signal window before the first traded session: the
+        # shared composite needs 126 daily returns for six-month momentum, so
+        # a run that starts cold never scores the long-horizon factors.
+        if self._is_simulated:
+            self._warmup_simulated_history(base_prices, rng)
+        else:
+            self._load_signal_history()
+
         failed_cycles = 0
         # D9: one broker/execution failure used to abort the entire multi-day
         # run and leave the session `active` with `_running=True` forever.
@@ -836,6 +906,57 @@ class LiveRunner:
         start = today - timedelta(days=max(days * 2 + 10, 30))
         sessions = trading_days(start, today)
         return [str(ts.date()) for ts in sessions[-days:]]
+
+    def _warmup_simulated_history(
+        self, base_prices: dict[str, float], rng: np.random.Generator,
+    ) -> None:
+        """Replay synthetic sessions before the first traded date.
+
+        The shared composite requires ``SIGNAL_HISTORY_SESSIONS`` (127) closes
+        for six-month momentum. These rows are strictly past data -- they are
+        generated before the first ``run_once`` and never include a traded
+        date -- so the simulated run exercises the same 7-factor score the
+        live engine uses instead of a short-horizon subset. Skipped when the
+        caller already supplied a history buffer.
+        """
+        if self._price_history:
+            return
+        for _ in range(SIGNAL_HISTORY_SESSIONS):
+            for code in self._universe:
+                daily_ret = rng.normal(0.0003, 0.01)
+                base_prices[code] = max(base_prices[code] * (1 + daily_ret), 0.5)
+            self.set_prices({
+                code: round(base_prices[code], 2) for code in self._universe
+            })
+
+    def _load_signal_history(self) -> None:
+        """Preload daily closes for a real-broker run via the history feed.
+
+        The web engine keeps a rolling quote buffer; a live runner only sees
+        one quote per cycle, so without a history preload its 3/6-month
+        factors would stay NaN indefinitely. The provider is asked for the
+        same window the engine scores.
+        """
+        if self._history_provider is not None:
+            try:
+                history = self._history_provider(
+                    list(self._universe), SIGNAL_HISTORY_SESSIONS,
+                ) or {}
+            except Exception as exc:
+                logger.error("Signal history provider failed: %s", exc)
+                history = {}
+            if history:
+                self.set_price_history(history)
+                return
+        shortest = min(
+            (len(self._price_history.get(code, [])) for code in self._universe),
+            default=0,
+        )
+        logger.warning(
+            "No signal history preloaded (shortest history %d < %d sessions); "
+            "3/6-month factors stay NaN until enough daily closes accumulate",
+            shortest, SIGNAL_HISTORY_SESSIONS,
+        )
 
     def _fresh_prices(self) -> dict[str, float]:
         """Fetch fresh quotes for a real-broker cycle, or raise."""

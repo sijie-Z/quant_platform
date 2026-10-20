@@ -64,6 +64,12 @@ class SyntheticDataProvider(DataProvider):
     adjusted_price_basis = "qfq"
     adjustment_factor_available = True
 
+    #: Synthetic data is regenerated deterministically for the requested
+    #: range; there is no cached panel to append to, and regenerating is
+    #: both cheap and exact. The incremental CLI path therefore warns and
+    #: performs a full fetch (never a silent no-op that leaves data stale).
+    supports_incremental = False
+
     def __init__(
         self,
         n_stocks: int = 500,

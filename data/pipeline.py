@@ -61,7 +61,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from quant_platform.data.providers.base import DataProvider
+from quant_platform.data.providers.base import (
+    DataProvider,
+    expected_data_end,
+    panel_last_date,
+    sessions_after,
+)
 from quant_platform.data.schema import (
     DataContractError,
     DataQualityError,
@@ -234,6 +239,11 @@ class DataPipeline:
         # Cached (date x asset) point-in-time sector panel.
         self._sector_panel: pd.DataFrame | None = None
 
+        # Completion-marker/freshness record of the loaded panel (D32),
+        # populated by run()/get_data_freshness(). ``data_age_days`` is
+        # measured in exchange sessions, not calendar days.
+        self.data_freshness: dict = {}
+
     def run(self) -> None:
         """Execute the full ETL pipeline.
 
@@ -326,6 +336,7 @@ class DataPipeline:
         self._compute_returns()
         self._align()
         self.prices.attrs.update(self.price_basis_info())
+        self.data_freshness = self.get_data_freshness()
 
         logger.info("Pipeline complete: %d assets, %d dates",
                      len(self.valid_assets) if self.valid_assets is not None else 0,
@@ -343,6 +354,59 @@ class DataPipeline:
             "adjustment_factor_available": bool(
                 self.adjustment_factor_available
             ),
+        }
+
+    def get_data_freshness(self) -> dict:
+        """Completion marker and exchange-session age of the loaded panel.
+
+        ``last_complete_date`` comes from the provider's cache manifest (D32);
+        it is deliberately *not* the last row of the panel -- a partial last
+        day must never be advertised as complete. ``data_age_days`` counts
+        exchange sessions between that marker and the last session a panel
+        could be expected to contain now (``min(requested_end, today)``), so a
+        historical backtest is not reported stale just because wall-clock time
+        moved on. Providers without a marker fall back to the panel's last
+        date.
+
+        The staleness *threshold* belongs to configuration
+        (``data.max_staleness_days``); this method exposes the measurement so
+        CLI/API callers can warn (research) or fail closed (live/decisive).
+        """
+        provider_status: dict = {}
+        hook = getattr(self.provider, "data_status", None)
+        if callable(hook):
+            try:
+                value = hook()
+                if isinstance(value, dict):
+                    provider_status = value
+            except Exception as exc:  # freshness must not kill a run
+                logger.warning("Provider data_status() failed: %s", exc)
+
+        panel_date = panel_last_date(self.prices)
+        marker = provider_status.get("last_complete_date") or panel_date
+        requested_end = provider_status.get("requested_end") or str(
+            self.end_date.date()
+        )
+        age: int | None = None
+        if marker is not None:
+            try:
+                age = sessions_after(marker, expected_data_end(requested_end))
+            except (TypeError, ValueError) as exc:
+                logger.warning("Could not compute data age: %s", exc)
+        return {
+            "last_complete_date": (
+                pd.Timestamp(marker).date().isoformat()
+                if marker is not None and pd.notna(marker) else None
+            ),
+            "data_date": (
+                pd.Timestamp(panel_date).date().isoformat()
+                if panel_date is not None and pd.notna(panel_date) else None
+            ),
+            "requested_end": str(requested_end),
+            "data_age_days": age,
+            "incomplete": bool(provider_status.get("incomplete", False)),
+            "updated_at": provider_status.get("updated_at"),
+            "source": provider_status.get("source", "panel"),
         }
 
     @staticmethod

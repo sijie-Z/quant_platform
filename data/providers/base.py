@@ -10,6 +10,7 @@ import json
 import os
 import time
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,17 @@ logger = get_logger(__name__)
 # convention, so a cache written under old semantics is rejected (and
 # refetched) instead of being replayed as current data.
 CACHE_MANIFEST_SUFFIX = ".manifest.json"
+
+# Sidecar recording the outcome of the most recent *incremental attempt*.
+# A partial response never touches the data file or its version manifest (D32
+# completion-marker rule: the marker only advances after a complete publish),
+# but the failed attempt must still be visible to provenance and operators.
+INCREMENTAL_STATUS_SUFFIX = ".incremental.json"
+
+#: Sessions re-fetched before the first new session on every incremental
+#: update. One overlap session is enough to detect a provider that revised
+#: the boundary row; the merge is last-wins on ``(date, asset)``.
+INCREMENTAL_OVERLAP_SESSIONS = 1
 
 
 def schema_version() -> int:
@@ -106,6 +118,303 @@ def cache_manifest_matches(
         return False
     return adjustment is None or str(manifest.get("adjustment", "")) == str(
         adjustment
+    )
+
+
+def exchange_sessions(start, end) -> pd.DatetimeIndex:
+    """Exchange sessions in ``[start, end]`` (never calendar/business days)."""
+    from quant_platform.utils.exchange_calendar import trading_days
+
+    return trading_days(start, end)
+
+
+def incremental_fetch_start(
+    last_complete_date,
+    requested_end,
+    *,
+    overlap: int = INCREMENTAL_OVERLAP_SESSIONS,
+) -> pd.Timestamp | None:
+    """First session of the incremental fetch window.
+
+    The window starts at ``last_complete_date + 1 exchange session`` but is
+    extended backwards by ``overlap`` sessions so a provider that revised the
+    boundary rows is re-read. Returns ``None`` when the marker already covers
+    the requested end (nothing to fetch).
+
+    Calendar arithmetic is never used: ``last + 1 day`` can be a weekend or an
+    exchange holiday, and treating it as a session is the classic off-by-one
+    that either skips a real session or forges a non-session row.
+    """
+    last = pd.Timestamp(last_complete_date).normalize()
+    end = pd.Timestamp(requested_end).normalize()
+    if end <= last:
+        return None
+    overlap = max(0, int(overlap))
+    # Enough lookback to always contain `overlap` sessions before `last`.
+    lookback = pd.Timedelta(days=max(21, 4 * overlap + 7))
+    sessions = exchange_sessions(last - lookback, end)
+    position = int(sessions.searchsorted(last, side="right"))
+    if position >= len(sessions):
+        return None
+    return sessions[max(0, position - overlap)]
+
+
+def sessions_after(last_date, until_date) -> int:
+    """Number of exchange sessions strictly after ``last_date`` up to ``until``.
+
+    This is the unit of ``data_age_days``: a marker on Friday and a requested
+    end on the following Tuesday is 2 exchange sessions old (Monday, Tuesday),
+    not 4 calendar days. Returns 0 when ``until`` is not later than
+    ``last_date`` (a panel can cover a future requested end).
+    """
+    last = pd.Timestamp(last_date).normalize()
+    until = pd.Timestamp(until_date).normalize()
+    if until <= last:
+        return 0
+    return int(len(exchange_sessions(last + pd.Timedelta(days=1), until)))
+
+
+def expected_data_end(requested_end, today=None) -> pd.Timestamp:
+    """The last session a panel can be expected to contain right now.
+
+    ``min(requested_end, today)``: a historical backtest is not stale because
+    wall-clock time moved on, while a daily refresh with an end date in the
+    future can only be as complete as today's session.
+    """
+    end = pd.Timestamp(requested_end).normalize()
+    current = pd.Timestamp(today).normalize() if today is not None else (
+        pd.Timestamp.now().normalize()
+    )
+    return min(end, current)
+
+
+def panel_last_date(prices: pd.DataFrame | None) -> pd.Timestamp | None:
+    """Last date of a ``(date, asset)`` panel (None when empty)."""
+    if prices is None or len(prices) == 0:
+        return None
+    if isinstance(prices.index, pd.MultiIndex):
+        return pd.Timestamp(prices.index.get_level_values("date").max())
+    return pd.Timestamp(prices.index.max())
+
+
+def canonicalize_panel_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalise a ``(date, asset)`` MultiIndex to canonical levels.
+
+    Two panels with identical row values can still differ in *level order*
+    (pandas keeps factorisation order from ``set_index``/``concat``), and
+    ``unstack`` turns that order into the column order of the pipeline
+    panels. Rebuilding the levels sorted -- and dropping inferred
+    ``freq=<BusinessDay>`` metadata that ``pd.concat`` adds when dates happen
+    to form a contiguous business-day range -- makes an incremental panel
+    byte-identical to a full fetch over the same range.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    if list(df.index.names) != ["date", "asset"]:
+        return df
+    dates = df.index.get_level_values("date")
+    assets = df.index.get_level_values("asset")
+    date_codes, date_levels = pd.factorize(dates, sort=True)
+    asset_codes, asset_levels = pd.factorize(assets, sort=True)
+    df = df.copy(deep=False)
+    df.index = pd.MultiIndex(
+        levels=[
+            pd.DatetimeIndex(date_levels, name="date"),
+            pd.Index(asset_levels, name="asset"),
+        ],
+        codes=[date_codes, asset_codes],
+        names=["date", "asset"],
+        verify_integrity=False,
+    )
+    return df
+
+
+def deduplicate_panel(
+    df: pd.DataFrame,
+    dataset: str = "panel",
+    *,
+    keep: str = "last",
+) -> pd.DataFrame:
+    """Drop duplicate ``(date, asset)`` rows and assert none remain.
+
+    Incremental appends overlap the cached range by at least one session, so
+    the merged frame is expected to contain duplicates. ``keep="last"`` is the
+    documented policy: freshly fetched rows supersede cached ones on the
+    boundary. The post-condition is part of the contract -- a provider that
+    still returns duplicates would otherwise fail later inside ``unstack``.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    duplicated = df.index.duplicated(keep=keep)
+    count = int(duplicated.sum())
+    if count:
+        logger.warning(
+            "%s: dropped %d duplicate (date, asset) row(s) while appending "
+            "(keep=%r)", dataset, count, keep,
+        )
+        df = df[~duplicated]
+    if df.index.duplicated(keep=keep).any():
+        raise ValueError(
+            f"{dataset}: duplicate (date, asset) rows remain after "
+            f"deduplication (keep={keep!r})"
+        )
+    return canonicalize_panel_index(df)
+
+
+def symbols_on_date(frame: pd.DataFrame, date) -> set[str]:
+    """Asset labels present on one date of a ``(date, asset)`` panel."""
+    if frame is None or frame.empty or not isinstance(frame.index, pd.MultiIndex):
+        return set()
+    target = pd.Timestamp(date).normalize()
+    dates = pd.DatetimeIndex(
+        frame.index.get_level_values("date")
+    ).normalize()
+    if not (dates == target).any():
+        return set()
+    return {str(asset) for asset in frame.index[dates == target].get_level_values("asset")}
+
+
+def last_day_missing_symbols(
+    frame: pd.DataFrame,
+    *,
+    delisted: set[str] | None = None,
+) -> set[str]:
+    """Symbols present on the previous session but missing on the last one.
+
+    A partial provider response can truncate the last day of the window
+    without failing a batch outright (the symbols appeared earlier in the
+    window). The completion marker must not advance past such a day. Symbols
+    whose provider metadata says they were delisted are exempt.
+    """
+    if frame is None or frame.empty or not isinstance(frame.index, pd.MultiIndex):
+        return set()
+    dates = pd.DatetimeIndex(
+        frame.index.get_level_values("date").unique()
+    ).sort_values()
+    if len(dates) < 2:
+        return set()
+    previous = symbols_on_date(frame, dates[-2])
+    current = symbols_on_date(frame, dates[-1])
+    exempt = {str(code) for code in (delisted or set())}
+    return previous - current - exempt
+
+
+def complete_panel_marker(
+    frame: pd.DataFrame,
+    *,
+    delisted: set[str] | None = None,
+) -> tuple[pd.Timestamp | None, bool]:
+    """Completion marker for a freshly fetched panel.
+
+    The last row alone is not proof of completeness: a provider can return a
+    truncated final cross-section. When the last session is missing symbols
+    present on the previous one (delisted names exempt), the marker is held
+    back to the previous session and ``incomplete`` is reported. Without a
+    suspension feed a legitimately suspended name looks the same as a
+    truncation, so the conservative reading wins -- the next append re-reads
+    the boundary and advances once the symbol reappears.
+    """
+    last = panel_last_date(frame)
+    if last is None:
+        return None, False
+    missing = last_day_missing_symbols(frame, delisted=delisted)
+    if not missing:
+        return last, False
+    dates = pd.DatetimeIndex(
+        frame.index.get_level_values("date").unique()
+    ).sort_values()
+    return (dates[-2] if len(dates) >= 2 else None), True
+
+
+def incremental_marker_extra(
+    *,
+    last_complete_date,
+    requested_end,
+    previous_last_complete_date=None,
+    new_sessions: int = 0,
+    incomplete: bool = False,
+    source: str = "full_fetch",
+) -> dict[str, Any]:
+    """Manifest fields of the D32 completion marker (JSON-friendly)."""
+    marker = (
+        pd.Timestamp(last_complete_date).normalize()
+        if last_complete_date is not None else None
+    )
+    end = pd.Timestamp(requested_end).normalize()
+    age = None
+    if marker is not None:
+        age = sessions_after(marker, expected_data_end(end))
+    previous = (
+        pd.Timestamp(previous_last_complete_date).normalize()
+        if previous_last_complete_date is not None else None
+    )
+    return {
+        "last_complete_date": marker.date().isoformat() if marker is not None else None,
+        "previous_last_complete_date": (
+            previous.date().isoformat() if previous is not None else None
+        ),
+        "requested_end": end.date().isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
+        "data_age_days": age,
+        "incomplete": bool(incomplete),
+        "new_sessions": int(new_sessions),
+        "incremental_source": str(source),
+    }
+
+
+def incremental_status_path(path: str | Path) -> Path:
+    path = Path(path)
+    return path.with_name(f"{path.name}{INCREMENTAL_STATUS_SUFFIX}")
+
+
+def write_incremental_status(path: str | Path, status: dict[str, Any]) -> None:
+    """Atomically record the outcome of an incremental attempt.
+
+    This sidecar is deliberately separate from the data file and its version
+    manifest: an incomplete attempt must never modify (or advance) either.
+    """
+    target = incremental_status_path(path)
+    tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(status, handle, sort_keys=True, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except OSError as exc:
+        logger.warning("Could not write incremental status %s: %s", target, exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def read_incremental_status(path: str | Path) -> dict[str, Any] | None:
+    target = incremental_status_path(path)
+    try:
+        with open(target, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def provider_cache_lock(directory: str | Path, *, timeout: float | None = None):
+    """Cross-process lock serialising provider-cache publication.
+
+    Reuses the pipeline cache's ``_CrossProcessLock`` (``msvcrt.locking`` on
+    Windows, ``fcntl.flock`` on POSIX) so an append and a pipeline-cache save
+    share the same well-tested primitives. ``__enter__`` returns ``True`` when
+    the lock was acquired and ``False`` on timeout; it never raises for
+    contention.
+    """
+    from quant_platform.utils.cache import DEFAULT_LOCK_TIMEOUT, _CrossProcessLock
+
+    return _CrossProcessLock(
+        Path(directory) / ".provider_cache.lock",
+        timeout=(
+            DEFAULT_LOCK_TIMEOUT if timeout is None else float(timeout)
+        ),
     )
 
 
@@ -279,6 +588,50 @@ class DataProvider(ABC):
     #: corporate-action factor in the price level (hfq) or ship a divisor
     #: column must declare it; it is part of every cache identity.
     price_adjustment: str = "provider-defined"
+
+    #: Whether :meth:`update` can append new sessions to an existing cache.
+    #: Callers (the CLI) must fall back to a full fetch -- with a warning --
+    #: when this is False or when ``update`` raises ``NotImplementedError``.
+    #: A provider that does not advertise this must never be treated as
+    #: "nothing new": stale data is reported by the freshness gate, not
+    #: assumed fresh because an append was skipped.
+    supports_incremental: bool = False
+
+    def update(self, start_date: str, end_date: str) -> dict[str, Any]:
+        """Append the sessions after the cached completion marker, if any.
+
+        Contract:
+
+        * Return a JSON-friendly status dict with at least ``supported``,
+          ``performed``, ``full_refetch``, ``new_sessions``,
+          ``last_complete_date``, ``requested_end``, ``incomplete`` and
+          ``reason``.
+        * Never advance ``last_complete_date`` past data that was not
+          completely fetched. A partial response returns ``incomplete=True``
+          (or raises :class:`DataFetchIncompleteError`) and leaves the data
+          file *and* its manifest untouched.
+        * Publish the appended panel atomically (temp file + ``os.replace``
+          under :func:`provider_cache_lock`) and write the version manifest
+          only after the data write succeeded.
+        * The merged panel must be byte-identical to a full fetch over the
+          same range: overlap rows win (``keep="last"``), no duplicate
+          ``(date, asset)`` rows remain, and corporate-action factors are
+          refreshed so adjusted series stay continuous.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support incremental updates; "
+            "perform a full fetch instead"
+        )
+
+    def data_status(self) -> dict[str, Any]:
+        """Completion marker/provenance of the currently loaded data.
+
+        Keys (any may be absent): ``last_complete_date``, ``requested_end``,
+        ``updated_at``, ``incomplete`` and ``source``. Providers that do not
+        maintain a marker return an empty dict; callers then derive freshness
+        from the panel's last date.
+        """
+        return {}
 
     def cache_identity(self) -> dict[str, Any]:
         """Describe the inputs that determine this provider's fetched data.

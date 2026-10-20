@@ -404,7 +404,7 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
    Baostock raw+hfq 双取），`get_raw_close()` 供成交/估值、`get_adjusted_close()` 供研究，
    货币路径在只有复权价时 fail closed；符号统一为 `CODE.EXCHANGE`（含北交所 30% 限价）。
    残余：Postgres/Adata 尚未声明基准，paper 引擎未做公司行动股数/分红记账。
-7. **增量数据**：无增量 append 路径（D32），每次按区间重新拉取。
+7. **增量数据**：已实现（D32）。`run --incremental` / `cache refresh --incremental` 只追加新交易日，边界重叠一天并 `keep="last"` 去重；每次更新全量刷新复权因子（除权日不产生假跳变）；数据写成功后才推进完成标记；部分响应不推进并保留旧缓存；`data.max_staleness_days` 对研究告警、对决定性运行 fail closed。边界：合成数据源 `supports_incremental=False`（回退全量）；财务/基准在追加时仍全量刷新；停牌与截断的区分偏保守。
 8. **ST 历史**：Tushare/Baostock 不提供 ST 公告历史（`st_available=False`，
    不伪造全 False 列）；合成数据提供，用于 PIT 验证。
 9. **产品定位**（#75）与 `framework/contracts/`、`kernel/`、`services/` 等零运行时
@@ -423,12 +423,14 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
 |---|---|
 | 缓存 provenance（D12/D13/D33-D36） | pipeline 缓存键在 provider 解析之后生成，包含物化配置（含 schema 默认值）、有效 provider 链（Validated + secondary）、实际采样符号集哈希、复权基、日期范围与 `DATA_SCHEMA_VERSION`；Tushare/Baostock provider 缓存带 schema/复权版本清单，不匹配即重取；`--force` 重算并原子覆盖，新增 `cache refresh`；仅真正损坏才删除缓存（瞬时 IO 错误保留）；完整 provenance 清单并入 `metrics.json`，缓存命中不会把 synthetic 伪装成真实 provider；跨进程锁 + 唯一临时文件 + 陈旧临时文件清理，保存失败保留旧条目 |
 | 价格基准/符号（D15/D41/D18/D19/D30） | 面板携带 `price_basis` / `adjusted_price_basis` / `adjustment_factor_available`；Tushare 改为 raw + `adj_factor`、Baostock raw(`adjustflag=3`)+hfq 双取、合成数据显式声明；`get_raw_close()` 用于 paper/live 成交与估值，只有复权价时 `DataQualityError`（fail closed）；`get_adjusted_close()` 供研究且与旧 hfq 序列逐点一致；双重复权守卫；`shared/symbols.py` 统一 `CODE.EXCHANGE`（前后缀、`sh.688`、北交所 4/8/920 与 30% 限价），pipeline 资产标签与 QMT/realtime/runner/API 边界统一规范化 |
-| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **2,773 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
+| 增量数据（D32） | provider 契约新增 `supports_incremental` / `update()` / `data_status()`；Tushare/Baostock 增量追加（完成标记 +1 交易日、重叠一天、`keep="last"` 去重、全量复权因子刷新、符号/行覆盖检查、原子 data→manifest 发布）；部分响应不推进标记并保留旧缓存；`run --incremental` / `cache refresh --incremental`；`data.max_staleness_days` 研究告警、决定性运行 fail closed；freshness 写入 provenance 与 `metrics.json`；合成数据源显式不支持并回退全量 |
+| 实盘信号统一 | 新增 `trading/signals.py::composite_signal`（因果 7 因子等权复合 + 横截面百分位 [0,1]）；Web `LiveTradingEngine`、CLI `LiveRunner`、`LiveSignalGenerator` 等权分支共用；删除 CLI 的 4 因子加权与短历史 RNG 兜底；127 日窗口预热，真实券商路径通过 `set_history_provider`（`main.py trade` 已接线 Baostock 日线），同一历史两条路径分数逐点一致 |
+| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **2,843 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
 
-**当前计数（2026-10-21 实测）**：2,502 个测试函数、2,776 条用例
-（2,773 passed / 3 skipped）、201 个测试文件、约 230 个非测试 Python 文件、
+**当前计数（2026-10-21 实测）**：2,572 个测试函数、2,846 条用例
+（2,843 passed / 3 skipped）、205 个测试文件、约 231 个非测试 Python 文件、
 99 HTTP + 1 WebSocket、21 个 CLI 命令、37 个 Vue 组件。
 
 **仍未处理（诚实清单）**：多租户隔离（#75）；7 个分析端点 `available:false`；
-WS `?token=` 旧回退；Postgres/Adata 价格基准声明；增量数据更新（D32，仅有设计）；
+WS `?token=` 旧回退；Postgres/Adata 价格基准声明；
 paper 引擎公司行动股数/分红记账；交易所日历 2027 年需通过 `QUANT_EXCHANGE_HOLIDAYS` 追加。

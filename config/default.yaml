@@ -22,6 +22,10 @@ data:
   # Set true (or pass --allow-synthetic-fallback) only for development: the
   # fallback is recorded in metrics.json/manifest as synthetic.
   allow_synthetic_fallback: false
+  # Freshness gate (exchange sessions): a completion marker more than this
+  # many sessions behind the requested end is stale. Research runs warn;
+  # live/decisive runs fail closed. 3 sessions tolerates a weekend + T+1 lag.
+  max_staleness_days: 3
 
 # --- Factors ---
 factors:

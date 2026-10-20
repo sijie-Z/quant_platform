@@ -37,6 +37,14 @@ class DataProviderUnavailableError(RuntimeError):
     """A configured real data provider could not be used (fail closed)."""
 
 
+class DataStalenessError(RuntimeError):
+    """The loaded panel is older than ``data.max_staleness_days`` sessions.
+
+    Raised by the freshness gate for live/decisive runs; research runs log the
+    same message as a warning instead of failing.
+    """
+
+
 def _install_shutdown_handlers(cleanup):
     """Install SIGTERM/SIGINT/atexit shutdown for a CLI entry point (S16).
 
@@ -278,6 +286,8 @@ def _build_data_manifest(
     config,
     data_date: str = "",
     payload_assets=None,
+    freshness: dict | None = None,
+    incremental: dict | None = None,
 ) -> dict:
     """Provenance record stored alongside a cached data stage (D35).
 
@@ -285,7 +295,9 @@ def _build_data_manifest(
     symbol-set hash, adjustment basis, data date, schema version, creation
     time and app version. A cache hit serves this record, not the current
     run's requested provider, so a synthetic fallback can never masquerade as
-    a real-provider result.
+    a real-provider result. D32 adds the completion marker/freshness record
+    (``last_complete_date``, ``data_age_days`` in exchange sessions,
+    ``incomplete``) and the incremental-update summary.
     """
     from datetime import UTC, datetime
 
@@ -308,6 +320,8 @@ def _build_data_manifest(
         }
     else:
         validation = {"wrapper": None}
+    freshness = dict(freshness or {})
+    incremental_summary = incremental or resolution.get("incremental")
     return {
         "requested_provider": resolution.get("requested_provider"),
         "effective_provider": resolution.get("effective_provider"),
@@ -331,6 +345,11 @@ def _build_data_manifest(
         "fallback_allowed": bool(resolution.get("allow_fallback")),
         "failures": list(resolution.get("failures") or []),
         "validation": validation,
+        "last_complete_date": freshness.get("last_complete_date"),
+        "data_age_days": freshness.get("data_age_days"),
+        "incomplete": bool(freshness.get("incomplete", False)),
+        "freshness": freshness,
+        "incremental": incremental_summary,
     }
 
 
@@ -404,6 +423,220 @@ def _payload_manifest_coherent(payload, manifest: dict | None) -> bool:
     return all(provenance.get(field) == manifest.get(field) for field in fields)
 
 
+def _max_staleness_days(config) -> int:
+    """Configured freshness threshold in exchange sessions (default 3)."""
+    value = getattr(getattr(config, "data", None), "max_staleness_days", 3)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid data.max_staleness_days=%r; using 3", value,
+        )
+        return 3
+
+
+def _freshness_from_values(
+    *,
+    last_complete_date,
+    data_date,
+    requested_end,
+    max_staleness_days: int,
+    incomplete: bool = False,
+    updated_at=None,
+    source: str = "provenance",
+) -> dict:
+    """Measure panel age in exchange sessions and decide staleness."""
+    from quant_platform.data.providers.base import (
+        expected_data_end,
+        sessions_after,
+    )
+
+    anchor = last_complete_date or data_date
+    age: int | None = None
+    if anchor:
+        try:
+            age = sessions_after(anchor, expected_data_end(requested_end))
+        except (TypeError, ValueError) as exc:
+            logger.warning("Could not compute data age from %r: %s", anchor, exc)
+    stale = bool(age is not None and age > max_staleness_days)
+    return {
+        "last_complete_date": last_complete_date,
+        "data_date": data_date,
+        "requested_end": str(requested_end),
+        "data_age_days": age,
+        "max_staleness_days": int(max_staleness_days),
+        "stale": stale,
+        "incomplete": bool(incomplete),
+        "updated_at": updated_at,
+        "source": source,
+    }
+
+
+def _freshness_from_provenance(provenance: dict | None, config) -> dict:
+    """Recompute freshness from a (possibly cached) provenance record.
+
+    Age is recomputed at load time against the current wall clock/requested
+    end: a stored ``data_age_days`` from a week ago must not make yesterday's
+    cached panel look fresh.
+    """
+    provenance = provenance or {}
+    stored = provenance.get("freshness") or {}
+    return _freshness_from_values(
+        last_complete_date=(
+            stored.get("last_complete_date")
+            or provenance.get("last_complete_date")
+        ),
+        data_date=stored.get("data_date") or provenance.get("data_date"),
+        requested_end=(
+            stored.get("requested_end")
+            or provenance.get("end_date")
+            or getattr(getattr(config, "data", None), "end_date", "")
+        ),
+        max_staleness_days=_max_staleness_days(config),
+        incomplete=bool(
+            stored.get("incomplete", provenance.get("incomplete", False))
+        ),
+        updated_at=stored.get("updated_at"),
+        source=stored.get("source", "provenance"),
+    )
+
+
+def _attach_freshness(provenance: dict | None, config) -> dict:
+    """Store the freshness record in provenance with top-level mirrors."""
+    freshness = _freshness_from_provenance(provenance, config)
+    if isinstance(provenance, dict):
+        provenance["freshness"] = freshness
+        provenance["last_complete_date"] = freshness["last_complete_date"]
+        provenance["data_age_days"] = freshness["data_age_days"]
+        provenance["stale"] = freshness["stale"]
+        provenance["incomplete"] = freshness["incomplete"]
+    return freshness
+
+
+def _enforce_freshness(
+    provenance: dict | None,
+    config,
+    *,
+    context: str = "research",
+    fail_closed: bool = False,
+) -> dict:
+    """Apply the freshness gate: warn for research, fail closed for live.
+
+    ``data.max_staleness_days`` (default 3) is measured in exchange sessions
+    between the completion marker and ``min(requested_end, today)``. A stale
+    research panel is served with a WARNING; a live/decisive run raises
+    :class:`DataStalenessError` rather than trading on aged data.
+    """
+    freshness = _attach_freshness(provenance, config)
+    message = (
+        "Data is stale: last complete session "
+        f"{freshness['last_complete_date']} is "
+        f"{freshness['data_age_days']} exchange session(s) behind the "
+        f"expected end {freshness['requested_end']} (max "
+        f"{freshness['max_staleness_days']})"
+    )
+    if freshness["stale"]:
+        if fail_closed:
+            raise DataStalenessError(
+                message + f"; refusing to run {context} on stale data"
+            )
+        logger.warning("%s; continuing with a warning (%s run)", message, context)
+    if freshness["incomplete"]:
+        logger.warning(
+            "The provider reported an incomplete data update; the panel is "
+            "the last complete snapshot (marker %s)",
+            freshness["last_complete_date"],
+        )
+    return freshness
+
+
+def _incremental_summary_line(provenance: dict | None, freshness: dict) -> str:
+    """One-line CLI summary required by D32.
+
+    ``data: <n> new sessions appended, data_date=..., stale=...``
+    """
+    provenance = provenance or {}
+    appended = int((provenance.get("incremental") or {}).get("new_sessions") or 0)
+    return (
+        f"data: {appended} new sessions appended, "
+        f"data_date={provenance.get('data_date') or ''}, "
+        f"stale={'yes' if freshness.get('stale') else 'no'}"
+    )
+
+
+def _run_incremental_update(resolution: dict, config) -> dict:
+    """Ask the effective provider to append new sessions (D32).
+
+    Returns a JSON-friendly summary; never raises for an unsupported provider
+    (the CLI falls back to a full fetch with a WARNING). A provider that
+    raises ``NotImplementedError`` despite advertising support is treated the
+    same way -- an append is optional, silently treating stale data as fresh
+    is not (the freshness gate still applies).
+    """
+    provider = resolution.get("provider")
+    requested_end = str(config.data.end_date)
+    unsupported = {
+        "supported": False,
+        "performed": False,
+        "full_refetch": True,
+        "new_sessions": 0,
+        "requested_end": requested_end,
+        "incomplete": False,
+        "reason": "",
+    }
+    if resolution.get("validated"):
+        logger.warning(
+            "--incremental: validated multi-source runs cannot attest which "
+            "sources contribute to an append; performing a full fetch"
+        )
+        return {
+            **unsupported,
+            "reason": "validated multi-source run cannot append",
+        }
+    if not bool(getattr(provider, "supports_incremental", False)):
+        logger.warning(
+            "--incremental: provider %s does not support incremental updates; "
+            "performing a full fetch",
+            type(provider).__name__,
+        )
+        return {
+            **unsupported,
+            "reason": "provider does not support incremental updates",
+        }
+    try:
+        summary = provider.update(
+            str(config.data.start_date), requested_end,
+        )
+    except NotImplementedError as exc:
+        logger.warning(
+            "--incremental: provider %s refused to append (%s); performing "
+            "a full fetch", type(provider).__name__, exc,
+        )
+        return {
+            **unsupported,
+            "reason": f"provider refused to append: {exc}",
+        }
+    summary = dict(summary or {})
+    summary.setdefault("supported", True)
+    summary.setdefault("requested_end", requested_end)
+    summary.setdefault("incomplete", False)
+    summary.setdefault("performed", False)
+    summary.setdefault("new_sessions", 0)
+    if summary.get("incomplete"):
+        logger.warning(
+            "Incremental data update incomplete: %s (cached panel kept; "
+            "freshness gate applies)", summary.get("reason"),
+        )
+    elif summary.get("full_refetch"):
+        logger.info(
+            "Incremental update fell back to a full refetch: %s",
+            summary.get("reason"),
+        )
+    else:
+        logger.info("Incremental update: %s", summary.get("reason") or "ok")
+    return summary
+
+
 def _load_data_stage(
     cache,
     cache_key: str,
@@ -414,6 +647,7 @@ def _load_data_stage(
     write_cache: bool,
     use_tushare: bool = False,
     use_baostock: bool = False,
+    incremental: bool = False,
 ):
     """Load the data stage from cache or recompute and (over)write it.
 
@@ -421,6 +655,14 @@ def _load_data_stage(
     atomically replaced instead of being left behind (D33). ``--no-cache`` is
     both False. A provider whose universe cannot be determined cheaply is not
     cached at all (a key without the symbol-set hash could serve stale data).
+
+    ``incremental`` asks the effective provider to append new exchange
+    sessions to its own cache before the pipeline runs (D32). Providers that
+    cannot append raise ``NotImplementedError`` / advertise
+    ``supports_incremental=False``; the CLI then falls back to a full fetch
+    with a WARNING and records that in provenance. The pipeline-cache read is
+    skipped by the caller when ``incremental`` is set, so a stale data-stage
+    pickle can never mask the append.
 
     Returns ``(data_tuple, provenance, cache_hit)``.
     """
@@ -445,6 +687,7 @@ def _load_data_stage(
                     "hit": True, "stage": stage, "key": cache_key,
                 }
                 logger.info("Data loaded from cache (key %s)", cache_key)
+                _attach_freshness(provenance, config)
                 return data_tuple, provenance, True
             if not compatible:
                 logger.warning(
@@ -468,6 +711,12 @@ def _load_data_stage(
             else "the provider universe cannot be determined before loading",
         )
 
+    if incremental:
+        # Append to the *provider* cache first; the pipeline then reads the
+        # extended panel. The provider keeps its marker unchanged on a
+        # partial response, and the freshness gate below still sees the age.
+        resolution["incremental"] = _run_incremental_update(resolution, config)
+
     prices, returns, benchmark, metadata, financials, turnover = _load_data(
         config,
         use_tushare=use_tushare,
@@ -479,6 +728,7 @@ def _load_data_stage(
     )
     provenance = dict(_LAST_DATA_PROVENANCE)
     provenance["cache"] = {"hit": False, "stage": stage, "key": cache_key}
+    _attach_freshness(provenance, config)
 
     if write_cache and can_cache:
         manifest = {
@@ -638,8 +888,17 @@ def _load_data(
             payload_assets = [str(asset) for asset in factor_prices.columns]
         except Exception:  # defensive: provenance must not kill the run
             payload_assets = []
+    freshness = None
+    freshness_hook = getattr(pipeline, "get_data_freshness", None)
+    if callable(freshness_hook):  # test doubles may not implement it
+        try:
+            freshness = freshness_hook()
+        except Exception as exc:  # provenance must not kill a run
+            logger.warning("Data freshness unavailable: %s", exc)
     _LAST_DATA_PROVENANCE = _build_data_manifest(
         resolution, config, data_date=data_date, payload_assets=payload_assets,
+        freshness=freshness,
+        incremental=(resolution or {}).get("incremental"),
     )
 
     return (
@@ -1160,6 +1419,16 @@ def cmd_run(args) -> int:
     run_id = uuid.uuid4().hex[:12]
     use_baostock = bool(getattr(args, "use_baostock", False))
     use_tushare = bool(getattr(args, "use_tushare", False))
+    # D32: --incremental appends new exchange sessions to the provider cache
+    # before the pipeline runs. --force still means "full refetch", which wins
+    # over --incremental; the data-stage pickle is not read for an incremental
+    # run, otherwise stale cached output would mask the append.
+    incremental = bool(getattr(args, "incremental", False))
+    if incremental and args.force:
+        logger.warning(
+            "--force overrides --incremental; performing a full refetch"
+        )
+        incremental = False
     # D12: resolve the provider *before* computing the key, so a silent
     # fallback, a ValidatedProvider wrapper or a changed secondary source
     # cannot reuse another run's entry. The universe (sampled symbols) is
@@ -1168,7 +1437,7 @@ def cmd_run(args) -> int:
         config,
         use_tushare=use_tushare,
         use_baostock=use_baostock,
-        with_universe=not args.no_cache,
+        with_universe=not args.no_cache or incremental,
     )
     cache_key = _data_cache_key(
         config, resolution,
@@ -1178,8 +1447,9 @@ def cmd_run(args) -> int:
     cache = PipelineCache(args.cache_dir)
     # D33: --force skips the *read* but still writes: a forced recomputation
     # must replace the stale entry, otherwise the next normal run serves the
-    # old payload again. --no-cache disables both.
-    read_cache = not args.force and not args.no_cache
+    # old payload again. --no-cache disables both. --incremental also skips
+    # the read (but writes) so the refreshed provider panel is used.
+    read_cache = not args.force and not args.no_cache and not incremental
     write_cache = not args.no_cache
 
     def _save_config_version() -> None:
@@ -1212,10 +1482,17 @@ def cmd_run(args) -> int:
             cache, cache_key, config, resolution,
             read_cache=read_cache, write_cache=write_cache,
             use_tushare=use_tushare, use_baostock=use_baostock,
+            incremental=incremental,
         )
     )
     if cache_hit:
         logger.info("Data loaded from cache")
+
+    freshness = _enforce_freshness(
+        provenance, config, context="research", fail_closed=False,
+    )
+    if incremental:
+        print(_incremental_summary_line(provenance, freshness))
 
     if provenance:
         logger.info(
@@ -1645,16 +1922,21 @@ def _cmd_cache_refresh(args) -> int:
         return 1
     cache_key = _data_cache_key(config, resolution, use_baostock=use_baostock)
     cache = PipelineCache(getattr(args, "cache_dir", None) or ".quant_cache")
+    incremental = bool(getattr(args, "incremental", False))
     _data_tuple, provenance, _hit = _load_data_stage(
         cache, cache_key, config, resolution,
         read_cache=False, write_cache=True, use_baostock=use_baostock,
+        incremental=incremental,
     )
+    freshness = _attach_freshness(provenance, config)
     print(
         f"Refreshed cache entry {DATA_STAGE} {cache_key}: "
         f"provider={provenance.get('effective_provider')} "
         f"symbols={provenance.get('symbol_count')} "
         f"data_date={provenance.get('data_date')}"
     )
+    if incremental:
+        print(_incremental_summary_line(provenance, freshness))
     if cache.save_failures:
         print(
             f"Warning: {cache.save_failures} cache save failure(s); "
@@ -2154,6 +2436,15 @@ def cmd_execute(args) -> int:
     prices, returns, benchmark, metadata, financials, turnover = _load_data(
         config, use_baostock=args.use_baostock
     )
+    try:
+        # Decisive run (orders/fills): stale data fails closed (D32).
+        _enforce_freshness(
+            _LAST_DATA_PROVENANCE, config,
+            context="decisive execute", fail_closed=True,
+        )
+    except DataStalenessError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     print(f"  Data: {len(prices)} days, {len(prices.columns)} assets")
 
     print("Computing factors...")
@@ -2392,6 +2683,54 @@ def cmd_profile(args) -> int:
     return 0
 
 
+def _make_signal_history_provider(config):
+    """Daily raw closes for a real-broker LiveRunner warm-up.
+
+    A live runner sees one quote per cycle; without a history preload its
+    3/6-month momentum factors stay NaN forever and the shared composite
+    scores nothing. Baostock is the free history source (raw ``close``);
+    failures return an empty mapping so the runner fails closed rather than
+    trading on invented scores.
+    """
+
+    def _fetch(codes, sessions):
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        from quant_platform.data.providers.baostock_provider import (
+            BaostockDataProvider,
+        )
+        from quant_platform.shared.symbols import normalize_symbol
+
+        end = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        start = end - timedelta(days=int(sessions * 2.2) + 30)
+        try:
+            provider = BaostockDataProvider(cache_enabled=True)
+            panel = provider.get_prices(start.isoformat(), end.isoformat())
+        except Exception as exc:
+            logger.warning("Signal history fetch failed: %s", exc)
+            return {}
+        if panel is None or panel.empty or "close" not in panel.columns:
+            return {}
+        close = panel["close"].unstack("asset")
+        history: dict[str, list[float]] = {}
+        for code in codes:
+            canonical = normalize_symbol(code)
+            series = None
+            for candidate in (canonical, str(code)):
+                if candidate in close.columns:
+                    series = close[candidate]
+                    break
+            if series is None:
+                continue
+            values = [float(v) for v in series.dropna().tail(sessions)]
+            if len(values) >= 20:
+                history[code] = values
+        return history
+
+    return _fetch
+
+
 def cmd_trade(args) -> int:
     """Execute live trading via LiveRunner (Paper or QMT).
 
@@ -2448,6 +2787,13 @@ def cmd_trade(args) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     runner.set_universe(universe)
+    # Real brokers see one quote per cycle; warm up the shared 7-factor
+    # signal from daily history (simulated/paper runs seed their own).
+    # `getattr` keeps injected test doubles without the new method working.
+    if broker_type in ("qmt", "qmt_sim", "qmt_live", "xtp"):
+        setter = getattr(runner, "set_history_provider", None)
+        if callable(setter):
+            setter(_make_signal_history_provider(config))
 
     def _cleanup_runner():
         """Flush and close the runner's store on normal exit or SIGTERM."""
@@ -3122,6 +3468,10 @@ def main() -> int:
     run_parser.add_argument("--allow-synthetic-fallback", action="store_true",
                             help="Development only: allow a configured real data "
                                  "provider to fall back to synthetic data")
+    run_parser.add_argument("--incremental", action="store_true",
+                            help="Append only new exchange sessions to the provider "
+                                 "cache (full fetch with a warning for providers that "
+                                 "cannot append; --force still forces a full refetch)")
     run_parser.add_argument("--description", "-d", type=str, default=None,
                             help="Optional description for this run (saved in config version)")
     run_parser.add_argument("--save-factors", action="store_true",
@@ -3261,6 +3611,9 @@ def main() -> int:
     cache_refresh.add_argument("--allow-synthetic-fallback", action="store_true",
                                help="Development only: allow a real provider to "
                                     "fall back to synthetic data")
+    cache_refresh.add_argument("--incremental", action="store_true",
+                               help="Append only new exchange sessions to the "
+                                    "provider cache before overwriting the data stage")
     cache_refresh.add_argument("--cache-dir", type=str, default=argparse.SUPPRESS,
                                help="Cache directory path")
     # Kept for backward compatibility with `cache --cache-dir X list`; the
