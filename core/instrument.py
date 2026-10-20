@@ -17,6 +17,30 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+# Canonical symbol helpers live in `shared/` so the research core
+# (`data/pipeline.py` board limits) can use them without importing this live
+# module; they are re-exported here as the public instrument API.
+from quant_platform.shared.symbols import (
+    EXCHANGES,
+    infer_exchange,
+    normalize_symbol,
+    price_limit_threshold,
+    symbol_code,
+    symbol_exchange,
+)
+
+__all__ = [
+    "EXCHANGES",
+    "AssetUniverse",
+    "Instrument",
+    "InstrumentType",
+    "infer_exchange",
+    "normalize_symbol",
+    "price_limit_threshold",
+    "symbol_code",
+    "symbol_exchange",
+]
+
 
 class InstrumentType(StrEnum):
     """Supported asset classes."""
@@ -121,17 +145,17 @@ class Instrument:
 
     @classmethod
     def stock(cls, symbol: str, exchange: str = "SSE") -> Instrument:
-        """Factory for A-share stock (default parameters)."""
-        # Determine price limit based on board
-        price_limit = 0.10
-        if symbol.startswith(("300", "301", "688")):
-            price_limit = 0.20  # 创业板/科创板 20%
+        """Factory for A-share stock (default parameters).
 
+        The price limit is taken from the normalized six-digit code, so
+        Beijing (``4``/``8``/``920``) names get 30% and prefix/suffix forms
+        get the correct board rule instead of the raw-label fallback.
+        """
         return cls(
             symbol=symbol, asset_type=InstrumentType.STOCK,
             exchange=exchange, multiplier=1.0, tick_size=0.01,
             lot_size=100, margin_rate=1.0, t_plus=1,
-            price_limit=price_limit,
+            price_limit=price_limit_threshold(symbol),
         )
 
     @classmethod
@@ -227,12 +251,49 @@ class AssetUniverse:
         self._instruments[instrument.symbol] = instrument
 
     def get(self, symbol: str) -> Instrument | None:
-        """Look up instrument by symbol. Returns None if not found."""
-        return self._instruments.get(symbol)
+        """Look up instrument by symbol. Returns None if not found.
+
+        Lookup accepts bare and canonical forms interchangeably: a broker
+        position keyed ``600519.SH`` still finds an instrument configured as
+        ``600519`` (and vice versa).  An *explicitly* labelled exchange is
+        never collapsed onto a same-numbered instrument on another exchange
+        (``000001.SH`` index vs ``000001.SZ`` stock); only a bare code may
+        fall back to a six-digit match.
+        """
+        inst = self._instruments.get(symbol)
+        if inst is not None:
+            return inst
+        canonical = normalize_symbol(symbol)
+        inst = self._instruments.get(canonical)
+        if inst is not None:
+            return inst
+        text = str(symbol).strip().upper()
+        explicit = text.endswith(EXCHANGES) or text.startswith(EXCHANGES)
+        code = symbol_code(symbol)
+        if code is not None:
+            request_exchange = (
+                symbol_exchange(symbol) if explicit else infer_exchange(code)
+            )
+            for registered, candidate in self._instruments.items():
+                if symbol_code(registered) != code:
+                    continue
+                registered_text = str(registered).strip().upper()
+                registered_explicit = (
+                    registered_text.endswith(EXCHANGES)
+                    or registered_text.startswith(EXCHANGES)
+                )
+                registered_exchange = (
+                    symbol_exchange(registered) if registered_explicit
+                    else infer_exchange(code)
+                )
+                if explicit and registered_exchange != request_exchange:
+                    continue
+                return candidate
+        return None
 
     def get_or_default(self, symbol: str) -> Instrument:
         """Look up instrument, falling back to stock defaults."""
-        inst = self._instruments.get(symbol)
+        inst = self.get(symbol)
         if inst is not None:
             return inst
         return Instrument.stock(symbol)

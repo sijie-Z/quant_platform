@@ -520,14 +520,17 @@ class TestSymbolNormalization:
         assert price_limit_threshold(symbol) == pytest.approx(threshold)
 
     def test_limit_flags_use_normalized_board_rules(self):
+        # Prefix, dotted-prefix and suffix forms mixed on purpose: the
+        # pipeline normalizes them to CODE.EXCHANGE, so symbols here are
+        # distinct codes, not alternate spellings of the same code.
         assets = [
-            "300001.SZ", "sz300001", "sh.688001",
+            "300001.SZ", "sz301001", "sh.688001",
             "920001.BJ", "430001.BJ", "600001.SH",
         ]
         dates = pd.bdate_range("2024-01-02", periods=6, name="date")
         close = pd.DataFrame(10.0, index=dates, columns=assets)
         # +15% on day 1 for the 20%/10% boards; +30% for Beijing.
-        close.loc[dates[1], ["300001.SZ", "sz300001", "sh.688001",
+        close.loc[dates[1], ["300001.SZ", "sz301001", "sh.688001",
                              "600001.SH"]] = 11.5
         close.loc[dates[1], ["920001.BJ", "430001.BJ"]] = 13.0
         close.iloc[2:] = close.iloc[1] * 1.001
@@ -561,18 +564,61 @@ class TestSymbolNormalization:
         )
         pipe.run()
 
+        # Canonical labels; same-code prefix/suffix spellings collapse onto
+        # the canonical asset (position identity), verified separately below.
+        canonical = ["300001.SZ", "301001.SZ", "688001.SH",
+                     "920001.BJ", "430001.BJ", "600001.SH"]
         limit_up = {
             asset: bool(pipe.prices.loc[(dates[1], asset), "is_limit_up"])
-            for asset in assets
+            for asset in canonical
         }
         # ChiNext/STAR boards: +15% is below the 20% limit.
-        for asset in ("300001.SZ", "sz300001", "sh.688001"):
+        for asset in ("300001.SZ", "301001.SZ", "688001.SH"):
             assert limit_up[asset] is False, asset
         # Main board: +15% exceeds 10%.
         assert limit_up["600001.SH"] is True
         # Beijing: +30% hits the 30% limit.
         assert limit_up["920001.BJ"] is True
         assert limit_up["430001.BJ"] is True
+
+    def test_prefix_and_suffix_symbols_are_one_position(self):
+        """`sz300001` and `300001.SZ` must not become two assets (D19/D41)."""
+        assets = ["300001.SZ", "sz300001"]
+        dates = pd.bdate_range("2024-01-02", periods=3, name="date")
+        index = pd.MultiIndex.from_product([dates, assets], names=["date", "asset"])
+        prices = pd.DataFrame(index=index)
+        for column, value in (
+            ("open", 10.0), ("high", 10.0), ("low", 10.0),
+            ("close", 10.0), ("volume", 1_000_000.0),
+            ("turnover", 0.02), ("adj_factor", 1.0),
+        ):
+            prices[column] = value
+        # The two spellings disagree on day 2; keep='last' (sz300001 is last)
+        # decides the value.
+        prices.loc[(dates[1], "300001.SZ"), "close"] = 10.0
+        prices.loc[(dates[1], "sz300001"), "close"] = 12.0
+
+        metadata = pd.DataFrame(
+            {
+                "sector": ["Tech", "Tech"],
+                "listing_date": [pd.Timestamp("2020-01-01")] * 2,
+                "delisting_date": [pd.NaT] * 2,
+                "is_st": [False, False],
+            },
+            index=pd.Index(assets, name="asset"),
+        )
+        pipe = DataPipeline(
+            CraftedProvider(prices=prices, financials=None, metadata=metadata),
+            str(dates[0].date()), str(dates[-1].date()),
+            exclude_st=False, exclude_suspended=False,
+        )
+        pipe.run()
+
+        assert list(pipe.prices.index.get_level_values("asset").unique()) == [
+            "300001.SZ"
+        ]
+        assert pipe.duplicate_rows_dropped["prices"] == 3
+        assert pipe.prices.loc[(dates[1], "300001.SZ"), "close"] == 12.0
 
 
 # ---------------------------------------------------------------------------

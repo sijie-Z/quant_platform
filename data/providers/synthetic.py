@@ -38,6 +38,14 @@ logger = get_logger(__name__)
 class SyntheticDataProvider(DataProvider):
     """Generates a complete synthetic A-share dataset.
 
+    Price basis: the stored ``close``/OHLCV are the **raw** traded prices;
+    a corporate action scales the raw path by ``adj_factor`` (a divisor) and
+    the pipeline's ``close / adj_factor`` is the generated continuous path
+    (``qfq``-style, anchored at the sample start).  This is the same data
+    contract the real providers follow, so money paths can use ``close`` and
+    research can use ``close_adj`` without either silently borrowing the
+    other's levels.
+
     Alpha strength levels (configurable via alpha_strength):
         - 0.00: Pure noise. No predictable patterns. For research validation.
         - 0.03: Weak/realistic (default). IC ~ 0.01-0.02, mimicking real A-share.
@@ -49,6 +57,12 @@ class SyntheticDataProvider(DataProvider):
         alpha[t] affects return[t+1] (not return[t]).
         This means factor[t] naturally correlates with future returns[t+1].
     """
+
+    #: ``close`` is the raw traded price; ``adj_factor`` is the divisor that
+    #: produces the return-generating continuous series.
+    price_adjustment = "raw"
+    adjusted_price_basis = "qfq"
+    adjustment_factor_available = True
 
     def __init__(
         self,
@@ -113,6 +127,11 @@ class SyntheticDataProvider(DataProvider):
             if unknown:
                 raise ValueError(f"Unknown price fields: {unknown}")
             df = df[list(fields)]
+        df.attrs.update({
+            "price_basis": "raw",
+            "adjusted_price_basis": self.adjusted_price_basis,
+            "adjustment_factor_available": True,
+        })
         return df
 
     def get_financials(

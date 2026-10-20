@@ -29,6 +29,32 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Bases that describe a return-generating (adjusted) series.  A paper/live
+# fill or mark must never use them: shares and cash are denominated in the
+# traded CNY price, and a split/dividend would silently re-scale the book.
+ADJUSTED_PRICE_BASES = frozenset({"qfq", "hfq", "adjusted"})
+
+
+def ensure_raw_price_basis(
+    price_basis: Any, *, context: str = "live/paper marks",
+) -> str:
+    """Validate that a price panel is in raw CNY terms.
+
+    Returns the normalized label.  An explicitly adjusted basis is a hard
+    error (D15); an unlabeled legacy panel returns ``"unknown"`` so the
+    caller can warn rather than silently assume.  Callers that need a hard
+    guarantee must check for ``"raw"``.
+    """
+    text = str(price_basis or "").strip().lower()
+    if text in ADJUSTED_PRICE_BASES:
+        raise ValueError(
+            f"{context} require raw (traded) CNY prices, got "
+            f"price_basis={text!r}. Adjusted levels are not tradeable: use "
+            "DataPipeline.get_raw_close(), a broker quote, or a real-time "
+            "feed."
+        )
+    return text or "unknown"
+
 # ── 策略参数 (alpha-v1.0, 已锁定) ──
 SIGNAL_H = 40
 HOLD_H = 80
@@ -78,11 +104,61 @@ class LiveEngine:
         self._history: pd.DataFrame | None = None
         self._day_count = 0
         self._rebalance_dates: list[pd.Timestamp] = []
+        # Basis of `self._prices`; money paths require "raw" (or an explicitly
+        # acknowledged legacy panel).
+        self._price_basis: str = "unknown"
 
     # ── 初始化 ──
 
-    def load_history(self, returns: pd.DataFrame, prices: pd.DataFrame):
-        """加载历史数据用于状态初始化."""
+    def load_history(
+        self,
+        returns: pd.DataFrame,
+        prices: pd.DataFrame,
+        price_basis: str | None = None,
+    ):
+        """加载历史数据用于状态初始化.
+
+        ``prices`` must be a **raw** (traded CNY) panel: every fill, equity
+        mark and kill-switch liquidation in this engine multiplies shares by
+        these levels.  An adjusted (``qfq``/``hfq``) panel raises instead of
+        silently marking the book at a level that never traded (D15).
+        ``price_basis`` overrides the panel's ``attrs["price_basis"]``.
+        """
+        if prices is None:
+            raise ValueError("LiveEngine.load_history requires a price panel")
+        panel_basis = getattr(prices, "attrs", {}).get("price_basis")
+        declared = price_basis
+        if declared is not None and panel_basis is not None:
+            declared_norm = ensure_raw_price_basis(
+                declared, context="LiveEngine fills/equity marks",
+            )
+            panel_norm = ensure_raw_price_basis(
+                panel_basis, context="LiveEngine fills/equity marks",
+            )
+            if (
+                declared_norm in {"raw", "qfq", "hfq"}
+                and panel_norm in {"raw", "qfq", "hfq"}
+                and declared_norm != panel_norm
+            ):
+                raise ValueError(
+                    f"price_basis override {declared_norm!r} contradicts the "
+                    f"panel's declared basis {panel_norm!r}; refusing to "
+                    "guess which one is true"
+                )
+        if declared is None:
+            declared = panel_basis
+        if declared is None:
+            logger.warning(
+                "LiveEngine.load_history received an unlabeled price panel; "
+                "assuming legacy raw prices. New callers must pass "
+                "DataPipeline.get_raw_close() (attrs['price_basis']='raw')."
+            )
+            basis = "unknown"
+        else:
+            basis = ensure_raw_price_basis(
+                declared, context="LiveEngine fills/equity marks",
+            )
+        self._price_basis = basis
         self._returns = returns
         self._prices = prices
         # `returns[t]` is the forward return t -> t+1. The signal at t must
@@ -124,7 +200,11 @@ class LiveEngine:
 
     # ── 状态持久化 ──
 
-    SNAPSHOT_VERSION = 1
+    # v2: prices/equity are recorded on the raw (traded CNY) basis. A v1
+    # snapshot was produced by the hfq-marked engine and is not comparable
+    # (same cash, different price level); restoring it would show a fake
+    # drawdown and could trip the kill switch on the first raw mark.
+    SNAPSHOT_VERSION = 2
 
     def to_snapshot(self) -> dict[str, Any]:
         """Serialize all runtime state for persistence across processes."""
@@ -155,7 +235,12 @@ class LiveEngine:
         version = snapshot.get("version")
         if version != self.SNAPSHOT_VERSION:
             raise ValueError(
-                f"Unsupported LiveEngine snapshot version: {version!r}"
+                f"Unsupported LiveEngine snapshot version: {version!r} "
+                f"(current {self.SNAPSHOT_VERSION}). v1 snapshots were marked "
+                "at adjusted (hfq) levels; this engine marks at raw CNY "
+                "prices. Do not restore across the price-basis migration: "
+                "reconcile the book against the broker and start a fresh "
+                "snapshot."
             )
 
         self.state.cash = float(snapshot.get("cash", INITIAL_CAPITAL))
@@ -228,6 +313,7 @@ class LiveEngine:
         result["cash"] = self.state.cash
         result["drawdown"] = drawdown
         result["n_positions"] = len(self.state.positions)
+        result["price_basis"] = self._price_basis
 
         self.state.last_processed_date = date_str
         return result
@@ -389,6 +475,7 @@ class LiveEngine:
             f"  Positions:   {len(self.state.positions):>6d}\n"
             f"  Drawdown:    {dd*100:>10.2f}%\n"
             f"  Trades:      {self.state.total_trades:>6d}\n"
+            f"  Price basis: {self._price_basis}\n"
             f"  Last rebal:  {self.state.last_rebalance}\n"
             f"  Next rebal:  {self.state.next_rebalance}\n"
             f"{'=' * 60}"

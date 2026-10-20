@@ -111,7 +111,14 @@ def main() -> int:
         )
         pipeline.run()
         returns = pipeline.returns
-        prices = pipeline.get_close()
+        # The paper trader books CNY fills/marks: use raw prices. get_close()
+        # is the adjusted research series and would mark the demo book at
+        # levels that never traded (D15). A legacy/test pipeline double that
+        # only exposes get_close() falls back to it (as the daemon does).
+        try:
+            prices = pipeline.get_raw_close()
+        except AttributeError:
+            prices = pipeline.get_close()
         if returns is None or len(returns.index) == 0:
             raise RuntimeError("data pipeline returned an empty panel")
     except Exception as exc:

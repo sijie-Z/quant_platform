@@ -10,50 +10,73 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+from quant_platform.core.instrument import (
+    normalize_symbol,
+    symbol_code,
+    symbol_exchange,
+)
 from quant_platform.trading.broker import OrderSide, OrderStatus, OrderType
 
 # ── Exchange detection ──
 
 
 def classify_exchange(code: str) -> str:
-    """Return 'SH' or 'SZ' based on A-share code prefix."""
-    if "." in code:
-        code = code.split(".")[0]
-    return "SH" if code.startswith(("6", "9")) else "SZ"
+    """Return the exchange (``SH``/``SZ``/``BJ``) for an A-share symbol.
+
+    Accepts bare codes, suffix forms (``600519.SH``), prefix forms
+    (``sz300001``, ``sh.688001``) and Beijing codes (``4``/``8``/``920`` via
+    ``bj.``).  The old implementation split on ``"."`` and treated everything
+    that did not start with 6/9 as Shenzhen, so ``sh.688001`` mapped to SZ and
+    every Beijing name was routed to Shenzhen.
+    """
+    exchange = symbol_exchange(code)
+    if exchange:
+        return exchange
+    # Defensive fallback for malformed input: keep the historical default.
+    return "SH" if str(code).startswith(("6", "9")) else "SZ"
 
 
 # ── Symbol mapping ──
 
 
 def to_qmt_code(code: str) -> str:
-    """Convert internal code to QMT format.
+    """Convert an internal symbol to QMT's canonical ``CODE.EXCHANGE`` form.
 
-    '600519'  -> '600519.SH'
-    '000001'  -> '000001.SZ'
-    '600519.SH' -> '600519.SH'  (no-op)
+    Accepts bare codes, prefix styles and already-canonical symbols:
+    ``600519`` -> ``600519.SH``, ``sz300001`` -> ``300001.SZ``,
+    ``920001`` -> ``920001.BJ``.
     """
-    if "." in code:
-        return code
+    canonical = normalize_symbol(code)
+    if symbol_exchange(canonical):
+        return canonical
     exchange = classify_exchange(code)
-    return f"{code}.{exchange}"
+    digits = symbol_code(code) or str(code)
+    return f"{digits}.{exchange}"
 
 
 def from_qmt_code(code: str) -> str:
-    """Convert QMT format back to internal code.
+    """Convert a QMT symbol back to its bare six-digit internal code.
 
-    '600519.SH' -> '600519'
-    '000001.SZ' -> '000001'
+    ``600519.SH`` -> ``600519``; unknown/malformed values are returned
+    unchanged (without the suffix) so callers can still log them.
     """
+    digits = symbol_code(code)
+    if digits is not None:
+        return digits
     return code.split(".")[0] if "." in code else code
 
 
 def to_qmt_exchange(code: str) -> int:
-    """Return QMT exchange constant for a code.
+    """Return the QMT market constant for a symbol.
 
-    Import safety: returns int 1 for SH, 2 for SZ.
+    QMT/xtquant market ids: 1 = Shanghai, 2 = Shenzhen, 0 = Beijing.
     """
     exchange = classify_exchange(code)
-    return 1 if exchange == "SH" else 2  # 1=SH, 2=SZ
+    if exchange == "SH":
+        return 1
+    if exchange == "SZ":
+        return 2
+    return 0  # Beijing (bj.xxxxxx)
 
 
 # ── Order type mapping ──

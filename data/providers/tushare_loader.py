@@ -1,10 +1,13 @@
 """Tushare real data provider for A-share market.
 
 Connects to Tushare Pro API to fetch actual CSI 300 constituent data with:
-- 后复权 (hfq) adjusted prices: raw prices are multiplied by the cumulative
-  ``adj_factor`` and the pipeline's divisor is set to 1.0, so the adjustment
-  is applied exactly once.  (The module previously claimed 前复权/qfq while
-  the code produced hfq levels.)
+- **Raw** OHLCV prices plus the corporate-action ``adj_factor`` divisor.
+  Tushare's native ``adj_factor`` is a cumulative multiplier
+  (``hfq = raw * adj_factor``); the provider inverts it to the shared
+  divisor contract (``adj_factor = 1 / native_factor``), so the pipeline's
+  ``close_adj = close / adj_factor`` reproduces the same hfq series as
+  before while ``close`` remains a tradeable CNY price (D15/D18).  Research
+  returns are therefore unchanged; money paths use ``close``.
 - HDF5 local caching for fast reloads (atomic temp-file + ``os.replace``)
 - Real suspension (停牌) handling
 - Delisting tracking (survivorship-bias aware: metadata includes
@@ -45,8 +48,13 @@ CACHE_DIR.mkdir(exist_ok=True)
 # Cache format/semantics version. Combined with DATA_SCHEMA_VERSION and the
 # adjustment convention in the sidecar manifest, so a schema bump (or a change
 # in what the HDF5 file means) refetches instead of replaying stale data (D13).
-_PROVIDER_CACHE_VERSION = "v3"
-_PRICE_ADJUSTMENT = "hfq"
+# v4: price semantics changed from pre-multiplied hfq levels (adj_factor=1) to
+# raw OHLCV plus a divisor; v3 files must never be replayed.
+_PROVIDER_CACHE_VERSION = "v4"
+#: Basis of the stored ``close`` column (raw traded price).
+_PRICE_ADJUSTMENT = "raw"
+#: Basis of ``close / adj_factor`` (the return-generating series).
+_ADJUSTED_PRICE_BASIS = "hfq"
 
 # Tushare unit conventions (see https://tushare.pro/document/2):
 #   vol is in 手 (lots, 100 shares), amount in 千元 (thousand CNY),
@@ -74,6 +82,8 @@ class TushareProvider(DataProvider):
     """
 
     price_adjustment = _PRICE_ADJUSTMENT
+    adjusted_price_basis = _ADJUSTED_PRICE_BASIS
+    adjustment_factor_available = True
 
     def __init__(
         self,
@@ -193,7 +203,13 @@ class TushareProvider(DataProvider):
         df = self._prices.loc[
             pd.Timestamp(start_date):pd.Timestamp(end_date)
         ]
-        return self._project_fields(df, fields)
+        df = self._project_fields(df, fields)
+        df.attrs.update({
+            "price_basis": _PRICE_ADJUSTMENT,
+            "adjusted_price_basis": _ADJUSTED_PRICE_BASIS,
+            "adjustment_factor_available": True,
+        })
+        return df
 
     def get_financials(
         self,
@@ -320,6 +336,8 @@ class TushareProvider(DataProvider):
                 "start_date": self.start_date,
                 "end_date": self.end_date,
                 "benchmark_source": self.benchmark_source,
+                "adjusted_price_basis": _ADJUSTED_PRICE_BASIS,
+                "adj_factor_role": "divisor",
             },
         )
 
@@ -336,6 +354,7 @@ class TushareProvider(DataProvider):
         return {
             "provider": "tushare",
             "adjustment": _PRICE_ADJUSTMENT,
+            "adjusted_price_basis": _ADJUSTED_PRICE_BASIS,
             "cache_version": _PROVIDER_CACHE_VERSION,
             "index_code": self.index_code,
             "start_date": self.start_date,
@@ -582,8 +601,8 @@ class TushareProvider(DataProvider):
         self._metadata = self._fetch_stock_basic(api, all_codes)
         logger.info("  Metadata: %d stocks", len(self._metadata))
 
-        # 3. Get daily price data (hfq; adjustment applied exactly once)
-        logger.info("  Fetching daily prices (hfq, may take a while)...")
+        # 3. Get daily price data (raw OHLCV + adjustment divisor)
+        logger.info("  Fetching daily prices (raw + adj_factor, may take a while)...")
         self._prices = self._fetch_daily_prices(api, all_codes)
         logger.info("  Prices: %d rows", len(self._prices))
 
@@ -808,17 +827,21 @@ class TushareProvider(DataProvider):
         return adj_df[["ts_code", "trade_date", "adj_factor"]]
 
     def _fetch_daily_prices(self, api, codes: list[str]) -> pd.DataFrame:
-        """Fetch daily OHLCV data with 后复权 (hfq) adjustment.
+        """Fetch daily OHLCV as **raw** prices plus the adjustment divisor.
 
-        Tushare reports raw prices; multiplying by the cumulative
-        ``adj_factor`` produces hfq levels.  The pipeline then divides by the
-        stored ``adj_factor`` column (constant 1.0 here), so the adjustment
-        is applied exactly once.
+        Tushare reports raw prices and a cumulative multiplier
+        ``native_factor`` (``hfq = raw * native_factor``).  The shared
+        provider contract is raw ``close`` plus a *divisor*
+        ``adj_factor = 1 / native_factor``, so the pipeline's
+        ``close_adj = close / adj_factor`` reproduces the same hfq levels
+        that this module used to pre-multiply into ``close`` while the stored
+        price is now the tradeable CNY price (D15/D18).  The adjustment is
+        applied exactly once, by the pipeline.
 
         Every batch is retried with exponential backoff.  If any batch (daily
         or adj_factor) still fails, the whole fetch raises
         :class:`DataFetchIncompleteError` — a partially adjusted panel (raw prices
-        next to hfq prices) must never be returned or cached.
+        next to adjusted prices) must never be returned or cached.
         """
         all_frames: list[pd.DataFrame] = []
         adj_frames: list[pd.DataFrame] = []
@@ -874,7 +897,7 @@ class TushareProvider(DataProvider):
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce") * _THOUSAND_CNY_TO_CNY
         df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce") / 100.0
 
-        # VWAP before adjustment: amount (CNY) / volume (shares).  Zero-volume
+        # VWAP on raw prices: amount (CNY) / volume (shares).  Zero-volume
         # rows yield inf; replace non-finite values with close below.
         df["vwap"] = df["amount"] / df["volume"]
         df["vwap"] = df["vwap"].where(np.isfinite(df["vwap"]), df["close"])
@@ -882,15 +905,15 @@ class TushareProvider(DataProvider):
         adj = pd.concat(adj_frames, ignore_index=True)
         adj["trade_date"] = pd.to_datetime(adj["trade_date"], format="%Y%m%d")
         adj = adj.rename(columns={
-            "ts_code": "asset", "trade_date": "date", "adj_factor": "cum_factor",
+            "ts_code": "asset", "trade_date": "date", "adj_factor": "native_factor",
         })
-        adj["cum_factor"] = pd.to_numeric(adj["cum_factor"], errors="coerce")
+        adj["native_factor"] = pd.to_numeric(adj["native_factor"], errors="coerce")
 
         df = df.merge(adj, on=["date", "asset"], how="left")
         bad_factor = (
-            df["cum_factor"].isna()
-            | ~np.isfinite(df["cum_factor"])
-            | (df["cum_factor"] <= 0)
+            df["native_factor"].isna()
+            | ~np.isfinite(df["native_factor"])
+            | (df["native_factor"] <= 0)
         )
         if bool(bad_factor.any()):
             missing = sorted(
@@ -901,22 +924,21 @@ class TushareProvider(DataProvider):
                 f"factor for {int(bad_factor.sum())} row(s), symbols {missing[:10]}"
             )
 
-        # Apply the factor exactly once.  `adj_factor` (the pipeline divisor)
-        # is 1.0 afterwards because the factor is already in the price level.
-        for column in ("open", "high", "low", "close", "vwap"):
-            df[column] = pd.to_numeric(df[column], errors="coerce") * df["cum_factor"]
-        df = df.drop(columns=["cum_factor"])
+        # Keep raw prices untouched.  The pipeline divides by this column, so
+        # it must be the reciprocal of Tushare's cumulative multiplier.
+        df["adj_factor"] = 1.0 / df["native_factor"]
+        df = df.drop(columns=["native_factor"])
 
         # Set MultiIndex
         df = df.set_index(["date", "asset"]).sort_index()
-
-        df["adj_factor"] = 1.0  # hfq adjustment already applied above
 
         # Handle suspensions: volume=0 means suspended
         suspended = df["volume"].isna() | (df["volume"] <= 0)
         df.loc[suspended, ["open", "high", "low", "close", "vwap"]] = np.nan
 
-        # Forward-fill suspension gaps (max 5 days for real data)
+        # Forward-fill suspension gaps (max 5 days for real data).  The
+        # divisor is a corporate-action property and is carried across the
+        # fill as well.
         df = df.groupby("asset").ffill(limit=5)
 
         # Drop rows where close is still NaN after ffill
@@ -1100,7 +1122,10 @@ class TushareProvider(DataProvider):
         self.benchmark_source = "equal_weight_fallback"
         if self._prices is None or self._prices.empty:
             return pd.Series(dtype=float, name="benchmark")
-        close = self._prices["close"].unstack("asset")
+        # Use the adjusted (return-generating) series: raw prices jump on
+        # ex-dividend/split dates, which would fabricate benchmark returns.
+        adjusted = self._prices["close"] / self._prices["adj_factor"]
+        close = adjusted.unstack("asset")
         daily_ret = close.pct_change(fill_method=None).mean(axis=1)
         daily_ret.name = "benchmark"
         return daily_ret.fillna(0)

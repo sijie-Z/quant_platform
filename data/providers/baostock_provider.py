@@ -5,8 +5,15 @@ Includes permanent caching for immutable historical data.
 
 Contract notes
 --------------
-* Prices are 后复权 (hfq, ``adjustflag="1"``) with ``adj_factor`` = 1.0, so
-  the pipeline applies the adjustment exactly once.
+* Prices are returned as **raw** OHLCV (``adjustflag="3"``) plus the
+  corporate-action ``adj_factor`` divisor.  With the default
+  ``adjustment="hfq"`` the provider also fetches the 后复权 series
+  (``adjustflag="1"``) and derives ``adj_factor = raw_close / hfq_close``,
+  so the pipeline's ``close_adj = close / adj_factor`` reproduces the hfq
+  levels research used before this wave while ``close`` is a tradeable CNY
+  price (D15/D18).  Pass ``adjustment="raw"`` to skip the second fetch and
+  run with ``adj_factor=1`` (``adjustment_factor_available`` is then False
+  and the research series is raw).  Never label hfq data as raw.
 * ``volume`` is in shares and ``turnover`` is a fraction (Baostock reports
   ``turn`` in percent).
 * Financials are returned as a ``(date, asset)`` panel keyed to the first
@@ -32,6 +39,7 @@ import random
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import (
@@ -51,8 +59,13 @@ CACHE_DIR = Path(__file__).parent.parent.parent / ".cache" / "baostock"
 # generation (DATA_SCHEMA_VERSION) is mixed into `_cache_version()` at call
 # time, so one bump invalidates the pipeline pickle *and* these provider
 # caches (D13).
-_CACHE_VERSION = "v2"
-_PRICE_ADJUSTMENT = "hfq"
+# v3: price semantics changed from pre-adjusted hfq levels (adj_factor=1) to
+# raw OHLCV plus a derived divisor; v2 files must never be replayed.
+_CACHE_VERSION = "v3"
+#: Basis of the stored ``close`` column (raw traded price).
+_PRICE_ADJUSTMENT = "raw"
+#: Basis of ``close / adj_factor`` when adjustment is enabled.
+_ADJUSTED_PRICE_BASIS = "hfq"
 _UNIVERSE_CACHE_VERSION = 2
 _UNIVERSE_CACHE_TTL_DAYS = 7
 
@@ -270,12 +283,24 @@ class BaostockDataProvider(DataProvider):
     """
 
     price_adjustment = _PRICE_ADJUSTMENT
+    adjusted_price_basis = _ADJUSTED_PRICE_BASIS
 
     def __init__(self, cache_enabled: bool = True, max_retries: int = 2,
-                 retry_backoff: float = 0.5):
+                 retry_backoff: float = 0.5, adjustment: str = "hfq"):
         self._cache_enabled = cache_enabled
         self.max_retries = max(1, int(max_retries))
         self.retry_backoff = max(0.0, float(retry_backoff))
+        mode = str(adjustment or "hfq").strip().lower()
+        if mode not in {"hfq", "raw"}:
+            raise ValueError(
+                f"adjustment must be 'hfq' (raw + derived divisor) or 'raw' "
+                f"(raw only, adj_factor=1); got {adjustment!r}"
+            )
+        #: "hfq" = fetch raw + hfq and derive the divisor (research series is
+        #: hfq, preserving prior returns); "raw" = raw only with adj_factor=1
+        #: (research series is raw; adjustment_factor_available is False).
+        self.adjustment_mode = mode
+        self.adjustment_factor_available = mode == "hfq"
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self._bs = None
         # No point-in-time ST history is supplied by this source.
@@ -302,6 +327,11 @@ class BaostockDataProvider(DataProvider):
         return {
             "provider": "baostock",
             "adjustment": _PRICE_ADJUSTMENT,
+            "adjusted_price_basis": (
+                _ADJUSTED_PRICE_BASIS
+                if self.adjustment_mode == "hfq" else "raw"
+            ),
+            "adjustment_mode": self.adjustment_mode,
             "cache_version": self._cache_version(),
             "cache_enabled": bool(self._cache_enabled),
             "synthetic": False,
@@ -410,8 +440,14 @@ class BaostockDataProvider(DataProvider):
 
     @staticmethod
     def _key_adjustment(key: str) -> str:
+        """Basis of the data stored under this cache key.
+
+        ``_adj1`` files hold the 后复权 series (hfq); ``_adj3`` files hold raw
+        prices.  The manifest records the file's own basis so a raw and an
+        adjusted panel can never be confused even if their keys collide.
+        """
         if "_adj1" in key:
-            return _PRICE_ADJUSTMENT
+            return _ADJUSTED_PRICE_BASIS
         if "_adj3" in key:
             return "raw"
         return "n/a"
@@ -938,7 +974,15 @@ class BaostockDataProvider(DataProvider):
         end_date: str,
         fields: list[str] | None = None,
     ) -> pd.DataFrame:
-        """Get daily price data for a range-overlapping stock sample."""
+        """Get daily price data for a range-overlapping stock sample.
+
+        The OHLCV path is fetched raw (``adjustflag="3"``).  In the default
+        ``hfq`` mode the 后复权 series is fetched too and the divisor
+        ``adj_factor = raw_close / hfq_close`` is attached, so
+        ``close / adj_factor`` is the hfq series research used before the
+        explicit basis contract.  In ``raw`` mode no factor is available
+        (``adj_factor=1``) and the research series is honestly raw.
+        """
         codes = self._pinned_codes(
             start_date, end_date, financial=False,
         )
@@ -946,16 +990,84 @@ class BaostockDataProvider(DataProvider):
             codes = self._get_major_stocks_list(
                 start_date=start_date, end_date=end_date,
             )
-        df = self._fetch_daily_data(codes, start_date, end_date)
-        if df.empty:
-            return self._project_price_fields(df, fields)
+        raw = self._fetch_daily_data(
+            codes, start_date, end_date, adjustflag="3",
+        )
 
-        # Prices are already 后复权 (adjustflag="1"), so the pipeline's
-        # divisor is 1; the adjustment is applied exactly once.
-        if "adj_factor" not in df.columns:
+        if raw.empty:
+            empty = self._project_price_fields(raw, fields)
+        elif self.adjustment_mode == "raw":
+            df = raw.copy()
             df["adj_factor"] = 1.0
+            empty = None
+        else:
+            hfq = self._fetch_daily_data(
+                codes, start_date, end_date, adjustflag="1",
+            )
+            df = self._merge_adjustment_divisor(raw, hfq)
+            empty = None
 
-        return self._project_price_fields(df, fields)
+        if empty is not None:
+            empty.attrs.update({
+                "price_basis": "raw",
+                "adjusted_price_basis": "raw",
+                "adjustment_factor_available": False,
+            })
+            return empty
+
+        df = self._project_price_fields(df, fields)
+        df.attrs.update({
+            "price_basis": "raw",
+            "adjusted_price_basis": (
+                _ADJUSTED_PRICE_BASIS
+                if self.adjustment_mode == "hfq" else "raw"
+            ),
+            "adjustment_factor_available": self.adjustment_factor_available,
+        })
+        return df
+
+    @staticmethod
+    def _merge_adjustment_divisor(
+        raw: pd.DataFrame, hfq: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Attach ``adj_factor = raw_close / hfq_close`` to the raw panel.
+
+        Baostock's hfq series is ``raw * cumulative_factor``, so this ratio is
+        exactly the divisor the pipeline needs (``close / adj_factor`` is
+        hfq).  A ratio is only meaningful where both closes are present; short
+        gaps are carried across per asset (corporate-action factors are
+        piecewise constant between actions).  If a row still has a raw close
+        but no derivable factor the fetch fails closed: silently assuming 1.0
+        would fabricate a corporate-action return in the research series.
+        """
+        if hfq is None or hfq.empty:
+            raise DataFetchIncompleteError(
+                "Baostock hfq fetch returned no data; cannot derive the "
+                "adjustment divisor. Use adjustment='raw' to run unadjusted."
+            )
+        raw_close = pd.to_numeric(raw["close"], errors="coerce")
+        hfq_close = pd.to_numeric(
+            hfq["close"].reindex(raw.index), errors="coerce",
+        )
+        factor = raw_close / hfq_close
+        valid = np.isfinite(factor) & (factor > 0)
+        factor = factor.where(valid)
+        factor = factor.groupby(level="asset").ffill()
+        factor = factor.groupby(level="asset").bfill()
+        bad = raw_close.notna() & factor.isna()
+        if bool(bad.any()):
+            sample = [
+                f"{asset}@{str(date)[:10]}"
+                for date, asset in bad[bad].index[:5]
+            ]
+            raise DataFetchIncompleteError(
+                "Baostock adjustment divisor unavailable for rows that carry "
+                f"a raw close ({int(bad.sum())} row(s), e.g. {sample}); "
+                "refusing to guess adj_factor=1.0"
+            )
+        merged = raw.copy()
+        merged["adj_factor"] = factor.astype(float)
+        return merged
 
     # ------------------------------------------------------------------
     # Financials (public)

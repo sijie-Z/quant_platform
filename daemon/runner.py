@@ -172,7 +172,24 @@ class Daemon:
 
         # 2. 恢复持久化状态并运行策略
         self.engine = LiveEngine()
-        self.engine.load_history(pipeline.returns, pipeline.get_close())
+        # Money marks require the raw (traded CNY) panel; get_close() is the
+        # adjusted research series and LiveEngine now refuses it (D15). A
+        # legacy/test pipeline double without get_raw_close() falls back to
+        # its close panel (the engine warns when the basis is unlabeled).
+        try:
+            history_prices = pipeline.get_raw_close()
+        except AttributeError:
+            history_prices = pipeline.get_close()
+        except Exception as e:
+            logger.error("ALERT: raw price panel unavailable: %s", e)
+            emit_alert(
+                "critical", f"raw price panel unavailable: {e}", source="daemon",
+                details={"error": type(e).__name__},
+            )
+            result["status"] = "data_failed"
+            result["alerts"].append(f"Raw price panel unavailable: {e}")
+            return result
+        self.engine.load_history(pipeline.returns, history_prices)
 
         previous_equity: float | None = None
         try:

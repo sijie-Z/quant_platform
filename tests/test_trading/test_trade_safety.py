@@ -143,7 +143,7 @@ def test_real_broker_orders_use_fresh_feed_prices(store, monkeypatch):
     runner.set_price_provider(feed)
     report = runner.run(days=1)
 
-    assert feed_calls == [["600519"]]
+    assert feed_calls == [["600519.SH"]]
     assert broker.orders, "the signal should have produced an order"
     assert all(order.price == 100.0 for order in broker.orders)
     assert report.total_fills == 1

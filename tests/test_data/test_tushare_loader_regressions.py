@@ -204,20 +204,34 @@ def test_adj_factor_missing_rows_fail_the_fetch(tmp_path):
 
 
 def test_no_fabricated_minus_49_percent_return(tmp_path):
-    """The audit probe's fabricated -49% one-day move must be impossible."""
+    """The audit probe's fabricated -49% one-day move must be impossible.
+
+    Raw prices jump on the split date (10 -> 5.1); the pipeline divides by
+    the divisor (``1/factor``), so the *adjusted* series stays continuous.
+    """
     api = FakeTushareAPI()
     prov = provider(tmp_path)
     df = prov._fetch_daily_prices(api, codes(4))
 
-    assert set(df["adj_factor"].unique()) == {1.0}
+    # Raw close is untouched; the divisor is 1/native factor.
+    assert set(df["adj_factor"].unique()) == {1.0, 0.5}
     close = df["close"].unstack("asset")
-    returns = close.pct_change(fill_method=None)
+    raw_day3 = df.loc[(pd.Timestamp("2024-01-04"), "600001.SH"), "close"]
+    assert raw_day3 == pytest.approx(5.2)
+    # The pipeline applies exactly one division; that series is continuous.
+    adjusted = (df["close"] / df["adj_factor"]).unstack("asset")
+    adjusted_returns = adjusted.pct_change(fill_method=None)
     by_prefix = {}
     for prefix in ("6000", "0000"):
-        cols = [c for c in close.columns if c.startswith(prefix)]
-        by_prefix[prefix] = float(returns[cols].abs().max().max())
+        cols = [c for c in adjusted.columns if c.startswith(prefix)]
+        by_prefix[prefix] = float(adjusted_returns[cols].abs().max().max())
     assert by_prefix["6000"] < 0.05
     assert by_prefix["0000"] < 0.05
+
+    # Raw returns *do* show the split; that is why money paths must not use
+    # raw-vs-adjusted interchangeably without the stated basis.
+    raw_move = close["600001.SH"].pct_change(fill_method=None).iloc[1]
+    assert raw_move < -0.4
 
 
 # ----------------------------------------------------------------------
@@ -236,10 +250,29 @@ def test_fetch_works_on_installed_pandas_and_units_are_normalised(tmp_path):
     assert row["turnover"] == pytest.approx(0.01)  # 1.0% -> fraction
     assert row["vwap"] == pytest.approx(10.0)      # amount/volume, not /1000
 
-    # hfq: raw close * cumulative factor, adjusted exactly once.
+    # Raw close (a tradeable CNY level); the pipeline divides by adj_factor
+    # (1/native factor) to obtain the same hfq series as before.
     assert row["close"] == pytest.approx(10.0)
     day3 = df.loc[(pd.Timestamp("2024-01-04"), "600001.SH")]
-    assert day3["close"] == pytest.approx(5.2 * 2.0)
+    assert day3["close"] == pytest.approx(5.2)
+    assert day3["adj_factor"] == pytest.approx(0.5)
+    assert day3["close"] / day3["adj_factor"] == pytest.approx(10.4)
+
+
+def test_get_prices_declares_raw_basis_with_divisor(tmp_path):
+    api = FakeTushareAPI()
+    prov = provider(tmp_path)
+    prov._ts_api = api
+
+    prices = prov.get_prices("2024-01-01", "2024-01-04")
+
+    assert prices.attrs["price_basis"] == "raw"
+    assert prices.attrs["adjusted_price_basis"] == "hfq"
+    assert prices.attrs["adjustment_factor_available"] is True
+    row = prices.loc[(pd.Timestamp("2024-01-04"), "600001.SH")]
+    assert row["close"] == pytest.approx(5.2)
+    assert row["adj_factor"] == pytest.approx(0.5)
+    assert row["close"] / row["adj_factor"] == pytest.approx(10.4)
 
 
 def test_vwap_infinite_value_is_replaced_with_close(tmp_path):

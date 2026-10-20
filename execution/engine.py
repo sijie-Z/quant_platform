@@ -22,6 +22,7 @@ from quant_platform.execution.models import (
     OrderStatus,
     Position,
 )
+from quant_platform.execution.oms import require_raw_price_basis
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -260,6 +261,8 @@ class ExecutionEngine:
         self._orders: dict[str, Order] = {}
         self._positions: dict[str, Position] = {}
         self._executed_orders: list[Order] = []
+        #: Basis of the most recent fill/mark prices (cash is CNY, so raw).
+        self.price_basis: str = "raw"
 
         #: Real cash ledger. Only enforced/mutated when tracking is enabled;
         #: engines constructed without `initial_cash` (and never enabled) keep
@@ -337,11 +340,13 @@ class ExecutionEngine:
         commission: float = 0.0,
         tax: float = 0.0,
         slippage: float = 0.0,
+        price_basis: str = "raw",
     ) -> Fill:
         """Process a fill for an order.
 
         Validation happens before any mutation, so a rejected fill leaves the
-        order, position and cash untouched.
+        order, position and cash untouched.  ``price`` must be a raw traded
+        CNY price; an adjusted basis raises before the book is touched (D15).
 
         Args:
             order: The order being filled.
@@ -350,15 +355,19 @@ class ExecutionEngine:
             commission: Commission cost.
             tax: Tax (stamp tax for A-share sells).
             slippage: Slippage cost.
+            price_basis: Basis of ``price``; must not be ``qfq``/``hfq``.
 
         Returns:
             The Fill object.
 
         Raises:
-            ValueError: on a naked sell (quantity > holding), a same-day sell
-                of T+1-locked shares, or a buy that would drive tracked cash
-                below zero.
+            ValueError: on an adjusted price basis, a naked sell (quantity >
+                holding), a same-day sell of T+1-locked shares, or a buy that
+                would drive tracked cash below zero.
         """
+        basis = require_raw_price_basis(
+            price_basis, context="ExecutionEngine fills",
+        )
         if order.side == OrderSide.SELL:
             position = self._positions.get(order.ticker)
             held = position.quantity if position else 0
@@ -414,6 +423,7 @@ class ExecutionEngine:
         # Mark the position at the fill price so risk consumers see a real
         # market value even before the next snapshot.
         position.update_price(price)
+        self.price_basis = basis
 
         return fill
 
@@ -441,8 +451,14 @@ class ExecutionEngine:
         for position in self._positions.values():
             position.available = position.quantity
 
-    def mark_to_market(self, prices: dict[str, float]) -> None:
-        """Mark every position at the given prices (missing prices skipped)."""
+    def mark_to_market(
+        self, prices: dict[str, float], price_basis: str = "raw",
+    ) -> None:
+        """Mark every position at the given raw CNY prices (missing skipped)."""
+        basis = require_raw_price_basis(
+            price_basis, context="ExecutionEngine marks",
+        )
+        self.price_basis = basis
         for position in self._positions.values():
             price = prices.get(position.ticker, 0.0)
             if price > 0:
@@ -455,11 +471,14 @@ class ExecutionEngine:
         self._executed_orders.clear()
         self.cash = self._initial_cash
 
-    def portfolio_snapshot(self, prices: dict[str, float]) -> dict:
+    def portfolio_snapshot(
+        self, prices: dict[str, float], price_basis: str = "raw",
+    ) -> dict:
         """Compute current portfolio snapshot.
 
         Args:
-            prices: {ticker: current_price}
+            prices: {ticker: current_price} in raw traded CNY.
+            price_basis: Basis of ``prices``; adjusted levels are refused.
 
         Returns:
             Dict with positions_value, n_positions, total_unrealized_pnl,
@@ -469,6 +488,9 @@ class ExecutionEngine:
             meaningful when cash tracking is enabled; untracked engines report
             the raw ledger (0.0) and callers should keep their own balance.
         """
+        self.price_basis = require_raw_price_basis(
+            price_basis, context="ExecutionEngine snapshot marks",
+        )
         total_upnl = 0.0
         total_rpnl = 0.0
         positions_value = 0.0

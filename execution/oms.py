@@ -36,6 +36,30 @@ MIN_COMMISSION = 5.0          # Minimum 5 RMB per trade
 STAMP_TAX_RATE = 0.001        # 0.1% sell-side only
 MIN_LOT = 100                 # 1 lot = 100 shares
 
+#: Bases that describe a return-generating (adjusted) series.  Cash, fills,
+#: commission and position marks are CNY amounts and must use raw prices.
+_ADJUSTED_PRICE_BASES = frozenset({"qfq", "hfq", "adjusted"})
+
+
+def require_raw_price_basis(
+    price_basis: str | None, *, context: str = "OMS marks/fills",
+) -> str:
+    """Validate that price inputs are raw (traded CNY) levels.
+
+    An explicitly adjusted basis is a hard error: dividing/multiplying shares
+    by an hfq level misstates cash and P&L (D15).  Unlabeled callers keep the
+    historical behaviour and are reported as ``"unknown"``; they must pass
+    ``"raw"`` to make the guarantee explicit.
+    """
+    text = str(price_basis or "").strip().lower()
+    if text in _ADJUSTED_PRICE_BASES:
+        raise ValueError(
+            f"{context} require raw (traded) CNY prices, got "
+            f"price_basis={text!r}. Adjusted levels are not tradeable; use a "
+            "broker/real-time quote or DataPipeline.get_raw_close()."
+        )
+    return text or "unknown"
+
 
 class OrderManager:
     """Core OMS engine.
@@ -60,6 +84,9 @@ class OrderManager:
         # both. Two concurrent fills could both pass validation: a 100-share
         # order accepted 60 + 60 and cash went negative.
         self._lock = threading.RLock()
+        #: Basis of the most recent fill/mark prices. Cash and share counts
+        #: are CNY-denominated, so this must stay raw (D15).
+        self.price_basis: str = "raw"
 
     # ── Order Lifecycle ──
 
@@ -145,10 +172,18 @@ class OrderManager:
         price: float,
         quantity: int | None = None,
         commission: float | None = None,
+        price_basis: str = "raw",
     ) -> Order:
-        """Process a fill atomically."""
+        """Process a fill atomically.
+
+        ``price`` must be a raw (traded) CNY price; an adjusted basis raises
+        before any cash/position mutation.
+        """
+        basis = require_raw_price_basis(price_basis, context="OMS fills")
         with self._lock:
-            return self._fill_order(order_id, price, quantity, commission)
+            order = self._fill_order(order_id, price, quantity, commission)
+            self.price_basis = basis
+            return order
 
     def _fill_order(
         self,
@@ -325,9 +360,15 @@ class OrderManager:
             for pos in self.positions.values():
                 pos.available = pos.quantity
 
-    def update_prices(self, prices: dict[str, float]):
-        """Update all positions with current market prices."""
+    def update_prices(
+        self, prices: dict[str, float], price_basis: str = "raw",
+    ):
+        """Update all positions with current market prices (raw CNY only)."""
+        basis = require_raw_price_basis(
+            price_basis, context="OMS position marks",
+        )
         with self._lock:
+            self.price_basis = basis
             for ticker, pos in self.positions.items():
                 if ticker in prices:
                     pos.update_price(prices[ticker])
@@ -453,6 +494,9 @@ class OrderManager:
                 "avg_order_size": round(
                     total_volume / len(self.blotter), 0
                 ) if self.blotter else 0,
+                # Fill prices are raw CNY levels; consumers can tell this
+                # apart from an adjusted research panel (D15).
+                "price_basis": self.price_basis,
             }
 
     # ── Persistence ──
@@ -501,8 +545,11 @@ class SimulatedExchange:
     def set_order_manager(self, om: OrderManager):
         self.order_manager = om
 
-    def update_market(self, prices: dict[str, float]):
-        """Update market prices."""
+    def update_market(self, prices: dict[str, float], price_basis: str = "raw"):
+        """Update market prices (raw traded CNY levels only)."""
+        require_raw_price_basis(
+            price_basis, context="SimulatedExchange marks/fills",
+        )
         self.current_prices.update(prices)
         for ticker, price in prices.items():
             if ticker not in self.price_history:
@@ -575,9 +622,11 @@ class SimulatedExchange:
 
             self.order_manager.fill_order(order.order_id, fill_price)
 
-    def simulate_trading_day(self, prices: dict[str, float]):
-        """Simulate a full trading day."""
-        self.update_market(prices)
+    def simulate_trading_day(
+        self, prices: dict[str, float], price_basis: str = "raw",
+    ):
+        """Simulate a full trading day (raw CNY prices only)."""
+        self.update_market(prices, price_basis=price_basis)
         if self.order_manager:
-            self.order_manager.update_prices(prices)
+            self.order_manager.update_prices(prices, price_basis=price_basis)
         self.match_orders()

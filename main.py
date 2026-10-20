@@ -612,6 +612,24 @@ def _load_data(
     _LAST_DATA_PROVIDER = resolution.get("effective_provider") or provider_name
 
     factor_prices = pipeline.get_factor_prices()
+    # Money paths (trade execute, smart-route, orchestrator fills) need the
+    # traded CNY panel; the adjusted research panel above is not tradeable.
+    # It rides on metadata (a DataFrame-valued attr on the *price* panel would
+    # propagate into derived frames, per the gates comment above).
+    if metadata is not None and hasattr(metadata, "attrs"):
+        from quant_platform.data.schema import DataQualityError
+
+        try:
+            raw_close = pipeline.get_raw_close()
+        except DataQualityError as exc:
+            logger.warning(
+                "Raw close unavailable; money paths must use broker/real-time "
+                "quotes instead: %s", exc,
+            )
+        else:
+            metadata.attrs["raw_prices"] = {
+                "close": raw_close, "price_basis": "raw",
+            }
     data_date = ""
     payload_assets: list[str] = []
     if factor_prices is not None and len(factor_prices.index) > 0:
@@ -2158,8 +2176,38 @@ def cmd_execute(args) -> int:
     ))
     orchestrator = PortfolioOrchestrator(ms)
 
-    # Get latest prices
-    last_prices = prices.iloc[-1].to_dict()
+    # Get latest **raw** prices. The `prices` first element of `_load_data`
+    # is the adjusted research panel; filling or marking a paper book at hfq
+    # levels would misstate cash and shares (D15).
+    raw_panel = None
+    if metadata is not None:
+        raw_panel = (
+            (getattr(metadata, "attrs", {}) or {})
+            .get("raw_prices", {})
+            .get("close")
+        )
+    if raw_panel is None or raw_panel.empty:
+        print(
+            "Error: the configured provider supplied no raw CNY price panel; "
+            "refusing to execute at adjusted levels. Use a provider that "
+            "returns raw OHLCV plus adj_factor.",
+            file=sys.stderr,
+        )
+        return 1
+    last_date_ts = prices.index[-1]
+    last_prices = (
+        raw_panel.loc[last_date_ts].dropna().to_dict()
+        if last_date_ts in raw_panel.index
+        else raw_panel.iloc[-1].dropna().to_dict()
+    )
+    if not last_prices:
+        print(
+            f"Error: no finite raw CNY price for {last_date_ts} in the "
+            "provider panel; refusing to execute against an empty book of "
+            "tradeable prices.",
+            file=sys.stderr,
+        )
+        return 1
     orchestrator._last_prices.update(last_prices)
 
     last_date = str(prices.index[-1])[:10]

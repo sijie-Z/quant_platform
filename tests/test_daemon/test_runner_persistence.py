@@ -78,7 +78,7 @@ def test_run_persists_state_and_does_not_replay_the_same_day(store, monkeypatch)
 def test_restart_rehydrates_positions_cash_and_watermark(store, monkeypatch):
     _, dates = _make_data()
     seeded = {
-        "version": 1,
+        "version": 2,
         "cash": 9_999_000.0,
         "positions": [{
             "asset": "S00", "entry_date": "2024-01-02",
@@ -113,7 +113,7 @@ def test_restart_rehydrates_positions_cash_and_watermark(store, monkeypatch):
 
 
 def test_killed_snapshot_blocks_trading(store, monkeypatch):
-    seeded = {"version": 1, "status": "killed", "cash": 1.0}
+    seeded = {"version": 2, "status": "killed", "cash": 1.0}
     store.save_engine_state(seeded, "live_engine_alpha_v1")
 
     daemon, _ = _make_daemon(store, monkeypatch)

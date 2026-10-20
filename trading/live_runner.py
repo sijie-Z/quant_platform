@@ -35,6 +35,7 @@ import numpy as np
 
 from quant_platform.core.audit import AuditAction, AuditLog
 from quant_platform.core.events import get_event_bus
+from quant_platform.core.instrument import normalize_symbol
 from quant_platform.core.state_machine import PortfolioStateMachine
 from quant_platform.core.store import Store
 from quant_platform.execution.paper_broker import (
@@ -50,6 +51,7 @@ from quant_platform.trading.broker import (
     SimulatedBroker,
     create_broker,
 )
+from quant_platform.trading.live_engine import ensure_raw_price_basis
 from quant_platform.utils.exchange_calendar import is_trading_day, trading_days
 from quant_platform.utils.logging import get_logger
 
@@ -87,6 +89,7 @@ class DailyReport:
     risk_level: str = "GREEN"
     drawdown_pct: float = 0.0
     paper_metrics: dict | None = None
+    price_basis: str = "raw"
 
     def to_dict(self) -> dict:
         return {
@@ -103,6 +106,9 @@ class DailyReport:
             "total_slippage": round(self.total_slippage, 4),
             "risk_level": self.risk_level,
             "drawdown_pct": round(self.drawdown_pct, 4),
+            # Every runner price is a broker/exchange quote (traded CNY), so
+            # the equity/P&L figures are on a raw basis (D15/D41).
+            "price_basis": self.price_basis,
             # The dual-track PaperBroker metrics were computed every cycle
             # and then dropped here, so the TCA comparison never surfaced.
             "paper_metrics": self.paper_metrics,
@@ -130,6 +136,7 @@ class SessionReport:
     status: str = "completed"
     failed_cycles: int = 0
     daily_reports: list[dict] = field(default_factory=list)
+    price_basis: str = "raw"
 
     def to_dict(self) -> dict:
         return {
@@ -147,6 +154,7 @@ class SessionReport:
             "max_drawdown_pct": round(self.max_drawdown_pct, 4),
             "avg_daily_volume": round(self.avg_daily_volume, 2),
             "broker_type": self.broker_type,
+            "price_basis": self.price_basis,
             "status": self.status,
             "failed_cycles": self.failed_cycles,
         }
@@ -261,12 +269,28 @@ class LiveRunner:
         self._session_report: SessionReport | None = None
         # Last observed cumulative totals for delta-based counters.
         self._metric_state: dict[str, float] = {}
+        # Basis of every quote this runner accepts; live/paper marks are raw
+        # traded CNY prices only (D15).
+        self._price_basis: str = "raw"
 
     # ── Setup ──
 
     def set_universe(self, codes: list[str]):
-        """Set the trading universe."""
-        self._universe = [c for c in codes if isinstance(c, str) and c.strip()]
+        """Set the trading universe in canonical ``CODE.EXCHANGE`` form.
+
+        Normalizing at the boundary means ``600519`` and ``600519.SH`` are
+        one position, not two, and Beijing/board rules see the right
+        exchange.  Quote keys fed through :meth:`set_prices` are normalized
+        the same way, so lookups always agree.
+        """
+        canonical = []
+        for code in codes:
+            if not isinstance(code, str) or not code.strip():
+                continue
+            normalized = normalize_symbol(code)
+            if normalized not in canonical:
+                canonical.append(normalized)
+        self._universe = canonical
         logger.info("Universe set: %d stocks", len(self._universe))
 
     def set_price_provider(self, provider: Callable[[list[str]], dict[str, float]]):
@@ -279,10 +303,24 @@ class LiveRunner:
         """
         self._price_provider = provider
 
-    def set_prices(self, prices: dict[str, float]):
-        """Feed market prices for the current cycle."""
-        self._current_prices.update(prices)
+    def set_prices(
+        self, prices: dict[str, float], price_basis: str = "raw",
+    ):
+        """Feed market prices for the current cycle.
+
+        Prices must be raw (traded CNY) quotes; an explicitly adjusted basis
+        is refused.  Keys are normalized to canonical form so a provider that
+        returns ``600519`` and a universe set as ``600519.SH`` still agree.
+        """
+        basis = ensure_raw_price_basis(
+            price_basis, context="LiveRunner marks/fills",
+        )
+        self._price_basis = basis if basis != "unknown" else "raw"
+        normalized: dict[str, float] = {}
         for code, price in prices.items():
+            normalized[normalize_symbol(code)] = price
+        self._current_prices.update(normalized)
+        for code, price in normalized.items():
             if code not in self._price_history:
                 self._price_history[code] = []
             self._price_history[code].append(price)
@@ -359,7 +397,9 @@ class LiveRunner:
         # cash per cycle and no position could ever be exited. Cash went
         # 1M -> 927k -> 873k -> 839k over three cycles with three positions
         # held throughout.
-        held = {p.code: p for p in self._broker.get_positions()}
+        held = {
+            normalize_symbol(p.code): p for p in self._broker.get_positions()
+        }
         wanted = {code for code, score in sorted_scores[:top_n] if score > 0.005}
 
         # Exit anything that has dropped out of the target set.
@@ -595,6 +635,10 @@ class LiveRunner:
         # D8: every generated signal is persisted (signal row + audit event)
         # before execution; nothing used to be written.
         for sig in signals:
+            # Signals may arrive from strategy code using a native symbol
+            # form; normalize once so order/position keys stay canonical.
+            if isinstance(sig.get("code"), str):
+                sig["code"] = normalize_symbol(sig["code"])
             try:
                 self._audit.log_signal(
                     sig["code"], sig["side"], float(sig.get("strength", 0) or 0),
@@ -673,6 +717,7 @@ class LiveRunner:
             risk_level=self._risk.get_status().get("risk_level", "GREEN"),
             drawdown_pct=drawdown,
             paper_metrics=paper_metrics,
+            price_basis=self._price_basis,
         )
         self._daily_reports.append(report)
 
@@ -808,7 +853,7 @@ class LiveRunner:
             except (TypeError, ValueError):
                 continue
             if price > 0 and np.isfinite(price):
-                prices[code] = price
+                prices[normalize_symbol(code)] = price
         if not prices:
             raise RuntimeError(
                 "market data feed returned no fresh quotes; cycle skipped"
@@ -883,7 +928,7 @@ class LiveRunner:
         for pos in self._broker.get_positions():
             weight = pos.market_value / equity if equity > 0 else 0.0
             sector = getattr(pos, "sector", "") or "Unknown"
-            positions[pos.code] = {
+            positions[normalize_symbol(pos.code)] = {
                 "value": pos.market_value,
                 "weight": weight,
                 "sector": sector,
@@ -999,6 +1044,7 @@ class LiveRunner:
                 avg_daily_volume=0, broker_type=self._broker_type_name,
                 status=self._session_status,
                 failed_cycles=self._failed_cycles,
+                price_basis=self._price_basis,
             )
 
         # Calculate metrics
@@ -1047,6 +1093,7 @@ class LiveRunner:
             status=self._session_status,
             failed_cycles=self._failed_cycles,
             daily_reports=[r.to_dict() for r in self._daily_reports],
+            price_basis=self._price_basis,
         )
 
     def get_state(self) -> dict:
@@ -1059,4 +1106,5 @@ class LiveRunner:
             "dual_track": self._dual_track,
             "broker": type(self._broker).__name__,
             "risk_level": self._risk.get_status().get("risk_level", "GREEN"),
+            "price_basis": self._price_basis,
         }

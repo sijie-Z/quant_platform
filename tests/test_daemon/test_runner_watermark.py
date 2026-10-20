@@ -72,7 +72,7 @@ def test_watermark_survives_a_process_restart(store, monkeypatch):
 def test_catch_up_replays_every_unprocessed_exchange_day(store, monkeypatch):
     daemon, dates = _make_daemon(store, monkeypatch)
     seeded = {
-        "version": 1,
+        "version": 2,
         "cash": 10_000_000.0,
         "positions": [],
         "equity_peak": 10_000_000.0,
@@ -101,7 +101,7 @@ def test_catch_up_is_bounded(store, monkeypatch):
     monkeypatch.setattr(runner_mod, "MAX_CATCHUP_DAYS", 2)
     daemon, dates = _make_daemon(store, monkeypatch)
     store.save_engine_state({
-        "version": 1,
+        "version": 2,
         "cash": 10_000_000.0,
         "positions": [],
         "equity_peak": 10_000_000.0,

@@ -1,4 +1,4 @@
-# 交接说明（2026-09-23，更新至 2026-10-20 第十轮）
+# 交接说明（2026-09-23，更新至 2026-10-21 第十一轮）
 
 > 这份文档写给接手这个仓库的人。它记录**当前状态、改过什么、还剩什么、以及那些代码里看不出来的坑**。
 > 未完成的工作全部开在 [Issues](https://github.com/sijie-Z/quant_platform/issues) 上，编号在下面对应。
@@ -400,8 +400,10 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
    向量化日频回测仍是权重层面（已明确标注，未隐藏）。
 5. **交易所日历**：内置休市表覆盖至 2026 年；2027 年休市日需通过
    `QUANT_EXCHANGE_HOLIDAYS` 追加。
-6. **跨数据源价格基准**：Tushare/Baostock 均为后复权 hfq、调整只应用一次，但跨源
-   价格基准尚未统一（D15/D41）。
+6. **价格基准**：已统一。provider 交付 raw OHLCV + 复权因子（Tushare `adj_factor=1/native_cum`、
+   Baostock raw+hfq 双取），`get_raw_close()` 供成交/估值、`get_adjusted_close()` 供研究，
+   货币路径在只有复权价时 fail closed；符号统一为 `CODE.EXCHANGE`（含北交所 30% 限价）。
+   残余：Postgres/Adata 尚未声明基准，paper 引擎未做公司行动股数/分红记账。
 7. **增量数据**：无增量 append 路径（D32），每次按区间重新拉取。
 8. **ST 历史**：Tushare/Baostock 不提供 ST 公告历史（`st_available=False`，
    不伪造全 False 列）；合成数据提供，用于 PIT 验证。
@@ -410,3 +412,23 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
 
 > 判据不变：任何"宣称"如果不能用测试或可运行命令表达，它就还不是真的。
 > 本轮文档校正的原则是**删掉无法验证的数字、标注不可用能力、把 roadmap 写成 roadmap**。
+
+---
+
+### 2026-10-21 第十一轮（缓存 provenance + 价格基准/符号统一）
+
+基线提交 `8f8caec`。这一轮补上第十轮留下的两块数据层缺口：
+
+| 波次 | 主要内容 |
+|---|---|
+| 缓存 provenance（D12/D13/D33-D36） | pipeline 缓存键在 provider 解析之后生成，包含物化配置（含 schema 默认值）、有效 provider 链（Validated + secondary）、实际采样符号集哈希、复权基、日期范围与 `DATA_SCHEMA_VERSION`；Tushare/Baostock provider 缓存带 schema/复权版本清单，不匹配即重取；`--force` 重算并原子覆盖，新增 `cache refresh`；仅真正损坏才删除缓存（瞬时 IO 错误保留）；完整 provenance 清单并入 `metrics.json`，缓存命中不会把 synthetic 伪装成真实 provider；跨进程锁 + 唯一临时文件 + 陈旧临时文件清理，保存失败保留旧条目 |
+| 价格基准/符号（D15/D41/D18/D19/D30） | 面板携带 `price_basis` / `adjusted_price_basis` / `adjustment_factor_available`；Tushare 改为 raw + `adj_factor`、Baostock raw(`adjustflag=3`)+hfq 双取、合成数据显式声明；`get_raw_close()` 用于 paper/live 成交与估值，只有复权价时 `DataQualityError`（fail closed）；`get_adjusted_close()` 供研究且与旧 hfq 序列逐点一致；双重复权守卫；`shared/symbols.py` 统一 `CODE.EXCHANGE`（前后缀、`sh.688`、北交所 4/8/920 与 30% 限价），pipeline 资产标签与 QMT/realtime/runner/API 边界统一规范化 |
+| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **2,773 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
+
+**当前计数（2026-10-21 实测）**：2,502 个测试函数、2,776 条用例
+（2,773 passed / 3 skipped）、201 个测试文件、约 230 个非测试 Python 文件、
+99 HTTP + 1 WebSocket、21 个 CLI 命令、37 个 Vue 组件。
+
+**仍未处理（诚实清单）**：多租户隔离（#75）；7 个分析端点 `available:false`；
+WS `?token=` 旧回退；Postgres/Adata 价格基准声明；增量数据更新（D32，仅有设计）；
+paper 引擎公司行动股数/分红记账；交易所日历 2027 年需通过 `QUANT_EXCHANGE_HOLIDAYS` 追加。

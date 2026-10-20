@@ -114,8 +114,9 @@ class TestLiveRunnerUniverse:
     def test_set_prices(self):
         self.runner.set_universe(["600519", "000001"])
         self.runner.set_prices({"600519": 1800.0, "000001": 15.0})
-        assert self.runner._current_prices["600519"] == 1800.0
-        assert "000001" in self.runner._price_history
+        # Quote keys are canonicalized to CODE.EXCHANGE at the boundary.
+        assert self.runner._current_prices["600519.SH"] == 1800.0
+        assert "000001.SZ" in self.runner._price_history
 
 
 class TestLiveRunnerSignalGeneration:

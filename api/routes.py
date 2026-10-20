@@ -66,6 +66,7 @@ from quant_platform.api.schemas import (
     VWAPResponse,
     WebSocketStatsResponse,
 )
+from quant_platform.core.instrument import normalize_symbol
 from quant_platform.execution.oms import OrderManager
 from quant_platform.main import (
     _compute_factors,
@@ -2389,6 +2390,7 @@ def _fetch_live_portfolio() -> dict:
 
         # Top holdings by market value
         top = valid.nlargest(20, "market_value")
+        top = top.assign(price_basis="raw")
         data_date = max(price_dates.values()) if price_dates else None
 
         return {
@@ -2401,8 +2403,13 @@ def _fetch_live_portfolio() -> dict:
             "data_date": data_date,
             "stale": data_date != today,
             "partial": deadline_hit,
+            # These marks come from baostock adjustflag="3" (unadjusted), i.e.
+            # the traded CNY price -- never an hfq/qfq level (D15/D41).
+            "price_basis": "raw",
+            "price_source": "baostock:adjustflag=3",
             "holdings": top[["code", "hold_vol", "close", "preclose",
-                             "market_value", "pnl", "pnl_pct"]].to_dict(orient="records"),
+                             "market_value", "pnl", "pnl_pct",
+                             "price_basis"]].to_dict(orient="records"),
             "timestamp": datetime.now().isoformat(),
         }
     except HTTPException:
@@ -2470,6 +2477,8 @@ async def create_order(order_req: dict):
     ticker = str(order_req.get("ticker", "") or "").strip()
     if not ticker:
         raise HTTPException(422, "ticker is required")
+    # Canonical identity: `600519` and `600519.SH` must be one position.
+    ticker = normalize_symbol(ticker)
     try:
         quantity = int(order_req.get("quantity", 100))
     except (TypeError, ValueError) as exc:
@@ -2533,12 +2542,16 @@ async def fill_order(fill_req: dict):
             order_id=fill_req.get("order_id", ""),
             price=price,
             quantity=fill_req.get("quantity"),
+            # Default raw; a caller that declares qfq/hfq is refused by the
+            # OMS instead of poisoning cash and P&L (D15).
+            price_basis=fill_req.get("price_basis", "raw"),
         )
         return {
             "order_id": order.order_id,
             "status": order.status.value,
             "filled_qty": order.filled_quantity,
             "avg_price": round(order.avg_fill_price, 2),
+            "price_basis": oms.price_basis,
         }
     except Exception as e:
         raise HTTPException(400, str(e)) from e
@@ -2571,6 +2584,9 @@ async def get_positions():
         "n_positions": snapshot.n_positions,
         "total_unrealized_pnl": snapshot.total_unrealized_pnl,
         "total_realized_pnl": snapshot.total_realized_pnl,
+        # Fills and marks are accepted as raw CNY prices only (adjusted
+        # qfq/hfq levels are rejected at the OMS boundary, D15).
+        "price_basis": oms.price_basis,
         "positions": [
             {
                 "ticker": p.ticker,
@@ -2582,6 +2598,7 @@ async def get_positions():
                 "unrealized_pnl_pct": round(p.unrealized_pnl_pct, 2),
                 "realized_pnl": round(p.realized_pnl, 2),
                 "weight": round(p.weight, 4),
+                "price_basis": oms.price_basis,
             }
             for p in snapshot.positions
         ],
@@ -2676,6 +2693,8 @@ def get_stock_realtime(code: str):
             "amount": float(row[7]) if row[7] else None,
             "pctChg": float(row[8]) if row[8] else None,
             "source": "baostock",
+            # adjustflag="3" is the unadjusted (traded CNY) series.
+            "price_basis": "raw",
         }
     except HTTPException:
         raise
@@ -3269,6 +3288,9 @@ def smart_route_order(req: dict):
 
     if not ticker:
         raise HTTPException(422, "ticker is required")
+    # Canonical CODE.EXCHANGE keeps OMS position identity consistent with the
+    # trading runner / live portfolio (D19/D30/D41).
+    ticker = normalize_symbol(ticker)
     try:
         quantity = int(quantity)
         adv = float(adv)
@@ -3310,18 +3332,45 @@ def smart_route_order(req: dict):
     if req.get("execute", False):
         price = req.get("price")
         if price is None:
+            # Money path: use the **raw** close, never the adjusted research
+            # panel (`_load_data`'s first element).  A provider that cannot
+            # supply raw prices must fail the request, not fill at hfq levels
+            # (D15).
             try:
                 config = load_config()
-                prices, *_rest = _load_data(config)
-                price = float(prices[ticker].dropna().iloc[-1])
+                _prices, _returns, _benchmark, metadata, *_rest = _load_data(
+                    config,
+                )
+                raw_panel = None
+                if metadata is not None:
+                    raw_panel = (
+                        (getattr(metadata, "attrs", {}) or {})
+                        .get("raw_prices", {})
+                        .get("close")
+                    )
+                if raw_panel is None or ticker not in raw_panel.columns:
+                    raise RuntimeError(
+                        "the active data provider supplied no raw price panel"
+                    )
+                price = float(raw_panel[ticker].dropna().iloc[-1])
             except Exception as e:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"execute=true needs a price and none could be derived for {ticker}: {e}",
+                    detail=(
+                        "execute=true needs a raw CNY price and none could "
+                        f"be derived for {ticker}: {e}"
+                    ),
                 ) from e
+        try:
+            price = float(price)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "price must be a number") from exc
+        if not np.isfinite(price) or price <= 0:
+            raise HTTPException(400, "price must be a finite positive number")
 
         report = PlanExecutor(_get_oms()).execute_plan(plan, price=float(price))
         response["execution"] = report.to_dict()
+        response["price_basis"] = "raw"
 
     return response
 
@@ -3876,8 +3925,8 @@ def trading_positions():
     """Get live trading positions."""
     engine = _get_live_engine()
     if not engine:
-        return {"positions": []}
-    return {"positions": engine.get_positions()}
+        return {"positions": [], "price_basis": "raw"}
+    return {"positions": engine.get_positions(), "price_basis": "raw"}
 
 
 @router.get("/trading/account")
@@ -3885,8 +3934,8 @@ def trading_account():
     """Get live trading account info."""
     engine = _get_live_engine()
     if not engine:
-        return {"account": {}}
-    return {"account": engine.get_account()}
+        return {"account": {}, "price_basis": "raw"}
+    return {"account": engine.get_account(), "price_basis": "raw"}
 
 
 @router.get("/trading/cycles")
@@ -4372,26 +4421,36 @@ def _ic_monitor_alerts_impl():
 # Barra Risk Model endpoints
 # ────────────────────────────────────────────────────────────────
 
-def _resolve_portfolio_weights(requested: dict[str, float] | None, prices: pd.DataFrame) -> pd.Series:
+def _resolve_portfolio_weights(
+    requested: dict[str, float] | None,
+    prices: pd.DataFrame,
+    raw_prices: pd.DataFrame | None = None,
+) -> pd.Series:
     """Pick the portfolio to decompose.
 
     Explicit weights win; otherwise the current OMS positions are marked to
-    the latest close; otherwise the universe is equal-weighted. Equal weight
-    over the whole universe has zero net exposure to every cross-sectionally
-    standardized factor by construction, so that fallback is only a safe
-    default, not a meaningful risk decomposition.
+    the latest **raw** close (an adjusted research panel would distort the
+    weights by the corporate-action factor, D15); otherwise the universe is
+    equal-weighted. Equal weight over the whole universe has zero net
+    exposure to every cross-sectionally standardized factor by construction,
+    so that fallback is only a safe default, not a meaningful risk
+    decomposition.
     """
     if requested:
         raw = pd.Series(requested, dtype=float)
     else:
         marks: dict[str, float] = {}
+        mark_panel = raw_prices if raw_prices is not None else prices
         for ticker, position in getattr(_get_oms(), "positions", {}).items():
-            if ticker not in prices.columns:
+            key = ticker
+            if key not in mark_panel.columns:
+                key = normalize_symbol(ticker)
+            if key not in mark_panel.columns:
                 continue
-            series = prices[ticker].dropna()
+            series = mark_panel[key].dropna()
             if series.empty:
                 continue
-            marks[ticker] = float(position.quantity) * float(series.iloc[-1])
+            marks[key] = float(position.quantity) * float(series.iloc[-1])
         raw = pd.Series(marks, dtype=float) if marks else pd.Series(1.0, index=prices.columns)
 
     weights = raw.reindex(prices.columns).fillna(0.0)
@@ -4417,7 +4476,13 @@ def _barra_decompose_impl(req: BarraDecomposeRequest) -> BarraRiskResponse:
         processed_factors, _ic_results, sector_map, fin_unstacked = _compute_factors(
             prices, returns, financials, metadata, turnover, config=config)
 
-        weights = _resolve_portfolio_weights(req.weights, prices)
+        raw_prices = (
+            (getattr(metadata, "attrs", {}) or {})
+            .get("raw_prices", {})
+            .get("close")
+            if metadata is not None else None
+        )
+        weights = _resolve_portfolio_weights(req.weights, prices, raw_prices)
 
         model = BarraModel(
             half_life=req.half_life,

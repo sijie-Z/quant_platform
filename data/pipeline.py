@@ -37,16 +37,26 @@ Data policies fixed in this module (regression-tested):
 * **Suspension detection** treats an unchanged close with no volume/OHLC
   evidence of a trade as stale (close-only forward-fill detection), instead
   of booking a fake zero return.
-* **Symbol normalization** for board price-limit rules accepts suffix
-  (``300001.SZ``), prefix (``sz300001``/``sh.688001``) and Beijing
-  (``4``/``8``/``920``) codes.  A shared normalizer is still needed in
-  ``core/instrument.py`` (owned by another wave); this module's local
-  helper is the reference implementation.
+* **Symbol normalization** happens once, at the provider boundary: every
+  ``asset`` label in prices, financials and metadata is rewritten through
+  :func:`quant_platform.core.instrument.normalize_symbol` to the canonical
+  ``CODE.EXCHANGE`` form (``sz300001`` -> ``300001.SZ``, ``sh.688001`` ->
+  ``688001.SH``, ``920001`` -> ``920001.BJ``).  Board price-limit rules then
+  use the shared helper (ChiNext/STAR 20%, Beijing 30%).
+* **Price basis is explicit** (D15/D18/D41).  Every panel the pipeline hands
+  out carries ``attrs["price_basis"]`` in ``{"raw", "qfq", "hfq"}`` and
+  ``attrs["adjustment_factor_available"]``.  ``get_close()`` is a deprecated
+  alias of ``get_adjusted_close()`` whose panel is the return-generating
+  (adjusted) series used by research.  ``get_raw_close()`` is the *traded*
+  CNY panel that every paper/live fill and mark must use; it raises
+  :class:`~quant_platform.data.schema.DataQualityError` when the provider only
+  shipped adjusted levels instead of silently returning them.  Research
+  returns/IC math is unchanged: for Tushare/Baostock the adjusted series
+  reproduces the previous hfq levels exactly, and synthetic's adjusted series
+  is its generated continuous path.
 """
 
 from __future__ import annotations
-
-import re
 
 import numpy as np
 import pandas as pd
@@ -60,77 +70,26 @@ from quant_platform.data.schema import (
     validate_metadata,
     validate_prices,
 )
+from quant_platform.shared.symbols import (
+    normalize_symbol,
+    price_limit_threshold,
+)
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Symbol normalization / board price-limit rules
+# Price-basis contract
 # ---------------------------------------------------------------------------
 
-_EXCHANGES = ("SH", "SZ", "BJ")
+#: Bases a price panel may declare.
+PRICE_BASES = ("raw", "qfq", "hfq")
 
-
-def _symbol_code(symbol) -> str | None:
-    """Extract the six-digit A-share code from any accepted symbol format.
-
-    Accepts ``600001.SH``, ``sh600001``, ``SH.600001``, ``sz.300001``,
-    ``bj430001`` and bare ``600001``.  Returns ``None`` when no six-digit
-    code can be found.
-    """
-    match = re.search(r"\d{6}", str(symbol))
-    return match.group(0) if match else None
-
-
-def _infer_exchange(code: str) -> str:
-    """Infer the exchange for a bare six-digit code (best effort)."""
-    if code.startswith("920") or code.startswith(("4", "8")):
-        return "BJ"
-    if code.startswith(("0", "2", "3")):
-        return "SZ"
-    if code.startswith(("6", "9")):
-        return "SH"
-    return "SZ"
-
-
-def normalize_symbol(symbol) -> str:
-    """Return a canonical ``CODE.EXCHANGE`` symbol (e.g. ``300001.SZ``).
-
-    Handles suffix (``300001.SZ``), prefix (``sz300001``), dotted prefix
-    (``sh.688001``) and Beijing codes.  Unrecognised formats are returned
-    upper-cased unchanged so callers can still log them.
-    """
-    s = str(symbol).strip().upper()
-    m = re.fullmatch(r"(\d{6})[.\-_]?(SH|SZ|BJ)", s)
-    if m:
-        return f"{m.group(1)}.{m.group(2)}"
-    m = re.fullmatch(r"(SH|SZ|BJ)[.\-_]?(\d{6})", s)
-    if m:
-        return f"{m.group(2)}.{m.group(1)}"
-    m = re.fullmatch(r"(\d{6})", s)
-    if m:
-        return f"{m.group(1)}.{_infer_exchange(m.group(1))}"
-    return s
-
-
-def price_limit_threshold(symbol) -> float:
-    """Daily price-limit threshold for an A-share symbol.
-
-    Board rules: ChiNext/STAR (``300``/``301``/``688``/``689``) 20%, Beijing
-    (``4``/``8``/``920``) 30%, everything else 10%.  The symbol is normalized
-    first, so ``sz300001`` and ``sh.688001`` get the correct board rule
-    instead of falling through ``str.startswith`` on the raw label.
-    Unknown formats default to 10%.
-    """
-    code = _symbol_code(symbol)
-    if code is None:
-        return 0.10
-    if code.startswith(("300", "301", "688", "689")):
-        return 0.20
-    if code.startswith(("4", "8", "920")):
-        return 0.30
-    return 0.10
+#: Provider declarations that mean "close is the traded (raw) price and
+#: ``adj_factor`` is the divisor".  ``synthetic_adj_factor`` is the legacy
+#: label the synthetic provider used before the explicit basis contract.
+_RAW_DECLARATIONS = frozenset({"raw", "synthetic_adj_factor", "none"})
 
 
 def realized_returns(returns: pd.DataFrame) -> pd.DataFrame:
@@ -246,6 +205,17 @@ class DataPipeline:
         # panel supports point-in-time queries via get_financials_as_of().
         self.financials_pit_available: bool = False
 
+        # Price-basis contract (D15/D18/D41), resolved from the provider
+        # declaration on every run():
+        #   price_basis              -- basis of `prices["close"]`
+        #   adjusted_price_basis     -- basis of `prices["close_adj"]`
+        #   adjustment_factor_available -- True when `adj_factor` is a real
+        #                                 corporate-action divisor rather than
+        #                                 a placeholder 1.0
+        self.price_basis: str = "unknown"
+        self.adjusted_price_basis: str = "unknown"
+        self.adjustment_factor_available: bool = False
+
         # Point-in-time data (populated during run if provider supports it)
         self._st_timeseries: pd.DataFrame | None = None
         self._industry_changes: pd.DataFrame | None = None
@@ -284,9 +254,17 @@ class DataPipeline:
         self.unknown_listing_assets = 0
         self._inferred_delistings = {}
         self.financials_pit_available = False
+        self.price_basis = "unknown"
+        self.adjusted_price_basis = "unknown"
+        self.adjustment_factor_available = False
 
         self.metadata = self.provider.get_metadata()
         validate_metadata(self.metadata, provider=self.provider)
+        # One symbol form for the whole platform: canonical CODE.EXCHANGE.
+        # Providers adapt to/from their native form internally; the pipeline
+        # boundary is where every consumer (factors, trading, OMS) can rely
+        # on a single identity.
+        self.metadata = self._normalize_metadata_assets(self.metadata)
         # Ensure date columns are datetime (Baostock returns strings)
         for col in ["listing_date", "delisting_date"]:
             if col in self.metadata.columns:
@@ -303,6 +281,14 @@ class DataPipeline:
             str(self.start_date.date()), str(self.end_date.date())
         )
         validate_prices(prices, provider=self.provider)
+        # Resolve the basis from the provider frame *before* normalization /
+        # deduplication (which may drop the frame attrs).
+        (
+            self.price_basis,
+            self.adjusted_price_basis,
+            self.adjustment_factor_available,
+        ) = self._resolve_price_basis(prices)
+        prices = self._normalize_panel_assets(prices, "prices")
         # Duplicate (date, asset) rows are a provider overlap, not a reason to
         # abort the run with pandas' opaque unstack error.  keep="last" is the
         # documented policy: the later observation supersedes the earlier one.
@@ -312,6 +298,7 @@ class DataPipeline:
             str(self.start_date.date()), str(self.end_date.date())
         )
         validate_financials(financials, provider=self.provider)
+        financials = self._normalize_panel_assets(financials, "financials")
         self.financials = self._deduplicate_rows(financials, "financials")
         self.financials_pit_available = bool(
             self.financials is not None
@@ -338,10 +325,202 @@ class DataPipeline:
         self._apply_pit_tradability_mask()
         self._compute_returns()
         self._align()
+        self.prices.attrs.update(self.price_basis_info())
 
         logger.info("Pipeline complete: %d assets, %d dates",
                      len(self.valid_assets) if self.valid_assets is not None else 0,
                      len(self.prices.index.get_level_values("date").unique()))
+
+    # ------------------------------------------------------------------
+    # Price-basis contract
+    # ------------------------------------------------------------------
+
+    def price_basis_info(self) -> dict:
+        """Basis metadata attached to every panel this pipeline hands out."""
+        return {
+            "price_basis": self.price_basis,
+            "adjusted_price_basis": self.adjusted_price_basis,
+            "adjustment_factor_available": bool(
+                self.adjustment_factor_available
+            ),
+        }
+
+    @staticmethod
+    def _normalize_metadata_assets(meta: pd.DataFrame) -> pd.DataFrame:
+        """Rewrite the metadata index to canonical ``CODE.EXCHANGE`` form.
+
+        A provider that lists the same instrument under two labels
+        (``600519`` and ``600519.SH``) collides after normalization; the
+        later row wins, matching the panel deduplication policy, and the
+        collision is logged.
+        """
+        if meta is None or meta.empty or meta.index.name != "asset":
+            return meta
+        mapped = pd.Index(
+            [normalize_symbol(asset) for asset in meta.index], name="asset",
+        )
+        if not mapped.equals(meta.index):
+            meta = meta.set_axis(mapped, axis=0)
+        duplicated = meta.index.duplicated(keep="last")
+        count = int(duplicated.sum())
+        if count:
+            sample = list(meta.index[duplicated][:5])
+            logger.warning(
+                "metadata: dropped %d duplicate asset label(s) created by "
+                "symbol normalization (keep='last'): %s",
+                count, sample,
+            )
+            meta = meta[~duplicated]
+        return meta
+
+    @staticmethod
+    def _normalize_panel_assets(
+        df: pd.DataFrame | None, dataset: str,
+    ) -> pd.DataFrame | None:
+        """Rewrite a ``(date, asset)`` panel's asset level to canonical form.
+
+        Collisions (a provider that returned both ``600519`` and
+        ``600519.SH`` for the same date) become duplicate index entries and
+        are resolved by the documented ``keep="last"`` deduplication that runs
+        immediately after this normalization.
+        """
+        if df is None or df.empty:
+            return df
+        if not isinstance(df.index, pd.MultiIndex):
+            return df
+        if list(df.index.names) != ["date", "asset"]:
+            return df
+        assets = df.index.get_level_values("asset")
+        normalized = [normalize_symbol(asset) for asset in assets]
+        if list(assets) == normalized:
+            return df
+        dates = df.index.get_level_values("date")
+        renamed = df.copy()
+        renamed.index = pd.MultiIndex.from_arrays(
+            [dates, normalized], names=["date", "asset"],
+        )
+        # ``copy()`` keeps attrs; a provider frame's basis declaration must
+        # survive so downstream provenance still sees it.
+        renamed.attrs.update(getattr(df, "attrs", {}) or {})
+        changed = sum(1 for old, new in zip(assets, normalized, strict=False) if old != new)
+        if changed:
+            logger.info(
+                "%s: normalized %d asset label(s) to CODE.EXCHANGE form",
+                dataset, changed,
+            )
+        return renamed
+
+    def _provider_basis_attr(self, attribute: str):
+        """Read a basis attribute through provider wrappers.
+
+        ``ValidatedProvider`` fuses several sources and does not redeclare the
+        price basis; its panel is the *primary* provider's panel, so the
+        declaration must be read from there.  The abstract default
+        ``"provider-defined"`` is treated as "not declared".
+        """
+        provider = self.provider
+        seen: set[int] = set()
+        while provider is not None and id(provider) not in seen:
+            seen.add(id(provider))
+            value = getattr(provider, attribute, None)
+            if value is not None and value != "provider-defined":
+                return value
+            providers = getattr(provider, "providers", None)
+            if not isinstance(providers, dict) or not providers:
+                break
+            primary = providers.get(getattr(provider, "primary", None))
+            provider = primary if primary is not None else next(
+                iter(providers.values())
+            )
+        return None
+
+    def _resolve_price_basis(
+        self, prices: pd.DataFrame,
+    ) -> tuple[str, str, bool]:
+        """Resolve explicit raw/adjusted price semantics for this run.
+
+        The provider declaration (frame ``attrs`` first, then the
+        ``price_adjustment`` instance attribute) is authoritative.  Long-lived
+        legacy declarations ``synthetic_adj_factor``/``none`` mean the shared
+        divisor contract (raw close + ``adj_factor`` divisor).  A provider
+        that declares an already-adjusted close (``qfq``/``hfq``) while also
+        shipping a non-constant ``adj_factor`` would be double-adjusted by
+        ``close / adj_factor``; that is a hard contract error, not a silent
+        50% return error (D20 risk).
+
+        A provider with no declaration but a non-constant factor is treated
+        as the shared divisor contract (raw close).  With no declaration and
+        a placeholder factor, the basis stays ``"unknown"``: research
+        accessors still work, but ``get_raw_close()`` and the live/paper
+        engines refuse to treat it as a CNY price.
+        """
+        attrs = getattr(prices, "attrs", {}) or {}
+        declared = attrs.get("price_basis")
+        if declared is None:
+            declared = self._provider_basis_attr("price_adjustment")
+        text = str(declared or "").strip().lower()
+        if text in _RAW_DECLARATIONS:
+            basis = "raw"
+        elif text in {"qfq", "hfq"}:
+            basis = text
+        else:
+            basis = "unknown"
+
+        factor_varies = False
+        factor_valid = False
+        if "adj_factor" in prices.columns and len(prices):
+            factor = pd.to_numeric(prices["adj_factor"], errors="coerce")
+            finite = np.isfinite(factor.to_numpy(dtype=float))
+            factor_valid = bool(finite.any())
+            values = factor.to_numpy(dtype=float)[finite]
+            factor_varies = bool(
+                values.size and (np.abs(values - 1.0) > 1e-12).any()
+            )
+
+        available = attrs.get("adjustment_factor_available")
+        if available is None:
+            available = self._provider_basis_attr("adjustment_factor_available")
+        if available is None:
+            available = bool(factor_varies and factor_valid)
+
+        if basis in {"qfq", "hfq"} and factor_varies:
+            raise DataQualityError(
+                f"{provider_label(self.provider)}: close is declared "
+                f"{basis!r} but adj_factor is non-constant. The pipeline "
+                "divides close by adj_factor, so this panel would be "
+                "double-adjusted. Providers must ship raw close plus a "
+                "divisor, or an already-adjusted close with adj_factor=1."
+            )
+        if basis == "unknown" and factor_varies:
+            # The only unambiguous reading of a non-constant factor is the
+            # shared divisor contract: close is the traded price.
+            basis = "raw"
+            available = True
+
+        adjusted = attrs.get("adjusted_price_basis")
+        if adjusted is None:
+            adjusted = self._provider_basis_attr("adjusted_price_basis")
+        if adjusted not in PRICE_BASES:
+            if basis in {"qfq", "hfq"}:
+                adjusted = basis
+            elif basis == "raw":
+                # The shared divisor contract (raw / divisor) is the same
+                # back-adjustment Tushare/Baostock produce; providers with a
+                # front-adjusted path (synthetic) declare it explicitly.
+                adjusted = "hfq" if available else "raw"
+            else:
+                adjusted = "unknown"
+
+        return basis, str(adjusted), bool(available)
+
+    def _tag_price_panel(self, panel: pd.DataFrame, basis: str) -> pd.DataFrame:
+        """Attach the explicit basis contract to a returned price panel."""
+        panel.attrs["price_basis"] = basis
+        panel.attrs["adjusted_price_basis"] = self.adjusted_price_basis
+        panel.attrs["adjustment_factor_available"] = bool(
+            self.adjustment_factor_available
+        )
+        return panel
 
     # ------------------------------------------------------------------
     # Universe filtering
@@ -808,10 +987,19 @@ class DataPipeline:
     # ------------------------------------------------------------------
 
     def _load_point_in_time_data(self) -> None:
-        """Load ST timeseries and industry changes from provider if available."""
+        """Load ST timeseries and industry changes from provider if available.
+
+        Their ``asset`` columns are normalized to the canonical symbol form
+        just like prices/financials/metadata; a provider that labels prices
+        ``600519.SH`` and its ST episodes ``600519`` would otherwise build a
+        mask that never matches the panel.
+        """
         if hasattr(self.provider, 'get_st_timeseries'):
             try:
                 self._st_timeseries = self.provider.get_st_timeseries()
+                self._st_timeseries = self._normalize_asset_column(
+                    self._st_timeseries,
+                )
                 logger.info("Loaded ST timeseries: %d records", len(self._st_timeseries))
             except Exception as e:
                 logger.warning("Failed to load ST timeseries: %s", e)
@@ -819,9 +1007,26 @@ class DataPipeline:
         if hasattr(self.provider, 'get_industry_changes'):
             try:
                 self._industry_changes = self.provider.get_industry_changes()
+                self._industry_changes = self._normalize_asset_column(
+                    self._industry_changes,
+                )
                 logger.info("Loaded industry changes: %d records", len(self._industry_changes))
             except Exception as e:
                 logger.warning("Failed to load industry changes: %s", e)
+
+    @staticmethod
+    def _normalize_asset_column(
+        df: pd.DataFrame | None,
+    ) -> pd.DataFrame | None:
+        """Rewrite a flat table's ``asset`` column to canonical symbols."""
+        if df is None or df.empty or "asset" not in df.columns:
+            return df
+        normalized = df["asset"].map(normalize_symbol)
+        if normalized.equals(df["asset"]):
+            return df
+        renamed = df.copy()
+        renamed["asset"] = normalized
+        return renamed
 
     def get_financials_as_of(self, as_of_date: pd.Timestamp) -> pd.DataFrame:
         """Get financial data available as of a given date (no look-ahead).
@@ -1291,12 +1496,69 @@ class DataPipeline:
     # Convenience accessors
     # ------------------------------------------------------------------
 
+    def get_adjusted_close(self) -> pd.DataFrame:
+        """Return the return-generating (adjusted) close panel (date x asset).
+
+        This is the continuous series research differences into returns and
+        factors: for Tushare/Baostock it carries the hfq levels (via the
+        provider's divisor), for synthetic the generated continuous path.
+        ``attrs["price_basis"]`` states ``hfq``/``qfq``/``raw`` explicitly
+        and ``attrs["adjustment_factor_available"]`` says whether a real
+        corporate-action divisor backed it.  This panel is **not** a traded
+        CNY price; never use it for fills, cash or position marks.
+        """
+        if self.prices is None:
+            raise DataQualityError(
+                f"{provider_label(self.provider)}: pipeline has not run; "
+                "call run() before requesting prices"
+            )
+        close = self.prices["close_adj"].unstack("asset")
+        return self._tag_price_panel(close, self.adjusted_price_basis)
+
     def get_close(self) -> pd.DataFrame:
-        """Return close prices (unstacked: date x asset)."""
-        return self.prices["close_adj"].unstack("asset")
+        """Deprecated alias of :meth:`get_adjusted_close`.
+
+        Kept because most call sites are research consumers that predate the
+        explicit basis contract.  It returns the *adjusted* series (the same
+        panel it returned before this wave) and is documented as such.
+        New money-path code must call :meth:`get_raw_close` instead.
+        """
+        return self.get_adjusted_close()
+
+    def get_raw_close(self) -> pd.DataFrame:
+        """Return the traded (raw) close panel (date x asset).
+
+        This is the CNY price a fill or mark must use.  It fails closed with
+        :class:`~quant_platform.data.schema.DataQualityError` when the
+        provider only supplied adjusted levels (``price_basis`` in
+        ``qfq``/``hfq``) or did not declare a basis at all: silently treating
+        an hfq level as a market price is exactly the D15 defect.  Callers
+        that have a real-time/broker quote should prefer it; there is no
+        honest way to invert an adjusted series without the factor.
+        """
+        if self.prices is None:
+            raise DataQualityError(
+                f"{provider_label(self.provider)}: pipeline has not run; "
+                "call run() before requesting prices"
+            )
+        if self.price_basis != "raw":
+            raise DataQualityError(
+                f"{provider_label(self.provider)}: no raw close is "
+                f"available (provider price basis is {self.price_basis!r}). "
+                "Refusing to use adjusted price levels as a CNY fill or "
+                "mark price. Configure a provider that returns raw OHLCV "
+                "plus adj_factor, or use the broker/real-time quote."
+            )
+        close = self.prices["close"].unstack("asset")
+        return self._tag_price_panel(close, "raw")
 
     def get_factor_prices(self) -> pd.DataFrame:
-        """Close prices with suspension rows blanked for research inputs.
+        """Adjusted close with suspension rows blanked for research inputs.
+
+        The panel is the return-generating (adjusted) series; its
+        ``attrs["price_basis"]`` is ``hfq``/``qfq`` (or ``raw`` for a
+        provider with no corporate-action factor).  It is research data, not
+        a CNY price -- use :meth:`get_raw_close` for money.
 
         `get_close()` keeps the stale mark, which is what valuation wants on a
         day a stock could not trade. Research inputs are different: a factor
@@ -1325,7 +1587,7 @@ class DataPipeline:
             ).reindex(
                 index=close.index, columns=close.columns, fill_value=True,
             )
-        return close
+        return self._tag_price_panel(close, self.adjusted_price_basis)
 
     def get_tradable_mask(self) -> pd.DataFrame | None:
         """(date x asset) True where a new signal/weight is allowed.
@@ -1380,7 +1642,9 @@ class DataPipeline:
                         index=panel.index, columns=panel.columns, fill_value=False,
                     )
                 )
-            panels[field] = panel
+            panels[field] = self._tag_price_panel(
+                panel, self.adjusted_price_basis,
+            )
         return panels
 
     def _blank_ineligible_rows(self, panel: pd.DataFrame) -> pd.DataFrame:
