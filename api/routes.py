@@ -5610,7 +5610,21 @@ async def _await_ws_provider_ready(provider) -> None:
         await asyncio.sleep(_QUOTE_READY_POLL)
 
 
-@router.get("/ws-quotes/start")
+@router.get("/ws-quotes/start", include_in_schema=False)
+def ws_quotes_start_get():
+    """State-changing endpoint: GET is rejected so a link/img cannot start it.
+
+    Without this stub the generic ``/ws-quotes/{code}`` route would swallow
+    ``GET /ws-quotes/start`` and start the provider while reporting a 404.
+    """
+    raise HTTPException(
+        status_code=405,
+        detail="Use POST /api/ws-quotes/start",
+        headers={"Allow": "POST"},
+    )
+
+
+@router.post("/ws-quotes/start")
 def ws_quotes_start():
     """Start WebSocket quote provider."""
     provider = _get_ws_provider()
@@ -5618,7 +5632,17 @@ def ws_quotes_start():
     return {"status": "started", **provider.stats}
 
 
-@router.get("/ws-quotes/stop")
+@router.get("/ws-quotes/stop", include_in_schema=False)
+def ws_quotes_stop_get():
+    """State-changing endpoint: GET is rejected (see ``ws_quotes_start_get``)."""
+    raise HTTPException(
+        status_code=405,
+        detail="Use POST /api/ws-quotes/stop",
+        headers={"Allow": "POST"},
+    )
+
+
+@router.post("/ws-quotes/stop")
 def ws_quotes_stop():
     """Stop WebSocket quote provider."""
     provider = _get_ws_provider()
@@ -5675,17 +5699,17 @@ def _get_l2_provider():
     return instance
 
 
-@router.get("/l2/start")
+@router.post("/l2/start")
 def l2_start():
-    """Start Level 2 data provider."""
+    """Start Level 2 data provider (POST-only; a GET changed state)."""
     provider = _get_l2_provider()
     provider.start()
     return {"status": "started", **provider.stats}
 
 
-@router.get("/l2/stop")
+@router.post("/l2/stop")
 def l2_stop():
-    """Stop Level 2 data provider."""
+    """Stop Level 2 data provider (POST-only; a GET changed state)."""
     provider = _get_l2_provider()
     provider.stop()
     return {"status": "stopped"}

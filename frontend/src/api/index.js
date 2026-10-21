@@ -359,6 +359,29 @@ export function getMarketSnapshot() {
   return api.get('/market/snapshot').then(r => r.data)
 }
 
+// WebSocket quote feed / Level 2 provider control.
+// These endpoints change server-side provider state, so the backend accepts
+// POST only; a GET is answered with 405 and performs nothing.
+export function startWsQuotes() {
+  return api.post('/ws-quotes/start').then(r => r.data)
+}
+
+export function stopWsQuotes() {
+  return api.post('/ws-quotes/stop').then(r => r.data)
+}
+
+export function getWsQuotes() {
+  return api.get('/ws-quotes').then(r => r.data)
+}
+
+export function startLevel2() {
+  return api.post('/l2/start').then(r => r.data)
+}
+
+export function stopLevel2() {
+  return api.post('/l2/stop').then(r => r.data)
+}
+
 export function getMarketGainers() {
   return api.get('/market/gainers').then(r => r.data)
 }

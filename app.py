@@ -189,6 +189,129 @@ def _host_is_allowed(value: str) -> bool:
     return False
 
 
+#: Default ports per URL scheme, used to normalize Origin/Host comparisons so
+#: ``http://host`` and ``http://host:80`` are the same origin.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+#: WebSocket handshake schemes are compared as their HTTP equivalent: a
+#: browser's ``Origin`` is always an http(s) origin.
+_SCHEME_TO_HTTP = {"http": "http", "https": "https", "ws": "http", "wss": "https"}
+
+#: A serialized origin is exactly ``scheme://authority``; browsers never send
+#: a path/query/fragment. One trailing slash is tolerated (a common curl
+#: habit) and stripped, but ``/path``, ``?query`` and ``#fragment`` are not.
+_ORIGIN_RE = re.compile(r"(?i)\A(https?)://([^/?#]+)/?\Z")
+
+
+def _split_host_port(value: str, default_port: int) -> tuple[str, int] | None:
+    """Lowercased host and numeric port from ``host[:port]``/``[v6][:port]``."""
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return None
+        host = value[1:end]
+        rest = value[end + 1:]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                return None
+            port = int(rest[1:])
+        else:
+            port = default_port
+    else:
+        if value.count(":") > 1:
+            return None
+        if ":" in value:
+            host, _, raw_port = value.partition(":")
+            if not raw_port.isdigit():
+                return None
+            port = int(raw_port)
+        else:
+            host, port = value, default_port
+    if not host or not 0 < port <= 65535:
+        return None
+    # A fully-qualified trailing dot is the same DNS name; normalize it so
+    # ``Host: example.com.`` and ``Origin: http://example.com`` compare equal.
+    return host.lower().rstrip("."), port
+
+
+def _parse_origin(value: str) -> tuple[str, str, int] | None:
+    """Parse an ``Origin`` header into a normalized ``(scheme, host, port)``.
+
+    ``None`` covers everything that is not a plain serialized http(s) origin:
+    ``null`` (opaque origin), malformed authorities, wildcards, userinfo,
+    paths and unknown schemes. Such values are never treated as same-origin.
+    """
+    match = _ORIGIN_RE.fullmatch((value or "").strip())
+    if not match:
+        return None
+    scheme = match.group(1).lower()
+    authority = match.group(2)
+    if not _valid_host_header(authority):
+        return None
+    split = _split_host_port(authority, _DEFAULT_PORTS[scheme])
+    if split is None:
+        return None
+    return (scheme, split[0], split[1])
+
+
+def _allowed_origins() -> set[tuple[str, str, int]]:
+    """``QUANT_ALLOWED_ORIGINS`` parsed into normalized origins.
+
+    Comma-separated exact origins, case-insensitive. Wildcards are not
+    supported and are ignored (they can never match); malformed entries are
+    skipped rather than widening the set.
+    """
+    raw = os.environ.get("QUANT_ALLOWED_ORIGINS", "")
+    allowed: set[tuple[str, str, int]] = set()
+    for entry in raw.split(","):
+        parsed = _parse_origin(entry)
+        if parsed is not None:
+            allowed.add(parsed)
+    return allowed
+
+
+def _origin_values(scope) -> list[str]:
+    """All ``Origin`` header values, preserving duplicates for rejection."""
+    return [
+        value.decode("latin-1")
+        for name, value in scope.get("headers") or []
+        if name.lower() == b"origin"
+    ]
+
+
+def _origin_is_allowed(scope) -> bool:
+    """CSRF gate for HTTP requests and WebSocket handshakes.
+
+    Requests without an ``Origin`` (curl, server-to-server, older clients)
+    pass. A present ``Origin`` must be same-origin with the validated ``Host``
+    (scheme http/https after mapping ws->http/wss->https, host and port
+    compared after default-port normalization) or listed verbatim in
+    ``QUANT_ALLOWED_ORIGINS``. The decision uses the raw Host header and the
+    ASGI scheme only -- ``X-Forwarded-*`` is deliberately ignored, so a forged
+    forwarding header cannot manufacture a same-origin match.
+    """
+    values = _origin_values(scope)
+    if not values:
+        return True
+    # Duplicate Origin headers are malformed (Fetch produces at most one) and
+    # could make a proxy and the app disagree; reject rather than guess.
+    if len(values) != 1:
+        return False
+    origin = _parse_origin(values[0])
+    if origin is None:
+        return False
+    if origin in _allowed_origins():
+        return True
+    scheme = _SCHEME_TO_HTTP.get((scope.get("scheme") or "").lower())
+    host = _scope_host(scope)
+    if scheme is None or not host:
+        return False
+    request_origin = _split_host_port(host, _DEFAULT_PORTS[scheme])
+    if request_origin is None:
+        return False
+    return origin == (scheme, request_origin[0], request_origin[1])
+
+
 def _normalized_route_path(scope) -> str | None:
     """Normalize ``scope["path"]`` for the authorization decision.
 
@@ -221,14 +344,15 @@ def _normalized_route_path(scope) -> str | None:
 
 
 class RequestGuardMiddleware:
-    """Outermost, pure-ASGI guard: Host validation, body cap, rate limit.
+    """Outermost, pure-ASGI guard: Host, Origin (CSRF), body cap, rate limit.
 
     It runs before routing, static files, docs, metrics and authentication, so
     a malformed Host can never reach the router (the P0 was that the auth
-    middleware and the router disagreed about the path), a giant body is
-    rejected before it is parsed, and one client cannot hammer expensive
-    compute endpoints. Pure ASGI, so it also covers WebSocket handshakes,
-    which ``BaseHTTPMiddleware`` never sees.
+    middleware and the router disagreed about the path), a browser request
+    from an untrusted Origin is rejected before any state can change, a giant
+    body is rejected before it is parsed, and one client cannot hammer
+    expensive compute endpoints. Pure ASGI, so it also covers WebSocket
+    handshakes, which ``BaseHTTPMiddleware`` never sees.
     """
 
     def __init__(self, app):
@@ -271,6 +395,19 @@ class RequestGuardMiddleware:
                 await _send_json(
                     send, 403, {"detail": "Invalid or untrusted Host header"},
                 )
+            return
+
+        # CSRF gate: a browser-supplied Origin must be same-origin with the
+        # validated Host or explicitly allowlisted. Runs before routing and
+        # authentication, for HTTP and the WebSocket handshake alike. CORS
+        # preflights are exempt: CORSMiddleware enforces its own origin
+        # allowlist for them and an OPTIONS request never reaches a handler.
+        is_preflight = scope_type == "http" and scope.get("method") == "OPTIONS"
+        if not is_preflight and not _origin_is_allowed(scope):
+            if scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            else:
+                await _send_json(send, 403, {"detail": "Origin not allowed"})
             return
 
         if scope_type == "websocket":
