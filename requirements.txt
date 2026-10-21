@@ -28,6 +28,8 @@ pydantic==2.12.5
 python-multipart==0.0.32
 websocket-client==1.9.0
 httpx==0.28.1
+certifi>=2026.10.19
+urllib3>=2.8.0
 
 # ML
 # xgboost-cpu, not xgboost: the plain PyPI wheel hard-depends on
