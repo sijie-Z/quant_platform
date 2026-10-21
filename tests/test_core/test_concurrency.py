@@ -25,7 +25,6 @@ from quant_platform.risk.circuit_breaker import (
     RiskLevel,
     RiskLimits,
     RiskMonitor,
-    get_risk_monitor,
 )
 from quant_platform.utils.cache import PipelineCache
 
@@ -426,49 +425,36 @@ def test_live_runners_share_process_wide_kill_switch(monkeypatch, tmp_path):
         lambda: Store(str(tmp_path / "live.db")),
     )
 
-    monitor = get_risk_monitor()
-    saved = {
-        "kill_switch_active": monitor.kill_switch_active,
-        "risk_level": monitor.risk_level,
-        "breaches": list(monitor.breaches),
-        "order_timestamps": list(monitor.order_timestamps),
-        "_last_state_breach": monitor._last_state_breach,
-        "_state_risk_level": monitor._state_risk_level,
-    }
-    try:
-        monitor.kill_switch_active = False
-        monitor.risk_level = RiskLevel.GREEN
-        monitor.breaches.clear()
-        monitor.order_timestamps.clear()
+    # The process-wide monitor must never persist test state into the real
+    # runtime DB (data/trading.db) — that is a one-way pollution channel and
+    # once armed a KILL switch blocked every later live run. Give this test
+    # its own monitor/store and route the module's default resolution to it.
+    monitor = RiskMonitor(store=Store(str(tmp_path / "risk_state.db")))
+    monkeypatch.setattr(
+        live_runner_module, "get_risk_monitor", lambda: monitor,
+    )
 
-        runner_a = LiveRunner(broker_type="simulated", dual_track=False)
-        runner_b = LiveRunner(broker_type="simulated", dual_track=False)
-        assert runner_a is not runner_b
-        assert runner_a._risk is runner_b._risk, (
-            "runners built without an injected monitor do not share one "
-            "RiskMonitor instance"
-        )
-        assert runner_a._risk is monitor
+    runner_a = LiveRunner(broker_type="simulated", dual_track=False)
+    runner_b = LiveRunner(broker_type="simulated", dual_track=False)
+    assert runner_a is not runner_b
+    assert runner_a._risk is runner_b._risk, (
+        "runners built without an injected monitor do not share one "
+        "RiskMonitor instance"
+    )
+    assert runner_a._risk is monitor
 
-        runner_a._risk.activate_kill_switch("concurrency test")
-        approved, breaches = runner_b._risk.check_pre_trade({
-            "ticker": "600519",
-            "side": "buy",
-            "quantity": 100,
-            "price": 10.0,
-        })
-        assert approved is False, (
-            "kill switch activated via runner A did not block a buy through "
-            "runner B"
-        )
-        assert any(b.severity == RiskLevel.KILL for b in breaches), (
-            f"expected a KILL-severity breach, got {breaches!r}"
-        )
-        assert any("KILL SWITCH" in b.message for b in breaches)
-    finally:
-        monitor.kill_switch_active = saved["kill_switch_active"]
-        monitor.risk_level = saved["risk_level"]
-        monitor.breaches[:] = saved["breaches"]
-        monitor.order_timestamps[:] = saved["order_timestamps"]
-        monitor._last_state_breach = saved["_last_state_breach"]
-        monitor._state_risk_level = saved["_state_risk_level"]
+    runner_a._risk.activate_kill_switch("concurrency test")
+    approved, breaches = runner_b._risk.check_pre_trade({
+        "ticker": "600519",
+        "side": "buy",
+        "quantity": 100,
+        "price": 10.0,
+    })
+    assert approved is False, (
+        "kill switch activated via runner A did not block a buy through "
+        "runner B"
+    )
+    assert any(b.severity == RiskLevel.KILL for b in breaches), (
+        f"expected a KILL-severity breach, got {breaches!r}"
+    )
+    assert any("KILL SWITCH" in b.message for b in breaches)
