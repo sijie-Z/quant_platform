@@ -24,10 +24,22 @@ import akshare as ak
 import numpy as np
 import pandas as pd
 
+# The repo directory IS the `quant_platform` package, so its parent must be on
+# sys.path when this file is executed directly from a fresh checkout (no
+# editable install). Mirrors the sys.path bootstrap in tools/*.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from quant_platform.backtest.metrics import max_drawdown as _metrics_max_drawdown
+from quant_platform.utils.research_window import compact_date, resolve_end_date
+
 DB = "data/trading.db"
 C, S, P = 0.0003, 0.001, 0.0005
 N_LONG, N_SHORT = 20, 0
 INITIAL = 1_000_000
+
+#: Fixed start of the price panel; the end is resolved at run time (CLI flag,
+#: ``QUANT_RESEARCH_END_DATE``, or today) instead of a hardcoded stale date.
+START_DATE = "2021-01-01"
 
 # ══════════════════════════════════════════════════════════════════════
 # FACTOR CATALOG — add new factors here (~10 lines each)
@@ -115,7 +127,9 @@ FACTORS["roe_proxy"] = {
 # DATA FETCH (once per run)
 # ══════════════════════════════════════════════════════════════════════
 
-def fetch_data():
+def fetch_data(end_date: str | None = None):
+    end_date = resolve_end_date(end_date)
+    start_s, end_s = compact_date(START_DATE), compact_date(end_date)
     t0 = time.time()
     df = ak.index_stock_cons(symbol="000300")
     code_col = [c for c in df.columns][0]
@@ -130,7 +144,7 @@ def fetch_data():
     for i, c in enumerate(codes):
         for retry in range(3):
             try:
-                r = ak.stock_zh_a_hist_tx(symbol=txsym(c), start_date="20210101", end_date="20260523", adjust="hfq")
+                r = ak.stock_zh_a_hist_tx(symbol=txsym(c), start_date=start_s, end_date=end_s, adjust="hfq")
                 if r is not None and not r.empty:
                     r = r.rename(columns={"date": "date", "close": "close"}) if "close" in r.columns else r
                     r["date"] = pd.to_datetime(r["date"])
@@ -148,7 +162,16 @@ def fetch_data():
     all_dates = prices.index.sort_values()
     ny = (all_dates[-1] - all_dates[0]).days / 365.25
     print(f"Price panel: {prices.shape} (fetch {int(time.time() - t0)}s)", flush=True)
-    return prices, rets, fwd_ret, all_dates, ny, n_stocks
+    # The actual data window, not the requested one: the provider may end
+    # earlier than requested. Written to the report and the registry.
+    window = {
+        "requested_end": end_date,
+        "data_start": str(all_dates[0].date()),
+        "data_end": str(all_dates[-1].date()),
+    }
+    print(f"Data window: {window['data_start']} → {window['data_end']} "
+          f"(requested end {end_date})", flush=True)
+    return prices, rets, fwd_ret, all_dates, ny, n_stocks, window
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -160,6 +183,7 @@ def backtest(factor_panel, rets, all_dates, rebals, ny,
     capital = INITIAL
     daily_rets = []
     turnover_log = []
+    cost_log = []
     current_w = {}
     rebal_dates = rebalance_override if rebalance_override is not None else rebals
     rebal_iter = iter(rebal_dates)
@@ -175,20 +199,34 @@ def backtest(factor_panel, rets, all_dates, rebals, ny,
                     rank = f.rank(ascending=False)
                     long_u = rank.nsmallest(N_LONG).index.tolist()
                     short_u = rank.nlargest(N_SHORT).index.tolist()
-                    if current_w:
-                        old_set = set(current_w.keys())
-                        new_set = set(long_u + short_u)
-                        sold = old_set - new_set
-                        if sold:
-                            to = sum(abs(current_w.get(a, 0)) for a in sold)
-                            turnover_log.append(float(to))
-                            pending_cost = to * (C + P + S) * cost_multiplier
                     total = max(len(long_u) + len(short_u), 1)
                     pending_w = {}
                     for a in long_u:
                         pending_w[a] = 1.0 / total
                     for a in short_u:
                         pending_w[a] = -1.0 / total
+
+                    # One-way turnover = 0.5 * sum(|w_new - w_old|). The old
+                    # formula counted only names that *left* the book, so new
+                    # entries were free and surviving names reset to 1/N
+                    # without charging drift; true turnover is roughly double.
+                    # Buys pay commission + slippage, sells also pay stamp
+                    # tax, so both sides are charged.
+                    old_w = current_w
+                    changed = set(old_w) | set(pending_w)
+                    buy_w = sum(
+                        max(pending_w.get(a, 0.0) - old_w.get(a, 0.0), 0.0)
+                        for a in changed
+                    )
+                    sell_w = sum(
+                        max(old_w.get(a, 0.0) - pending_w.get(a, 0.0), 0.0)
+                        for a in changed
+                    )
+                    to = 0.5 * (buy_w + sell_w)
+                    pending_cost = (buy_w * (C + P)
+                                    + sell_w * (C + P + S)) * cost_multiplier
+                    turnover_log.append(float(to))
+                    cost_log.append(float(pending_cost))
             try:
                 next_rebal = next(rebal_iter)
             except StopIteration:
@@ -216,12 +254,16 @@ def backtest(factor_panel, rets, all_dates, rebals, ny,
     dr = pd.Series(daily_rets, index=all_dates)
     cagr = (capital / INITIAL) ** (1 / ny) - 1
     sharpe = float((dr.mean() / (dr.std() + 1e-12)) * np.sqrt(252))
-    dd = float((dr.cumsum() + np.log(INITIAL) -
-                 (dr.cumsum() + np.log(INITIAL)).cummax()).min() / INITIAL)
+    # Max drawdown of the compounded equity curve, identical to
+    # backtest.metrics.max_drawdown. The old formula divided a log-equity
+    # cumsum by INITIAL, giving values around -4e-7 (printed as "-0.00%") for
+    # every strategy, including ones that lost 38%.
+    dd = float(_metrics_max_drawdown(dr)[0])
     avg_to = float(np.mean(turnover_log)) if turnover_log else 0
     return {"cagr": cagr, "sharpe": sharpe, "max_dd": dd,
             "avg_turnover": avg_to, "daily_rets": dr,
-            "turnover_log": turnover_log, "n_rebals": len(turnover_log)}
+            "turnover_log": turnover_log, "cost_log": cost_log,
+            "n_rebals": len(turnover_log)}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -275,7 +317,7 @@ def style_benchmark(factor_panel, rets, all_dates, rebals, ny):
 # MAIN REPORT
 # ══════════════════════════════════════════════════════════════════════
 
-def run_factor_report(factor_key):
+def run_factor_report(factor_key, end_date: str | None = None):
     if factor_key not in FACTORS:
         print(f"Unknown factor: {factor_key}")
         print(f"Available: {list(FACTORS.keys())}")
@@ -287,7 +329,7 @@ def run_factor_report(factor_key):
     print("=" * 72, flush=True)
 
     # Data
-    prices, rets, fwd_ret, all_dates, ny, n_stocks = fetch_data()
+    prices, rets, fwd_ret, all_dates, ny, n_stocks, window = fetch_data(end_date)
     factor_panel = entry["compute"](prices, rets)
 
     # IC
@@ -336,7 +378,7 @@ def run_factor_report(factor_key):
     style_excess = base["cagr"] - style["cagr"]
 
     # Turnover & cost
-    total_cost_paid = sum(t * (C + P + S) for t in base["turnover_log"])
+    total_cost_paid = sum(base["cost_log"])
     annual_cost_drag = total_cost_paid / ny if ny > 0 else 0
     gross_cagr = base["cagr"] + annual_cost_drag
     weight_loss = theo_ann - gross_cagr
@@ -346,7 +388,14 @@ def run_factor_report(factor_key):
     turnover_zero = backtest(factor_panel, rets, all_dates, rebals, ny,
                              rebalance_override=[rebals[0]])
     to_ok = len(turnover_zero["turnover_log"]) <= 1
-    rebals_ok = abs(base["n_rebals"] - len(rebals) + 1) <= 2
+    # Long-warm-up factors (momentum_12m needs 252+21 days) legitimately skip
+    # the first ~13 month-ends; comparing against len(rebals) unconditionally
+    # made every such factor report FAIL and be recorded as a failed run.
+    eligible_rebals = sum(
+        1 for d in rebals
+        if d in factor_panel.index and len(factor_panel.loc[d].dropna()) >= 60
+    )
+    rebals_ok = abs(base["n_rebals"] - eligible_rebals) <= 2
 
     # ── Print ──
     print("")
@@ -405,6 +454,10 @@ def run_factor_report(factor_key):
         "sanity": {"cost_ok": cost_ok, "to_ok": to_ok, "rebals_ok": rebals_ok,
                    "all_pass": all_sanity},
         "n_stocks": n_stocks, "period_years": round(ny, 1),
+        # The as-of window is part of the result: without it a reader cannot
+        # tell a current report from one built on a stale hardcoded end date.
+        "data_start": window["data_start"], "data_end": window["data_end"],
+        "requested_end": window["requested_end"],
     }
     conn = sqlite3.connect(DB)
     conn.execute(
@@ -413,7 +466,11 @@ def run_factor_report(factor_key):
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (rid, pd.Timestamp.now('UTC').isoformat()[:19], "success" if all_sanity else "failed",
          "", "factor_report", "akshare",
-         json.dumps({"adjust": "hfq", "provider": "akshare"}),
+         json.dumps({"adjust": "hfq", "provider": "akshare",
+                     "start_date": window["data_start"],
+                     "end_date": window["data_end"],
+                     "requested_end": window["requested_end"],
+                     "as_of": window["data_end"]}),
          "CurrentConstituentUniverseProvider",
          json.dumps({"pit": False, "bias_warning": ["survivorship_bias_possible"]}),
          entry["name"], json.dumps(entry["params"]),
@@ -430,15 +487,25 @@ def run_factor_report(factor_key):
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        target = sys.argv[1]
+    argv = sys.argv[1:]
+    end_arg = None
+    if "--end-date" in argv:
+        pos = argv.index("--end-date")
+        try:
+            end_arg = argv[pos + 1]
+        except IndexError:
+            print("--end-date requires a value (YYYY-MM-DD)")
+            sys.exit(2)
+        del argv[pos:pos + 2]
+    if argv:
+        target = argv[0]
         if target == "list":
             print("Available factors:")
             for k, v in FACTORS.items():
                 print(f"  {k:25s}  {v['category']}")
             sys.exit(0)
-        run_factor_report(target)
+        run_factor_report(target, end_date=end_arg)
     else:
-        print("Usage: python run_factor.py <factor_key>")
+        print("Usage: python run_factor.py <factor_key> [--end-date YYYY-MM-DD]")
         print("       python run_factor.py list")
         print(f"Available: {list(FACTORS.keys())}")

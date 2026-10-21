@@ -40,6 +40,15 @@ from quant_platform.factors.technical import (  # noqa: E402
 )
 from quant_platform.lab.registry import DEFAULT_DB, RunStore  # noqa: E402
 from quant_platform.lab.reports import generate_report  # noqa: E402
+from quant_platform.utils.research_window import (  # noqa: E402
+    compact_date,
+    resolve_end_date,
+)
+
+START_DATE = "2021-01-01"
+#: Below this many cross-sectional IC observations a run has not been
+#: meaningfully evaluated; record it as failed, not success (R5).
+MIN_IC_OBS = 20
 
 # ---------------------------------------------------------------------------
 # 因子目录 — 每个因子是一个 compute(prices, rets) -> (date x asset) DataFrame 的函数
@@ -103,8 +112,9 @@ FACTOR_CATALOG = {
 # 共享管线逻辑
 # ---------------------------------------------------------------------------
 
-def _fetch_csi300_prices() -> pd.DataFrame:
-    """拉取 CSI300 全部成分股 hfq 日线行情。"""
+def _fetch_csi300_prices(end_date: str | None = None) -> pd.DataFrame:
+    """拉取 CSI300 全部成分股 hfq 日线行情。结束日期运行期解析。"""
+    end_date = resolve_end_date(end_date)
     df = ak.index_stock_cons(symbol="000300")
     code_col = [c for c in df.columns][0]
     codes = sorted({str(c).zfill(6) for c in df[code_col].tolist()})
@@ -113,7 +123,7 @@ def _fetch_csi300_prices() -> pd.DataFrame:
     def _txsym(c):
         return ("sh" if c.startswith(("60", "68", "9")) else "sz") + c
 
-    start_s, end_s = "20210101", "20260523"
+    start_s, end_s = compact_date(START_DATE), compact_date(end_date)
     frames = {}
     for i, code in enumerate(codes):
         for _retry in range(3):
@@ -134,15 +144,17 @@ def _fetch_csi300_prices() -> pd.DataFrame:
     return panel
 
 
-def run_single_factor(factor_key: str) -> str:
+def run_single_factor(factor_key: str, end_date: str | None = None) -> str:
     """运行单个因子的完整 Honest Run 管线。"""
     entry = FACTOR_CATALOG[factor_key]
     slice_name = f"honest_{factor_key}"
+    end_date = resolve_end_date(end_date)
 
     DATA_META = {
         "provider": "akshare", "adjust": "hfq", "adjust_basis": "ipo_date_per_stock",
         "cross_sectional_use": True, "interface": "stock_zh_a_hist_tx",
         "trust_warning": [], "description": "AkShare daily OHLCV, back-adjusted (hfq)",
+        "requested_end": end_date,
     }
     UNIVERSE_META = {
         "provider": "CurrentConstituentUniverseProvider", "kind": "current_constituent",
@@ -161,10 +173,14 @@ def run_single_factor(factor_key: str) -> str:
     try:
         # ---- 1. 数据 -----
         t0 = time.time()
-        prices = _fetch_csi300_prices()
+        prices = _fetch_csi300_prices(end_date)
         print(f"[{slice_name}] price panel: {prices.shape} (t={int(time.time() - t0)}s)", flush=True)
         if prices.shape[1] < 50:
             raise RuntimeError(f"price panel too narrow: {prices.shape}")
+        data_start = str(prices.index[0].date())
+        data_end = str(prices.index[-1].date())
+        print(f"[{slice_name}] data window: {data_start} → {data_end} "
+              f"(requested end {end_date})", flush=True)
 
         rets = prices.pct_change(fill_method=None)
         fwd_ret = rets.shift(-1)
@@ -217,11 +233,21 @@ def run_single_factor(factor_key: str) -> str:
                      "observed_sharpe_proxy": ls_sharpe, "note": "Do not read this as formal validation."},
             "bh_fdr": "n/a (single factor)",
             "fetch_duration_s": int(time.time() - t0),
+            "data_start": data_start, "data_end": data_end,
+            "requested_end": end_date,
         }
-        store.finish_run(run_id, status="success", evaluation=evaluation, report_path=None, warnings=[])
+        n_ic_obs = int(len(ic_series))
+        status = "success" if n_ic_obs >= MIN_IC_OBS else "failed"
+        reason = None if status == "success" else (
+            f"insufficient_ic_observations: n_ic_obs={n_ic_obs} < {MIN_IC_OBS}"
+        )
+        status_warnings = [reason] if reason else []
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=None, reason=reason, warnings=status_warnings)
         final_run = store.get_run(run_id)
         report_path = generate_report(final_run, out_dir="data/reports")
-        store.finish_run(run_id, status="success", evaluation=evaluation, report_path=report_path, warnings=[])
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=report_path, reason=reason, warnings=status_warnings)
         print(f"[{slice_name}] SUCCESS  IC={evaluation['ic_mean']}  ICIR={evaluation['icir']}  report={report_path}", flush=True)
         return run_id
 
@@ -239,13 +265,23 @@ def run_single_factor(factor_key: str) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        target = sys.argv[1]
+    argv = sys.argv[1:]
+    end_arg = None
+    if "--end-date" in argv:
+        pos = argv.index("--end-date")
+        try:
+            end_arg = argv[pos + 1]
+        except IndexError:
+            print("--end-date requires a value (YYYY-MM-DD)")
+            sys.exit(2)
+        del argv[pos:pos + 2]
+    if argv:
+        target = argv[0]
         if target not in FACTOR_CATALOG:
             print(f"Unknown factor: {target}")
             print(f"Available: {list(FACTOR_CATALOG.keys())}")
             sys.exit(1)
-        run_single_factor(target)
+        run_single_factor(target, end_date=end_arg)
     else:
-        print("Usage: python common_runner.py <factor_key>")
+        print("Usage: python common_runner.py <factor_key> [--end-date YYYY-MM-DD]")
         print(f"Available keys: {list(FACTOR_CATALOG.keys())}")

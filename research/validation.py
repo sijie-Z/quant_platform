@@ -39,12 +39,17 @@ class DeflatedSharpeResult:
     num_trials: int              # Number of strategies tested
     skew: float                  # Return skewness
     kurtosis: float              # Return kurtosis (excess)
-    significant: bool            # p < significance_level
+    significant: bool            # Final decision: DSR *and* BH (batch) — see below
     # One-sided p-value of the observed Sharpe against zero, WITHOUT the
     # E[max SR] deflation. Used as the input to Benjamini-Hochberg in
     # ``validate_factor_batch`` so the multiple-testing correction is applied
     # once, not twice.
     raw_p_value: float = 1.0
+    #: Whether the deflated p-value passes the significance level on its own.
+    dsr_significant: bool | None = None
+    #: Whether the raw p-value passes BH within the batch. ``None`` when no
+    #: batch correction was applied (single-factor use).
+    bh_significant: bool | None = None
 
 
 class FactorValidator:
@@ -71,6 +76,7 @@ class FactorValidator:
         returns: np.ndarray,
         num_trials: int = 1,
         expected_max_sharpe: float | None = None,
+        periods_per_year: float = 252.0,
     ) -> DeflatedSharpeResult:
         """Test if an observed Sharpe ratio is significant after accounting
         for multiple testing (the "deflated" Sharpe ratio).
@@ -85,17 +91,33 @@ class FactorValidator:
         2. Provide `expected_max_sharpe` directly (e.g., from bootstrap).
 
         Args:
-            returns: Array of strategy daily returns.
+            returns: Array of strategy periodic returns (daily by default).
             num_trials: Number of strategies/parameters tested (N).
             expected_max_sharpe: Override for E[max SR] under null. Pass an
                 **annualized** Sharpe; it is converted to per-period units
                 internally.
+            periods_per_year: Annualization basis for the returns. The old
+                implementation hardcoded 252, silently mis-annualizing
+                weekly or monthly series. Non-finite returns (inf) are
+                dropped together with NaN; an inf used to yield a silent
+                observed_sharpe=nan / p=1.0.
 
         Returns:
             DeflatedSharpeResult with p-value and significance flag.
         """
+        try:
+            periods_per_year = float(periods_per_year)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"periods_per_year must be a positive number, got {periods_per_year!r}"
+            ) from exc
+        if not math.isfinite(periods_per_year) or periods_per_year <= 0:
+            raise ValueError(
+                f"periods_per_year must be finite and > 0, got {periods_per_year!r}"
+            )
+
         returns = np.asarray(returns, dtype=float)
-        returns = returns[~np.isnan(returns)]
+        returns = returns[np.isfinite(returns)]
 
         if len(returns) < 20:
             logger.warning("Too few observations (%d) for reliable DSR test", len(returns))
@@ -107,6 +129,7 @@ class FactorValidator:
                 skew=0.0,
                 kurtosis=0.0,
                 significant=False,
+                dsr_significant=False,
             )
 
         n = len(returns)
@@ -122,6 +145,7 @@ class FactorValidator:
                 skew=0.0,
                 kurtosis=0.0,
                 significant=False,
+                dsr_significant=False,
             )
 
         # Work in per-period units. The old code compared an *annualized*
@@ -131,7 +155,7 @@ class FactorValidator:
         # a true annualized SR of 2.0 over 1260 days with N=10 came out at
         # p=0.59, while a short-sample fluke could pass.
         sr = mu / sigma
-        observed_sr = sr * math.sqrt(252)
+        observed_sr = sr * math.sqrt(periods_per_year)
 
         # Higher moments (kurtosis is non-excess in the DSR formula)
         skew = float(((returns - mu) ** 3).mean() / (sigma ** 3))
@@ -161,7 +185,7 @@ class FactorValidator:
                 )
         else:
             # The override is documented as an annualized Sharpe.
-            e_max_sr = expected_max_sharpe / math.sqrt(252)
+            e_max_sr = expected_max_sharpe / math.sqrt(periods_per_year)
 
         if se_sr < 1e-12:
             raw_p = 0.0 if sr > 0 else 1.0
@@ -183,13 +207,14 @@ class FactorValidator:
 
         return DeflatedSharpeResult(
             observed_sharpe=round(observed_sr, 6),
-            expected_max_sharpe=round(e_max_sr * math.sqrt(252), 6),
+            expected_max_sharpe=round(e_max_sr * math.sqrt(periods_per_year), 6),
             deflated_p_value=round(deflated_p, 6),
             num_trials=num_trials,
             skew=round(skew, 6),
             kurtosis=round(excess_kurt, 6),
             significant=significant,
             raw_p_value=round(raw_p, 6),
+            dsr_significant=significant,
         )
 
     def multiple_testing_correction(
@@ -233,15 +258,20 @@ class FactorValidator:
     ) -> dict[str, DeflatedSharpeResult]:
         """Validate a batch of factors, applying multiple testing correction.
 
-        Multiple-testing policy (corrected once, not twice): the Deflated
-        Sharpe p-value already deflates for ``num_trials`` through the
-        E[max SR] term. Running Benjamini-Hochberg on those deflated
-        p-values corrected for the same N trials a second time and made the
-        batch test far too conservative. This method therefore applies BH to
-        the *raw* one-sided p-values (``raw_p_value``) and reports the DSR
-        p-value separately as an effect-size adjustment; the ``significant``
-        flag follows the BH decision. With a single factor BH is a no-op and
-        the DSR decision is used.
+        Multiple-testing policy: a factor is reported ``significant`` only
+        when **both** tests pass:
+
+        1. the DSR deflated p-value is below ``significance_level`` (the
+           effect survives the E[max SR] deflation), and
+        2. its raw one-sided p-value survives Benjamini-Hochberg within the
+           batch.
+
+        The old implementation set ``significant`` from the BH mask alone and
+        ignored the deflated p-value: a factor with raw_p=0.0319 but
+        deflated_p=0.0911 was returned as significant. ``deflated_p_value`` is
+        still reported as the effect-size adjustment, and the two components
+        are exposed separately as ``dsr_significant`` / ``bh_significant``.
+        With a single factor BH is a no-op and the DSR decision is used.
 
         Args:
             factor_returns: Dict of factor_name -> daily returns array.
@@ -263,20 +293,25 @@ class FactorValidator:
             raw_p_values.append(result.raw_p_value)
             factor_names.append(name)
 
-        # Apply the multiple-testing correction once, to the raw p-values.
+        # Apply the multiple-testing correction once, to the raw p-values,
+        # and require the deflated p-value to pass as well.
         if len(raw_p_values) > 1:
             significant_mask = self.multiple_testing_correction(raw_p_values, method="bh")
             for i, name in enumerate(factor_names):
-                # Override significance with corrected result
+                prev = results[name]
+                dsr_sig = prev.deflated_p_value < self.significance_level
+                bh_sig = bool(significant_mask[i])
                 results[name] = DeflatedSharpeResult(
-                    observed_sharpe=results[name].observed_sharpe,
-                    expected_max_sharpe=results[name].expected_max_sharpe,
-                    deflated_p_value=results[name].deflated_p_value,
+                    observed_sharpe=prev.observed_sharpe,
+                    expected_max_sharpe=prev.expected_max_sharpe,
+                    deflated_p_value=prev.deflated_p_value,
                     num_trials=num_trials,
-                    skew=results[name].skew,
-                    kurtosis=results[name].kurtosis,
-                    significant=bool(significant_mask[i]),
-                    raw_p_value=results[name].raw_p_value,
+                    skew=prev.skew,
+                    kurtosis=prev.kurtosis,
+                    significant=bh_sig and dsr_sig,
+                    raw_p_value=prev.raw_p_value,
+                    dsr_significant=dsr_sig,
+                    bh_significant=bh_sig,
                 )
 
         n_significant = sum(1 for r in results.values() if r.significant)

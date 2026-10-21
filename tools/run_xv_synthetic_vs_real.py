@@ -29,6 +29,18 @@ from quant_platform.factors.registry import get_registry
 from quant_platform.factors.technical import register_all as register_technical
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import (
+    resolve_end_date,
+    stamp_provenance,
+    year_windows,
+)
+
+# Reuse RQ3's corrected regime helpers: its month labels are contemporaneous
+# and its %Time denominator is labelled trading days, not calendar days.
+# The sibling directory is put on sys.path so the import works when the file
+# is executed as a script, imported by path, or loaded by tests.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run_rq3_stability import classify_regimes, regime_pct_time  # noqa: E402
 
 setup_logging()
 logger = get_logger("xvld")
@@ -38,9 +50,10 @@ logger = get_logger("xvld")
 # ---------------------------------------------------------------------------
 N_STOCKS = 500
 SYNTHETIC_START = "2021-01-01"
-SYNTHETIC_END = "2025-12-31"
+# End dates are resolved at run time; no hardcoded stale windows.
+SYNTHETIC_END = resolve_end_date()
 REAL_START = "2018-01-01"
-REAL_END = "2025-12-31"
+REAL_END = resolve_end_date()
 ALPHA_STRENGTH = 0.06
 INITIAL_CAPITAL = 10_000_000
 
@@ -82,18 +95,6 @@ FLIP_EXPERIMENTS = [
     ("Flip_D",    {"A_ShortReversal": +1, "B_MediumTrend": +1, "C_LongTrend": +1, "D_Liquidity": -1}),
 ]
 
-YEAR_WINDOWS = [
-    ("2018", "2018-01-01", "2018-12-31"),
-    ("2019", "2019-01-01", "2019-12-31"),
-    ("2020", "2020-01-01", "2020-12-31"),
-    ("2021", "2021-01-01", "2021-12-31"),
-    ("2022", "2022-01-01", "2022-12-31"),
-    ("2023", "2023-01-01", "2023-12-31"),
-    ("2024", "2024-01-01", "2024-12-31"),
-    ("2025", "2025-01-01", "2025-12-31"),
-]
-
-REGIME_THRESHOLDS = {"Bull": 0.02, "Bear": -0.02, "Sideways": None}
 
 
 # ======================================================================
@@ -180,6 +181,19 @@ def build_signals(pf):
     aligned = [s[common] for s in sigs]
     all_sig = sum(aligned) / len(aligned)
     cs[ALL_NAME] = all_sig.rank(axis=1, pct=True) - 0.5
+
+    # TOP8 = equal-weight combination of the eight INDIVIDUAL factors, as in
+    # RQ1. The old code reused the four cluster signals here, so the TOP8 row
+    # was numerically identical to ALL and one of the sixteen experiments was
+    # fabricated.
+    top8 = [pf[f] for f in TOP8_FACTORS if f in pf]
+    if top8:
+        common8 = sorted(set.intersection(*(set(s.columns) for s in top8)))
+        aligned8 = [s[common8] for s in top8]
+        top8_sig = sum(aligned8) / len(aligned8)
+        cs["TOP8"] = top8_sig.rank(axis=1, pct=True) - 0.5
+    else:
+        logger.warning("TOP8: no individual factors available")
     return cs
 
 
@@ -207,24 +221,9 @@ def compute_ic(signal, returns):
     return ic_summary(ic)
 
 
-def classify_regimes(benchmark_returns):
-    if benchmark_returns is None or len(benchmark_returns) == 0:
-        return pd.Series("Sideways", index=pd.date_range(REAL_START, REAL_END, freq="D"))
-    monthly = benchmark_returns.resample(pd.offsets.MonthEnd()).apply(lambda x: (1 + x).prod() - 1)
-    regimes = {}
-    for date, ret in monthly.items():
-        if ret > REGIME_THRESHOLDS["Bull"]:
-            regimes[date] = "Bull"
-        elif ret < REGIME_THRESHOLDS["Bear"]:
-            regimes[date] = "Bear"
-        else:
-            regimes[date] = "Sideways"
-    regime_series = pd.Series(regimes, name="regime")
-    regime_series.index = pd.DatetimeIndex(regime_series.index)
-    daily = regime_series.reindex(
-        pd.date_range(REAL_START, REAL_END, freq="D"), method="ffill"
-    )
-    return daily
+# `classify_regimes` is imported from run_rq3_stability. The local copy that
+# used to live here forward-filled month-end labels across calendar days
+# (month M's days carried month M-1's label) and has been deleted.
 
 
 # ======================================================================
@@ -234,8 +233,8 @@ def classify_regimes(benchmark_returns):
 def run_rq1(cs, prices, returns, benchmark, sector_map, label=""):
     results = []
     for exp_name, combo in COMBOS.items():
-        if combo is None:  # TOP8
-            sigs = [cs[c] for c in CLUSTER_NAMES if c in cs]
+        if combo is None:  # TOP8: the eight individual factors, not the clusters
+            sigs = [cs["TOP8"]] if "TOP8" in cs else []
         else:
             sigs = [cs[c] for c in combo if c in cs]
         if not sigs:
@@ -245,16 +244,24 @@ def run_rq1(cs, prices, returns, benchmark, sector_map, label=""):
         signal = comb.rank(axis=1, pct=True) - 0.5
 
         ic_s = compute_ic(signal, returns)
+        record = {"Experiment": exp_name,
+                  "IC": ic_s.get("mean_ic", np.nan),
+                  "ICIR": ic_s.get("icir", np.nan),
+                  "Status": "ok", "Error": ""}
         try:
             bt = run_bt(signal, prices, returns, benchmark, sector_map)
             s = bt.get("summary", {})
-            results.append({"Experiment": exp_name, "IC": ic_s.get("mean_ic", 0),
-                           "ICIR": ic_s.get("icir", 0), "Sharpe": s.get("sharpe_ratio", 0),
-                           "MDD": s.get("max_drawdown", 0)})
-        except Exception:
-            results.append({"Experiment": exp_name, "IC": ic_s.get("mean_ic", 0),
-                           "ICIR": ic_s.get("icir", 0), "Sharpe": 0, "MDD": 0})
-        logger.info("  %s %-12s IC=%.4f Sharpe=%.2f", label, exp_name, results[-1]["IC"], results[-1]["Sharpe"])
+            record.update({"Sharpe": s.get("sharpe_ratio", np.nan),
+                           "MDD": s.get("max_drawdown", np.nan)})
+        except Exception as exc:
+            # A failed calculation is not "no edge": record NaN + the error.
+            logger.warning("  %s %-12s backtest failed: %s", label, exp_name, exc)
+            record.update({"Sharpe": np.nan, "MDD": np.nan,
+                           "Status": "failed",
+                           "Error": f"{type(exc).__name__}: {exc}"})
+        results.append(record)
+        logger.info("  %s %-12s IC=%.4f Sharpe=%.2f", label, exp_name,
+                    record["IC"], record["Sharpe"])
     return pd.DataFrame(results)
 
 
@@ -271,22 +278,30 @@ def run_rq2(cs, prices, returns, benchmark, sector_map, label=""):
         signal = comb.rank(axis=1, pct=True) - 0.5
 
         ic_s = compute_ic(signal, returns)
+        record = {"Experiment": exp_name,
+                  "IC": ic_s.get("mean_ic", np.nan),
+                  "ICIR": ic_s.get("icir", np.nan),
+                  "Status": "ok", "Error": ""}
         try:
             bt = run_bt(signal, prices, returns, benchmark, sector_map)
             s = bt.get("summary", {})
-            results.append({"Experiment": exp_name, "IC": ic_s.get("mean_ic", 0),
-                           "ICIR": ic_s.get("icir", 0), "Sharpe": s.get("sharpe_ratio", 0),
-                           "MDD": s.get("max_drawdown", 0)})
-        except Exception:
-            results.append({"Experiment": exp_name, "IC": ic_s.get("mean_ic", 0),
-                           "ICIR": ic_s.get("icir", 0), "Sharpe": 0, "MDD": 0})
-        logger.info("  %s %-12s IC=%.4f Sharpe=%.2f", label, exp_name, results[-1]["IC"], results[-1]["Sharpe"])
+            record.update({"Sharpe": s.get("sharpe_ratio", np.nan),
+                           "MDD": s.get("max_drawdown", np.nan)})
+        except Exception as exc:
+            logger.warning("  %s %-12s backtest failed: %s", label, exp_name, exc)
+            record.update({"Sharpe": np.nan, "MDD": np.nan,
+                           "Status": "failed",
+                           "Error": f"{type(exc).__name__}: {exc}"})
+        results.append(record)
+        logger.info("  %s %-12s IC=%.4f Sharpe=%.2f", label, exp_name,
+                    record["IC"], record["Sharpe"])
     return pd.DataFrame(results)
 
 
 def run_rq3(cs, prices, returns, benchmark, sector_map, label=""):
     yearly = []
-    for year_name, ys, ye in YEAR_WINDOWS:
+    windows = year_windows(int(prices.index.min().year), str(prices.index.max().date()))
+    for year_name, ys, ye in windows:
         yp = prices[ys:ye]
         yr = returns[ys:ye]
         for sn in CLUSTER_NAMES + [ALL_NAME]:
@@ -294,23 +309,37 @@ def run_rq3(cs, prices, returns, benchmark, sector_map, label=""):
                 continue
             sig = cs[sn][ys:ye]
             ic_s = compute_ic(sig, yr)
+            record = {"Cluster": sn, "Year": year_name,
+                      "IC": ic_s.get("mean_ic", np.nan),
+                      "ICIR": ic_s.get("icir", np.nan),
+                      "Status": "ok", "Error": ""}
             try:
                 bt = run_bt(sig, yp, yr, returns, sector_map)
                 s = bt.get("summary", {})
-                yearly.append({"Cluster": sn, "Year": year_name, "IC": ic_s.get("mean_ic", 0),
-                              "ICIR": ic_s.get("icir", 0), "Sharpe": s.get("sharpe_ratio", 0),
-                              "MDD": s.get("max_drawdown", 0)})
-            except Exception:
-                pass
+                record.update({"Sharpe": s.get("sharpe_ratio", np.nan),
+                               "MDD": s.get("max_drawdown", np.nan)})
+            except Exception as exc:
+                # Keep the row with NaN and the error instead of dropping it:
+                # a silently missing year looked like "not tested".
+                logger.warning("  %s %s %s backtest failed: %s", label, year_name, sn, exc)
+                record.update({"Sharpe": np.nan, "MDD": np.nan,
+                               "Status": "failed",
+                               "Error": f"{type(exc).__name__}: {exc}"})
+            yearly.append(record)
         logger.info("  %s Year %s done", label, year_name)
 
     regime_records = []
-    daily_regime = classify_regimes(benchmark) if label == "REAL" else \
-        pd.Series("Sideways", index=pd.date_range(SYNTHETIC_START, SYNTHETIC_END, freq="D"))
+    # RQ3's corrected helper: each trading day carries its OWN calendar
+    # month's label (no forward-fill across calendar days), and unlabelled
+    # days are excluded rather than silently labelled. The old code applied
+    # month-end labels by reindex(method="ffill") over calendar days.
+    daily_regime = classify_regimes(benchmark, trading_days=returns.index)
+    total_labelled = int(daily_regime.notna().sum())
+    if total_labelled == 0:
+        logger.warning("  %s: no regime labels available", label)
 
-    total_days = len(daily_regime)
     for regime_name in ["Bull", "Bear", "Sideways"]:
-        regime_dates = daily_regime[daily_regime == regime_name].index
+        regime_dates = daily_regime.index[daily_regime == regime_name]
         for sn in CLUSTER_NAMES + [ALL_NAME]:
             if sn not in cs:
                 continue
@@ -320,25 +349,28 @@ def run_rq3(cs, prices, returns, benchmark, sector_map, label=""):
             rsig = cs[sn].loc[common_dates]
             rret = returns.loc[common_dates]
             ic_s = compute_ic(rsig, rret)
+            status, error = "ok", ""
             try:
                 bt = run_bt(cs[sn], prices, returns, benchmark, sector_map)
                 btr = bt.get("daily_returns", pd.Series(dtype=float))
                 regime_bt = btr[btr.index.isin(regime_dates)]
                 if len(regime_bt) >= 5:
-                    bench = bt.get("benchmark_returns")
-                    rm = all_metrics(
-                        regime_bt,
-                        bench if isinstance(bench, pd.Series) else None,
-                    )
-                    sharpe = rm.get("sharpe_ratio", 0)
+                    # Explicit daily basis: infer_periods_per_year would read
+                    # the sparse regime calendar as ~20-82 periods/year.
+                    rm = all_metrics(regime_bt, None, periods_per_year=252)
+                    sharpe = rm.get("sharpe_ratio", np.nan) if rm else np.nan
                 else:
-                    sharpe = 0
+                    sharpe = np.nan
             except Exception as exc:
                 logger.warning("Regime metrics failed: %s", exc)
-                sharpe = 0
-            pct = len(common_dates) / total_days * 100
-            regime_records.append({"Cluster": sn, "Regime": regime_name, "IC": ic_s.get("mean_ic", 0),
-                                  "ICIR": ic_s.get("icir", 0), "Sharpe": sharpe, "%Time": round(pct, 1)})
+                sharpe = np.nan
+                status, error = "failed", f"{type(exc).__name__}: {exc}"
+            pct = regime_pct_time(common_dates, daily_regime)
+            regime_records.append({"Cluster": sn, "Regime": regime_name,
+                                   "IC": ic_s.get("mean_ic", np.nan),
+                                   "ICIR": ic_s.get("icir", np.nan),
+                                   "Sharpe": sharpe, "%Time": round(pct, 1),
+                                   "Status": status, "Error": error})
         logger.info("  %s Regime %s done", label, regime_name)
 
     return pd.DataFrame(yearly), pd.DataFrame(regime_records)
@@ -423,6 +455,9 @@ if __name__ == "__main__":
     # === Synthetic ===
     logger.info("[1/6] Synthetic data...")
     sp, sr, sb, ss, st = load_synthetic()
+    syn_start, syn_end = str(sp.index.min().date()), str(sp.index.max().date())
+    logger.info("Synthetic data window: %s → %s (requested end %s)",
+                syn_start, syn_end, SYNTHETIC_END)
     pf_syn = compute_factors(sp, ss, st)
     cs_syn = build_signals(pf_syn)
 
@@ -438,6 +473,9 @@ if __name__ == "__main__":
     # === Real A-Share ===
     logger.info("[5/6] Real A-share data...")
     rp, rr, rb, rs, rt = load_real()
+    real_start, real_end = str(rp.index.min().date()), str(rp.index.max().date())
+    logger.info("Real data window: %s → %s (requested end %s)",
+                real_start, real_end, REAL_END)
     pf_real = compute_factors(rp, rs, rt)
     cs_real = build_signals(pf_real)
 
@@ -449,15 +487,15 @@ if __name__ == "__main__":
     # === Comparison Report ===
     print_comparison(syn_r1, real_r1, syn_r2, real_r2, syn_r3y, real_r3y, syn_r3r, real_r3r)
 
-    # Save all
+    # Save all (each artifact declares the window it was computed on)
     out = Path("results")
     out.mkdir(parents=True, exist_ok=True)
-    syn_r1.to_csv(out / "xv_syn_rq1.csv", index=False)
-    syn_r2.to_csv(out / "xv_syn_rq2.csv", index=False)
-    syn_r3y.to_csv(out / "xv_syn_rq3_yearly.csv", index=False)
-    syn_r3r.to_csv(out / "xv_syn_rq3_regime.csv", index=False)
-    real_r1.to_csv(out / "xv_real_rq1.csv", index=False)
-    real_r2.to_csv(out / "xv_real_rq2.csv", index=False)
-    real_r3y.to_csv(out / "xv_real_rq3_yearly.csv", index=False)
-    real_r3r.to_csv(out / "xv_real_rq3_regime.csv", index=False)
+    stamp_provenance(syn_r1, syn_start, syn_end).to_csv(out / "xv_syn_rq1.csv", index=False)
+    stamp_provenance(syn_r2, syn_start, syn_end).to_csv(out / "xv_syn_rq2.csv", index=False)
+    stamp_provenance(syn_r3y, syn_start, syn_end).to_csv(out / "xv_syn_rq3_yearly.csv", index=False)
+    stamp_provenance(syn_r3r, syn_start, syn_end).to_csv(out / "xv_syn_rq3_regime.csv", index=False)
+    stamp_provenance(real_r1, real_start, real_end).to_csv(out / "xv_real_rq1.csv", index=False)
+    stamp_provenance(real_r2, real_start, real_end).to_csv(out / "xv_real_rq2.csv", index=False)
+    stamp_provenance(real_r3y, real_start, real_end).to_csv(out / "xv_real_rq3_yearly.csv", index=False)
+    stamp_provenance(real_r3r, real_start, real_end).to_csv(out / "xv_real_rq3_regime.csv", index=False)
     logger.info("All results saved.")

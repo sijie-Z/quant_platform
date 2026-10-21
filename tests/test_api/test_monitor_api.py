@@ -1,5 +1,6 @@
 """Tests for monitor API endpoints — aggregation layer for dashboard."""
 
+import pandas as pd
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -14,6 +15,7 @@ from quant_platform.api.monitor import (
     router,
 )
 from quant_platform.core.store import Store
+from tests.test_api.research_helpers import make_context
 
 
 @pytest.fixture
@@ -34,6 +36,29 @@ def app(tmp_path):
 @pytest.fixture
 def client(app):
     return TestClient(app)
+
+
+@pytest.fixture
+def short_context(monkeypatch):
+    """A 50-session context: too short for rolling IC and without volume."""
+    import quant_platform.api.monitor as mod
+
+    index = pd.bdate_range("2024-01-01", periods=50)
+    assets = [f"{i:06d}.SZ" for i in range(20)]
+    prices = pd.DataFrame(100.0, index=index, columns=assets)
+    returns = prices.pct_change(fill_method=None).fillna(0.0)
+    context = make_context(
+        prices, returns,
+        {"momentum": prices.pct_change(fill_method=None)},
+        turnover=None,
+        fin_unstacked=None,
+    )
+
+    async def _context(start_date=None, end_date=None):
+        return context
+
+    monkeypatch.setattr(mod, "_research_context_or_503", _context)
+    return context
 
 
 # ── Risk Overview ──
@@ -119,7 +144,7 @@ class TestTCASummary:
         assert "cost_breakdown" in data
         assert "by_ticker" in data
 
-    def test_with_trades(self, app, client):
+    def test_with_trades_computes_shortfall_from_the_order_price(self, app, client):
         import quant_platform.api.monitor as mod
         store = mod._core_store
         for i in range(5):
@@ -135,8 +160,12 @@ class TestTCASummary:
             })
         data = client.get("/api/monitor/tca-summary").json()
         assert data["n_orders"] == 5
+        assert data["n_trades"] == 5
+        assert data["available"] is True
+        assert data["n_analyzed"] == 5
+        assert data["mean_is_bps"] == 0.0  # executed at the reference price
 
-    def test_no_synthetic_tca_metrics(self, app, client):
+    def test_trade_without_an_order_has_no_invented_metrics(self, app, client):
         import quant_platform.api.monitor as mod
         store = mod._core_store
         store.save_trade({
@@ -145,20 +174,22 @@ class TestTCASummary:
             "executed_at": "2024-07-15T10:00:00",
         })
         data = client.get("/api/monitor/tca-summary").json()
+        assert data["available"] is False
         assert data["daily_trend"] == []
         assert data["cost_breakdown"] == []
         assert data["mean_is_bps"] == 0
+        assert "reference price" in data["reason"]
 
 
 # ── Factor Status ──
 
 
 class TestFactorStatus:
-    def test_returns_200(self, client):
+    def test_returns_200(self, client, short_context):
         resp = client.get("/api/monitor/factor-status")
         assert resp.status_code == 200
 
-    def test_response_structure(self, client):
+    def test_response_structure(self, client, short_context):
         data = client.get("/api/monitor/factor-status").json()
         assert "factors" in data
         assert "rolling_ic" in data
@@ -167,27 +198,17 @@ class TestFactorStatus:
         assert "decay_alerts" in data
         assert "disabled_factors" in data
 
-    def test_factors_have_required_fields(self, client):
+    def test_insufficient_history_explains_the_requirement(self, client, short_context):
         data = client.get("/api/monitor/factor-status").json()
-        for f in data["factors"]:
-            assert "name" in f
-            assert "current_ic" in f
-            assert "icir" in f
-            assert "trend" in f
-            assert "alert" in f
+        assert data["available"] is False
+        assert data["factors"] == []
+        assert data["required_sessions"] > 50
+        assert "sessions" in data["reason"]
+        assert "at least" in data["reason"]
 
-    def test_rolling_ic_length(self, client):
-        data = client.get("/api/monitor/factor-status").json()
-        if data["rolling_ic"]:
-            for name, series in data["rolling_ic"].items():
-                assert len(series) == 60
-
-    def test_ic_dates_length(self, client):
-        data = client.get("/api/monitor/factor-status").json()
-        # Either 60 dates (with data) or 0 (no signals)
-        assert len(data["ic_dates"]) in (0, 60)
-
-    def test_no_synthetic_ic_data(self, client):
+    def test_stored_signals_do_not_become_factor_stats(self, client, short_context):
+        """Factor status is computed from factor panels, never from the
+        factor_values blobs on stored signals."""
         import quant_platform.api.monitor as mod
         store = mod._core_store
         store.save_signal({
@@ -205,11 +226,11 @@ class TestFactorStatus:
 
 
 class TestCapacityGauge:
-    def test_returns_200(self, client):
+    def test_returns_200(self, client, short_context):
         resp = client.get("/api/monitor/capacity-gauge")
         assert resp.status_code == 200
 
-    def test_response_structure(self, client):
+    def test_response_structure(self, client, short_context):
         data = client.get("/api/monitor/capacity-gauge").json()
         assert "current_aum" in data
         assert "capacity_aum" in data
@@ -217,14 +238,23 @@ class TestCapacityGauge:
         assert "participation_rate" in data
         assert "aum_curve" in data
 
-    def test_aum_curve_structure(self, client):
+    def test_aum_curve_structure(self, client, short_context):
         data = client.get("/api/monitor/capacity-gauge").json()
         for point in data["aum_curve"]:
             assert "aum" in point
             assert "sharpe" in point
             assert "return" in point
 
-    def test_with_positions(self, app, client):
+    def test_missing_volume_panel_is_explained(self, client, short_context):
+        """No turnover/market-cap panel means no ADV, so no gauge."""
+        data = client.get("/api/monitor/capacity-gauge").json()
+        assert data["available"] is False
+        assert "no volume panel" in data["reason"]
+        assert data["aum_curve"] == []
+        assert data["capacity_aum"] == 0
+        assert data["usage_pct"] == 0
+
+    def test_current_aum_still_comes_from_the_live_book(self, app, client, short_context):
         import quant_platform.api.monitor as mod
         store = mod._core_store
         store.save_pnl_snapshot({
@@ -233,18 +263,8 @@ class TestCapacityGauge:
         })
         data = client.get("/api/monitor/capacity-gauge").json()
         assert data["current_aum"] == 15_000_000
-
-    def test_no_synthetic_capacity_curve(self, app, client):
-        import quant_platform.api.monitor as mod
-        store = mod._core_store
-        store.save_pnl_snapshot({
-            "total_equity": 15_000_000, "cash": 5_000_000,
-            "market_value": 10_000_000,
-        })
-        data = client.get("/api/monitor/capacity-gauge").json()
-        assert data["aum_curve"] == []
-        assert data["capacity_aum"] == 0
-        assert data["usage_pct"] == 0
+        assert data["aum_source"] == "pnl_history"
+        assert data["usage_available"] is True
 
 
 # ── Config Update ──
@@ -414,12 +434,16 @@ class TestUnavailableMetricsAreExplicit:
         assert data["available"] is False
         assert data["reason"]
 
-    def test_factor_status_is_marked_unavailable(self, client):
+    def test_factor_status_is_marked_unavailable_without_history(
+        self, client, short_context,
+    ):
         data = client.get("/api/monitor/factor-status").json()
         assert data["available"] is False
         assert data["reason"]
 
-    def test_capacity_is_marked_unavailable(self, client):
+    def test_capacity_is_marked_unavailable_without_volume(
+        self, client, short_context,
+    ):
         data = client.get("/api/monitor/capacity-gauge").json()
         assert data["available"] is False
         assert data["reason"]

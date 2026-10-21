@@ -74,7 +74,7 @@ export default {
     killSwitch: '紧急熔断', armed: '已就绪', triggered: '已触发',
   },
   // 面板通用
-  panel: { loading: '加载中...', error: '加载失败', empty: '暂无数据', retry: '重试' },
+  panel: { loading: '加载中...', error: '加载失败', empty: '暂无数据', retry: '重试', maximize: '最大化', restore: '还原' },
   // 通用
   common: {
     confirm: '确认', cancel: '取消', ok: '确定', close: '关闭', yes: '是', no: '否',

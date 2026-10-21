@@ -2,7 +2,7 @@
 
 > **一句话**：A股多因子量化研究+交易平台，从数据到回测到执行的完整流水线。面向量化开发面试，展示架构设计、性能优化、真实市场处理、LLM增强选股、ML信号、图网络因子、Barra风险模型、Prometheus监控、机构级风控和执行。
 
-**最终状态（2026-10-21 实测）**：2,572 个测试函数（2,846 条用例；2026-10-21 全量 2843 passed / 3 skipped；基线 8f8caec 为 2709 passed / 3 skipped）。约 231 个非测试 Python 文件 + 205 个测试文件 + 37 个 Vue 组件。约 75,000 行非测试 Python + 约 11,000 行 Vue。6 个 Numba JIT 内核加速。**99 个 HTTP 端点 + 1 个 WebSocket**。**事件驱动核心架构 + 实时风控熔断 + 多因子信号 + WebSocket实时推送 + 实时A股行情 + Level 2盘口 + 实时基本面 + PostgreSQL存储 + Paper Trading(延迟/部分成交/撤单失败/L2回放) + QMT/XTP实盘接口 + 合规导出 + 基金运营(NAV/投资者门户) + 跨资产接口(股票/ETF/期货/期权)**。**企业级就绪度评估：A（生产级研究+交易平台）**——详见[企业级就绪度评估](#企业级就绪度评估)。
+**最终状态（2026-10-21 实测）**：2,791 个测试函数（3,065 条用例；2026-10-21 全量 3062 passed / 3 skipped；基线 8f8caec 为 2709 passed / 3 skipped）。约 233 个非测试 Python 文件 + 217 个测试文件 + 37 个 Vue 组件。约 75,000 行非测试 Python + 约 11,000 行 Vue。6 个 Numba JIT 内核加速。**99 个 HTTP 端点 + 1 个 WebSocket**。**事件驱动核心架构 + 实时风控熔断 + 多因子信号 + WebSocket实时推送 + 实时A股行情 + Level 2盘口 + 实时基本面 + PostgreSQL存储 + Paper Trading(延迟/部分成交/撤单失败/L2回放) + QMT/XTP实盘接口 + 合规导出 + 基金运营(NAV/投资者门户) + 跨资产接口(股票/ETF/期货/期权)**。**企业级就绪度评估：A（生产级研究+交易平台）**——详见[企业级就绪度评估](#企业级就绪度评估)。
 
 ---
 
@@ -277,7 +277,7 @@ quant_platform/
 │   ├── package.json
 │   └── vite.config.js
 │
-├── tests/                      # 205个测试文件, 2,572个测试函数（2,846条用例）
+├── tests/                      # 217个测试文件, 2,791个测试函数（3,065条用例）
 │   ├── conftest.py             # 共享fixtures
 │   ├── test_data/              # 合成数据(9) + pipeline(5) + 质量(7) + 连接池(11) + PostgreSQL(10) + WebSocket(18) + Level2(22) + 基本面(23) = 105
 │   ├── test_factors/           # 技术(6) + 基本面(5) + 处理(5) + 评估(7) + IC监控(12) + 网络(17) + 正交化(18) + 择时(25) = 95
@@ -502,7 +502,7 @@ pure_volatility、mtf_resonance 及 5 个 K 线形态因子（klen/klow/kmid/ksf
 
 ### Monitor Dashboard (`api/monitor.py` + `MonitorDashboard.vue`)
 
-Bloomberg Terminal风格监控大屏，6个面板；其中 TCA / Factor / Capacity 三个端点从存储数据无法计算时返回 `available:false` 及原因（前端显示不可用，不伪造数据），Risk Dashboard 的因子暴露需要 Barra 缓存或 `POST /api/barra/decompose`：
+Bloomberg Terminal风格监控大屏，6个面板；TCA / Factor / Capacity 由有界研究上下文现算（TTL 缓存、饱和 429），确实无数据（如无成交）时返回 `available:false` 及原因（前端显示不可用，不伪造数据）；Risk Dashboard 的因子暴露来自同一 Barra 计算：
 
 | 面板 | 数据源 | 展示内容 |
 |------|--------|---------|
@@ -513,7 +513,7 @@ Bloomberg Terminal风格监控大屏，6个面板；其中 TCA / Factor / Capaci
 | **Risk Config** | RiskMonitor.limits | 风控限额表单(仓位/行业/回撤/日亏) + Kill Switch按钮 |
 | **Factor Alerts** | FactorICAutoDecay | 因子IC/ICIR/趋势/状态表 + 自动降权因子列表 |
 
-**API端点**: `GET /api/monitor/risk-overview|tca-summary|factor-status|capacity-gauge` + `POST /api/monitor/config|kill-switch`（tca-summary/factor-status/capacity-gauge 无预计算数据时 `available:false`）
+**API端点**: `GET /api/monitor/risk-overview|tca-summary|factor-status|capacity-gauge` + `POST /api/monitor/config|kill-switch`（tca-summary/factor-status/capacity-gauge 由有界研究上下文现算，无成交/行情时明确 `available:false`）
 
 **前端**: 15秒轮询刷新 + ECharts图表(雷达/折线/柱状/仪表盘/瀑布) + Kill Switch确认弹窗
 
@@ -733,7 +733,7 @@ cd frontend && npm run dev
 
 ### API端点总览 (99 HTTP + 1 WebSocket)
 
-> 标注 ⚠️ 的端点从存储 run / 当前进程状态无法计算，返回 `available:false` 及原因；
+> 分析/监控端点从有界 TTL 缓存的研究上下文现算；无数据（如无成交、样本过短）时返回 `available:false` 及原因；
 > 不要把它们当作已实现的分析能力宣传。
 
 | 类别 | 端点 | 说明 |
@@ -749,11 +749,11 @@ cd frontend && npm run dev
 | | `GET /api/runs` | 历史运行列表 |
 | **分析** | `POST /api/compare` | 多策略对比 |
 | | `POST /api/sweep` | 参数网格搜索 |
-| | ⚠️ `GET /api/analysis/ic-decay` | IC衰减曲线——stored run 只有因子汇总，返回 `available:false`；用 `main.py run` 计算 |
-| | ⚠️ `GET /api/analysis/correlation` | 因子相关矩阵——需要因子面板，返回 `available:false`；用 `main.py run` 计算 |
-| **高级** | ⚠️ `POST /api/walkforward` | Walk-Forward验证——stored run 无逐期收益/因子面板，返回 `available:false`；用 `main.py walkforward` |
+| | `GET /api/analysis/ic-decay` | IC衰减曲线——因子面板+前向收益现算（horizon 1/5/10/20，含 n） |
+| | `GET /api/analysis/correlation` | 因子相关矩阵——处理后的因子面板现算（方阵/对称，NaN 政策已文档化） |
+| **高级** | `POST /api/walkforward` | Walk-Forward验证——真实 validator 现算，每折 train-only 重算信号，仅取 OOS 窗口 |
 | | `POST /api/montecarlo` | 蒙特卡洛模拟 |
-| | ⚠️ `POST /api/risk/decompose` | 因子风险分解——stored run 只有 IC 汇总，返回 `available:false`；用 `POST /api/barra/decompose` |
+| | `POST /api/risk/decompose` | 因子风险分解——与 `/api/barra/decompose` 共用同一 Barra 计算，Euler 风险份额合计为 1 |
 | | `POST /api/regime/detect` | 行情状态检测 |
 | | `POST /api/report/html` | 生成HTML报告 |
 | **OMS** | `POST /api/oms/order` | 创建订单 |
@@ -810,9 +810,9 @@ cd frontend && npm run dev
 | **监控** | `GET /api/metrics` | Prometheus指标(text格式) |
 | | `GET /api/metrics/json` | 系统指标(JSON) |
 | **Monitor大屏** | `GET /api/monitor/risk-overview` | 风控概览(因子暴露/集中度/回撤/VaR) |
-| | ⚠️ `GET /api/monitor/tca-summary` | TCA统计——存储成交无 arrival price，返回 `available:false` |
-| | ⚠️ `GET /api/monitor/factor-status` | 因子状态——无滚动 IC 预计算时返回 `available:false` |
-| | ⚠️ `GET /api/monitor/capacity-gauge` | 策略容量——无预计算容量曲线时返回 `available:false` |
+| | `GET /api/monitor/tca-summary` | TCA统计——存储成交+订单参考价现算实现落差；无成交时明确 `available:false` |
+| | `GET /api/monitor/factor-status` | 因子状态——滚动 IC/ICIR/衰减现算；样本不足时说明所需会话数 |
+| | `GET /api/monitor/capacity-gauge` | 策略容量——ADV 参与率假设下的容量曲线现算；无成交量数据时明确 `available:false` |
 | | `POST /api/monitor/config` | 风控限额更新 |
 | | `POST /api/monitor/kill-switch` | Kill Switch触发 |
 | **PostgreSQL** | `GET /api/postgres/stats` | PostgreSQL存储统计(SQLite回退) |
@@ -1091,7 +1091,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 32. **FastAPI + Vue 3 Web 界面** — REST API 99端点 + Bloomberg Terminal风格暗色仪表盘 + 10个视图
 33. **ABC抽象接口** — DataProvider / BaseFactor / PortfolioOptimizer 全部可插拔，注册表模式
 34. **配置驱动** — YAML参数化，零硬编码，类型化dataclass验证
-35. **2,572个测试函数（2,846条用例；2843 passed / 3 skipped）** — 覆盖全模块：数据/因子/Alpha/组合/回测/风险/LLM/报告/工具/核心架构/执行/交易/策略/ML/IC/Barra/指标/并行/Agent/连接池/图因子/PostgreSQL/WebSocket/Level2/基本面/合规导出/基金运营/监控API/跨资产/Paper Broker/XTP Broker/Live Runner/QMT Broker
+35. **2,791个测试函数（3,065条用例；3062 passed / 3 skipped）** — 覆盖全模块：数据/因子/Alpha/组合/回测/风险/LLM/报告/工具/核心架构/执行/交易/策略/ML/IC/Barra/指标/并行/Agent/连接池/图因子/PostgreSQL/WebSocket/Level2/基本面/合规导出/基金运营/监控API/跨资产/Paper Broker/XTP Broker/Live Runner/QMT Broker
 36. **Pipeline 缓存** — 基于 config hash 的自动缓存，支持 `--force` `--no-cache`
 
 ---
@@ -1113,7 +1113,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 | **实时风控** | RiskMonitor集成到交易引擎，下单前自动检查，Kill Switch一键熔断，前端实时风险面板 | A |
 | **多因子信号** | Web 引擎与 CLI LiveRunner 共用同一 7 因子等权复合（1/3/6月动量+20/60日波动+RSI+MACD，百分位分数 [0,1]），默认启用21个因子 | B+ |
 | **实时推送** | EventBus→WebSocket桥接，交易事件(order/fill/risk/portfolio)实时推送到前端 | A |
-| **可测试性** | 2,572个测试函数（2,846条用例；2843 passed / 3 skipped），fixture共享，覆盖全模块 | A |
+| **可测试性** | 2,791个测试函数（3,065条用例；3062 passed / 3 skipped），fixture共享，覆盖全模块 | A |
 | **可扩展性** | ABC抽象接口，注册表模式，Strategy模式，插件式因子/优化器/数据源 | A |
 | **配置管理** | YAML驱动，零硬编码，类型化dataclass验证，环境变量覆盖 | A- |
 | **性能优化** | 6个Numba JIT内核，prange并行化，Pipeline缓存，向量化回测 | A- |

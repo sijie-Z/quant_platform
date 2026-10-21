@@ -348,6 +348,10 @@ let pollTimer = null
 let runCancelled = false
 let runId = null
 let ws = null
+// Guards against applying one completed/failed run twice: the poll tick and
+// the WebSocket close the same run independently, and `clearInterval` cannot
+// cancel an already-in-flight getRunStatus request.
+let finishedRunId = null
 const generatingReport = ref(false)
 const reportPath = ref('')
 
@@ -398,9 +402,17 @@ async function startRun() {
     params.use_baostock = params.data_source === 'baostock'
     params.use_tushare = params.data_source === 'tushare'
     delete params.data_source
+    // Set the flag before the POST: cancelling while /run is in flight used to
+    // be overwritten by the post-POST reset, and polling then started anyway.
+    runCancelled = false
     const status = await runPipeline(params)
     runId = status.run_id
-    runCancelled = false
+    if (runCancelled) {
+      running.value = false
+      loading.value = false
+      log('warn', locale.value === 'zh-CN' ? '已停止等待本次运行的结果' : 'Stopped watching this run')
+      return
+    }
     log('info', `Pipeline ${runId} queued`)
     startPolling()
   } catch (e) {
@@ -408,44 +420,78 @@ async function startRun() {
     loading.value = false
     log('error', `Failed to start: ${e.message}`)
     emit('toast', { message: 'Failed to start pipeline', type: 'error' })
+    if (chartData.value) nextTick(() => renderCharts())
   }
+}
+
+// Both the poller and the WebSocket can observe the same terminal state. These
+// helpers make applying the result idempotent per run id. Result fetches are
+// serialized through a promise chain so two different runs can never apply out
+// of order (and a fetch in flight for run A does not silently swallow run B).
+let resultQueue = Promise.resolve()
+
+function finishRunCompleted(id) {
+  if (finishedRunId === id) return Promise.resolve()
+  resultQueue = resultQueue.then(async () => {
+    if (finishedRunId === id) return
+    try {
+      const data = await getRunResult(id)
+      applyResults(data)
+      lastRunId.value = id
+      finishedRunId = id
+      log('success', locale.value === 'zh-CN' ? '流水线完成' : 'Pipeline completed')
+      emit('toast', { message: 'Pipeline completed', type: 'success' })
+    } catch (e) {
+      loading.value = false
+      log('error', `Failed to fetch results: ${e.message}`)
+      emit('toast', { message: 'Failed to fetch results', type: 'error' })
+    }
+  })
+  return resultQueue
+}
+
+function finishRunFailed(id, error) {
+  if (finishedRunId === id) return
+  finishedRunId = id
+  running.value = false
+  loading.value = false
+  log('error', `Pipeline failed: ${error || 'unknown'}`)
+  // The operator explicitly stopped watching; do not contradict the
+  // "stopped watching" toast with a late failure toast.
+  if (runCancelled) return
+  emit('toast', { message: 'Pipeline failed', type: 'error' })
 }
 
 function startPolling() {
   let failCount = 0
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
   pollTimer = setInterval(async () => {
+    // Capture the id this tick asked about: `runId` is mutable, and an
+    // in-flight response for an old run must not clear the new run's timer or
+    // apply the old result under the new id.
+    const polledRunId = runId
     try {
-      const status = await getRunStatus(runId)
+      const status = await getRunStatus(polledRunId)
+      if (polledRunId !== runId) return
       failCount = 0
       progress.value = status.progress
       stage.value = status.stage
 
       if (status.status === 'completed') {
-        clearInterval(pollTimer)
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
         if (runCancelled) return
         running.value = false
-        log('success', locale.value === 'zh-CN' ? '流水线完成' : 'Pipeline completed')
-
-        try {
-          const data = await getRunResult(runId)
-          applyResults(data)
-          lastRunId.value = runId
-          emit('toast', { message: 'Pipeline completed', type: 'success' })
-        } catch (e) {
-          loading.value = false
-          log('error', `Failed to fetch results: ${e.message}`)
-        }
+        await finishRunCompleted(polledRunId)
       } else if (status.status === 'failed') {
-        clearInterval(pollTimer)
-        running.value = false
-        loading.value = false
-        log('error', `Pipeline failed: ${status.error || 'unknown'}`)
-        emit('toast', { message: 'Pipeline failed', type: 'error' })
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+        finishRunFailed(polledRunId, status.error)
       }
     } catch {
+      if (polledRunId !== runId) return
       failCount++
       if (failCount >= 5) {
         clearInterval(pollTimer)
+        pollTimer = null
         running.value = false
         loading.value = false
         log('error', 'Lost connection to server')
@@ -476,6 +522,9 @@ async function loadDemo() {
     loading.value = false
     log('error', `Demo failed: ${e.message}`)
     emit('toast', { message: 'Failed to load demo', type: 'error' })
+    // loading=false remounts the chart containers; without a re-render the
+    // previous results stay in state but their chart DOM is gone.
+    if (chartData.value) nextTick(() => renderCharts())
   }
 }
 
@@ -697,14 +746,19 @@ function renderCharts() {
     for (let yi = 0; yi < years.length; yi++) {
       for (let mi = 0; mi < months.length; mi++) {
         const val = mr.data?.[yi]?.[mi]
-        if (val != null && !isNaN(val)) {
-          const pct = (val * 100)
+        if (val != null && Number.isFinite(Number(val))) {
+          const pct = Number(val) * 100
           data.push([mi, yi, Number(pct.toFixed(2))])
           minVal = Math.min(minVal, pct)
           maxVal = Math.max(maxVal, pct)
         }
       }
     }
+
+    // Empty/all-null grids leave minVal/maxVal at ±Infinity, which used to
+    // produce an Infinity visualMap range. Show the (empty) panel instead of
+    // feeding non-finite values to ECharts.
+    if (!data.length || !Number.isFinite(minVal) || !Number.isFinite(maxVal)) return
 
     const absMax = Math.max(Math.abs(minVal), Math.abs(maxVal), 1)
 
@@ -775,16 +829,15 @@ function renderCharts() {
   }
 }
 
-// Keyboard shortcuts
+// Keyboard shortcuts. Ctrl/Cmd+K belongs to the command palette (the single
+// owner of the shortcut); this component used to toggle the run overlay on the
+// same key, so one press opened two stacked overlays. R remains the run
+// shortcut, and modified keys are ignored so Ctrl+R etc. keep working.
 function onKeydown(e) {
   // Don't trigger shortcuts when typing in inputs
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return
+  if (e.ctrlKey || e.metaKey || e.altKey) return
 
-  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-    e.preventDefault()
-    showRunPanel.value = !showRunPanel.value
-    return
-  }
   if (e.key === 'Escape') {
     showRunPanel.value = false
     return
@@ -823,10 +876,26 @@ function exportResults() {
   emit('toast', { message: 'Results exported', type: 'success' })
 }
 
+// Seed the run panel from the defaults saved in Settings (they used to be
+// stored and never read — a dead setting).
+function applySavedDefaults() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('quant_settings') || '{}')
+    const d = saved?.defaults
+    if (!d || typeof d !== 'object') return
+    const nStocks = Number(d.n_stocks)
+    if ([100, 200, 300, 500].includes(nStocks)) runConfig.n_stocks = nStocks
+    if (['equal_weight', 'mean_variance', 'risk_parity'].includes(d.optimizer)) runConfig.optimizer = d.optimizer
+    if (['equal_weight', 'ic_weighted', 'icir_weighted'].includes(d.alpha_method)) runConfig.alpha_method = d.alpha_method
+    if (['monthly', 'weekly'].includes(d.rebalance_frequency)) runConfig.rebalance_frequency = d.rebalance_frequency
+  } catch (_) {}
+}
+
 onMounted(() => {
   window.addEventListener('keydown', onKeydown)
+  applySavedDefaults()
   log('info', locale.value === 'zh-CN' ? '量化终端已初始化' : 'Quant Terminal initialized')
-  log('info', locale.value === 'zh-CN' ? '快捷键: R=运行, D=示例, E=导出, Ctrl+K=命令' : 'Shortcuts: R=Run, D=Demo, E=Export, Ctrl+K=Command')
+  log('info', locale.value === 'zh-CN' ? '快捷键: R=运行, D=示例, E=导出, Ctrl+K=命令面板' : 'Shortcuts: R=Run, D=Demo, E=Export, Ctrl+K=Command Palette')
   log('info', locale.value === 'zh-CN' ? '点击"示例数据"或按 D 键查看结果' : 'Click Demo Data or press D to see results instantly')
 
   // WebSocket for real-time pipeline status
@@ -838,28 +907,26 @@ onMounted(() => {
           stage.value = data.stage || ''
           if (data.status === 'completed') {
             if (runCancelled) return
-            // The poller would otherwise fetch and apply the same result a
-            // second time (double render and double toast).
+            // The poller may already have fetched/applied this result; the
+            // run-id guard inside finishRunCompleted makes that a no-op.
             if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
             running.value = false
-            log('success', 'Pipeline completed (WS)')
-            getRunResult(runId).then(result => {
-              applyResults(result)
-              lastRunId.value = runId
-              emit('toast', { message: 'Pipeline completed', type: 'success' })
-            }).catch(e => {
-              loading.value = false
-              log('error', `Failed to fetch results: ${e.message}`)
-            })
+            finishRunCompleted(runId)
           } else if (data.status === 'failed') {
-            running.value = false
-            loading.value = false
-            log('error', `Pipeline failed: ${data.error || 'unknown'}`)
-            emit('toast', { message: 'Pipeline failed', type: 'error' })
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+            finishRunFailed(runId, data.error)
           }
         }
       },
-      () => { log('warn', 'WebSocket connection failed, using polling') }
+      (err) => {
+        if (err?.type === 'auth') {
+          log('error', locale.value === 'zh-CN'
+            ? '状态推送认证失败（1008），已停止重连；请检查设置中的 API Token'
+            : 'Status stream authentication failed (1008); reconnection stopped. Check the API token in Settings.')
+        } else {
+          log('warn', 'WebSocket connection failed, using polling')
+        }
+      }
     )
   } catch (_) {}
 })

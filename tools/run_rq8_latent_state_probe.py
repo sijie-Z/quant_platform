@@ -27,12 +27,13 @@ from hmmlearn import hmm
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 
 setup_logging()
 logger = get_logger("rq8")
 
 REAL_START = "2018-01-01"
-REAL_END = "2025-12-31"
+REAL_END = resolve_end_date()  # as-of resolved at run time
 SIGNAL_H = 40
 HOLD_H = 80
 SELECT_PCT = 0.20
@@ -263,7 +264,9 @@ def main():
     rows = [{"model": n, "sharpe": r["sharpe"], "ann_ret": r["ann_ret"],
              "mdd": r["mdd"], "n_trades": r["n"], "skipped": r["skipped"]}
             for n, r in all_results]
-    pd.DataFrame(rows).to_csv("results/rq8_latent_state_probe.csv", index=False)
+    out = Path("results")
+    out.mkdir(parents=True, exist_ok=True)
+    stamp_provenance(pd.DataFrame(rows), str(returns.index.min().date()), str(returns.index.max().date())).to_csv(out / "rq8_latent_state_probe.csv", index=False)
 
 
 if __name__ == "__main__":

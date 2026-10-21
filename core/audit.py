@@ -40,6 +40,7 @@ class AuditAction(StrEnum):
     ENGINE_STOP = "engine_stop"
     CONFIG_CHANGE = "config_change"
     MANUAL_ORDER = "manual_order"
+    EXPORT = "export"
 
 
 class AuditLog:
@@ -81,14 +82,23 @@ class AuditLog:
         details: dict | None = None,
         reason: str = "",
         result: str = "success",
+        tenant_id: str = "",
     ):
-        """Log an audit event."""
+        """Log an audit event.
+
+        ``tenant_id`` overrides the acting tenant for events whose subject is
+        another tenant's data (e.g. a compliance export resolved to
+        ``fund_a`` from a default context), so tenant-scoped audit queries
+        find them.
+        """
         event_id = uuid.uuid4().hex[:12]
         datetime.now().isoformat()
 
+        tenant = tenant_id or self._tenant()
+        actor = self._tenant()
         record = {
             "event_id": event_id,
-            "tenant_id": self._tenant(),
+            "tenant_id": tenant,
             "topic": f"audit.{action.value}",
             "data": {
                 "action": action.value,
@@ -96,7 +106,8 @@ class AuditLog:
                 "details": details or {},
                 "reason": reason,
                 "result": result,
-                "tenant_id": self._tenant(),
+                "tenant_id": tenant,
+                "actor_tenant": actor,
             },
             "source": component,
             "timestamp": time.time(),

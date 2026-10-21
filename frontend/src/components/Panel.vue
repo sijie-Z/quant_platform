@@ -10,7 +10,7 @@
         <button
           class="panel-max-btn"
           @click="maximized = !maximized"
-          :title="maximized ? $t('common.close') : $t('panel.loading')"
+          :title="maximizeTitle"
         >{{ maximized ? '&#9633;' : '&#9634;' }}</button>
       </div>
     </div>
@@ -34,7 +34,7 @@ const props = defineProps({
 
 const maximized = ref(false)
 
-const maximizeTitle = computed(() => maximized.value ? $t('common.close') : $t('panel.loading'))
+const maximizeTitle = computed(() => maximized.value ? $t('panel.restore') : $t('panel.maximize'))
 
 const dotStyle = computed(() => {
   if (!props.dotColor) return {}

@@ -315,6 +315,41 @@ class BarraDecomposeRequest(BaseModel):
     )
 
 
+class WalkForwardRequest(BaseModel):
+    """POST /api/walkforward body.
+
+    ``run_id`` is optional: the validator runs on the cached research
+    context, and the field is accepted so the dashboard can keep sending the
+    run it is displaying.  ``start_date``/``end_date`` override the
+    configured data range for this request (and change the context cache
+    key).
+    """
+
+    run_id: str | None = None
+    mode: Literal["rolling", "expanding"] = Field(
+        default="rolling", description="Rolling or expanding train window",
+    )
+    train_period: int = Field(default=504, ge=21, le=2520, description="Train sessions")
+    test_period: int = Field(default=126, ge=5, le=1260, description="Test sessions")
+    folds: int | None = Field(default=None, ge=1, le=50, description="Max folds")
+    start_date: str | None = Field(default=None, description="ISO start date override")
+    end_date: str | None = Field(default=None, description="ISO end date override")
+
+
+class RiskDecomposeRequest(BaseModel):
+    """POST /api/risk/decompose body (additive fields over the old run_id)."""
+
+    run_id: str | None = None
+    weights: dict[str, float] | None = Field(
+        default=None, description="Portfolio weights; defaults to positions/equal weight",
+    )
+    date: str | None = Field(default=None, description="Exposure date (YYYY-MM-DD)")
+    half_life: int = Field(default=252, ge=63, le=504)
+    shrinkage_target: str = Field(default="identity")
+    start_date: str | None = Field(default=None, description="ISO start date override")
+    end_date: str | None = Field(default=None, description="ISO end date override")
+
+
 class BarraRiskResponse(BaseModel):
     total_risk: float
     factor_risk: float

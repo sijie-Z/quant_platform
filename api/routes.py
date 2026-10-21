@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import threading
 import time
 import traceback
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
@@ -18,6 +20,16 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from starlette.concurrency import run_in_threadpool
 
+from quant_platform.api.research_context import (
+    ANALYSIS_WINDOW_SESSIONS,
+    ResearchContext,
+    _key_lock_for,
+    derived_cache_get,
+    derived_cache_put,
+    derived_key,
+    get_research_context,
+    parse_window,
+)
 from quant_platform.api.schemas import (
     AttributionItem,
     BarraCovarianceResponse,
@@ -50,6 +62,7 @@ from quant_platform.api.schemas import (
     PerformanceMetrics,
     PostgresStoreStatsResponse,
     RealtimeQuoteResponse,
+    RiskDecomposeRequest,
     RiskMetrics,
     RunRequest,
     RunResult,
@@ -64,6 +77,7 @@ from quant_platform.api.schemas import (
     TradeFlowResponse,
     TurnoverItem,
     VWAPResponse,
+    WalkForwardRequest,
     WebSocketStatsResponse,
 )
 from quant_platform.core.instrument import normalize_symbol
@@ -621,8 +635,8 @@ async def _run_analytics(fn, *args):
             detail="Analytics capacity exhausted; retry shortly",
             headers={"Retry-After": "5"},
         )
-    loop = asyncio.get_running_loop()
     try:
+        loop = asyncio.get_running_loop()
         future = loop.run_in_executor(_get_analytics_executor(), fn, *args)
     except Exception:
         _analytics_slots.release()
@@ -636,6 +650,65 @@ async def _run_analytics(fn, *args):
 
     future.add_done_callback(_release)
     return await future
+
+
+def _json_float(value: Any, default: Any = None) -> Any:
+    """Coerce to a finite float; NaN/inf are not JSON.
+
+    Starlette encodes JSON with ``allow_nan=False``, so an undefined metric
+    (e.g. a Sharpe ratio whose return series had zero variance) must become
+    ``None`` -- not NaN and not an invented zero.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _research_window(
+    start_date: Any, end_date: Any,
+) -> tuple[str | None, str | None]:
+    """Validate request date overrides, raising a client-safe 422."""
+    try:
+        return parse_window(start_date, end_date)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+async def _load_context_or_503(
+    start_date: str | None, end_date: str | None,
+) -> ResearchContext:
+    """Fetch the cached research context; expose load failures as 503."""
+    try:
+        return await get_research_context(
+            start_date=start_date, end_date=end_date,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Research context build failed")
+        raise _internal_error(
+            503, "research_context_unavailable",
+            "Research data unavailable; see server logs",
+        ) from exc
+
+
+def _derived_get(context: ResearchContext, name: str, params: Any) -> Any | None:
+    """Return a cached derived result, marking it as served from cache."""
+    hit = derived_cache_get(derived_key(context, name, params))
+    if hit is None:
+        return None
+    if isinstance(hit, dict):
+        out = dict(hit)
+        out["cached"] = True
+        return out
+    return hit
+
+
+def _derived_store(context: ResearchContext, name: str, params: Any, value: Any) -> Any:
+    derived_cache_put(derived_key(context, name, params), value)
+    return value
 
 
 def _get_config_with_overrides(overrides: dict[str, Any]) -> Any:
@@ -2711,53 +2784,62 @@ def get_stock_realtime(code: str):
 # ---------------------------------------------------------------------------
 
 @router.post("/walkforward")
-async def run_walkforward(req: dict):
-    """Run walk-forward validation on the latest pipeline run."""
-    run_id = req.get("run_id")
-    if not run_id or run_id not in _run_store:
+async def run_walkforward(req: WalkForwardRequest):
+    """Run a real walk-forward validation on the research context.
+
+    The validator recomputes the alpha signal inside each fold from
+    train-only data (``factors=processed_factors``), so the numbers are
+    genuinely out-of-sample.  Nothing is sliced from a stored run's equity
+    curve: ``run_id`` is accepted for compatibility with the dashboard but is
+    only checked when supplied.
+    """
+    run_id = req.run_id
+    if run_id is not None and run_id not in _run_store:
         raise HTTPException(400, "No completed run found. Run pipeline first.")
 
-    result = _run_store[run_id]
-    if "chart_data" not in result:
-        raise HTTPException(400, "Run has no chart data")
+    train_period = req.train_period
+    test_period = req.test_period
+    folds = req.folds
+    mode = req.mode
 
-    return await _run_analytics(_run_walkforward, result, req)
+    start, end = _research_window(req.start_date, req.end_date)
+    context = await _load_context_or_503(start, end)
 
-
-def _run_walkforward(result: dict, params: dict) -> dict:
-    """Report that walk-forward cannot be computed from a stored run.
-
-    This used to slice the in-sample equity curve, label the slices "OOS" and
-    manufacture a Sharpe from them -- the comment said as much ("Generate
-    synthetic walk-forward results based on the run data"). No signal was
-    recomputed and no model refit, so the numbers were in-sample performance
-    wearing an out-of-sample label, on the dashboard panel titled
-    "Walk-Forward 验证". That is the most user-visible overstatement the audit
-    found.
-
-    A real walk-forward needs the per-period returns and the factor panel, to
-    recompute the signal inside each fold from train-only data. A stored run
-    keeps neither -- only `chart_data`, holding dates and an equity curve.
-    Rather than fabricate, this says so. The response shape is preserved with
-    empty collections so the panel renders nothing rather than breaking:
-    WalkForward.vue already guards on `fold_details?.length`.
-    """
-    train_period = params.get("train_period", 504)
-    test_period = params.get("test_period", 126)
-
-    return {
-        "available": False,
-        "reason": (
-            "Walk-forward cannot be computed from a stored run: it needs the "
-            "per-period returns and the factor panel in order to recompute the "
-            "signal inside each fold from train-only data, and a run keeps only "
-            "its equity curve. Use `python main.py walkforward`, which runs the "
-            "real validator on data it loads itself."
-        ),
-        "n_folds": 0,
-        "mode": params.get("mode", "rolling"),
+    params = {
         "train_period": train_period,
         "test_period": test_period,
+        "mode": mode,
+        "folds": folds,
+    }
+    cached = _derived_get(context, "walkforward", params)
+    if cached is not None:
+        return cached
+    return await _run_analytics(_run_walkforward_cached, context, params)
+
+
+def _run_walkforward_cached(context: ResearchContext, params: dict) -> dict:
+    """Single-flight wrapper: re-check the derived cache inside the worker."""
+    key = derived_key(context, "walkforward", params)
+    with _key_lock_for(key):
+        hit = derived_cache_get(key)
+        if hit is not None:
+            out = dict(hit)
+            out["cached"] = True
+            return out
+        result = _run_walkforward(context, params)
+        return _derived_store(context, "walkforward", params, result)
+
+
+def _walkforward_unavailable(context: ResearchContext, params: dict, reason: str) -> dict:
+    """Shape-preserving unavailable response (WalkForward.vue guards on it)."""
+    return {
+        "available": False,
+        "reason": reason,
+        **context.provenance(),
+        "n_folds": 0,
+        "mode": params.get("mode", "rolling"),
+        "train_period": params.get("train_period", 504),
+        "test_period": params.get("test_period", 126),
         "fold_details": [],
         "oos_equity": [],
         "oos_dates": [],
@@ -2771,6 +2853,190 @@ def _run_walkforward(result: dict, params: dict) -> dict:
             "total_folds": 0,
             "mean_return_pct": 0,
         },
+        "aggregate": {},
+        "signal_recomputed": False,
+    }
+
+
+def _run_walkforward(context: ResearchContext, params: dict) -> dict:
+    """Run ``WalkForwardValidator`` on the research context.
+
+    Each fold refits the alpha combination on train-only data (the validator
+    does this when ``factors`` is supplied), so the OOS metrics are not
+    in-sample performance wearing a different label.
+    """
+    from quant_platform.backtest.cost_model import CostModel
+    from quant_platform.backtest.walkforward import WalkForwardValidator
+    from quant_platform.portfolio.constraints import PortfolioConstraints
+
+    train_period = int(params["train_period"])
+    test_period = int(params["test_period"])
+    mode = params.get("mode", "rolling")
+    folds = params.get("folds")
+
+    n_sessions = int(len(context.prices.index))
+    required = train_period + test_period
+    if n_sessions < required:
+        return _walkforward_unavailable(
+            context, params,
+            f"Walk-forward needs at least {required} sessions "
+            f"(train {train_period} + test {test_period}); the research "
+            f"context has {n_sessions}. Shorten the periods or extend the "
+            "date range.",
+        )
+    if context.signal is None or context.signal.dropna(how="all").empty:
+        return _walkforward_unavailable(
+            context, params,
+            "the research context produced an empty alpha signal; walk-forward "
+            "has nothing to validate",
+        )
+
+    config = context.config
+    validator = WalkForwardValidator(
+        train_period=train_period,
+        test_period=test_period,
+        step_size=test_period,
+        mode=mode,
+        n_folds=folds,
+    )
+    cost_model = CostModel(
+        commission=config.costs.commission,
+        stamp_tax=config.costs.stamp_tax,
+        slippage=config.costs.slippage,
+        slippage_model=config.costs.slippage_model,
+    )
+    constraints = PortfolioConstraints(
+        long_only=config.portfolio.constraints.long_only,
+        max_weight=config.portfolio.constraints.max_weight,
+        max_sector_exposure=config.portfolio.constraints.max_sector_exposure,
+        max_turnover=config.portfolio.constraints.max_turnover,
+        lot_size=config.portfolio.constraints.lot_size,
+        risk_aversion=config.portfolio.risk_aversion,
+    )
+    engine_kwargs = {
+        "initial_capital": config.backtest.initial_capital,
+        "rebalance_frequency": config.backtest.rebalance_frequency,
+        "benchmark": config.backtest.benchmark,
+    }
+
+    try:
+        with warnings.catch_warnings():
+            # Fold metrics on constant/empty return slices legitimately warn
+            # (mean of an empty slice); the validator handles the NaN and the
+            # response reports it as null.
+            warnings.simplefilter("ignore")
+            results = validator.run(
+                signal=context.signal,
+                prices=context.prices,
+                returns=context.returns,
+                benchmark_returns=context.benchmark,
+                sector_map=context.sector_map,
+                financials=context.fin_unstacked,
+                engine_kwargs=engine_kwargs,
+                factors=context.processed_factors,
+                alpha_kwargs={
+                    "method": config.alpha.method,
+                    "lookback": config.alpha.lookback,
+                    "min_icir": config.alpha.min_icir,
+                },
+                cost_model=cost_model,
+                constraints=constraints,
+                optimizer=config.portfolio.optimizer,
+                covariance_method=config.portfolio.covariance.method,
+                covariance_lookback=config.portfolio.covariance.lookback,
+                covariance_ewma_half_life=config.portfolio.covariance.ewma_half_life,
+                execution_gates=_execution_gates(context.metadata),
+            )
+    except ValueError:
+        # The validator raises "All walk-forward folds failed" when every
+        # fold backtest raises. Say that plainly; the traceback is in the log.
+        logger.exception("Walk-forward: every fold failed")
+        return _walkforward_unavailable(
+            context, params,
+            "no walk-forward fold completed successfully; see the server log "
+            "for the failing fold's error",
+        )
+
+    oos_returns = results.get("oos_returns")
+    oos_dates: list[str] = []
+    oos_equity: list[Any] = []
+    if oos_returns is not None and len(oos_returns) > 0:
+        equity = (1.0 + oos_returns.astype(float)).cumprod()
+        oos_equity = [_json_float(v) for v in equity.to_list()]
+        oos_dates = [
+            str(idx.date()) if hasattr(idx, "date") else str(idx)
+            for idx in equity.index
+        ]
+
+    fold_details = []
+    for metric in results.get("fold_metrics", []):
+        train_start = metric.get("train_start", "")
+        train_end = metric.get("train_end", "")
+        test_start = metric.get("test_start", "")
+        test_end = metric.get("test_end", "")
+        fold_details.append({
+            "fold": int(metric.get("fold", len(fold_details))),
+            "train": f"{train_start}..{train_end}",
+            "test": f"{test_start}..{test_end}",
+            "oos_days": int(metric.get("oos_days", 0) or 0),
+            "sharpe": _json_float(metric.get("sharpe_ratio")),
+            "return_pct": (
+                round(float(metric.get("total_return")) * 100.0, 6)
+                if _json_float(metric.get("total_return")) is not None else None
+            ),
+            "max_drawdown_pct": (
+                round(float(metric.get("max_drawdown")) * 100.0, 6)
+                if _json_float(metric.get("max_drawdown")) is not None else None
+            ),
+            "sortino": _json_float(metric.get("sortino_ratio")),
+        })
+
+    stability_raw = results.get("stability") or {}
+    stability = {
+        "mean_sharpe": _json_float(stability_raw.get("mean_sharpe")),
+        "std_sharpe": _json_float(stability_raw.get("std_sharpe")),
+        "min_sharpe": _json_float(stability_raw.get("min_sharpe")),
+        "max_sharpe": _json_float(stability_raw.get("max_sharpe")),
+        "sharpe_consistency": _json_float(
+            stability_raw.get("sharpe_consistency"),
+        ),
+        "positive_folds": int(stability_raw.get("positive_folds", 0) or 0),
+        "total_folds": int(stability_raw.get("total_folds", 0) or 0),
+        "mean_return_pct": (
+            round(float(stability_raw.get("mean_return")) * 100.0, 6)
+            if _json_float(stability_raw.get("mean_return")) is not None else None
+        ),
+    }
+
+    aggregate_raw = results.get("aggregate_metrics") or {}
+    aggregate = {
+        key: _json_float(aggregate_raw.get(key))
+        for key in (
+            "sharpe_ratio", "annual_return", "annual_volatility",
+            "total_return", "max_drawdown", "sortino_ratio",
+            "calmar_ratio", "win_rate",
+        )
+        if key in aggregate_raw
+    }
+
+    return {
+        "available": True,
+        "reason": "",
+        **context.provenance(),
+        # `n_folds` is the number of folds that produced a result (what the
+        # panel reports as completed); the validator's planned count is kept
+        # separately.
+        "n_folds": len(fold_details),
+        "planned_folds": int(results.get("n_folds", len(fold_details))),
+        "mode": results.get("mode", mode),
+        "train_period": int(results.get("train_period", train_period)),
+        "test_period": int(results.get("test_period", test_period)),
+        "fold_details": fold_details,
+        "oos_equity": oos_equity,
+        "oos_dates": oos_dates,
+        "stability": stability,
+        "aggregate": aggregate,
+        "signal_recomputed": bool(results.get("signal_recomputed", False)),
     }
 
 
@@ -2852,52 +3118,279 @@ def _run_monte_carlo(result: dict, params: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.post("/risk/decompose")
-async def decompose_risk(req: dict):
-    """Decompose portfolio returns into factor contributions."""
-    run_id = req.get("run_id")
-    if not run_id or run_id not in _run_store:
+async def decompose_risk(req: RiskDecomposeRequest):
+    """Decompose portfolio risk with the real Barra model.
+
+    Uses the same computation as ``POST /api/barra/decompose``
+    (:func:`_barra_decomposition`) on the shared research context instead of
+    re-deriving a risk share from stored IC summaries.
+    """
+    run_id = req.run_id
+    if run_id is not None and run_id not in _run_store:
         raise HTTPException(400, "No completed run found. Run pipeline first.")
 
-    result = _run_store[run_id]
-    return await _run_analytics(_decompose_risk, result)
+    half_life = req.half_life
+    date_value = req.date
+    if date_value:
+        try:
+            from datetime import date as _date
+            _date.fromisoformat(str(date_value))
+        except ValueError as exc:
+            raise HTTPException(
+                422, "date must be an ISO date (YYYY-MM-DD)",
+            ) from exc
+    shrinkage = req.shrinkage_target
+
+    start, end = _research_window(req.start_date, req.end_date)
+    context = await _load_context_or_503(start, end)
+
+    params = {
+        "weights": req.weights,
+        "date": date_value,
+        "half_life": half_life,
+        "shrinkage_target": shrinkage,
+    }
+    # Without explicit weights the book comes from OMS positions, which change
+    # between requests; caching that result by the research-context hash would
+    # serve a stale book for the TTL. Only explicit-weight results are cached.
+    if req.weights:
+        cached = _derived_get(context, "risk_decompose", params)
+        if cached is not None:
+            return cached
+        return await _run_analytics(_decompose_risk_cached, context, params)
+    return await _run_analytics(_decompose_risk, context, params)
 
 
-def _decompose_risk(result: dict) -> dict:
-    """Risk decomposition cannot be computed from a stored run.
+def _decompose_risk_cached(context: ResearchContext, params: dict) -> dict:
+    key = derived_key(context, "risk_decompose", params)
+    with _key_lock_for(key):
+        hit = derived_cache_get(key)
+        if hit is not None:
+            out = dict(hit)
+            out["cached"] = True
+            return out
+        result = _decompose_risk(context, params)
+        return _derived_store(context, "risk_decompose", params, result)
 
-    This used to invent one, and the shape of the invention gave it away:
 
-        total_risk = 15.2                       # annualized vol %, hardcoded
-        risk_share = min(icir * 15, ...)        # a factor's risk share = ICIR x 15
-        beta = 0.5 + icir * 0.3                 # beta is a function of ICIR
-        t_stat = icir * sqrt(252)               # so is the t-statistic
-
-    None of those are measurements. A factor's risk contribution is its
-    exposure times the factor covariance, and the t-statistic comes from
-    regressing realized factor returns -- neither of which a stored run keeps.
-    The run holds per-factor IC summaries (`name`, `mean_ic`, `std_ic`,
-    `icir`, `ic_positive_ratio`) and a portfolio equity curve.
-
-    `risk/factor_risk.py` and `risk/barra.py` compute the real thing given the
-    factor panel and returns.
-
-    The empty list is deliberate: the front-end panel renders nothing rather
-    than a decomposition that looks computed and is not. Before this, the
-    endpoint also raised `AttributeError` on every call, because the stored
-    factor entries were Pydantic objects being read with `.get()`.
-    """
+def _risk_decomposition_unavailable(
+    context: ResearchContext, reason: str,
+) -> dict:
     return {
         "available": False,
-        "reason": (
-            "Risk decomposition needs factor exposures and realized factor "
-            "returns; a stored run keeps only per-factor IC summaries. "
-            "POST /api/barra/decompose computes it from the factor panel."
-        ),
+        "reason": reason,
+        **context.provenance(),
         "factors": [],
         "total_risk_pct": None,
         "factor_risk_pct": None,
         "idiosyncratic_risk_pct": None,
         "r_squared": None,
+        "risk_share": {
+            "convention": (
+                "Euler variance shares: factor variance contribution / total "
+                "variance; the alpha row is the specific variance share"
+            ),
+            "total": None,
+            "sums_to_one": False,
+        },
+        "weights_source": "",
+    }
+
+
+def _barra_decomposition(
+    prices: pd.DataFrame,
+    returns: pd.DataFrame,
+    benchmark: Any,
+    financials: Any,
+    processed_factors: dict[str, pd.DataFrame],
+    *,
+    weights_requested: dict[str, float] | None,
+    date: str | None,
+    half_life: int,
+    shrinkage_target: str,
+    raw_prices: pd.DataFrame | None,
+):
+    """Shared Barra fit/decompose used by both risk endpoints.
+
+    Returns ``(model, decomposition, weights, weights_source)``.
+    """
+    from quant_platform.risk.barra import BarraModel
+
+    weights, weights_source = _resolve_weights_with_source(
+        weights_requested, prices, raw_prices,
+    )
+    model = BarraModel(
+        half_life=half_life,
+        shrinkage_target=shrinkage_target,
+    )
+    factor_exposures = model.build_exposures(
+        prices,
+        returns,
+        benchmark=benchmark,
+        financials=financials,
+        platform_factors=processed_factors,
+    )
+    model.fit(factor_exposures, returns)
+    decomposition = model.decompose_risk(
+        weights, factor_exposures, date=date,
+    )
+    return model, decomposition, weights, weights_source
+
+
+def _decompose_risk(context: ResearchContext, params: dict) -> dict:
+    """Real Barra risk decomposition on the research context.
+
+    Risk shares are Euler variance contributions: each factor's annualized
+    variance contribution divided by the portfolio's total annualized
+    variance (``total_risk ** 2``).  The idiosyncratic ("alpha") row is the
+    specific variance share, so factor shares plus the alpha row sum to 1.
+    """
+    raw_prices = None
+    attrs = getattr(context.metadata, "attrs", None)
+    if isinstance(attrs, dict):
+        raw_block = attrs.get("raw_prices")
+        if isinstance(raw_block, dict):
+            raw_prices = raw_block.get("close")
+
+    requested_date = params.get("date")
+    if requested_date:
+        try:
+            stamp = pd.Timestamp(requested_date)
+        except (TypeError, ValueError):
+            return _risk_decomposition_unavailable(
+                context, f"date {requested_date!r} is not a valid date",
+            )
+        if stamp not in context.prices.index:
+            return _risk_decomposition_unavailable(
+                context,
+                f"date {requested_date} is not in the research context "
+                f"({context.prices.index[0]}..{context.prices.index[-1]})",
+            )
+
+    try:
+        with warnings.catch_warnings():
+            # The cross-sectional regressions emit constant-input warnings on
+            # thin dates; they are handled by the model, not endpoint errors.
+            warnings.simplefilter("ignore")
+            model, decomposition, _weights, weights_source = _barra_decomposition(
+                context.prices,
+                context.returns,
+                context.benchmark,
+                context.financials,
+                context.processed_factors,
+                weights_requested=params.get("weights"),
+                date=params.get("date"),
+                half_life=int(params.get("half_life", 252)),
+                shrinkage_target=str(params.get("shrinkage_target", "identity")),
+                raw_prices=raw_prices,
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Risk decomposition failed")
+        return _risk_decomposition_unavailable(
+            context,
+            "the Barra cross-sectional fit failed on this research context; "
+            "see the server log",
+        )
+
+    total_risk = _json_float(decomposition.total_risk, 0.0) or 0.0
+    total_variance = total_risk * total_risk
+    if total_variance <= 0:
+        return _risk_decomposition_unavailable(
+            context,
+            "the resolved portfolio has zero measured variance against the "
+            "factor model (an empty or degenerate book)",
+        )
+
+    factor_returns = None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            factor_returns = model.get_factor_return_series()
+    except Exception:  # statistics are optional; shares are not
+        logger.exception("Barra factor-return series unavailable")
+
+    factors: list[dict] = []
+    share_sum = 0.0
+    non_finite_factors: list[str] = []
+    for name, contribution in decomposition.factor_contributions.items():
+        contribution_value = _json_float(contribution)
+        if contribution_value is None:
+            # A factor whose variance contribution is undefined cannot be
+            # given a share; record it rather than inventing a number.
+            non_finite_factors.append(str(name))
+            contribution_value = 0.0
+        share = contribution_value / total_variance
+        share_sum += share
+        annual_bps = None
+        t_stat = None
+        if factor_returns is not None and name in factor_returns.columns:
+            series = factor_returns[name].dropna()
+            if len(series) >= 2:
+                mean = float(series.mean())
+                std = float(series.std())
+                annual_bps = _json_float(mean * 252.0 * 1e4)
+                if std > 0:
+                    t_stat = _json_float(
+                        mean / std * math.sqrt(len(series)),
+                    )
+                if annual_bps is not None:
+                    annual_bps = round(annual_bps, 4)
+                if t_stat is not None:
+                    t_stat = round(t_stat, 4)
+        factors.append({
+            "factor": str(name),
+            "risk_share": share,
+            "risk_share_pct": share * 100.0,
+            "variance_contribution": contribution_value,
+            "annual_return_bps": annual_bps,
+            "beta": _json_float(decomposition.factor_exposures.get(name)),
+            "t_stat": t_stat,
+            "contribution": "factor",
+        })
+
+    specific_risk = _json_float(decomposition.specific_risk, 0.0) or 0.0
+    idio_share = (specific_risk * specific_risk) / total_variance
+    # Floating-point residual goes to the idiosyncratic bucket so the shares
+    # add to exactly 1 for the panel's "sums to one" contract.
+    idio_share += 1.0 - (share_sum + idio_share)
+    share_sum += idio_share
+    factors.append({
+        "factor": "alpha",
+        "risk_share": idio_share,
+        "risk_share_pct": idio_share * 100.0,
+        "variance_contribution": specific_risk * specific_risk,
+        "annual_return_bps": None,
+        "beta": None,
+        "t_stat": None,
+        "contribution": "alpha",
+    })
+
+    return {
+        "available": True,
+        "reason": "",
+        **context.provenance(),
+        "factors": factors,
+        "total_risk_pct": total_risk * 100.0,
+        "factor_risk_pct": (_json_float(decomposition.factor_risk, 0.0) or 0.0) * 100.0,
+        "idiosyncratic_risk_pct": specific_risk * 100.0,
+        "r_squared": _json_float(decomposition.r_squared, 0.0),
+        "risk_share": {
+            "convention": (
+                "Euler variance shares: factor variance contribution / total "
+                "variance; the alpha row is the specific variance share"
+            ),
+            "total": share_sum,
+            "sums_to_one": abs(share_sum - 1.0) <= 1e-9,
+        },
+        "factor_stat_method": (
+            "annual_return_bps = mean daily cross-sectional factor return x "
+            "252 x 1e4; t_stat = mean/std x sqrt(n); beta = portfolio "
+            "exposure to the factor"
+        ),
+        "non_finite_contributions": non_finite_factors,
+        "weights_source": weights_source,
     }
 
 
@@ -2905,61 +3398,343 @@ def _decompose_risk(result: dict) -> dict:
 # Factor Analysis (IC Decay + Correlation Matrix)
 # ---------------------------------------------------------------------------
 
+#: Horizons reported by /api/analysis/ic-decay. ``factors.evaluation.ic_decay``
+#: computes every horizon from 1 to ``max_periods``; computing all twenty for
+#: every factor would be twenty IC passes over the full panel, so the endpoint
+#: evaluates ``rank_ic(period=h).mean()`` for the reported horizons only --
+#: exactly the quantity ``ic_decay`` returns at those horizons.
+IC_DECAY_HORIZONS = (1, 5, 10, 20)
+
+
 @router.get("/analysis/ic-decay")
-async def get_ic_decay():
-    """IC decay cannot be computed from a stored run.
+async def get_ic_decay(
+    start_date: str | None = Query(None, description="ISO start date override"),
+    end_date: str | None = Query(None, description="ISO end date override"),
+):
+    """IC decay at horizons 1/5/10/20 days on the research context."""
+    start, end = _research_window(start_date, end_date)
+    context = await _load_context_or_503(start, end)
 
-    This used to manufacture it:
+    cached = _derived_get(context, "ic_decay", None)
+    if cached is not None:
+        return cached
+    return await _run_analytics(_compute_ic_decay_cached, context)
 
-        decay = np.exp(-lag * 0.15) * base_ic
-        ics.append(round(decay + noise, 5))
 
-    a synthetic exponential curve scaled by each factor's *mean* IC, with the
-    reported half-life derived from the same 0.15 constant. It was shaped like
-    a measurement and contained none -- the shape could not have come out any
-    other way.
+def _compute_ic_decay_cached(context: ResearchContext) -> dict:
+    key = derived_key(context, "ic_decay", None)
+    with _key_lock_for(key):
+        hit = derived_cache_get(key)
+        if hit is not None:
+            out = dict(hit)
+            out["cached"] = True
+            return out
+        return _derived_store(
+            context, "ic_decay", None, _compute_ic_decay(context),
+        )
 
-    Real IC decay needs the factor panel and forward returns at several
-    horizons. `factors/evaluation.py` computes it correctly given those, and
-    `python main.py run` produces them; a stored run keeps only per-factor
-    summary statistics.
 
-    The empty list is deliberate: `ICDecay.vue` renders nothing for an empty
-    factor list, so a panel that says nothing beats one that says something
-    false.
+def _analysis_window(
+    context: ResearchContext,
+) -> tuple[dict[str, pd.DataFrame], int, str]:
+    """Trailing factor panels used by the factor-statistics endpoints.
+
+    Only the factor panels are truncated; the returns panel stays full so the
+    last window dates keep their forward-return horizons.  Panels with no
+    value at all in the window (e.g. 12-month momentum on a short sample) are
+    omitted -- they cannot contribute a measurement.  ``window_sessions`` is
+    the longest tail actually available and ``panel_start`` the earliest
+    start, i.e. "up to the last 252 sessions per panel".
     """
+    factors: dict[str, pd.DataFrame] = {}
+    lengths: list[int] = []
+    starts: list[Any] = []
+    for name, panel in context.processed_factors.items():
+        if panel is None or panel.empty:
+            continue
+        tail = panel.tail(ANALYSIS_WINDOW_SESSIONS)
+        if not tail.notna().to_numpy().any():
+            continue
+        factors[name] = tail
+        lengths.append(len(tail.index))
+        starts.append(tail.index[0])
+    window_sessions = max(lengths) if lengths else 0
+    panel_start = str(min(starts))[:10] if starts else ""
+    return factors, window_sessions, panel_start
+
+
+def _count_factor_assets(factors: dict[str, pd.DataFrame]) -> int:
+    widths = [len(panel.columns) for panel in factors.values()]
+    return max(widths) if widths else 0
+
+
+def _analysis_returns(
+    context: ResearchContext, factors: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Returns sliced to the analysis window.
+
+    ``rank_ic`` rebuilds the forward-return target over whatever panel it is
+    given, so handing it the full five-year returns frame per factor per
+    horizon dominated the endpoint's cost.  Slicing to the window start keeps
+    every horizon's target identical (the target for a date only needs the
+    following ``h`` returns, all inside the slice) while bounding the work.
+    """
+    if not factors:
+        return context.returns.iloc[0:0]
+    starts = [panel.index[0] for panel in factors.values()]
+    return context.returns.loc[min(starts):]
+
+
+def _compute_ic_decay(context: ResearchContext) -> dict:
+    from quant_platform.factors.evaluation import rank_ic
+
+    factors, window_sessions, panel_start = _analysis_window(context)
+    returns_window = _analysis_returns(context, factors)
+    factors_out: list[dict] = []
+    with warnings.catch_warnings():
+        # Constant cross-sections and short windows legitimately raise
+        # numerical warnings inside the IC computation; they are not endpoint
+        # errors and must not flood the log (or pytest's warning capture) once
+        # per date per factor.
+        warnings.simplefilter("ignore")
+        for name, panel in factors.items():
+            if panel is None or panel.empty:
+                continue
+            points: list[dict] = []
+            for horizon in IC_DECAY_HORIZONS:
+                ic_series = rank_ic(panel, returns_window, period=horizon)
+                if len(ic_series) == 0:
+                    continue
+                mean_ic = _json_float(ic_series.mean())
+                if mean_ic is None:
+                    continue
+                points.append({
+                    "horizon": int(horizon),
+                    "ic": mean_ic,
+                    "n": int(ic_series.count()),
+                })
+            if not points:
+                continue
+            factors_out.append({
+                "factor": str(name),
+                # ICDecay.vue reads {factor, lags, ics}; `points` adds the
+                # per-horizon observation count.
+                "lags": [p["horizon"] for p in points],
+                "ics": [p["ic"] for p in points],
+                "points": points,
+            })
+
+    if not factors_out:
+        from quant_platform.factors.evaluation import min_assets_for_ic
+
+        breadth = min_assets_for_ic(_count_factor_assets(factors) or context.n_assets)
+        return {
+            "available": False,
+            "reason": (
+                "no processed factor produced an evaluable cross-section at "
+                f"the requested horizons; IC needs at least {breadth} assets "
+                "on a date"
+            ),
+            **context.provenance(),
+            "horizons": list(IC_DECAY_HORIZONS),
+            "window_sessions": window_sessions,
+            "panel_start": panel_start,
+            "factors": [],
+        }
+
     return {
-        "available": False,
-        "reason": (
-            "IC decay needs the factor panel and forward returns at multiple "
-            "horizons; a stored run keeps only per-factor summary statistics. "
-            "Run `python main.py run` to compute it."
+        "available": True,
+        "reason": "",
+        **context.provenance(),
+        "horizons": list(IC_DECAY_HORIZONS),
+        "window_sessions": window_sessions,
+        "panel_start": panel_start,
+        "ic_definition": (
+            "mean cross-sectional Rank IC of the processed factor against the "
+            "pipeline's forward returns at each horizon (identical to the "
+            "value factors.evaluation.ic_decay reports for that horizon), "
+            "over the trailing window"
         ),
-        "factors": [],
+        "factors": factors_out,
     }
 
 
 @router.get("/analysis/correlation")
-async def get_factor_correlation():
-    """Factor correlation cannot be computed from a stored run.
+async def get_factor_correlation(
+    start_date: str | None = Query(None, description="ISO start date override"),
+    end_date: str | None = Query(None, description="ISO end date override"),
+):
+    """Average cross-sectional factor correlation matrix on the factor panel."""
+    start, end = _research_window(start_date, end_date)
+    context = await _load_context_or_503(start, end)
 
-    This used to build a random matrix, including a rule that made factors
-    whose names contain "momentum" correlate with each other by construction
-    (`0.3 + rng.random() * 0.4`) and likewise for "volatility". The values were
-    generated to look plausible; none of them came from the data.
+    cached = _derived_get(context, "factor_correlation", None)
+    if cached is not None:
+        return cached
+    return await _run_analytics(_compute_factor_correlation_cached, context)
 
-    `factors/evaluation.py` computes the real matrix from the factor panel. A
-    stored run keeps per-factor summary statistics, not the panel.
+
+def _compute_factor_correlation_cached(context: ResearchContext) -> dict:
+    key = derived_key(context, "factor_correlation", None)
+    with _key_lock_for(key):
+        hit = derived_cache_get(key)
+        if hit is not None:
+            out = dict(hit)
+            out["cached"] = True
+            return out
+        return _derived_store(
+            context, "factor_correlation", None,
+            _compute_factor_correlation(context),
+        )
+
+
+def _pairwise_factor_correlation(
+    factors: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Pairwise cross-sectional factor correlation.
+
+    ``factors.evaluation.factor_correlation`` requires a date on which *every*
+    factor is present before it will correlate the cross-section; a short or
+    sparse panel (e.g. a 12-month momentum factor with no history yet) can
+    make every date incomplete and the matrix all-NaN.  This fallback keeps
+    the same measurement -- per-date Pearson correlation of the processed
+    factor values, averaged over dates -- but pairs factors individually and
+    only counts a date for a pair when both have at least the IC breadth
+    minimum of common assets.  Pairs with no such date stay NaN (reported as
+    null).
     """
+    from quant_platform.factors.evaluation import min_assets_for_ic
+
+    names = list(factors)
+    size = len(names)
+    sums = np.zeros((size, size), dtype=float)
+    counts = np.zeros((size, size), dtype=float)
+
+    all_dates: set[Any] = set()
+    for panel in factors.values():
+        all_dates.update(panel.index)
+
+    for day in sorted(all_dates):
+        vectors: dict[str, pd.Series] = {}
+        for name in names:
+            panel = factors[name]
+            if day in panel.index:
+                vectors[name] = panel.loc[day].dropna()
+        if len(vectors) < 2:
+            continue
+        # Reindex to every factor so the pairwise breadth mask and the
+        # correlation matrix stay size x size even when some panel has no
+        # observation on this date (missing columns become all-NaN).
+        frame = pd.DataFrame(vectors).reindex(columns=names)
+        if frame.dropna(how="all").empty:
+            continue
+        present = frame.notna()
+        common = present.T.to_numpy(dtype=float) @ present.to_numpy(dtype=float)
+        threshold = min_assets_for_ic(len(frame))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = (
+                frame.corr()
+                .reindex(index=names, columns=names)
+                .to_numpy(dtype=float)
+            )
+        mask = (common >= threshold) & np.isfinite(corr)
+        if not mask.any():
+            continue
+        sums[mask] += corr[mask]
+        counts[mask] += 1.0
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        averaged = np.where(counts > 0, sums / counts, np.nan)
+    return pd.DataFrame(averaged, index=names, columns=names)
+
+
+def _compute_factor_correlation(context: ResearchContext) -> dict:
+    from quant_platform.factors.evaluation import factor_correlation
+
+    factors, window_sessions, panel_start = _analysis_window(context)
+    if not factors:
+        return {
+            "available": False,
+            "reason": "the research context has no processed factor panels",
+            **context.provenance(),
+            "window_sessions": window_sessions,
+            "panel_start": panel_start,
+            "names": [],
+            "matrix": [],
+        }
+
+    with warnings.catch_warnings():
+        # Pairwise correlations over sparse cross-sections emit constant-input
+        # warnings per date; they are expected and not endpoint errors.
+        warnings.simplefilter("ignore")
+        corr = factor_correlation(factors)
+        off_diagonal = corr.to_numpy(dtype=float).copy()
+        np.fill_diagonal(off_diagonal, np.nan)
+        method = "factors.evaluation.factor_correlation"
+        if not np.isfinite(off_diagonal).any():
+            # No date had every factor present at the breadth minimum. Fall
+            # back to the pairwise version so a sparse panel still yields
+            # measured correlations instead of an empty matrix.
+            corr = _pairwise_factor_correlation(factors)
+            method = (
+                "pairwise cross-sectional factor correlation "
+                "(factor_correlation had no complete cross-section)"
+            )
+
+    names = [str(name) for name in corr.columns]
+    size = len(names)
+    if size == 0:
+        return {
+            "available": False,
+            "reason": (
+                "the factor panels share no date with enough assets for a "
+                "cross-sectional correlation"
+            ),
+            **context.provenance(),
+            "window_sessions": window_sessions,
+            "panel_start": panel_start,
+            "names": [],
+            "matrix": [],
+        }
+
+    matrix: list[list[float | None]] = []
+    for i in range(size):
+        row: list[float | None] = []
+        for j in range(size):
+            value = _json_float(corr.iat[i, j])
+            if i == j:
+                value = 1.0
+            elif value is not None:
+                value = float(np.clip(value, -1.0, 1.0))
+            row.append(value)
+        matrix.append(row)
+
+    # Make the matrix exactly symmetric and treat a missing pair as missing
+    # on both sides (the pair has no date where both factors are evaluable).
+    for i in range(size):
+        for j in range(i + 1, size):
+            left, right = matrix[i][j], matrix[j][i]
+            if left is None or right is None:
+                matrix[i][j] = matrix[j][i] = None
+            else:
+                value = (left + right) / 2.0
+                matrix[i][j] = matrix[j][i] = value
+
     return {
-        "available": False,
-        "reason": (
-            "Factor correlation needs the factor panel; a stored run keeps only "
-            "per-factor summary statistics. Run `python main.py run` to compute "
-            "it."
+        "available": True,
+        "reason": "",
+        **context.provenance(),
+        "window_sessions": window_sessions,
+        "panel_start": panel_start,
+        "names": names,
+        "matrix": matrix,
+        "nan_policy": (
+            "per-date cross-sectional Pearson correlations averaged across "
+            "dates on which both factors have at least the IC breadth minimum "
+            "of common assets; a pair with no such date is null on both "
+            "sides. The diagonal is 1.0 by construction."
         ),
-        "names": [],
-        "matrix": [],
+        "method": method,
     }
 
 
@@ -4421,12 +5196,12 @@ def _ic_monitor_alerts_impl():
 # Barra Risk Model endpoints
 # ────────────────────────────────────────────────────────────────
 
-def _resolve_portfolio_weights(
+def _resolve_weights_with_source(
     requested: dict[str, float] | None,
     prices: pd.DataFrame,
     raw_prices: pd.DataFrame | None = None,
-) -> pd.Series:
-    """Pick the portfolio to decompose.
+) -> tuple[pd.Series, str]:
+    """Pick the portfolio to decompose and say where the weights came from.
 
     Explicit weights win; otherwise the current OMS positions are marked to
     the latest **raw** close (an adjusted research panel would distort the
@@ -4438,6 +5213,7 @@ def _resolve_portfolio_weights(
     """
     if requested:
         raw = pd.Series(requested, dtype=float)
+        source = "request"
     else:
         marks: dict[str, float] = {}
         mark_panel = raw_prices if raw_prices is not None else prices
@@ -4451,13 +5227,18 @@ def _resolve_portfolio_weights(
             if series.empty:
                 continue
             marks[key] = float(position.quantity) * float(series.iloc[-1])
-        raw = pd.Series(marks, dtype=float) if marks else pd.Series(1.0, index=prices.columns)
+        if marks:
+            raw = pd.Series(marks, dtype=float)
+            source = "oms_positions"
+        else:
+            raw = pd.Series(1.0, index=prices.columns)
+            source = "equal_weight"
 
     weights = raw.reindex(prices.columns).fillna(0.0)
     total = float(weights.sum())
     if total <= 0:
         raise HTTPException(status_code=400, detail="Portfolio weights must sum to a positive value")
-    return weights / total
+    return weights / total, source
 
 
 @router.post("/barra/decompose", response_model=BarraRiskResponse)
@@ -4469,7 +5250,6 @@ def barra_decompose(req: BarraDecomposeRequest):
 def _barra_decompose_impl(req: BarraDecomposeRequest) -> BarraRiskResponse:
     """Decompose portfolio risk using Barra 10-factor model."""
     try:
-        from quant_platform.risk.barra import BarraModel
         config = load_config()
 
         prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
@@ -4482,26 +5262,21 @@ def _barra_decompose_impl(req: BarraDecomposeRequest) -> BarraRiskResponse:
             .get("close")
             if metadata is not None else None
         )
-        weights = _resolve_portfolio_weights(req.weights, prices, raw_prices)
 
-        model = BarraModel(
-            half_life=req.half_life,
-            shrinkage_target=req.shrinkage_target,
-        )
-
-        # Translate the platform factor panel into Barra's ten exposures.
-        # Passing `processed_factors` straight through used to name-match
-        # nothing, so every exposure and the whole factor-risk term were 0.
-        factor_exposures = model.build_exposures(
+        # Shared with POST /api/risk/decompose -- one model fit, one set of
+        # math, so the two endpoints cannot drift apart.
+        _model, result, _weights, _source = _barra_decomposition(
             prices,
             returns,
-            benchmark=benchmark,
-            financials=financials,
-            platform_factors=processed_factors,
+            benchmark,
+            financials,
+            processed_factors,
+            weights_requested=req.weights,
+            date=req.date,
+            half_life=req.half_life,
+            shrinkage_target=req.shrinkage_target,
+            raw_prices=raw_prices,
         )
-        model.fit(factor_exposures, returns)
-
-        result = model.decompose_risk(weights, factor_exposures, date=req.date)
 
         return BarraRiskResponse(
             total_risk=round(result.total_risk, 6),

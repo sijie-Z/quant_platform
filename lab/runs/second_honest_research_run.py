@@ -16,7 +16,9 @@ Trust metadata (identical structure, different adjust/completeness caveats):
     - data_meta.trust_warning = ["quarterly_point_in_time"]
     - universe_meta.pit = False, same survivorship caveat as run 1
 
-Run:  .venv/Scripts/python.exe run_slice.py  (or direct import)
+Run:  python -m lab.runs.second_honest_research_run  (or direct import).
+      run_slice.py runs the FIRST honest run only; it does not invoke this
+      script.
 """
 
 from __future__ import annotations
@@ -36,14 +38,18 @@ import akshare as ak  # noqa: E402
 from quant_platform.factors.evaluation import ic_summary  # noqa: E402
 from quant_platform.lab.registry import DEFAULT_DB, RunStore  # noqa: E402
 from quant_platform.lab.reports import generate_report  # noqa: E402
+from quant_platform.utils.research_window import resolve_end_date  # noqa: E402
 
 SLICE = "second_honest_research_run"
+MIN_IC_OBS = 20  # R5: below this the run has not been evaluated
 
 # ---- Trust metadata (same structure as first run) ---------------------------
 DATA_META = {
     "provider": "akshare",
     "adjust": "none",  # financial data, no OHLCV adjustment needed
-    "basis": "statutory_publication_deadline",
+    # Canonical key is `adjust_basis` (the first/third runs used it; this run
+    # used `basis`, so a cross-run query could not find it).
+    "adjust_basis": "statutory_publication_deadline",
     "cross_sectional_use": True,
     "interface": "stock_financial_analysis_indicator",
     "trust_warning": [
@@ -183,10 +189,12 @@ def _fetch_roe_scores(codes: list[str]) -> pd.DataFrame:
 
 def run() -> str:
     store = RunStore(DEFAULT_DB)
+    end = resolve_end_date()
+    data_meta = dict(DATA_META, requested_start="2021-01-01", requested_end=end)
     inputs = {
         "slice": SLICE,
         "data_source": "akshare",
-        "data_meta": DATA_META,
+        "data_meta": data_meta,
         "universe_provider": UNIVERSE_META["provider"],
         "universe_meta": UNIVERSE_META,
         "factor": FACTOR_PARAMS["name"],
@@ -199,12 +207,16 @@ def run() -> str:
         codes = _fetch_csi300_members()
         print(f"[{SLICE}] CSI300 members: {len(codes)}", flush=True)
 
-        start, end = "2021-01-01", "2026-05-23"
+        start = "2021-01-01"
         t0 = time_module.time()
         prices = _fetch_prices_for_fwd(codes, start, end)
         print(f"[{SLICE}] price panel: {prices.shape} (t={time_module.time() - t0:.0f}s)", flush=True)
         if prices.shape[1] < 50:
             raise RuntimeError(f"price panel too narrow: {prices.shape}")
+        data_meta["data_start"] = str(prices.index[0].date())
+        data_meta["data_end"] = str(prices.index[-1].date())
+        print(f"[{SLICE}] data window: {data_meta['data_start']} → "
+              f"{data_meta['data_end']} (requested end {end})", flush=True)
 
         t1 = time_module.time()
         roe_panel = _fetch_roe_scores(codes)
@@ -274,14 +286,24 @@ def run() -> str:
                 "note": "Do not read this as formal validation. Run more factors first.",
             },
             "bh_fdr": "n/a (single factor; BH-FDR requires multiple factors)",
+            "data_start": data_meta["data_start"],
+            "data_end": data_meta["data_end"],
+            "requested_end": end,
         }
 
-        store.finish_run(run_id, status="success", evaluation=evaluation,
-                         report_path=None, warnings=[])
+        status = "success" if len(ic_series) >= MIN_IC_OBS else "failed"
+        status_reason = None if status == "success" else (
+            f"insufficient_ic_observations: n_ic_obs={len(ic_series)} < {MIN_IC_OBS}"
+        )
+        status_warnings = [status_reason] if status_reason else []
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=None, reason=status_reason,
+                         warnings=status_warnings, data_meta=data_meta)
         final_run = store.get_run(run_id)
         report_path = generate_report(final_run, out_dir="data/reports")
-        store.finish_run(run_id, status="success", evaluation=evaluation,
-                         report_path=report_path, warnings=[])
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=report_path, reason=status_reason,
+                         warnings=status_warnings, data_meta=data_meta)
 
         print(f"[{SLICE}] SUCCESS run_id={run_id}", flush=True)
         print(f"[{SLICE}] IC={evaluation.get('ic_mean')} ICIR={evaluation.get('icir')}", flush=True)
@@ -293,9 +315,11 @@ def run() -> str:
         tb = traceback.format_exc()
         reason = f"{type(e).__name__}: {e}"
         store.finish_run(run_id, status="failed", reason=reason,
-                         warnings=[f"traceback_excerpt: {tb[-400:]}"])
+                         warnings=[f"traceback_excerpt: {tb[-400:]}"],
+                         data_meta=data_meta)
         report_path = generate_report(store.get_run(run_id), out_dir="data/reports")
-        store.finish_run(run_id, status="failed", reason=reason, report_path=report_path)
+        store.finish_run(run_id, status="failed", reason=reason,
+                         report_path=report_path, data_meta=data_meta)
         print(f"[{SLICE}] FAILED (recorded) run_id={run_id}: {e}", flush=True)
         print(f"[{SLICE}] failure report: {report_path}", flush=True)
         raise

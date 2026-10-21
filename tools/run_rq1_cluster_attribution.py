@@ -38,6 +38,7 @@ from quant_platform.factors.technical import register_all as register_technical
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.reporting.dashboard import generate_dashboard
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 
 setup_logging()
 logger = get_logger("rq1")
@@ -48,7 +49,9 @@ logger = get_logger("rq1")
 ALPHA_STRENGTH = 0.06       # "normal" strength per protocol
 N_STOCKS = 500
 START_DATE = "2021-01-01"
-END_DATE = "2025-12-31"
+# Resolved at run time (QUANT_RESEARCH_END_DATE or today); the old hardcoded
+# "2025-12-31" made every artifact silently stale.
+END_DATE = resolve_end_date()
 INITIAL_CAPITAL = 10_000_000
 
 # Top 8 factors from Ablation #001
@@ -172,11 +175,14 @@ def build_cluster_signals(processed_factors):
     return cluster_signals
 
 
-def build_experiment_signal(cluster_signals, combo_clusters):
+def build_experiment_signal(cluster_signals, combo_clusters, processed_factors):
     """Build the combined signal for an experiment.
 
     Equal-weights across clusters, then rank-standardize to [-0.5, 0.5].
     For TOP8: equal-weight all 8 individual factors.
+
+    ``processed_factors`` used to be an undefined global here, so the TOP8
+    experiment raised NameError; it is now an explicit argument.
     """
     if combo_clusters is None:
         # TOP8: all 8 individual factors, equal-weight
@@ -245,13 +251,29 @@ def extract_metrics(bt_results, signal_ic):
     """Extract protocol metrics from backtest results and IC."""
     summary = bt_results.get("summary", {})
     metrics = {
-        "IC":        signal_ic.get("mean_ic", 0),
-        "ICIR":      signal_ic.get("icir", 0),
-        "Sharpe":    summary.get("sharpe_ratio", 0),
-        "MDD":       summary.get("max_drawdown", 0),
-        "Turnover":  summary.get("avg_turnover", summary.get("turnover", 0)),
+        "IC":        signal_ic.get("mean_ic", np.nan),
+        "ICIR":      signal_ic.get("icir", np.nan),
+        "Sharpe":    summary.get("sharpe_ratio", np.nan),
+        "MDD":       summary.get("max_drawdown", np.nan),
+        # BacktestEngine.summary exposes annual_turnover. The old fallback
+        # keys (avg_turnover/turnover) never exist, so every Turnover cell
+        # in the CSV was 0.
+        "Turnover":  summary.get("annual_turnover", np.nan),
+        "Status":    "ok",
+        "Error":     "",
     }
     return metrics
+
+
+def failed_metrics(signal_ic, exc):
+    """Metrics for a failed backtest: NaN, never 0 (R64)."""
+    return {
+        "IC": signal_ic.get("mean_ic", np.nan),
+        "ICIR": signal_ic.get("icir", np.nan),
+        "Sharpe": np.nan, "MDD": np.nan, "Turnover": np.nan,
+        "Status": "failed",
+        "Error": f"{type(exc).__name__}: {exc}",
+    }
 
 
 def per_date_cross_sectional_corr(signal_a, signal_b, method="pearson", min_assets=10):
@@ -489,6 +511,9 @@ if __name__ == "__main__":
     # Step 1: Load data
     logger.info("[1/4] Loading data...")
     prices, returns, benchmark, metadata, sector_map, turnover = load_data()
+    data_start = str(prices.index[0].date())
+    data_end = str(prices.index[-1].date())
+    logger.info("Data window: %s → %s (requested end %s)", data_start, data_end, END_DATE)
 
     # Step 2: Compute all 8 factors
     logger.info("[2/4] Computing factors...")
@@ -515,7 +540,7 @@ if __name__ == "__main__":
         logger.info("  Experiment: %s", exp_name)
 
         # Build signal
-        signal = build_experiment_signal(cluster_signals, combo_clusters)
+        signal = build_experiment_signal(cluster_signals, combo_clusters, processed_factors)
         if signal is None:
             logger.warning("  Skipping %s: no signal", exp_name)
             continue
@@ -529,8 +554,7 @@ if __name__ == "__main__":
             metrics = extract_metrics(bt_results, signal_ic)
         except Exception as e:
             logger.error("  Backtest failed for %s: %s", exp_name, e)
-            metrics = {"IC": signal_ic.get("mean_ic", 0), "ICIR": signal_ic.get("icir", 0),
-                       "Sharpe": 0, "MDD": 0, "Turnover": 0}
+            metrics = failed_metrics(signal_ic, e)
 
         metrics["Experiment"] = exp_name
         results_list.append(metrics)
@@ -546,7 +570,8 @@ if __name__ == "__main__":
     df_raw = pd.DataFrame(raw_records)
     print_raw_section("RQ1_RAW", df_raw)
 
-    # Save to CSV
+    # Save to CSV (with the actual data window as provenance columns)
+    df_raw = stamp_provenance(df_raw, data_start, data_end)
     output_path = Path("results/rq1_cluster_attribution.csv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df_raw.to_csv(output_path, index=False)

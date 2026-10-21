@@ -390,11 +390,11 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
 
 1. **多租户隔离**（#75）：产品定位未定，API 不提供租户隔离；`core/context.py` 的
    TenantContext 不是端到端隔离。
-2. **7 个分析/监控端点从存储 run 无法计算**，显式返回 `available:false` 及原因：
-   `/api/walkforward`、`/api/risk/decompose`、`/api/analysis/ic-decay`、
-   `/api/analysis/correlation`、`/api/monitor/tca-summary`、
-   `/api/monitor/factor-status`、`/api/monitor/capacity-gauge`。替代路径分别是
-   `main.py walkforward`、`POST /api/barra/decompose`、`main.py run` 和预计算容量曲线。
+2. **分析/监控端点已接线**：`/api/walkforward`、`/api/risk/decompose`、
+   `/api/analysis/ic-decay`、`/api/analysis/correlation`、`/api/monitor/tca-summary`、
+   `/api/monitor/factor-status`、`/api/monitor/capacity-gauge` 现在从有界 TTL 缓存的
+   研究上下文现算（真实 validator / Barra / IC 衰减 / 相关矩阵 / TCA / 容量），
+   并发饱和返回 429；确实无数据时仍返回 `available:false` 及精确原因。
 3. **WebSocket token**：当前前端用 `bearer.<token>` 子协议；`?token=` 仅为旧客户端保留。
 4. **回测整手限制**：执行层（TWAP/VWAP/Iceberg、paper broker、OMS）强制整手，
    向量化日频回测仍是权重层面（已明确标注，未隐藏）。
@@ -425,12 +425,17 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
 | 价格基准/符号（D15/D41/D18/D19/D30） | 面板携带 `price_basis` / `adjusted_price_basis` / `adjustment_factor_available`；Tushare 改为 raw + `adj_factor`、Baostock raw(`adjustflag=3`)+hfq 双取、合成数据显式声明；`get_raw_close()` 用于 paper/live 成交与估值，只有复权价时 `DataQualityError`（fail closed）；`get_adjusted_close()` 供研究且与旧 hfq 序列逐点一致；双重复权守卫；`shared/symbols.py` 统一 `CODE.EXCHANGE`（前后缀、`sh.688`、北交所 4/8/920 与 30% 限价），pipeline 资产标签与 QMT/realtime/runner/API 边界统一规范化 |
 | 增量数据（D32） | provider 契约新增 `supports_incremental` / `update()` / `data_status()`；Tushare/Baostock 增量追加（完成标记 +1 交易日、重叠一天、`keep="last"` 去重、全量复权因子刷新、符号/行覆盖检查、原子 data→manifest 发布）；部分响应不推进标记并保留旧缓存；`run --incremental` / `cache refresh --incremental`；`data.max_staleness_days` 研究告警、决定性运行 fail closed；freshness 写入 provenance 与 `metrics.json`；合成数据源显式不支持并回退全量 |
 | 实盘信号统一 | 新增 `trading/signals.py::composite_signal`（因果 7 因子等权复合 + 横截面百分位 [0,1]）；Web `LiveTradingEngine`、CLI `LiveRunner`、`LiveSignalGenerator` 等权分支共用；删除 CLI 的 4 因子加权与短历史 RNG 兜底；127 日窗口预热，真实券商路径通过 `set_history_provider`（`main.py trade` 已接线 Baostock 日线），同一历史两条路径分数逐点一致 |
-| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **2,843 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
+| 分析端点接线 | 7 个原本 `available:false` 的分析/监控端点改为从有界 TTL 缓存的研究上下文现算：真实 Walk-Forward（折内 train-only 重算信号、仅取 OOS）、与 `/api/barra/decompose` 共用的 Euler 风险分解、IC 衰减、因子相关矩阵、TCA（成交+订单参考价）、滚动 IC 状态、ADV 容量；并发饱和 429，缺失输入仍给精确原因与所需样本 |
+| 前端契约 | LivePortfolio 挂载即加载服务端持仓；完整 en-US 语言包 + `check-i18n` 脚本；Settings 后端 URL 真正驱动 axios/WS；Ctrl+K 单一归属；行业条 100% 轴；不可用/失败 KPI 显示 `—`/N/A+原因；WS 退避+鉴权停止；OMS 行级成交；策略配比全量提交且 >100% 阻断；readiness 指示灯；上海时间解析；NaN/Inf 防护 |
+| 研究数字/lab | P1 因子报告最大回撤（复利权益，旧公式显示 -0.00%）、P1 回撤 PNG 缺 `cumprod`；健康分改为带符号 ICIR；报告/比较展示 validity/affected_by；`is_trusted` 要求完整 lineage；零 IC 运行不再 success；run_id 用 uuid；迁移补齐全部列；脚本前视/买卖双边换手/硬编码结束日期/TOP8 重复/失败写成 0/成交量字段等修正 |
+| LLM 诚实性 | 请求后端与实际后端一致并可观测；真实 LLM 无新闻时 fail closed（演示路径显式 `is_synthetic`）；调用方新闻入口；缓存 v4 校验/TTL；关键词去重；LLM JSON（数组/包装/围栏）解析与字段校验；输入长度上限 |
+| 合规/运营 | 租户过滤（默认取 TenantContext，跨租户需显式）；风险日志 P&L 五列真实计算；CSV/XLSX 公式注入中和；导出审计；NAV 读取失败 fail closed、零净值不落库、回溯日期不继承未来费率；对账缺失腿按价格估值；投资者口径统一 |
+| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **3,062 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
 
-**当前计数（2026-10-21 实测）**：2,572 个测试函数、2,846 条用例
-（2,843 passed / 3 skipped）、205 个测试文件、约 231 个非测试 Python 文件、
+**当前计数（2026-10-21 实测）**：2,791 个测试函数、3,065 条用例
+（3,062 passed / 3 skipped）、217 个测试文件、约 233 个非测试 Python 文件、
 99 HTTP + 1 WebSocket、21 个 CLI 命令、37 个 Vue 组件。
 
-**仍未处理（诚实清单）**：多租户隔离（#75）；7 个分析端点 `available:false`；
+**仍未处理（诚实清单）**：多租户隔离（#75）；
 WS `?token=` 旧回退；Postgres/Adata 价格基准声明；
 paper 引擎公司行动股数/分红记账；交易所日历 2027 年需通过 `QUANT_EXCHANGE_HOLIDAYS` 追加。

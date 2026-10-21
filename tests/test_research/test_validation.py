@@ -222,3 +222,101 @@ class TestValidateFactorBatch:
         # With 20 noise factors and BH correction, most should not be significant
         n_significant = sum(1 for r in results.values() if r.significant)
         assert n_significant < 10  # Much less than 20
+
+
+class TestSignificanceRequiresBothCorrections:
+    """R12: significant used to follow the BH mask alone, ignoring the DSR
+    deflated p-value. The audit probe had raw_p=0.0319 (passes BH) but
+    deflated_p=0.0911 (fails alpha), and both factors were returned as
+    significant.
+    """
+
+    @staticmethod
+    def _fake_result(raw_p, deflated_p):
+        from quant_platform.research.validation import DeflatedSharpeResult
+
+        return DeflatedSharpeResult(
+            observed_sharpe=1.0, expected_max_sharpe=0.5,
+            deflated_p_value=deflated_p, num_trials=2,
+            skew=0.0, kurtosis=0.0, significant=True, raw_p_value=raw_p,
+        )
+
+    def test_bh_pass_with_dsr_fail_is_not_significant(self, monkeypatch):
+        validator = FactorValidator(significance_level=0.05)
+        monkeypatch.setattr(
+            validator, "deflated_sharpe_test",
+            lambda rets, num_trials=1: self._fake_result(0.031874, 0.091072),
+        )
+        results = validator.validate_factor_batch({"f1": None, "f2": None})
+        for result in results.values():
+            # BH rejects both raw p-values at m=2 (0.0319 <= 0.05) ...
+            assert result.bh_significant is True
+            # ... but the deflated p-value does not clear alpha.
+            assert result.dsr_significant is False
+            assert result.significant is False
+
+    def test_dsr_pass_with_bh_fail_is_not_significant(self, monkeypatch):
+        validator = FactorValidator(significance_level=0.05)
+        monkeypatch.setattr(
+            validator, "deflated_sharpe_test",
+            lambda rets, num_trials=1: self._fake_result(0.001, 0.01),
+        )
+        # Force the BH mask to reject only the first factor.
+        monkeypatch.setattr(
+            validator, "multiple_testing_correction",
+            lambda p, method="bh": np.array([True, False]),
+        )
+        results = validator.validate_factor_batch({"f1": None, "f2": None})
+        assert results["f1"].significant is True
+        assert results["f1"].dsr_significant is True
+        assert results["f2"].significant is False
+
+    def test_single_factor_uses_dsr_only(self):
+        validator = FactorValidator(significance_level=0.05)
+        rng = np.random.default_rng(3)
+        returns = rng.normal(0.001, 0.01, size=500)
+        results = validator.validate_factor_batch({"only": returns})
+        result = results["only"]
+        assert result.bh_significant is None
+        assert result.dsr_significant == result.significant
+
+
+class TestNonFiniteInputsAndAnnualization:
+    """R13: inf returns produced nan/nan silently; annualization was fixed
+    at sqrt(252) regardless of the actual return frequency.
+    """
+
+    def test_non_finite_returns_are_dropped(self):
+        validator = FactorValidator()
+        rng = np.random.default_rng(11)
+        clean = rng.normal(0.001, 0.01, size=300)
+        # Append the non-finite values so filtering restores exactly `clean`.
+        with_inf = np.concatenate([clean, [np.inf, -np.inf]])
+
+        base = validator.deflated_sharpe_test(clean, num_trials=1)
+        noisy = validator.deflated_sharpe_test(with_inf, num_trials=1)
+
+        assert np.isfinite(noisy.observed_sharpe)
+        assert noisy.observed_sharpe == pytest.approx(base.observed_sharpe, abs=1e-9)
+        assert noisy.deflated_p_value == pytest.approx(base.deflated_p_value, abs=1e-9)
+
+    def test_periods_per_year_scales_the_annualized_sharpe(self):
+        validator = FactorValidator()
+        rng = np.random.default_rng(12)
+        monthly = rng.normal(0.005, 0.04, size=240)
+        daily_result = validator.deflated_sharpe_test(monthly, periods_per_year=252)
+        monthly_result = validator.deflated_sharpe_test(monthly, periods_per_year=12)
+
+        per_period = monthly_result.observed_sharpe / np.sqrt(12)
+        assert daily_result.observed_sharpe == pytest.approx(
+            per_period * np.sqrt(252), abs=1e-5
+        )
+        # Same per-period Sharpe -> the 12x basis reports 12x/252x lower
+        # annualized numbers, not the hardcoded 252 ones.
+        assert monthly_result.observed_sharpe < daily_result.observed_sharpe
+
+    def test_invalid_periods_per_year_raises(self):
+        validator = FactorValidator()
+        for bad in (0, -1, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="periods_per_year"):
+                validator.deflated_sharpe_test(np.zeros(100), periods_per_year=bad)

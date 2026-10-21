@@ -122,6 +122,7 @@
             <th>{{ locale === 'zh-CN' ? '状态' : 'Status' }}</th>
             <th>{{ locale === 'zh-CN' ? '策略' : 'Strategy' }}</th>
             <th>{{ locale === 'zh-CN' ? '时间' : 'Time' }}</th>
+            <th>{{ locale === 'zh-CN' ? '操作' : 'Action' }}</th>
           </tr>
         </thead>
         <tbody>
@@ -141,9 +142,32 @@
             <td :class="['oms-status', `oms-status-${o.status}`]">{{ o.status }}</td>
             <td class="oms-dim">{{ o.strategy }}</td>
             <td class="oms-dim oms-time">{{ formatTime(o.filled_at || o.created_at) }}</td>
+            <td class="oms-action-cell">
+              <div v-if="canFill(o)" class="oms-fill-inline">
+                <input
+                  v-model="fillPriceDrafts[o.order_id]"
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  class="oms-input oms-fill-input"
+                  :placeholder="fillPricePlaceholder(o)"
+                  :aria-label="locale === 'zh-CN' ? '成交价格' : 'Fill price'"
+                />
+                <button
+                  class="oms-fill-btn"
+                  @click="fillRow(o)"
+                  :disabled="fillingId === o.order_id"
+                >{{ fillingId === o.order_id ? '...' : (locale === 'zh-CN' ? '成交' : 'Fill') }}</button>
+              </div>
+              <span v-else class="oms-dim">—</span>
+            </td>
           </tr>
         </tbody>
       </table>
+      <div v-else-if="loading" class="oms-empty">
+        <div class="status-spinner" style="width:20px;height:20px;"></div>
+        <p>{{ locale === 'zh-CN' ? '加载订单簿...' : 'Loading order blotter...' }}</p>
+      </div>
       <div v-else class="oms-empty">
         <div class="oms-empty-icon">&#9776;</div>
         <h3>{{ locale === 'zh-CN' ? '暂无订单' : 'No Orders' }}</h3>
@@ -165,6 +189,7 @@
             <th>{{ locale === 'zh-CN' ? '浮动盈亏' : 'Unrealized P&L' }}</th>
             <th>{{ locale === 'zh-CN' ? '盈亏%' : 'P&L %' }}</th>
             <th>{{ locale === 'zh-CN' ? '权重' : 'Weight' }}</th>
+            <th>{{ locale === 'zh-CN' ? '价格基准' : 'Basis' }}</th>
             <th>{{ locale === 'zh-CN' ? '已实现盈亏' : 'Realized P&L' }}</th>
           </tr>
         </thead>
@@ -183,12 +208,17 @@
               {{ p.unrealized_pnl_pct >= 0 ? '+' : '' }}{{ p.unrealized_pnl_pct?.toFixed(2) }}%
             </td>
             <td class="oms-mono">{{ (p.weight * 100)?.toFixed(2) }}%</td>
+            <td class="oms-basis">{{ (p.price_basis || positionsPriceBasis || '—').toString().toUpperCase() }}</td>
             <td :class="['oms-mono', p.realized_pnl >= 0 ? 'oms-pos' : 'oms-neg']">
               {{ p.realized_pnl >= 0 ? '+' : '' }}{{ formatNum(p.realized_pnl) }}
             </td>
           </tr>
         </tbody>
       </table>
+      <div v-else-if="loading" class="oms-empty">
+        <div class="status-spinner" style="width:20px;height:20px;"></div>
+        <p>{{ locale === 'zh-CN' ? '加载持仓...' : 'Loading positions...' }}</p>
+      </div>
       <div v-else class="oms-empty">
         <div class="oms-empty-icon">&#9734;</div>
         <h3>{{ locale === 'zh-CN' ? '暂无持仓' : 'No Positions' }}</h3>
@@ -238,9 +268,19 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, reactive, watch, onMounted } from 'vue'
 import { useI18n } from '../i18n/index.js'
-import { createOrder, fillOrder, getBaostockStock, getBlotter, getPositions, getTCA } from '../api/index.js'
+import {
+  createOrder,
+  fillOrder,
+  getBaostockStock,
+  getBlotter,
+  getPositions,
+  getTCA,
+  getApiErrorMessage,
+} from '../api/index.js'
+
+import { formatBackendTime, shanghaiToday } from '../utils/time.js'
 
 const { $t, locale } = useI18n()
 
@@ -249,10 +289,16 @@ const emit = defineEmits(['toast'])
 const tab = ref('blotter')
 const blotter = ref([])
 const positions = ref([])
+const positionsPriceBasis = ref('')
 const tca = ref({})
 const loading = ref(false)
 const submitting = ref(false)
 const showNewOrder = ref(false)
+const fillingId = ref(null)
+// order_id -> price draft, seeded from the limit price when we created the
+// order (the blotter response does not echo limit_price) or from
+// `limit_price` if a future backend starts returning it.
+const fillPriceDrafts = reactive({})
 
 const newOrder = ref({
   ticker: '',
@@ -263,14 +309,70 @@ const newOrder = ref({
   strategy: '',
 })
 
+// A limit price typed for a limit order must not survive a switch to market:
+// it used to be sent with the market order and used directly as the fill
+// price, bypassing the quote/staleness check.
+watch(() => newOrder.value.order_type, (type) => {
+  if (type !== 'limit') newOrder.value.limit_price = null
+})
+
 function formatNum(v) {
   if (v == null) return '--'
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(v)
 }
 
 function formatTime(t) {
-  if (!t) return '--'
-  return t.replace('T', ' ').substring(0, 19)
+  // Naive Shanghai timestamps, rendered in the operator's locale/timezone
+  // (same convention as RunHistory / LiveTrading).
+  return formatBackendTime(t, locale.value)
+}
+
+// A resting order (pending/submitted/partially filled) can be filled from the
+// UI; complete orders cannot.
+function canFill(o) {
+  if (!o) return false
+  if (!['pending', 'submitted', 'partial'].includes(o.status)) return false
+  const remaining = o.remaining_quantity == null ? o.quantity : o.remaining_quantity
+  return Number(remaining) > 0
+}
+
+function fillPricePlaceholder(o) {
+  const limit = o?.limit_price ?? fillPriceDrafts[o?.order_id]
+  if (limit != null && Number(limit) > 0) return String(limit)
+  return locale.value === 'zh-CN' ? '成交价' : 'price'
+}
+
+async function fillRow(order) {
+  const price = Number(fillPriceDrafts[order.order_id])
+  if (!Number.isFinite(price) || price <= 0) {
+    emit('toast', {
+      message: locale.value === 'zh-CN' ? '请输入有效的成交价格' : 'Enter a valid fill price',
+      type: 'error',
+    })
+    return
+  }
+  fillingId.value = order.order_id
+  try {
+    const result = await fillOrder({ order_id: order.order_id, price })
+    const basis = result?.price_basis ? String(result.price_basis).toUpperCase() : ''
+    const filledAt = Number(result?.avg_price ?? price)
+    emit('toast', {
+      message: locale.value === 'zh-CN'
+        ? `订单 ${order.order_id} 已成交 @ ${filledAt.toFixed(2)}${basis ? `（${basis}）` : ''}`
+        : `Order ${order.order_id} filled @ ${filledAt.toFixed(2)}${basis ? ` (${basis})` : ''}`,
+      type: 'success',
+    })
+  } catch (err) {
+    emit('toast', {
+      message: (locale.value === 'zh-CN' ? '成交失败: ' : 'Fill failed: ') + getApiErrorMessage(err),
+      type: 'error',
+    })
+  } finally {
+    fillingId.value = null
+    // The server book changed even when the fill failed (it may have filled
+    // partially); never leave the blotter silently stale.
+    await refreshAll()
+  }
 }
 
 async function submitOrder() {
@@ -279,29 +381,35 @@ async function submitOrder() {
     return
   }
   submitting.value = true
+  let created = null
+  // Snapshot the submitted order: the form stays editable while the POST is in
+  // flight, and reading `newOrder` after the await could quote a different
+  // ticker / type than the order that was actually created.
+  const submitted = {
+    ticker: newOrder.value.ticker,
+    side: newOrder.value.side,
+    quantity: newOrder.value.quantity,
+    order_type: newOrder.value.order_type,
+    limit_price: newOrder.value.order_type === 'limit' ? newOrder.value.limit_price : null,
+    strategy: newOrder.value.strategy,
+  }
   try {
-    const order = await createOrder({
-      ticker: newOrder.value.ticker,
-      side: newOrder.value.side,
-      quantity: newOrder.value.quantity,
-      order_type: newOrder.value.order_type,
-      limit_price: newOrder.value.limit_price,
-      strategy: newOrder.value.strategy,
-    })
+    created = await createOrder(submitted)
+
+    // Remember the limit price so the row's Fill action can offer it (the
+    // blotter response does not echo limit_price).
+    if (submitted.limit_price != null && Number(submitted.limit_price) > 0) {
+      fillPriceDrafts[created.order_id] = String(submitted.limit_price)
+    }
 
     // Auto-fill market orders (simulate immediate execution). The fill price
     // must come from a real quote: the old fallback was Math.random()*50+100,
     // so every stock filled at CNY 100-150 regardless of its price.
-    if (newOrder.value.order_type === 'market') {
-      let price = newOrder.value.limit_price
-      if (!price) {
-        const quote = await getBaostockStock(newOrder.value.ticker)
-        const now = new Date()
-        const today = [
-          now.getFullYear(),
-          String(now.getMonth() + 1).padStart(2, '0'),
-          String(now.getDate()).padStart(2, '0'),
-        ].join('-')
+    if (submitted.order_type === 'market') {
+      try {
+        // Always quote: a market order must not reuse a leftover limit price.
+        const quote = await getBaostockStock(submitted.ticker)
+        const today = shanghaiToday()
         // The quote endpoint falls back to the last available bar (up to a
         // few days old). Filling a market order at a stale close is worse
         // than refusing: ask for an explicit limit price instead.
@@ -312,35 +420,55 @@ async function submitOrder() {
               : `Last bar is ${quote.date}, not today; enter a limit price`),
           )
         }
-        price = quote.close
+        const price = quote.close
+        if (!price || price <= 0) {
+          throw new Error('No market price available for ' + submitted.ticker)
+        }
+        await fillOrder({ order_id: created.order_id, price })
+        emit('toast', { message: locale.value === 'zh-CN' ? `订单 ${created.order_id} 已成交` : `Order ${created.order_id} filled`, type: 'success' })
+      } catch (fillErr) {
+        // The order already exists server-side; report it and point at the
+        // row's Fill action instead of claiming the whole submission failed.
+        emit('toast', {
+          message: locale.value === 'zh-CN'
+            ? `订单 ${created.order_id} 已提交但未成交：${getApiErrorMessage(fillErr)}。可在订单簿中手动成交。`
+            : `Order ${created.order_id} was submitted but not filled: ${getApiErrorMessage(fillErr)}. Fill it manually from the blotter.`,
+          type: 'warning',
+        })
       }
-      if (!price || price <= 0) {
-        throw new Error('No market price available for ' + newOrder.value.ticker)
-      }
-      await fillOrder({ order_id: order.order_id, price })
-      emit('toast', { message: locale.value === 'zh-CN' ? `订单 ${order.order_id} 已成交` : `Order ${order.order_id} filled`, type: 'success' })
     } else {
-      emit('toast', { message: locale.value === 'zh-CN' ? `订单 ${order.order_id} 已创建 (${order.status})` : `Order ${order.order_id} created (${order.status})`, type: 'success' })
+      emit('toast', {
+        message: locale.value === 'zh-CN'
+          ? `限价单 ${created.order_id} 已创建（${created.status}），可在订单簿中成交`
+          : `Limit order ${created.order_id} created (${created.status}); fill it from the blotter`,
+        type: 'success',
+      })
     }
-
-    await refreshAll()
     showNewOrder.value = false
   } catch (err) {
-    emit('toast', { message: locale.value === 'zh-CN' ? `订单提交失败: ${err.response?.data?.detail || err.message}` : `Order failed: ${err.response?.data?.detail || err.message}`, type: 'error' })
+    emit('toast', {
+      message: (locale.value === 'zh-CN' ? '订单提交失败: ' : 'Order failed: ') + getApiErrorMessage(err),
+      type: 'error',
+    })
   } finally {
     submitting.value = false
+    // Refresh unconditionally: a failed fill still mutated the server book.
+    await refreshAll()
   }
 }
 
 async function refreshAll() {
   loading.value = true
   try {
-    const [b, p, t] = await Promise.all([getBlotter(), getPositions(), getTCA()])
-    blotter.value = b.orders || []
-    positions.value = p.positions || []
-    tca.value = t
-  } catch {
-    // endpoints may not have data yet
+    const [b, p, t] = await Promise.allSettled([getBlotter(), getPositions(), getTCA()])
+    if (b.status === 'fulfilled') blotter.value = b.value.orders || []
+    if (p.status === 'fulfilled') {
+      positions.value = p.value.positions || []
+      positionsPriceBasis.value = p.value.price_basis || ''
+    }
+    if (t.status === 'fulfilled') tca.value = t.value
+    // One failing endpoint used to reject Promise.all and leave all three
+    // tables at their previous state.
   } finally {
     loading.value = false
   }
@@ -630,5 +758,42 @@ onMounted(refreshAll)
   font-weight: 700;
   font-family: var(--font-mono);
   color: var(--text-primary);
+}
+
+.oms-action-cell { white-space: nowrap; }
+
+.oms-fill-inline {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.oms-fill-input {
+  width: 74px;
+  min-width: 0;
+  padding: 3px 6px;
+  font-size: 10px;
+}
+
+.oms-fill-btn {
+  padding: 3px 8px;
+  border: 1px solid var(--green);
+  background: transparent;
+  color: var(--green);
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.oms-fill-btn:hover { background: rgba(52,211,153,0.12); }
+.oms-fill-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.oms-basis {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-align: center;
+  color: var(--green);
 }
 </style>

@@ -22,6 +22,7 @@ import hashlib
 import json
 import sqlite3
 import time
+import uuid
 from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -85,18 +86,41 @@ class RunStore:
                 """
             )
 
-            # Databases created before the validity columns exist need them
+            # Databases created before the newer columns exist need them
             # added: CREATE TABLE IF NOT EXISTS leaves an existing table alone.
+            # Earlier "migrations" only added validity/affected_by, leaving a
+            # legacy table readable but unwritable: begin_run failed on the
+            # missing data_source column and finish_run on report_path. Diff
+            # every expected column and add what is missing.
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(research_runs)")}
-            if "validity" not in cols:
-                conn.execute(
-                    "ALTER TABLE research_runs ADD COLUMN validity TEXT DEFAULT 'valid'"
-                )
-            if "affected_by" not in cols:
-                conn.execute(
-                    "ALTER TABLE research_runs ADD COLUMN affected_by TEXT DEFAULT '[]'"
-                )
+            missing = [
+                (name, ddl)
+                for name, ddl in self._MIGRATABLE_COLUMNS.items()
+                if name not in cols
+            ]
+            for name, ddl in missing:
+                conn.execute(f"ALTER TABLE research_runs ADD COLUMN {name} {ddl}")
             conn.commit()
+
+    #: Columns that may be absent in a legacy ``research_runs`` table, with
+    #: the DDL used to add them. The four NOT NULL columns (run_id, timestamp,
+    #: status, slice) cannot be added by ALTER TABLE and must already exist —
+    #: every historical schema in the project has them.
+    _MIGRATABLE_COLUMNS = {
+        "reason": "TEXT",
+        "data_source": "TEXT",
+        "data_meta": "TEXT",
+        "universe_provider": "TEXT",
+        "universe_meta": "TEXT",
+        "factor": "TEXT",
+        "factor_params": "TEXT",
+        "evaluation": "TEXT",
+        "input_hash": "TEXT",
+        "report_path": "TEXT",
+        "warnings": "TEXT",
+        "validity": "TEXT DEFAULT 'valid'",
+        "affected_by": "TEXT DEFAULT '[]'",
+    }
 
     def begin_run(self, slice_name: str, inputs: dict[str, Any]) -> str:
         """Open a run record BEFORE work begins. Returns run_id.
@@ -105,7 +129,12 @@ class RunStore:
         successful completion flips it to 'success' via finish_run(). This
         guarantees criterion #6 even on uncaught exceptions.
         """
-        run_id = f"run_{int(time.time())}_{_content_hash(inputs)}"
+        # A per-run uuid4 suffix keeps two identical-input runs started in
+        # the same second from colliding on the primary key. The input hash
+        # remains its own column for reproducibility queries.
+        run_id = (
+            f"run_{int(time.time())}_{_content_hash(inputs)}_{uuid.uuid4().hex[:8]}"
+        )
         with self._conn() as conn:
             conn.execute(
                 """INSERT INTO research_runs
@@ -141,18 +170,56 @@ class RunStore:
         report_path: str | None = None,
         reason: str | None = None,
         warnings: list[str] | None = None,
+        data_meta: dict | None = None,
     ) -> None:
+        """Finalise a run.
+
+        Warnings are additive: ``None`` leaves the stored list untouched (the
+        failure path writes a traceback excerpt, then calls finish_run again
+        after generating the report — the old unconditional overwrite wiped
+        the excerpt to ``[]``), and an explicit list is merged into whatever
+        is already stored, without duplicates.
+
+        ``data_meta``, when provided, replaces the lineage metadata recorded
+        at ``begin_run`` — used to persist the *actual* data window once the
+        provider has returned it.
+        """
         with self._conn() as conn:
+            # Warnings are merged read-modify-write; take the write lock first
+            # so two concurrent finalisers cannot drop each other's warnings.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT warnings, data_meta FROM research_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            try:
+                existing = json.loads(row["warnings"] or "[]") if row else []
+            except (json.JSONDecodeError, TypeError):
+                existing = []
+            if not isinstance(existing, list):
+                existing = []
+            merged = list(existing)
+            for warning in warnings or []:
+                if warning not in merged:
+                    merged.append(warning)
+
+            if data_meta is not None:
+                new_data_meta = json.dumps(data_meta, default=str)
+            else:
+                new_data_meta = row["data_meta"] if row else None
+
             conn.execute(
                 """UPDATE research_runs
-                   SET status=?, evaluation=?, report_path=?, reason=?, warnings=?
+                   SET status=?, evaluation=?, report_path=?, reason=?,
+                       warnings=?, data_meta=?
                    WHERE run_id=?""",
                 (
                     status,
                     json.dumps(evaluation or {}, default=str),
                     report_path,
                     reason,
-                    json.dumps(warnings or [], default=str),
+                    json.dumps(merged, default=str),
+                    new_data_meta,
                     run_id,
                 ),
             )
@@ -192,14 +259,38 @@ class RunStore:
             rows = conn.execute(query, tuple(params)).fetchall()
         return [dict(r) for r in rows]
 
+    @staticmethod
+    def has_complete_lineage(run: dict) -> bool:
+        """Whether a run declares the lineage criterion #5 requires.
+
+        A run is traceable only when it names its data source, its factor and
+        the universe's point-in-time status. The old ``is_trusted`` accepted a
+        success run with ``data_source=NULL``, ``factor=NULL`` and empty
+        metadata, which is the exact opposite of what the module promises.
+        """
+        if not str(run.get("data_source") or "").strip():
+            return False
+        if not str(run.get("factor") or "").strip():
+            return False
+        try:
+            universe_meta = json.loads(run.get("universe_meta") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(universe_meta, dict):
+            return False
+        # A present-but-None pit is "undeclared" in the generated reports,
+        # so it does not satisfy the lineage criterion either.
+        return universe_meta.get("pit") is not None
+
     def is_trusted(self, run_id: str) -> bool:
-        """Whether a run completed successfully and is still plain 'valid'."""
+        """Whether a run is successful, still valid, and fully traceable."""
         run = self.get_run(run_id)
         if run is None:
             return False
         return (
             run.get("status") == "success"
             and (run.get("validity") or "valid") in self.TRUSTED_STATES
+            and self.has_complete_lineage(run)
         )
 
     # ── Result validity ─────────────────────────────────────────────────
@@ -243,6 +334,11 @@ class RunStore:
             )
 
         with self._conn() as conn:
+            # Read-modify-write on affected_by: two concurrent marks with
+            # different reasons could each read the same list and the second
+            # UPDATE would drop the first reason. Take the write lock before
+            # the SELECT so the merge is atomic.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT affected_by FROM research_runs WHERE run_id=?", (run_id,)
             ).fetchone()

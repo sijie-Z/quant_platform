@@ -24,6 +24,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -844,6 +845,68 @@ class Store:
             self._save_pnl(conn, snapshot)
 
     def _save_pnl(self, conn: sqlite3.Connection, snapshot: dict) -> None:
+        """Insert a P&L snapshot, filling the risk columns when omitted.
+
+        ``daily_pnl``/``daily_pnl_pct``/``cumulative_pnl``/``max_drawdown``/
+        ``sharpe_ratio`` used to be written with literal ``0`` defaults (the
+        trading engine never computed them), so the compliance risk log
+        exported five permanently-zero columns. They are now derived from the
+        stored equity series at write time; an explicit non-null value from
+        the caller still wins.
+
+        Snapshots are expected to be appended in chronological order, which
+        is how the EOD path writes them. ``sharpe_ratio`` is the sample
+        mean/std of daily equity returns annualized with 252 trading days and
+        a zero risk-free rate (the risk log's own convention).
+        """
+        total_equity = float(snapshot["total_equity"])
+        cash = float(snapshot["cash"])
+        market_value = float(snapshot["market_value"])
+
+        rows = conn.execute(
+            "SELECT total_equity FROM pnl_history ORDER BY timestamp, id"
+        ).fetchall()
+        equity = [float(r[0]) for r in rows]
+        previous_equity = equity[-1] if equity else None
+        first_equity = equity[0] if equity else total_equity
+        equity.append(total_equity)
+
+        daily_pnl = (
+            total_equity - previous_equity if previous_equity is not None else 0.0
+        )
+        daily_pnl_pct = (
+            daily_pnl / previous_equity
+            if previous_equity not in (None, 0.0)
+            else 0.0
+        )
+        cumulative_pnl = (
+            total_equity - first_equity if previous_equity is not None else 0.0
+        )
+
+        peak = equity[0]
+        max_drawdown = 0.0
+        for value in equity:
+            peak = max(peak, value)
+            if peak > 0:
+                max_drawdown = min(max_drawdown, value / peak - 1.0)
+
+        returns = [
+            equity[i] / equity[i - 1] - 1.0
+            for i in range(1, len(equity))
+            if equity[i - 1] > 0
+        ]
+        sharpe_ratio = 0.0
+        if len(returns) >= 2:
+            mean = sum(returns) / len(returns)
+            variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+            std = math.sqrt(variance)
+            if std > 0:
+                sharpe_ratio = mean / std * math.sqrt(252.0)
+
+        def _or_default(key: str, computed: float) -> float:
+            value = snapshot.get(key)
+            return computed if value is None else value
+
         conn.execute("""
                 INSERT INTO pnl_history
                 (timestamp, total_equity, cash, market_value, daily_pnl,
@@ -851,11 +914,13 @@ class Store:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
             snapshot.get('timestamp', exchange_now_iso()),
-            snapshot['total_equity'], snapshot['cash'],
-            snapshot['market_value'], snapshot.get('daily_pnl', 0),
-            snapshot.get('daily_pnl_pct', 0), snapshot.get('cumulative_pnl', 0),
-            snapshot.get('n_positions', 0), snapshot.get('max_drawdown', 0),
-            snapshot.get('sharpe_ratio', 0),
+            total_equity, cash, market_value,
+            _or_default('daily_pnl', daily_pnl),
+            _or_default('daily_pnl_pct', daily_pnl_pct),
+            _or_default('cumulative_pnl', cumulative_pnl),
+            snapshot.get('n_positions', 0),
+            _or_default('max_drawdown', max_drawdown),
+            _or_default('sharpe_ratio', sharpe_ratio),
         ))
 
     def save_pnl_and_mark_eod(

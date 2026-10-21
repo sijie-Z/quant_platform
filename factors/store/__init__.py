@@ -18,13 +18,23 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _utcnow_iso() -> str:
+    """Timezone-aware UTC timestamp, matching the research registry.
+
+    The old naive ``datetime.now().isoformat()`` mixed local-time records
+    with the registry's UTC ones; cross-store ordering and joins could not be
+    compared.
+    """
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass
@@ -73,7 +83,14 @@ class FactorEvalRecord:
     coverage: float
     n_assets: int
     run_id: str = ""
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = field(default_factory=_utcnow_iso)
+    # Lineage / lifecycle (audit R10): without these an evaluation row cannot
+    # be traced to a provider or invalidated later.
+    data_source: str = ""
+    adjust: str = ""
+    pit: bool | None = None
+    validity: str = "valid"
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +103,11 @@ class FactorEvalRecord:
             "n_assets": self.n_assets,
             "run_id": self.run_id,
             "timestamp": self.timestamp,
+            "data_source": self.data_source,
+            "adjust": self.adjust,
+            "pit": self.pit,
+            "validity": self.validity,
+            "warnings": list(self.warnings),
         }
 
 
@@ -101,7 +123,12 @@ class FactorBacktestRecord:
     short_n: int
     turnover: float
     run_id: str = ""
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = field(default_factory=_utcnow_iso)
+    data_source: str = ""
+    adjust: str = ""
+    pit: bool | None = None
+    validity: str = "valid"
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -115,6 +142,11 @@ class FactorBacktestRecord:
             "turnover": round(self.turnover, 6),
             "run_id": self.run_id,
             "timestamp": self.timestamp,
+            "data_source": self.data_source,
+            "adjust": self.adjust,
+            "pit": self.pit,
+            "validity": self.validity,
+            "warnings": list(self.warnings),
         }
 
 
@@ -132,7 +164,12 @@ class WalkForwardFoldRecord:
     train_ic: float
     test_ic: float
     run_id: str = ""
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = field(default_factory=_utcnow_iso)
+    data_source: str = ""
+    adjust: str = ""
+    pit: bool | None = None
+    validity: str = "valid"
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -148,6 +185,11 @@ class WalkForwardFoldRecord:
             "test_ic": round(self.test_ic, 6),
             "run_id": self.run_id,
             "timestamp": self.timestamp,
+            "data_source": self.data_source,
+            "adjust": self.adjust,
+            "pit": self.pit,
+            "validity": self.validity,
+            "warnings": list(self.warnings),
         }
 
 
@@ -165,7 +207,12 @@ class FactorStabilityRecord:
     total_folds: int
     coverage: float
     run_id: str = ""
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = field(default_factory=_utcnow_iso)
+    data_source: str = ""
+    adjust: str = ""
+    pit: bool | None = None
+    validity: str = "valid"
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -181,6 +228,11 @@ class FactorStabilityRecord:
             "coverage": round(self.coverage, 4),
             "run_id": self.run_id,
             "timestamp": self.timestamp,
+            "data_source": self.data_source,
+            "adjust": self.adjust,
+            "pit": self.pit,
+            "validity": self.validity,
+            "warnings": list(self.warnings),
         }
 
 
@@ -237,6 +289,12 @@ class FactorResearchStore:
                     value REAL,
                     coverage REAL,
                     version TEXT DEFAULT '1.0.0',
+                    data_source TEXT DEFAULT '',
+                    adjust TEXT DEFAULT '',
+                    pit INTEGER,
+                    validity TEXT DEFAULT 'valid',
+                    warnings TEXT DEFAULT '[]',
+                    run_id TEXT DEFAULT '',
                     created_at TEXT NOT NULL,
                     UNIQUE(factor_name, symbol, signal_date, version)
                 );
@@ -251,6 +309,11 @@ class FactorResearchStore:
                     coverage REAL,
                     n_assets INTEGER DEFAULT 0,
                     run_id TEXT DEFAULT '',
+                    data_source TEXT DEFAULT '',
+                    adjust TEXT DEFAULT '',
+                    pit INTEGER,
+                    validity TEXT DEFAULT 'valid',
+                    warnings TEXT DEFAULT '[]',
                     timestamp TEXT NOT NULL
                 );
 
@@ -265,6 +328,11 @@ class FactorResearchStore:
                     short_n INTEGER DEFAULT 0,
                     turnover REAL DEFAULT 0,
                     run_id TEXT DEFAULT '',
+                    data_source TEXT DEFAULT '',
+                    adjust TEXT DEFAULT '',
+                    pit INTEGER,
+                    validity TEXT DEFAULT 'valid',
+                    warnings TEXT DEFAULT '[]',
                     timestamp TEXT NOT NULL
                 );
 
@@ -281,6 +349,11 @@ class FactorResearchStore:
                     train_ic REAL,
                     test_ic REAL,
                     run_id TEXT DEFAULT '',
+                    data_source TEXT DEFAULT '',
+                    adjust TEXT DEFAULT '',
+                    pit INTEGER,
+                    validity TEXT DEFAULT 'valid',
+                    warnings TEXT DEFAULT '[]',
                     timestamp TEXT NOT NULL
                 );
 
@@ -297,6 +370,11 @@ class FactorResearchStore:
                     total_folds INTEGER DEFAULT 0,
                     coverage REAL DEFAULT 0,
                     run_id TEXT DEFAULT '',
+                    data_source TEXT DEFAULT '',
+                    adjust TEXT DEFAULT '',
+                    pit INTEGER,
+                    validity TEXT DEFAULT 'valid',
+                    warnings TEXT DEFAULT '[]',
                     timestamp TEXT NOT NULL
                 );
 
@@ -307,6 +385,11 @@ class FactorResearchStore:
                     rank_ic REAL,
                     n_samples INTEGER DEFAULT 0,
                     run_id TEXT DEFAULT '',
+                    data_source TEXT DEFAULT '',
+                    adjust TEXT DEFAULT '',
+                    pit INTEGER,
+                    validity TEXT DEFAULT 'valid',
+                    warnings TEXT DEFAULT '[]',
                     timestamp TEXT NOT NULL
                 );
 
@@ -326,13 +409,49 @@ class FactorResearchStore:
                 CREATE INDEX IF NOT EXISTS idx_fsh_factor ON factor_stability_history(factor_name);
                 CREATE INDEX IF NOT EXISTS idx_frh_factor ON factor_regime_history(factor_name, regime);
             """)
+            self._migrate_schema(conn)
         logger.info("FactorResearchStore initialized: %s", self._db_path)
+
+    #: Provenance/lifecycle columns added after the original schema. Existing
+    #: databases get them through ALTER TABLE; without the migration, writes
+    #: with lineage metadata fail on a store created by an older checkout.
+    _PROVENANCE_COLUMNS = {
+        "data_source": "TEXT DEFAULT ''",
+        "adjust": "TEXT DEFAULT ''",
+        "pit": "INTEGER",
+        "validity": "TEXT DEFAULT 'valid'",
+        "warnings": "TEXT DEFAULT '[]'",
+    }
+    _PROVENANCE_TABLES = (
+        "factor_values",
+        "factor_evaluation_history",
+        "factor_backtest_history",
+        "factor_walk_forward_history",
+        "factor_stability_history",
+        "factor_regime_history",
+    )
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        for table in self._PROVENANCE_TABLES:
+            cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in self._PROVENANCE_COLUMNS.items():
+                if name not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        # factor_values predates the run_id convention; history tables had it.
+        value_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(factor_values)")
+        }
+        if "run_id" not in value_cols:
+            conn.execute(
+                "ALTER TABLE factor_values ADD COLUMN run_id TEXT DEFAULT ''"
+            )
+        conn.commit()
 
     # ── Factor Definitions ──
 
     def save_definition(self, definition: FactorDefinition) -> None:
         """Upsert a factor definition."""
-        now = datetime.now().isoformat()
+        now = _utcnow_iso()
         with self._lock, self._conn() as conn:
             conn.execute("""
                 INSERT INTO factor_definitions
@@ -402,6 +521,12 @@ class FactorResearchStore:
         values: list[dict],
         coverage: float | None = None,
         version: str = "1.0.0",
+        data_source: str = "",
+        adjust: str = "",
+        pit: bool | None = None,
+        validity: str = "valid",
+        warnings: list[str] | None = None,
+        run_id: str = "",
     ) -> int:
         """Save factor values for multiple (symbol, signal_date) pairs.
 
@@ -410,14 +535,23 @@ class FactorResearchStore:
             values: List of dicts with 'symbol', 'signal_date', 'value' keys.
             coverage: Optional coverage fraction.
             version: Factor version.
+            data_source: Provider that produced the values (lineage).
+            adjust: Price adjustment basis, e.g. "hfq".
+            pit: Whether the universe/values are point-in-time; None = undeclared.
+            validity: valid | affected | invalidated | superseded.
+            warnings: Data-quality warnings stored with the rows.
+            run_id: Research run that produced these values.
 
         Returns:
             Number of rows inserted/updated.
         """
-        now = datetime.now().isoformat()
+        now = _utcnow_iso()
+        warnings_json = json.dumps(list(warnings or []))
+        pit_val = None if pit is None else int(bool(pit))
         rows = [
             (factor_name, v["symbol"], v["signal_date"], v.get("value"),
-             coverage, version, now)
+             coverage, version, data_source, adjust, pit_val, validity,
+             warnings_json, run_id, now)
             for v in values
         ]
         if not rows:
@@ -426,11 +560,18 @@ class FactorResearchStore:
             before = conn.total_changes
             conn.executemany("""
                 INSERT INTO factor_values
-                (factor_name, symbol, signal_date, value, coverage, version, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (factor_name, symbol, signal_date, value, coverage, version,
+                 data_source, adjust, pit, validity, warnings, run_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(factor_name, symbol, signal_date, version) DO UPDATE SET
                     value = excluded.value,
-                    coverage = excluded.coverage
+                    coverage = excluded.coverage,
+                    data_source = excluded.data_source,
+                    adjust = excluded.adjust,
+                    pit = excluded.pit,
+                    validity = excluded.validity,
+                    warnings = excluded.warnings,
+                    run_id = excluded.run_id
             """, rows)
             return conn.total_changes - before
 
@@ -467,13 +608,17 @@ class FactorResearchStore:
             conn.execute("""
                 INSERT INTO factor_evaluation_history
                 (factor_name, signal_date, rank_ic, pearson_ic, icir,
-                 coverage, n_assets, run_id, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 coverage, n_assets, run_id, data_source, adjust, pit,
+                 validity, warnings, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.factor_name, record.signal_date,
                 record.rank_ic, record.pearson_ic, record.icir,
                 record.coverage, record.n_assets,
-                record.run_id, record.timestamp,
+                record.run_id, record.data_source, record.adjust,
+                None if record.pit is None else int(bool(record.pit)),
+                record.validity, json.dumps(list(record.warnings)),
+                record.timestamp,
             ))
 
     def get_evaluation_history(
@@ -498,6 +643,11 @@ class FactorResearchStore:
                 n_assets=r["n_assets"] or 0,
                 run_id=r["run_id"] if r["run_id"] else "",
                 timestamp=r["timestamp"],
+                data_source=r["data_source"] or "",
+                adjust=r["adjust"] or "",
+                pit=bool(r["pit"]) if r["pit"] is not None else None,
+                validity=r["validity"] or "valid",
+                warnings=json.loads(r["warnings"] or "[]"),
             ) for r in rows]
 
     # ── Backtest History ──
@@ -508,13 +658,17 @@ class FactorResearchStore:
             conn.execute("""
                 INSERT INTO factor_backtest_history
                 (factor_name, signal_date, long_return, short_return,
-                 spread_return, long_n, short_n, turnover, run_id, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 spread_return, long_n, short_n, turnover, run_id,
+                 data_source, adjust, pit, validity, warnings, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.factor_name, record.signal_date,
                 record.long_return, record.short_return, record.spread_return,
                 record.long_n, record.short_n, record.turnover,
-                record.run_id, record.timestamp,
+                record.run_id, record.data_source, record.adjust,
+                None if record.pit is None else int(bool(record.pit)),
+                record.validity, json.dumps(list(record.warnings)),
+                record.timestamp,
             ))
 
     # ── Walk-Forward History ──
@@ -526,15 +680,19 @@ class FactorResearchStore:
                 INSERT INTO factor_walk_forward_history
                 (factor_name, fold_id, train_start, train_end,
                  test_start, test_end, train_sharpe, test_sharpe,
-                 train_ic, test_ic, run_id, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 train_ic, test_ic, run_id, data_source, adjust, pit,
+                 validity, warnings, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.factor_name, record.fold_id,
                 record.train_start, record.train_end,
                 record.test_start, record.test_end,
                 record.train_sharpe, record.test_sharpe,
                 record.train_ic, record.test_ic,
-                record.run_id, record.timestamp,
+                record.run_id, record.data_source, record.adjust,
+                None if record.pit is None else int(bool(record.pit)),
+                record.validity, json.dumps(list(record.warnings)),
+                record.timestamp,
             ))
 
     def get_walk_forward_summary(self, factor_name: str) -> dict | None:
@@ -575,15 +733,18 @@ class FactorResearchStore:
                 INSERT INTO factor_stability_history
                 (factor_name, ic_mean, ic_std, icir, sharpe_mean, sharpe_std,
                  sharpe_consistency, positive_folds, total_folds, coverage,
-                 run_id, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 run_id, data_source, adjust, pit, validity, warnings, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.factor_name,
                 record.ic_mean, record.ic_std, record.icir,
                 record.sharpe_mean, record.sharpe_std,
                 record.sharpe_consistency, record.positive_folds,
                 record.total_folds, record.coverage,
-                record.run_id, record.timestamp,
+                record.run_id, record.data_source, record.adjust,
+                None if record.pit is None else int(bool(record.pit)),
+                record.validity, json.dumps(list(record.warnings)),
+                record.timestamp,
             ))
 
     # ── Regime History ──
@@ -594,17 +755,27 @@ class FactorResearchStore:
         regime_ics: dict[str, float],
         regime_samples: dict[str, int],
         run_id: str = "",
+        data_source: str = "",
+        adjust: str = "",
+        pit: bool | None = None,
+        validity: str = "valid",
+        warnings: list[str] | None = None,
     ) -> None:
         """Save factor performance by market regime."""
-        now = datetime.now().isoformat()
+        now = _utcnow_iso()
+        warnings_json = json.dumps(list(warnings or []))
+        pit_val = None if pit is None else int(bool(pit))
         with self._lock, self._conn() as conn:
             for regime, ic in regime_ics.items():
                 n = regime_samples.get(regime, 0)
                 conn.execute("""
                     INSERT INTO factor_regime_history
-                    (factor_name, regime, rank_ic, n_samples, run_id, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (factor_name, regime, ic, n, run_id, now))
+                    (factor_name, regime, rank_ic, n_samples, run_id,
+                     data_source, adjust, pit, validity, warnings, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (factor_name, regime, ic, n, run_id,
+                      data_source, adjust, pit_val, validity,
+                      warnings_json, now))
 
     def get_regime_diagnostics(self, factor_name: str) -> list[dict]:
         """Get regime diagnostics for a factor."""
@@ -612,7 +783,7 @@ class FactorResearchStore:
             rows = conn.execute("""
                 SELECT * FROM factor_regime_history
                 WHERE factor_name = ?
-                ORDER BY timestamp DESC LIMIT 50
+                ORDER BY id DESC LIMIT 50
             """, (factor_name,)).fetchall()
             return [dict(r) for r in rows]
 
@@ -624,6 +795,11 @@ class FactorResearchStore:
         Health score blends: ICIR, coverage, stability, consistency.
         """
         with self._conn() as conn:
+            # Latest row per factor joined on the monotonic id, not on the
+            # timestamp text: legacy rows carry naive local timestamps while
+            # new rows carry UTC offsets, so text ordering across the two
+            # formats is not chronological. Invalidated/superseded rows are
+            # excluded so a marked-wrong result cannot drive the ranking.
             rows = conn.execute("""
                 SELECT
                     s.factor_name,
@@ -637,18 +813,22 @@ class FactorResearchStore:
                     s.timestamp as last_updated
                 FROM factor_stability_history s
                 INNER JOIN (
-                    SELECT factor_name, MAX(timestamp) as max_ts
+                    SELECT factor_name, MAX(id) as max_id
                     FROM factor_stability_history
+                    WHERE COALESCE(validity, 'valid') = 'valid'
                     GROUP BY factor_name
                 ) latest ON s.factor_name = latest.factor_name
-                    AND s.timestamp = latest.max_ts
+                    AND s.id = latest.max_id
                 ORDER BY s.icir DESC
             """).fetchall()
 
             ranked = []
             for r in rows:
                 d = dict(r)
-                icir_score = max(0, min(1, (abs(d["icir"] or 0) / 0.5)))
+                # Sign-aware ICIR score. abs(ICIR) promoted a factor with
+                # ICIR=-0.5 to 0.91 health while a correct-sign ICIR=+0.1
+                # scored 0.59: wrong-direction factors ranked first.
+                icir_score = max(0.0, min(1.0, (d["icir"] or 0.0) / 0.5))
                 coverage_score = d["coverage"] or 0
                 consistency_score = d["sharpe_consistency"] or 0
                 health = (icir_score * 0.4 + coverage_score * 0.3
@@ -675,7 +855,7 @@ class FactorResearchStore:
         params: dict | None = None,
     ) -> None:
         """Record a factor version."""
-        now = datetime.now().isoformat()
+        now = _utcnow_iso()
         with self._lock, self._conn() as conn:
             conn.execute("""
                 INSERT INTO factor_versions

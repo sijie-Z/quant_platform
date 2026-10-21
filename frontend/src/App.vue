@@ -66,10 +66,16 @@
     </div>
 
     <!-- Status Bar -->
-    <StatusBar :connected="backendAlive" @action="onStatusBarAction" />
+    <StatusBar :connected="backendAlive" :readiness="readiness" @action="onStatusBarAction" />
 
     <!-- Command Palette -->
-    <CommandPalette ref="paletteRef" v-model="currentView" @action="onPaletteAction" @toast="onToast" />
+    <CommandPalette
+      ref="paletteRef"
+      v-model="currentView"
+      @action="onPaletteAction"
+      @open="onPaletteOpen"
+      @toast="onToast"
+    />
 
     <!-- Toast -->
     <Toast ref="toastRef" />
@@ -92,10 +98,10 @@ import MonitorDashboard from './components/MonitorDashboard.vue'
 import StatusBar from './components/StatusBar.vue'
 import Toast from './components/Toast.vue'
 import CommandPalette from './components/CommandPalette.vue'
-import { healthCheck } from './api/index.js'
+import { healthCheck, getReadiness, getApiErrorMessage } from './api/index.js'
 import { useI18n } from './i18n/index.js'
 
-const { $t } = useI18n()
+const { $t, locale } = useI18n()
 
 const views = computed(() => [
   { id: 'terminal', label: $t('nav.terminal') },
@@ -112,15 +118,19 @@ const views = computed(() => [
 
 const currentView = ref('terminal')
 const backendAlive = ref(false)
+// Dead-man switch state from /api/readiness (200 ready / 503 degraded).
+const readiness = ref({ status: 'unknown', reason: '', checks: [] })
 const toastRef = ref(null)
 const terminalRef = ref(null)
 const paletteRef = ref(null)
 let healthTimer = null
+let readinessTimer = null
 
 function onToast({ message, type }) {
   if (!toastRef.value) return
   if (type === 'success') toastRef.value.toastSuccess(message)
   else if (type === 'error') toastRef.value.toastError(message)
+  else if (type === 'warning') toastRef.value.toastWarning(message)
   else toastRef.value.toast(message)
 }
 
@@ -145,11 +155,27 @@ function togglePalette() {
   paletteRef.value?.toggle?.()
 }
 
+function onPaletteOpen() {
+  // One shortcut, one overlay: Ctrl+K opens the palette only, so close the
+  // run panel first (it used to stay stacked underneath and reappear when the
+  // palette was dismissed).
+  if (terminalRef.value) terminalRef.value.showRunPanel = false
+}
+
 function onPaletteAction(action) {
   if (action === 'run') onRun()
   else if (action === 'demo') onDemo()
   else if (action === 'export') {
     if (terminalRef.value) terminalRef.value.exportResults()
+  } else if (action === 'refresh') {
+    window.location.reload()
+  } else if (action === 'health') {
+    checkHealth()
+    checkReadiness()
+    onToast({
+      message: locale.value === 'zh-CN' ? '正在检查后端连接...' : 'Checking backend connectivity...',
+      type: 'info',
+    })
   }
 }
 
@@ -166,13 +192,40 @@ async function checkHealth() {
   }
 }
 
+async function checkReadiness() {
+  try {
+    const payload = await getReadiness()
+    const checks = Array.isArray(payload?.checks) ? payload.checks : []
+    const failing = checks.filter(c => c && c.ok === false)
+    readiness.value = {
+      status: payload?.status === 'ready' ? 'ready' : 'degraded',
+      reason: failing
+        .map(c => `${c.name}: ${c.reason || 'failed'}`)
+        .join('; '),
+      checks,
+      timestamp: payload?.timestamp || '',
+    }
+  } catch (e) {
+    // The readiness probe itself failed (backend unreachable / timed out).
+    readiness.value = {
+      status: 'unknown',
+      reason: getApiErrorMessage(e, 'readiness unavailable'),
+      checks: [],
+    }
+  }
+}
+
 onMounted(() => {
   checkHealth()
   healthTimer = setInterval(checkHealth, 15000)
+  // Low-frequency: this is a dead-man switch, not a liveness ping.
+  checkReadiness()
+  readinessTimer = setInterval(checkReadiness, 30000)
 })
 
 onBeforeUnmount(() => {
   if (healthTimer) clearInterval(healthTimer)
+  if (readinessTimer) clearInterval(readinessTimer)
 })
 </script>
 

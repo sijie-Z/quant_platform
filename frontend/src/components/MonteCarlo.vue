@@ -189,16 +189,36 @@ async function runMC() {
 function renderDistChart() {
   if (!distChartRef.value || !result.value?.terminal_values?.length) return
 
+  // The container lives inside v-if, so a new result after an error can be a
+  // fresh DOM node. Reusing the old instance rendered into a detached node.
+  if (distChart && (distChart.isDisposed?.() || distChart.getDom() !== distChartRef.value)) {
+    try { distChart.dispose() } catch (_) {}
+    distChart = null
+  }
   if (!distChart) {
     distChart = echarts.init(distChartRef.value, null, { renderer: 'canvas' })
   }
+  if (resizeObs) {
+    try {
+      // Drop targets from earlier (possibly detached) containers before
+      // observing the current one.
+      resizeObs.disconnect()
+      resizeObs.observe(distChartRef.value)
+    } catch (_) {}
+  }
 
   // Build histogram
-  const vals = result.value.terminal_values
+  const vals = (result.value.terminal_values || [])
+    .map(Number)
+    .filter(Number.isFinite)
+  if (!vals.length) return
   const min = Math.min(...vals)
   const max = Math.max(...vals)
   const nBins = 50
   const binWidth = (max - min) / nBins
+  // All-equal terminal values give max === min and a zero bin width, which
+  // made every bin index NaN. Nothing meaningful can be plotted.
+  if (!Number.isFinite(binWidth) || binWidth <= 0) return
   const bins = new Array(nBins).fill(0)
   const labels = []
 
@@ -207,7 +227,7 @@ function renderDistChart() {
   }
   for (const v of vals) {
     const idx = Math.min(Math.floor((v - min) / binWidth), nBins - 1)
-    if (idx >= 0) bins[idx]++
+    if (Number.isFinite(idx) && idx >= 0) bins[idx]++
   }
 
   distChart.setOption({
@@ -239,8 +259,11 @@ function renderDistChart() {
 }
 
 onMounted(() => {
-  resizeObs = new ResizeObserver(() => distChart?.resize())
-  if (distChartRef.value) resizeObs.observe(distChartRef.value)
+  if (window.ResizeObserver) {
+    resizeObs = new ResizeObserver(() => distChart?.resize())
+    // The chart container may not exist yet (v-if); renderDistChart observes
+    // it once the chart is created.
+  }
 })
 onBeforeUnmount(() => {
   resizeObs?.disconnect()

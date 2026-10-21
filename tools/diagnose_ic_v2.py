@@ -19,6 +19,7 @@ from quant_platform.factors.evaluation import ic_summary, rank_ic
 from quant_platform.factors.processing import process_factor
 from quant_platform.factors.technical import Momentum1M
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date
 from scipy.stats import spearmanr
 
 logger = get_logger(__name__)
@@ -36,7 +37,7 @@ config_universe = {
 config_data = {
     "provider": "synthetic",
     "start_date": "2021-01-01",
-    "end_date": "2025-12-31",
+    "end_date": resolve_end_date(),
     "synthetic": {"embedded_alpha": True},
 }
 

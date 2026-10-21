@@ -34,6 +34,7 @@ from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 from scipy import stats as scipy_stats
 
 setup_logging()
@@ -43,7 +44,7 @@ logger = get_logger("ms3")
 # Protocol-frozen parameters
 # ---------------------------------------------------------------------------
 REAL_START = "2018-01-01"
-REAL_END = "2025-12-31"
+REAL_END = resolve_end_date()  # as-of resolved at run time
 INITIAL_CAPITAL = 10_000_000
 
 HORIZONS = [5, 10, 20, 40, 60, 80, 120, 160, 200, 240]
@@ -455,11 +456,12 @@ def run():
     out = Path("results")
     out.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame(rq5_results).drop(columns=["ic_series"], errors="ignore").to_csv(out / "ms3_rq5_horizon_ic.csv", index=False)
-    pd.DataFrame(bt_results_list).to_csv(out / "ms3_rq5a_backtest.csv", index=False)
-    pd.DataFrame(rq6_results).to_csv(out / "ms3_rq6_size_bucket.csv", index=False)
+    win = (str(returns.index.min().date()), str(returns.index.max().date()))
+    stamp_provenance(pd.DataFrame(rq5_results).drop(columns=["ic_series"], errors="ignore"), *win).to_csv(out / "ms3_rq5_horizon_ic.csv", index=False)
+    stamp_provenance(pd.DataFrame(bt_results_list), *win).to_csv(out / "ms3_rq5a_backtest.csv", index=False)
+    stamp_provenance(pd.DataFrame(rq6_results), *win).to_csv(out / "ms3_rq6_size_bucket.csv", index=False)
     if rq7_results:
-        pd.DataFrame(rq7_results).to_csv(out / "ms3_rq7_sector.csv", index=False)
+        stamp_provenance(pd.DataFrame(rq7_results), *win).to_csv(out / "ms3_rq7_sector.csv", index=False)
     logger.info("Results saved to results/ms3_*.csv")
 
 

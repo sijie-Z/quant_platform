@@ -29,7 +29,7 @@
         </div>
         <div class="fs-stat">
           <span class="fs-stat-label">Significance</span>
-          <span :class="['fs-stat-value', sigClass(activeItem.t_stat)]">{{ significance(activeItem.t_stat) }}</span>
+          <span :class="['fs-stat-value', tStatClass(activeItem.t_stat)]">{{ significance(activeItem.t_stat) }}</span>
         </div>
       </div>
     </template>
@@ -145,6 +145,9 @@ function renderChart() {
   })
 
   if (window.ResizeObserver) {
+    // The chart is disposed/re-created on every data change; drop the previous
+    // observer instead of accumulating one per render.
+    if (resizeObserver) resizeObserver.disconnect()
     resizeObserver = new ResizeObserver(() => chartInstance?.resize())
     resizeObserver.observe(chartRef.value)
   }

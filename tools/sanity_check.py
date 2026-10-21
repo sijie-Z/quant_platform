@@ -24,16 +24,27 @@ import os
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
 import akshare as ak
 import numpy as np
 import pandas as pd
+
+# Repo dir is the `quant_platform` package; its parent must be importable when
+# this script runs without an editable install.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from quant_platform.backtest.metrics import max_drawdown
+from quant_platform.utils.research_window import compact_date, resolve_end_date
 
 DB = "data/trading.db"
 C, S, P = 0.0003, 0.001, 0.0005
 N_LONG, N_SHORT = 20, 0
 INITIAL = 1_000_000
 RNG = np.random.default_rng(42)
+
+START_DATE = "2021-01-01"
+END_DATE = resolve_end_date()
 
 print("=" * 72)
 print("  PIPELINE SANITY CHECK")
@@ -56,7 +67,7 @@ frames = {}
 for i, c in enumerate(codes):
     for retry in range(3):
         try:
-            r = ak.stock_zh_a_hist_tx(symbol=txsym(c), start_date="20210101", end_date="20260523", adjust="hfq")
+            r = ak.stock_zh_a_hist_tx(symbol=txsym(c), start_date=compact_date(START_DATE), end_date=compact_date(END_DATE), adjust="hfq")
             if r is not None and not r.empty:
                 r = r.rename(columns={"date":"date","close":"close"}) if "close" in r.columns else r
                 r["date"] = pd.to_datetime(r["date"])
@@ -90,8 +101,10 @@ def run_factor(factor_panel: pd.DataFrame) -> dict:
     Returns dict with cagr, sharpe, max_dd, turnover, style_cagr, ic_mean.
     """
     capital = INITIAL
+    gross_capital = INITIAL  # same path before costs (for the no-cost style gap)
     daily_rets = []
     turnover_log = []
+    cost_log = []
     current_w = {}
     rebal_iter = iter(rebals)
     next_rebal = next(rebal_iter, None)
@@ -104,30 +117,45 @@ def run_factor(factor_panel: pd.DataFrame) -> dict:
     style_next_rebal = next(style_rebal_iter, None)
 
     for date in all_dates:
-        # ── Strategy (with costs) ──
+        # ── Strategy decision (executed at today's close) ──
+        pending_w = None
+        pending_cost = 0.0
         if next_rebal is not None and date >= next_rebal:
             if date in factor_panel.index:
                 f = factor_panel.loc[date].dropna()
                 if len(f) >= 60:
                     rank = f.rank(ascending=False)
                     long_u = rank.nsmallest(N_LONG).index.tolist()
-                    if current_w:
-                        old_set = set(current_w.keys())
-                        new_set = set(long_u)
-                        sold = old_set - new_set
-                        if sold and len(current_w) > 0:
-                            to = sum(abs(current_w.get(a,0)) for a in sold)
-                            turnover_log.append(float(to))
-                            capital -= to * (C + P + S) * capital
                     total = max(len(long_u), 1)
-                    current_w = {}
-                    for a in long_u:
-                        current_w[a] = 1.0 / total
+                    pending_w = {a: 1.0 / total for a in long_u}
+
+                    # One-way turnover = 0.5*sum|w_new - w_old|. The old
+                    # formula counted only names that left the book, so new
+                    # entries were free and surviving names reset to 1/N
+                    # without charging drift. Buys pay commission+slippage;
+                    # sells also pay stamp tax.
+                    old_w = current_w
+                    changed = set(old_w) | set(pending_w)
+                    buy_w = sum(
+                        max(pending_w.get(a, 0.0) - old_w.get(a, 0.0), 0.0)
+                        for a in changed
+                    )
+                    sell_w = sum(
+                        max(old_w.get(a, 0.0) - pending_w.get(a, 0.0), 0.0)
+                        for a in changed
+                    )
+                    turnover_log.append(0.5 * (buy_w + sell_w))
+                    pending_cost = buy_w * (C + P) + sell_w * (C + P + S)
+                    cost_log.append(float(pending_cost))
             try:
                 next_rebal = next(rebal_iter)
             except StopIteration:
                 next_rebal = None
 
+        # Today's return is earned by the weights held since the previous
+        # close. The decision taken above must not earn today's already
+        # realized t-1 -> t return; it becomes active tomorrow. (The old code
+        # assigned current_w before the return, a one-day lookahead.)
         if current_w:
             daily = 0.0
             for a, w in current_w.items():
@@ -137,10 +165,18 @@ def run_factor(factor_panel: pd.DataFrame) -> dict:
                         daily += w * r
             daily_rets.append(daily)
             capital *= (1 + daily)
+            gross_capital *= (1 + daily)
         else:
             daily_rets.append(0.0)
 
-        # ── Style benchmark (no costs) ──
+        # Pay the trade cost at today's close, then activate the new weights.
+        if pending_cost:
+            capital -= pending_cost * capital
+        if pending_w is not None:
+            current_w = pending_w
+
+        # ── Style benchmark (no costs, same next-day activation) ──
+        style_pending_w = None
         if style_next_rebal is not None and date >= style_next_rebal:
             if date in factor_panel.index:
                 f = factor_panel.loc[date].dropna()
@@ -148,9 +184,7 @@ def run_factor(factor_panel: pd.DataFrame) -> dict:
                     rank = f.rank(ascending=False)
                     long_u = rank.nsmallest(N_LONG).index.tolist()
                     total = max(len(long_u), 1)
-                    style_current_w = {}
-                    for a in long_u:
-                        style_current_w[a] = 1.0 / total
+                    style_pending_w = {a: 1.0 / total for a in long_u}
             try:
                 style_next_rebal = next(style_rebal_iter)
             except StopIteration:
@@ -167,6 +201,8 @@ def run_factor(factor_panel: pd.DataFrame) -> dict:
             style_capital *= (1 + daily)
         else:
             style_daily_rets.append(0.0)
+        if style_pending_w is not None:
+            style_current_w = style_pending_w
 
     dr = pd.Series(daily_rets, index=all_dates)
 
@@ -184,20 +220,29 @@ def run_factor(factor_panel: pd.DataFrame) -> dict:
     # Metrics
     cagr = (capital/INITIAL) ** (1/ny) - 1
     sharpe = float((dr.mean()/(dr.std()+1e-12)) * np.sqrt(252))
-    dd = float((dr.cumsum() + np.log(INITIAL) - (dr.cumsum() + np.log(INITIAL)).cummax()).min() / INITIAL)
+    # Same function as the backtest engine: compounding equity curve, initial
+    # wealth 1.0. The old log-cumsum / INITIAL formula produced -4e-7.
+    dd = float(max_drawdown(dr)[0])
     avg_to = float(np.mean(turnover_log)) if turnover_log else 0
 
     style_cagr = (style_capital/INITIAL) ** (1/ny) - 1
-    style_excess = cagr - style_cagr
-    annual_cost = sum(t*(C+P+S) for t in turnover_log)/ny if turnover_log else 0
+    gross_cagr = (gross_capital/INITIAL) ** (1/ny) - 1
+    # Compare like with like: the style leg is explicitly no-cost, so the
+    # strategy side of this gap must also be gross of costs. With buy-side
+    # charging added, net-vs-gross made the random-factor null test fail
+    # systematically (~2.9%/yr drag on a 300-name monthly book).
+    style_excess = gross_cagr - style_cagr
+    annual_cost = sum(cost_log)/ny if cost_log else 0
 
     return {
-        "cagr": cagr, "sharpe": sharpe, "max_dd": dd,
+        "cagr": cagr, "gross_cagr": gross_cagr, "sharpe": sharpe, "max_dd": dd,
         "avg_turnover": avg_to, "style_cagr": style_cagr,
         "style_excess": style_excess, "cost_drag": annual_cost,
         "ic_mean": float(np.mean(ic_vals)) if ic_vals else float("nan"),
         "ic_std": float(np.std(ic_vals)) if ic_vals else float("nan"),
         "n_ic": len(ic_vals),
+        "turnover_log": turnover_log, "cost_log": cost_log,
+        "daily_rets": dr,
     }
 
 
@@ -292,6 +337,8 @@ ev = {
     "test_a_random": {"ic_mean": r["ic_mean"], "sharpe": r["sharpe"], "style_excess": r["style_excess"], "result": result_a},
     "test_b_oracle": {"ic_mean": r2["ic_mean"], "sharpe": r2["sharpe"], "style_excess": r2["style_excess"], "result": result_b},
     "test_c_mc": {"n_trials": N_TRIALS, "mean_ic": float(np.mean(mc_ics)), "median_sharpe": float(np.median(mc_sharpes)), "sharpe_gt_0_5_pct": float(np.mean(mc_sharpes > 0.5)*100), "result": result_c},
+    "data_start": str(all_dates[0].date()), "data_end": str(all_dates[-1].date()),
+    "requested_end": END_DATE,
     "overall": "PASS" if all_pass else "INVESTIGATE",
 }
 conn = sqlite3.connect(DB)
@@ -301,7 +348,10 @@ conn.execute(
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
     (rid, pd.Timestamp.now('UTC').isoformat()[:19], "success" if all_pass else "failed",
      "", "pipeline_sanity_check", "akshare",
-     json.dumps({"adjust":"hfq","provider":"akshare"}),
+     json.dumps({"adjust":"hfq","provider":"akshare",
+                 "start_date": str(all_dates[0].date()),
+                 "end_date": str(all_dates[-1].date()),
+                 "requested_end": END_DATE}),
      "CurrentConstituentUniverseProvider",
      json.dumps({"pit":False,"bias_warning":["survivorship_bias_possible"]}),
      "sanity_check", json.dumps({"tests":["random","oracle","mc_100"]}),

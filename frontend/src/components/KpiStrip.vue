@@ -45,9 +45,9 @@ const placeholderMetrics = computed(() => [
   { key: 'ann',    label: $t('kpi.annualizedReturn'),    display: '--', tone: 'dim' },
   { key: 'vol',    label: $t('kpi.volatility'),    display: '--', tone: 'dim' },
   { key: 'sharpe', label: $t('kpi.sharpe'),      display: '--', tone: 'dim' },
-  { key: 'sort',   label: $t('kpi.calmar'),     display: '--', tone: 'dim' },
+  { key: 'sort',   label: $t('kpi.sortino'),     display: '--', tone: 'dim' },
   { key: 'dd',     label: $t('kpi.maxDrawdown'),      display: '--', tone: 'dim' },
-  { key: 'var',    label: $t('kpi.volatility'),     display: '--', tone: 'dim' },
+  { key: 'var',    label: $t('kpi.var'),     display: '--', tone: 'dim' },
   { key: 'win',    label: $t('kpi.winRate'),    display: '--', tone: 'dim' },
 ])
 

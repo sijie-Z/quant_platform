@@ -31,18 +31,28 @@ def calc(store):
 
 
 class TestNAVDataclass:
-    def test_to_dict_rounds_values(self):
+    def test_to_dict_persists_full_precision(self):
+        """R44: persistence must not round before the next day re-reads it.
+
+        nav_per_unit/HWM at 4dp and fees at 2dp produced spurious daily
+        returns on unchanged NAVs (4.5e-5) and fee/HWM drift. Rounding is a
+        presentation concern only.
+        """
         nav = NAV(
             date="2024-07-15", nav_total=10_050_000.123456,
             nav_per_unit=1.005000123, total_units=10_000_000,
             cash=5_000_000.567, market_value=5_050_000.89,
-            mgmt_fee=550.123, perf_fee=1000.456,
-            high_water_mark=1.005, daily_return=0.005, cumulative_return=0.005,
+            mgmt_fee=550.123456, perf_fee=1000.456789,
+            high_water_mark=1.005000123, daily_return=0.005,
+            cumulative_return=0.005,
         )
         d = nav.to_dict()
         assert d["date"] == "2024-07-15"
-        assert d["nav_per_unit"] == 1.005
-        assert d["nav_total"] == 10_050_000.1235
+        assert d["nav_per_unit"] == 1.005000123
+        assert d["nav_total"] == 10_050_000.123456
+        assert d["mgmt_fee"] == 550.123456
+        assert d["perf_fee"] == 1000.456789
+        assert d["high_water_mark"] == 1.005000123
         assert d["daily_return"] == 0.005
 
 

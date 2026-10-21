@@ -65,7 +65,14 @@ def plot_drawdown(
     # Include the initial wealth of 1.0 as the first peak, matching
     # backtest.metrics.max_drawdown. Starting from the first *return* made a
     # loss on day one invisible to the running maximum.
-    growth = (1 + strategy_returns.fillna(0)).to_numpy()
+    #
+    # The per-day returns must be compounded before the underwater scan: the
+    # old code treated each daily growth factor (1 + r) as the wealth level
+    # itself, so the plotted "drawdown" was the dispersion of daily returns
+    # (about -6% on a random series) instead of a drawdown of the equity curve
+    # (about -9% to -56% on real results). The chart is now exactly
+    # backtest.metrics.max_drawdown in percent.
+    growth = (1 + strategy_returns.fillna(0)).cumprod().to_numpy()
     wealth = np.concatenate([[1.0], growth])
     running_max = np.maximum.accumulate(wealth)
     dd_values = (wealth / running_max - 1)[1:] * 100

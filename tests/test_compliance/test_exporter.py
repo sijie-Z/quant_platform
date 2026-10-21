@@ -268,6 +268,7 @@ class TestExportRiskLog:
         _seed_pnl(store, 3)
         result = exporter.export_risk_log(
             start="2024-01-01", end="2024-12-31", format="csv",
+            include_all_tenants=True,
         )
         assert os.path.exists(result.file_path)
         assert result.n_records == 3
@@ -276,6 +277,7 @@ class TestExportRiskLog:
         _seed_pnl(store, 3)
         result = exporter.export_risk_log(
             start="2024-01-01", end="2024-12-31", format="xlsx",
+            include_all_tenants=True,
         )
         assert os.path.exists(result.file_path)
         assert result.n_records == 3
@@ -284,6 +286,7 @@ class TestExportRiskLog:
         _seed_pnl(store, 1)
         result = exporter.export_risk_log(
             start="2024-01-01", end="2024-12-31", format="csv",
+            include_all_tenants=True,
         )
         with open(result.file_path, encoding="utf-8-sig") as f:
             reader = csv.reader(f)
@@ -293,6 +296,7 @@ class TestExportRiskLog:
     def test_risk_empty_export(self, exporter, store):
         result = exporter.export_risk_log(
             start="2024-01-01", end="2024-12-31",
+            include_all_tenants=True,
         )
         assert result.n_records == 0
 

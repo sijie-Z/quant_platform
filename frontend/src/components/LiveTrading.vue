@@ -277,9 +277,9 @@ import {
   getTradingPositions, getTradingAccount, getTradingCycles,
   runTradingCycle, getMarketSnapshot,
   getCoreState, getCoreAudit, getCoreRisk, toggleCoreKillSwitch,
-  createStatusSocket
+  createStatusSocket, getApiErrorMessage
 } from '../api/index.js'
-
+import { formatBackendClock } from '../utils/time.js'
 const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
@@ -317,10 +317,12 @@ const config = reactive({
 
 let pollTimer = null
 let ws = null
+let unmounted = false
 
 async function start() {
   try {
     await startTrading(config)
+    if (unmounted) return
     engineStatus.value = 'running'
     emit('toast', { message: locale.value === 'zh-CN' ? '实盘交易引擎已启动' : 'Live trading engine started', type: 'success' })
     startPolling()
@@ -406,12 +408,12 @@ async function fetchMarket() {
     const r = await getMarketSnapshot()
     marketStocks.value = (r.stocks || []).slice(0, 30)
     marketError.value = ''
-    const time = r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : ''
+    const time = formatBackendClock(r.timestamp, locale.value)
     marketTime.value = time ? (r.stale ? `stale ${time}` : time) : ''
   } catch (e) {
     // Previously swallowed: an unavailable feed (503) or server error left
     // the panel on "Loading market data..." forever.
-    marketError.value = e.response?.data?.detail || e.message || 'Market data unavailable'
+    marketError.value = getApiErrorMessage(e, 'Market data unavailable')
   }
 }
 
@@ -439,7 +441,10 @@ async function fetchRisk() {
 }
 
 function connectWS() {
-  if (ws) return
+  // `ws` may be a self-disposed handle (auth close stopped reconnection);
+  // a truthy-but-dead handle used to block every later reconnect.
+  if (ws && !ws.disposed) return
+  ws = null
   try {
     ws = createStatusSocket(
       (data) => {
@@ -448,7 +453,19 @@ function connectWS() {
           if (wsEvents.value.length > 100) wsEvents.value = wsEvents.value.slice(0, 50)
         }
       },
-      () => {}
+      (err) => {
+        // The socket factory stops reconnecting on 1008/4401 (rejected token)
+        // instead of looping forever; surface that once so the operator can
+        // fix the token in Settings.
+        if (err?.type === 'auth') {
+          emit('toast', {
+            message: locale.value === 'zh-CN'
+              ? '实时事件流认证失败（WebSocket 1008），已停止重连。请在设置中检查 API Token。'
+              : 'Realtime event stream authentication failed (WS 1008); reconnection stopped. Check the API token in Settings.',
+            type: 'error',
+          })
+        }
+      }
     )
   } catch (_) {}
 }
@@ -480,16 +497,19 @@ function fmtMoney(v) {
 }
 
 function fmtTime(t) {
-  if (!t) return ''
-  return new Date(t).toLocaleTimeString()
+  // Backend timestamps are naive Asia/Shanghai strings; parse as UTC+8 so a
+  // browser outside China does not shift them.
+  return formatBackendClock(t, locale.value)
 }
 
 onMounted(async () => {
   await fetchStatus()
+  if (unmounted) return
   await fetchMarket()
   await fetchState()
   await fetchAudit()
   await fetchRisk()
+  if (unmounted) return
   if (engineStatus.value === 'running') {
     startPolling()
     connectWS()
@@ -497,6 +517,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  unmounted = true
   stopPolling()
   if (ws) { ws.close(); ws = null }
 })

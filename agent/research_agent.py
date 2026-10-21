@@ -16,6 +16,20 @@ Architecture:
 
 This module demonstrates how Agent/RAG skills transfer directly to quant.
 
+Backend honesty:
+- ``mode="llm"`` without an API key is *visibly* downgraded: ``mode`` /
+  ``effective_mode`` become "keyword", while ``requested_mode`` stays "llm",
+  ``mode_downgraded`` is True and ``backend`` is "keyword". A warning is
+  logged. ``status()`` returns the whole picture.
+- Every LLM call path records ``last_fallback_reason`` when it degrades to the
+  keyword implementation, so a caller can tell LLM output from keyword output.
+- LLM responses may be bare JSON arrays, dict wrappers such as
+  ``{"signals": [...]}`` / ``{"hypotheses": [...]}``, fenced ```json blocks,
+  or prose around the JSON; all are parsed. Field values are validated
+  against the ``ExtractedSignal`` / ``FactorHypothesis`` contracts: entries
+  missing required fields are dropped, out-of-range values are repaired, and
+  every drop/repair is warned about.
+
 Usage:
     agent = ResearchAgent(api_key="sk-...")
     signals = agent.extract_signals_from_text(research_report, stock="600519")
@@ -27,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -73,7 +88,10 @@ class ResearchAgent:
 
     Modes:
     - keyword: Zero-cost keyword extraction (default, for demo)
-    - llm: Real DeepSeek/LLM API calls (requires DEEPSEEK_API_KEY)
+    - llm: Real DeepSeek/LLM API calls (requires DEEPSEEK_API_KEY). If the key
+      is missing the agent runs in keyword mode but keeps
+      ``requested_mode="llm"``, ``mode_downgraded=True`` and
+      ``backend="keyword"`` so the downgrade is never silent.
 
     Examples:
         # Analyze a research report
@@ -96,6 +114,52 @@ class ResearchAgent:
         )
     """
 
+    #: Hard caps on LLM input assembled from user data. They keep a broken or
+    #: hostile caller from pushing unbounded text into a paid API request.
+    MAX_NARRATIVE_CHARS = 2000
+    MAX_CONTEXT_CHARS = 500
+    MAX_AVAILABLE_FACTORS = 50
+    MAX_FACTOR_NAME_CHARS = 100
+    MAX_CONTRIBUTIONS = 50
+    MAX_LIST_ITEMS = 20
+    MAX_REASONING_CHARS = 1000
+    MAX_STOCK_CHARS = 100
+    MAX_SOURCE_TYPE_CHARS = 50
+    MAX_PERIOD_CHARS = 100
+    #: Each chunk fits in the prompt excerpt exactly (no silent tail loss),
+    #: and a pathological document cannot trigger thousands of paid calls.
+    MAX_CHUNK_CHARS = 1500
+    MAX_CHUNKS = 50
+    #: Final defense: no prompt may exceed this many characters.
+    MAX_PROMPT_CHARS = 20_000
+    MAX_PROMPT_CACHE_ENTRIES = 256
+
+    _SIGNAL_TYPES = frozenset({"sentiment", "event", "hypothesis", "risk"})
+    _DIRECTION_ALIASES = {
+        "bullish": "bullish",
+        "bearish": "bearish",
+        "neutral": "neutral",
+        "up": "bullish",
+        "down": "bearish",
+        "bull": "bullish",
+        "bear": "bearish",
+        "positive": "bullish",
+        "negative": "bearish",
+        "看多": "bullish",
+        "看空": "bearish",
+        "利好": "bullish",
+        "利空": "bearish",
+        "中性": "neutral",
+    }
+    _SIGNAL_WRAPPER_KEYS = ("signals", "items", "results", "data", "output")
+    _HYPOTHESIS_WRAPPER_KEYS = ("hypotheses", "items", "results", "data", "output")
+    _SIGNAL_MARKERS = ("signal_type", "direction", "strength")
+    _HYPOTHESIS_MARKERS = ("factor_name", "expected_ic", "economic_logic")
+    _FENCED_JSON_RE = re.compile(
+        r"```[ \t]*(?:json)?[ \t]*\r?\n?(?P<body>.*?)```",
+        re.IGNORECASE | re.DOTALL,
+    )
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -103,13 +167,91 @@ class ResearchAgent:
         mode: Literal["keyword", "llm"] = "keyword",
         cache_dir: str | None = None,
     ):
+        if mode not in ("keyword", "llm"):
+            raise ValueError(f"mode must be 'keyword' or 'llm', got {mode!r}")
+
         self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
         self.model = model
-        self.mode = mode if not (mode == "llm" and not self.api_key) else "keyword"
+        self.requested_mode = mode
+
+        # Explicit, observable downgrade instead of a silent one: mode stays
+        # truthful about what runs; requested_mode/mode_downgraded preserve
+        # the fact that the caller asked for the LLM.
+        downgraded = mode == "llm" and not self.api_key
+        self.downgrade_reason: str | None = None
+        if downgraded:
+            self.downgrade_reason = (
+                "mode='llm' requested but DEEPSEEK_API_KEY (or api_key) is not "
+                "set; running keyword mode, no LLM calls will be made"
+            )
+            logger.warning("ResearchAgent downgraded: %s", self.downgrade_reason)
+        self.mode = "keyword" if downgraded else mode
+
         self.cache_dir = Path(cache_dir) if cache_dir else Path("./.agent_cache")
         self.cache_dir.mkdir(exist_ok=True)
         self._client = None
         self._cache: dict[str, Any] = {}
+
+        #: Set whenever an LLM call path falls back to keyword extraction so
+        #: callers can distinguish LLM output from keyword output. Aggregates
+        #: over all chunks of one public call (first reason first).
+        self.last_fallback_reason: str | None = None
+        #: True when a long input was truncated to MAX_CHUNKS before analysis.
+        self.last_input_truncated: bool = False
+
+    # ──────────────────────────────────────────────────────────────
+    # Backend status
+    # ──────────────────────────────────────────────────────────────
+
+    @property
+    def effective_mode(self) -> str:
+        """Backend that actually runs ("keyword" or "llm")."""
+        return self.mode
+
+    @property
+    def mode_downgraded(self) -> bool:
+        """True when mode='llm' was requested but keyword mode actually runs.
+
+        Derived from live state, so it stays truthful if ``mode`` is changed.
+        """
+        return self.requested_mode == "llm" and self.mode == "keyword"
+
+    @property
+    def is_llm(self) -> bool:
+        return self.mode == "llm"
+
+    @property
+    def backend(self) -> str:
+        """Machine-readable backend label for result provenance."""
+        return f"llm:{self.model}" if self.mode == "llm" else "keyword"
+
+    def status(self) -> dict[str, Any]:
+        """Return the requested vs. effective backend state.
+
+        Callers should surface this next to any result produced by the agent
+        so a downgraded (keyword) run is never mistaken for LLM output.
+        """
+        return {
+            "requested_mode": self.requested_mode,
+            "effective_mode": self.effective_mode,
+            "backend": self.backend,
+            "mode_downgraded": self.mode_downgraded,
+            "downgrade_reason": self.downgrade_reason if self.mode_downgraded else None,
+            "last_fallback_reason": self.last_fallback_reason,
+            "input_truncated": self.last_input_truncated,
+        }
+
+    def _reset_fallback_state(self) -> None:
+        """Clear per-call degradation flags before a public operation."""
+        self.last_fallback_reason = None
+        self.last_input_truncated = False
+
+    def _record_fallback(self, reason: str) -> None:
+        """Record an LLM->keyword degradation, keeping earlier chunk reasons."""
+        if self.last_fallback_reason is None:
+            self.last_fallback_reason = reason
+        else:
+            self.last_fallback_reason = f"{self.last_fallback_reason}; {reason}"
 
     # ──────────────────────────────────────────────────────────────
     # Core: Extract signals from research text
@@ -131,8 +273,19 @@ class ResearchAgent:
         Returns:
             List of ExtractedSignal objects
         """
-        # Chunk long text
-        chunks = self._chunk_text(text, max_chars=2000)
+        self._reset_fallback_state()
+        # Chunks are sized to the prompt excerpt; an extreme document is
+        # truncated to MAX_CHUNKS so total LLM calls stay bounded.
+        chunks = self._chunk_text(text, max_chars=self.MAX_CHUNK_CHARS)
+        # The cap exists to bound paid LLM calls; keyword mode is local, so
+        # it processes every chunk.
+        if self.mode == "llm" and len(chunks) > self.MAX_CHUNKS:
+            logger.warning(
+                "ResearchAgent: input has %d chunks, analyzing only the first "
+                "%d (last_input_truncated=True)", len(chunks), self.MAX_CHUNKS,
+            )
+            self.last_input_truncated = True
+            chunks = chunks[: self.MAX_CHUNKS]
         all_signals = []
 
         for chunk in chunks:
@@ -201,12 +354,15 @@ class ResearchAgent:
         self, text: str, stock: str, source_type: str
     ) -> list[ExtractedSignal]:
         """LLM-based signal extraction (higher quality, costs money)."""
+        stock_text = self._bounded_text(stock, self.MAX_STOCK_CHARS)
+        source_text = self._bounded_text(source_type, self.MAX_SOURCE_TYPE_CHARS)
+        text_excerpt = self._bounded_text(text, self.MAX_CHUNK_CHARS)
         prompt = f"""Analyze this Chinese financial text and extract trading signals.
 
-Text ({source_type}):
-{text[:1500]}
+Text ({source_text}):
+{text_excerpt}
 
-Stock: {stock}
+Stock: {stock_text}
 
 Output a JSON array of signals. Each signal has:
 - signal_type: "sentiment" | "event" | "hypothesis" | "risk"
@@ -220,21 +376,14 @@ Output ONLY valid JSON array, no other text."""
 
         try:
             result = self._call_llm(prompt)
-            data = json.loads(result)
-            return [
-                ExtractedSignal(
-                    stock=stock,
-                    signal_type=item.get("signal_type", "sentiment"),
-                    direction=item.get("direction", "neutral"),
-                    strength=item.get("strength", 0),
-                    confidence=item.get("confidence", 0.5),
-                    reasoning=item.get("reasoning", ""),
-                    source_text=text[:200],
-                    factor_implications=item.get("factor_implications", {}),
-                )
-                for item in data if isinstance(item, dict)
-            ]
+            items = self._parse_llm_json(
+                result,
+                wrapper_keys=self._SIGNAL_WRAPPER_KEYS,
+                item_markers=self._SIGNAL_MARKERS,
+            )
+            return self._signals_from_items(items, stock, text)
         except Exception as e:
+            self._record_fallback(f"llm_signal_extraction: {e}")
             logger.warning("LLM signal extraction failed: %s, falling back to keyword", e)
             return self._extract_signals_keyword(text, stock)
 
@@ -258,6 +407,7 @@ Output ONLY valid JSON array, no other text."""
         Returns:
             List of FactorHypothesis objects
         """
+        self._reset_fallback_state()
         if self.mode == "llm":
             return self._generate_hypotheses_llm(narrative, available_factors, market_context)
         return self._generate_hypotheses_keyword(narrative, available_factors)
@@ -296,14 +446,23 @@ Output ONLY valid JSON array, no other text."""
         return hypotheses
 
     def _generate_hypotheses_llm(
-        self, narrative: str, available_factors: list[str], market_context: str
+        self, narrative: str, available_factors: list[str] | None, market_context: str
     ) -> list[FactorHypothesis]:
         """LLM-based hypothesis generation."""
+        factors_text = (
+            ", ".join(
+                self._bounded_text(f, self.MAX_FACTOR_NAME_CHARS)
+                for f in available_factors[: self.MAX_AVAILABLE_FACTORS]
+            )[: self.MAX_NARRATIVE_CHARS]
+            if available_factors else "any"
+        )
+        narrative_text = self._bounded_text(narrative, self.MAX_NARRATIVE_CHARS)
+        context_text = self._bounded_text(market_context, self.MAX_CONTEXT_CHARS)
         prompt = f"""You are a quantitative researcher. Based on this market narrative, generate factor hypotheses.
 
-Narrative: {narrative}
-Available factors: {', '.join(available_factors) if available_factors else 'any'}
-Market context: {market_context[:500]}
+Narrative: {narrative_text}
+Available factors: {factors_text}
+Market context: {context_text}
 
 Generate 2-4 testable hypotheses as a JSON array. Each:
 - factor_name: which factor to test
@@ -318,20 +477,14 @@ Output ONLY valid JSON array."""
 
         try:
             result = self._call_llm(prompt)
-            data = json.loads(result)
-            return [
-                FactorHypothesis(
-                    factor_name=item.get("factor_name", "unknown"),
-                    description=item.get("description", ""),
-                    expected_ic=item.get("expected_ic", 0.03),
-                    economic_logic=item.get("economic_logic", ""),
-                    data_requirements=item.get("data_requirements", []),
-                    risk_factors=item.get("risk_factors", []),
-                    confidence=item.get("confidence", 0.5),
-                )
-                for item in data if isinstance(item, dict)
-            ]
+            items = self._parse_llm_json(
+                result,
+                wrapper_keys=self._HYPOTHESIS_WRAPPER_KEYS,
+                item_markers=self._HYPOTHESIS_MARKERS,
+            )
+            return self._hypotheses_from_items(items, available_factors)
         except Exception as e:
+            self._record_fallback(f"llm_hypothesis_generation: {e}")
             logger.warning("LLM hypothesis generation failed: %s", e)
             return self._generate_hypotheses_keyword(narrative, available_factors)
 
@@ -355,6 +508,7 @@ Output ONLY valid JSON array."""
         Returns:
             Chinese natural language summary
         """
+        self._reset_fallback_state()
         if self.mode == "llm":
             return self._summarize_attribution_llm(factor_contributions, daily_returns, period)
         return self._summarize_attribution_keyword(factor_contributions, daily_returns, period)
@@ -412,18 +566,41 @@ Output ONLY valid JSON array."""
             vol = daily_returns.std() * np.sqrt(252)
             context = f"期间收益：{total_ret:.2%}，年化波动率：{vol:.2%}"
 
+        # Bound the factor list and name lengths and drop non-finite values so
+        # a huge or corrupted attribution dict cannot blow up the prompt.
+        finite = [
+            (str(k), float(v))
+            for k, v in contributions.items()
+            if self._coerce_float(v) is not None
+        ]
+        finite.sort(key=lambda kv: abs(kv[1]), reverse=True)
+        top = finite[: self.MAX_CONTRIBUTIONS]
+        contributions_text = json.dumps(
+            {
+                self._prompt_key(k, self.MAX_FACTOR_NAME_CHARS): round(v * 10000, 1)
+                for k, v in top
+            },
+            ensure_ascii=False,
+        )
+        period_text = self._bounded_text(period, self.MAX_PERIOD_CHARS)
+
         prompt = f"""用中文写一段简洁的组合归因分析（100字以内）。
 
-{period}因子贡献（bps）：
-{json.dumps({k: round(v*10000, 1) for k, v in contributions.items()}, ensure_ascii=False)}
+{period_text}因子贡献（bps）：
+{contributions_text}
 
 {context}
 
 要求：指出主要正/负贡献因子，分析原因，给出建议。"""
 
         try:
-            return self._call_llm(prompt)
-        except Exception:
+            result = self._call_llm(prompt)
+            if not isinstance(result, str) or not result.strip():
+                raise ValueError("empty LLM attribution response")
+            return result
+        except Exception as e:
+            self._record_fallback(f"llm_attribution_summary: {e}")
+            logger.warning("LLM attribution summary failed: %s, falling back to keyword", e)
             return self._summarize_attribution_keyword(contributions, daily_returns, period)
 
     # ──────────────────────────────────────────────────────────────
@@ -475,11 +652,396 @@ Output ONLY valid JSON array."""
         return "\n".join(lines)
 
     # ──────────────────────────────────────────────────────────────
+    # LLM response parsing and contract validation
+    # ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    def _parse_llm_json(
+        cls,
+        raw: object,
+        wrapper_keys: tuple[str, ...],
+        item_markers: tuple[str, ...],
+    ) -> list:
+        """Parse an LLM response into a list of entries.
+
+        Accepts a bare JSON array, a dict wrapper (``{"signals": [...]}``,
+        ``{"hypotheses": [...]}``, ...), a single item object, fenced
+        ```json blocks, and prose around the JSON payload. Raises ValueError
+        when no usable JSON is present; callers then fall back to keyword
+        extraction and record ``last_fallback_reason``.
+        """
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("empty LLM response")
+
+        text = raw.strip()
+        fence = cls._FENCED_JSON_RE.search(text)
+        if fence:
+            text = fence.group("body").strip()
+
+        # Try every bracket position in order: prose may contain brackets
+        # before the real payload (e.g. "[Note] ... {json}"). Responses are
+        # short (max_tokens=500), so a linear scan is cheap.
+        positions = [index for index, char in enumerate(text) if char in "[{"]
+        if not positions:
+            raise ValueError("no JSON object/array found in LLM response")
+
+        decoder = json.JSONDecoder()
+        last_error: Exception | None = None
+        first_payload: object = None
+        payload: object = None
+        for start in positions:
+            try:
+                candidate, _end = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                continue
+            if first_payload is None:
+                first_payload = candidate
+            if cls._looks_like_item_payload(candidate, wrapper_keys, item_markers):
+                payload = candidate
+                break
+        if payload is None:
+            payload = first_payload
+        if payload is None:
+            raise ValueError(f"LLM response is not valid JSON: {last_error}")
+
+        if isinstance(payload, list):
+            return payload
+
+        if isinstance(payload, dict):
+            for key in wrapper_keys:
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return value
+                if isinstance(value, dict) and any(m in value for m in item_markers):
+                    return [value]
+            if any(marker in payload for marker in item_markers):
+                return [payload]
+            raise ValueError(
+                f"unsupported JSON object shape (keys: {sorted(map(str, payload))[:8]})"
+            )
+
+        raise ValueError(f"unsupported JSON payload type: {type(payload).__name__}")
+
+    @staticmethod
+    def _looks_like_item_payload(
+        payload: object,
+        wrapper_keys: tuple[str, ...],
+        item_markers: tuple[str, ...],
+    ) -> bool:
+        """True when a decoded payload plausibly carries the requested items.
+
+        Used to skip a stray JSON fragment in the prose (e.g. "[Note]") in
+        favour of the real wrapper/array later in the response.
+        """
+        if isinstance(payload, list):
+            return not payload or any(isinstance(item, dict) for item in payload)
+        if isinstance(payload, dict):
+            if any(
+                isinstance(payload.get(key), (list, dict)) for key in wrapper_keys
+            ):
+                return True
+            if any(marker in payload for marker in item_markers):
+                return True
+        return False
+
+    @staticmethod
+    def _bounded_text(value: object, max_chars: int) -> str:
+        """Render any user-supplied value as a bounded string for a prompt."""
+        text = value if isinstance(value, str) else str(value)
+        return text[:max_chars]
+
+    @staticmethod
+    def _prompt_key(value: object, max_chars: int) -> str:
+        """Bound a key without collapsing distinct long keys onto one another."""
+        text = str(value)
+        if len(text) <= max_chars:
+            return text
+        digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+        return f"{text[: max(max_chars - 9, 0)]}#{digest}"
+
+    @staticmethod
+    def _coerce_float(value: object) -> float | None:
+        """Coerce a JSON number (or numeric string) to a finite float."""
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            number = float(value)
+        elif isinstance(value, str):
+            try:
+                number = float(value.strip())
+            except ValueError:
+                return None
+        else:
+            return None
+        if not math.isfinite(number):
+            return None
+        return number
+
+    @classmethod
+    def _coerce_str_list(cls, value: object) -> list[str]:
+        """Coerce a list-ish field to a bounded list of non-empty strings."""
+        if isinstance(value, str):
+            items = [value]
+        elif isinstance(value, (list, tuple, set)):
+            items = list(value)
+        else:
+            return []
+        cleaned = [str(item).strip() for item in items if str(item).strip()]
+        return cleaned[: cls.MAX_LIST_ITEMS]
+
+    @classmethod
+    def _signals_from_items(
+        cls, items: list, stock: str, text: str
+    ) -> list[ExtractedSignal]:
+        """Validate LLM signal entries against the ExtractedSignal contract."""
+        signals: list[ExtractedSignal] = []
+        dropped = 0
+        repaired = 0
+        for item in items:
+            if not isinstance(item, dict):
+                dropped += 1
+                continue
+            signal, repairs = cls._signal_from_dict(item, stock, text)
+            if signal is None:
+                dropped += 1
+                continue
+            repaired += repairs
+            signals.append(signal)
+        if dropped:
+            logger.warning(
+                "LLM signals: dropped %d invalid entr(ies) that violated the "
+                "ExtractedSignal contract", dropped,
+            )
+        if repaired:
+            logger.warning(
+                "LLM signals: repaired %d out-of-contract field(s) "
+                "(clamped ranges / normalised enums)", repaired,
+            )
+        return signals
+
+    @classmethod
+    def _signal_from_dict(
+        cls, item: dict, stock: str, text: str
+    ) -> tuple[ExtractedSignal | None, int]:
+        """Build one validated ExtractedSignal; return (signal, repair_count)."""
+        repairs = 0
+
+        required = ("signal_type", "direction", "strength", "confidence")
+        missing = [name for name in required if name not in item]
+        if missing:
+            logger.warning(
+                "LLM signal dropped: missing required field(s) %s", missing,
+            )
+            return None, 0
+
+        signal_type = item["signal_type"]
+        if not isinstance(signal_type, str):
+            logger.warning("LLM signal dropped: non-string signal_type %r", signal_type)
+            return None, 0
+        signal_type = signal_type.strip().lower()
+        if signal_type not in cls._SIGNAL_TYPES:
+            logger.warning(
+                "LLM signal dropped: signal_type %r is not one of %s",
+                signal_type, sorted(cls._SIGNAL_TYPES),
+            )
+            return None, 0
+
+        direction = item["direction"]
+        if not isinstance(direction, str):
+            direction = "neutral"
+            repairs += 1
+        else:
+            raw_direction = direction.strip().lower()
+            mapped = cls._DIRECTION_ALIASES.get(raw_direction)
+            if mapped is None:
+                logger.warning(
+                    "LLM signal: unknown direction %r normalised to 'neutral'",
+                    direction,
+                )
+                mapped = "neutral"
+            if mapped != raw_direction:
+                repairs += 1
+            direction = mapped
+
+        raw_strength = item["strength"]
+        strength = cls._coerce_float(raw_strength)
+        if strength is None:
+            logger.warning("LLM signal dropped: invalid strength %r", raw_strength)
+            return None, repairs
+        if not -1.0 <= strength <= 1.0:
+            strength = max(-1.0, min(1.0, strength))
+            repairs += 1
+
+        raw_confidence = item["confidence"]
+        confidence = cls._coerce_float(raw_confidence)
+        if confidence is None:
+            logger.warning("LLM signal dropped: invalid confidence %r", raw_confidence)
+            return None, repairs
+        if not 0.0 <= confidence <= 1.0:
+            confidence = max(0.0, min(1.0, confidence))
+            repairs += 1
+
+        reasoning = item.get("reasoning", "")
+        if reasoning is None:
+            reasoning = ""
+        elif not isinstance(reasoning, str):
+            reasoning = str(reasoning)
+            repairs += 1
+        reasoning = reasoning[: cls.MAX_REASONING_CHARS]
+
+        raw_implications = item.get("factor_implications", {})
+        implications: dict[str, float] = {}
+        if raw_implications is None:
+            raw_implications = {}
+        if not isinstance(raw_implications, dict):
+            logger.warning(
+                "LLM signal: factor_implications is %s, expected a dict; ignored",
+                type(raw_implications).__name__,
+            )
+            repairs += 1
+        else:
+            for key, raw_value in raw_implications.items():
+                value = cls._coerce_float(raw_value)
+                if not isinstance(key, str) or value is None:
+                    repairs += 1
+                    continue
+                if not -1.0 <= value <= 1.0:
+                    value = max(-1.0, min(1.0, value))
+                    repairs += 1
+                implications[key] = value
+
+        return ExtractedSignal(
+            stock=stock,
+            signal_type=signal_type,
+            direction=direction,
+            strength=strength,
+            confidence=confidence,
+            reasoning=reasoning,
+            source_text=text[:200],
+            factor_implications=implications,
+        ), repairs
+
+    @classmethod
+    def _hypotheses_from_items(
+        cls, items: list, available_factors: list[str] | None
+    ) -> list[FactorHypothesis]:
+        """Validate LLM hypothesis entries against the FactorHypothesis contract."""
+        hypotheses: list[FactorHypothesis] = []
+        dropped = 0
+        repaired = 0
+        for item in items:
+            if not isinstance(item, dict):
+                dropped += 1
+                continue
+            hypothesis, repairs = cls._hypothesis_from_dict(item, available_factors)
+            if hypothesis is None:
+                dropped += 1
+                continue
+            repaired += repairs
+            hypotheses.append(hypothesis)
+        if dropped:
+            logger.warning(
+                "LLM hypotheses: dropped %d invalid entr(ies) that violated "
+                "the FactorHypothesis contract", dropped,
+            )
+        if repaired:
+            logger.warning(
+                "LLM hypotheses: repaired %d out-of-contract field(s)", repaired,
+            )
+        return hypotheses
+
+    @classmethod
+    def _hypothesis_from_dict(
+        cls, item: dict, available_factors: list[str] | None
+    ) -> tuple[FactorHypothesis | None, int]:
+        """Build one validated FactorHypothesis; return (hypothesis, repairs)."""
+        repairs = 0
+
+        required = ("factor_name", "expected_ic", "confidence")
+        missing = [name for name in required if name not in item]
+        if missing:
+            logger.warning(
+                "LLM hypothesis dropped: missing required field(s) %s", missing,
+            )
+            return None, 0
+
+        factor_name = item["factor_name"]
+        if not isinstance(factor_name, str) or not factor_name.strip():
+            logger.warning("LLM hypothesis dropped: missing/invalid factor_name %r", factor_name)
+            return None, 0
+        factor_name = factor_name.strip()
+        if available_factors is not None and factor_name not in available_factors:
+            logger.warning(
+                "LLM hypothesis: factor_name %r is not in available_factors; kept",
+                factor_name,
+            )
+
+        raw_expected_ic = item["expected_ic"]
+        expected_ic = cls._coerce_float(raw_expected_ic)
+        if expected_ic is None:
+            logger.warning("LLM hypothesis dropped: invalid expected_ic %r", raw_expected_ic)
+            return None, repairs
+        if not -1.0 <= expected_ic <= 1.0:
+            expected_ic = max(-1.0, min(1.0, expected_ic))
+            repairs += 1
+
+        raw_confidence = item["confidence"]
+        confidence = cls._coerce_float(raw_confidence)
+        if confidence is None:
+            logger.warning("LLM hypothesis dropped: invalid confidence %r", raw_confidence)
+            return None, repairs
+        if not 0.0 <= confidence <= 1.0:
+            confidence = max(0.0, min(1.0, confidence))
+            repairs += 1
+
+        description = item.get("description", "")
+        if description is None:
+            description = ""
+        elif not isinstance(description, str):
+            description = str(description)
+            repairs += 1
+        description = description[:500]
+
+        economic_logic = item.get("economic_logic", "")
+        if economic_logic is None:
+            economic_logic = ""
+        elif not isinstance(economic_logic, str):
+            economic_logic = str(economic_logic)
+            repairs += 1
+        economic_logic = economic_logic[: cls.MAX_REASONING_CHARS]
+
+        data_requirements = cls._coerce_str_list(item.get("data_requirements", []))
+        risk_factors = cls._coerce_str_list(item.get("risk_factors", []))
+
+        return FactorHypothesis(
+            factor_name=factor_name,
+            description=description,
+            expected_ic=expected_ic,
+            economic_logic=economic_logic,
+            data_requirements=data_requirements,
+            risk_factors=risk_factors,
+            confidence=confidence,
+        ), repairs
+
+    # ──────────────────────────────────────────────────────────────
     # Internal helpers
     # ──────────────────────────────────────────────────────────────
 
     def _call_llm(self, prompt: str) -> str:
         """Call OpenAI API with caching."""
+        if not self.api_key:
+            raise RuntimeError(
+                "ResearchAgent LLM call refused: no DEEPSEEK_API_KEY / api_key "
+                "configured (the agent was downgraded to keyword mode)"
+            )
+
+        if len(prompt) > self.MAX_PROMPT_CHARS:
+            raise ValueError(
+                f"LLM prompt too long ({len(prompt)} chars; "
+                f"max {self.MAX_PROMPT_CHARS})"
+            )
+
         cache_key = hashlib.md5(prompt.encode()).hexdigest()
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -495,19 +1057,31 @@ Output ONLY valid JSON array."""
             temperature=0.1,
         )
         result = response.choices[0].message.content.strip()
+        if len(self._cache) >= self.MAX_PROMPT_CACHE_ENTRIES:
+            # Bounded FIFO eviction; prompts are built from bounded inputs.
+            self._cache.pop(next(iter(self._cache)))
         self._cache[cache_key] = result
         return result
 
     @staticmethod
-    def _chunk_text(text: str, max_chars: int = 2000) -> list[str]:
-        """Split text into chunks respecting sentence boundaries."""
+    def _chunk_text(text: str, max_chars: int = 1500) -> list[str]:
+        """Split text into chunks of at most ``max_chars`` characters.
+
+        Sentence boundaries are preferred; a single sentence longer than
+        ``max_chars`` is hard-split so its tail is never silently dropped.
+        """
         if len(text) <= max_chars:
             return [text]
 
-        chunks = []
-        sentences = re.split(r'(?<=[。！？\n])', text)
+        chunks: list[str] = []
         current = ""
-        for sentence in sentences:
+        for sentence in re.split(r'(?<=[。！？\n])', text):
+            while len(sentence) > max_chars:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.append(sentence[:max_chars])
+                sentence = sentence[max_chars:]
             if len(current) + len(sentence) > max_chars:
                 if current:
                     chunks.append(current)

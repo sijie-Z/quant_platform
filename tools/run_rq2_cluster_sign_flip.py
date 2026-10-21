@@ -26,6 +26,7 @@ from quant_platform.factors.registry import get_registry
 from quant_platform.factors.technical import register_all as register_technical
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 
 setup_logging()
 logger = get_logger("rq2")
@@ -36,7 +37,8 @@ logger = get_logger("rq2")
 ALPHA_STRENGTH = 0.06
 N_STOCKS = 500
 START_DATE = "2021-01-01"
-END_DATE = "2025-12-31"
+# Resolved at run time (QUANT_RESEARCH_END_DATE or today); never hardcoded.
+END_DATE = resolve_end_date()
 INITIAL_CAPITAL = 10_000_000
 
 TOP8_FACTORS = [
@@ -203,13 +205,27 @@ def extract_metrics(bt_results, signal_ic):
     """Extract protocol metrics from backtest results and IC."""
     summary = bt_results.get("summary", {})
     metrics = {
-        "IC":        signal_ic.get("mean_ic", 0),
-        "ICIR":      signal_ic.get("icir", 0),
-        "Sharpe":    summary.get("sharpe_ratio", 0),
-        "MDD":       summary.get("max_drawdown", 0),
-        "Turnover":  summary.get("avg_turnover", summary.get("turnover", 0)),
+        "IC":        signal_ic.get("mean_ic", np.nan),
+        "ICIR":      signal_ic.get("icir", np.nan),
+        "Sharpe":    summary.get("sharpe_ratio", np.nan),
+        "MDD":       summary.get("max_drawdown", np.nan),
+        # Engine key is annual_turnover; the old fallbacks never exist.
+        "Turnover":  summary.get("annual_turnover", np.nan),
+        "Status":    "ok",
+        "Error":     "",
     }
     return metrics
+
+
+def failed_metrics(signal_ic, exc):
+    """Metrics for a failed backtest: NaN, never a fake zero (R64)."""
+    return {
+        "IC": signal_ic.get("mean_ic", np.nan),
+        "ICIR": signal_ic.get("icir", np.nan),
+        "Sharpe": np.nan, "MDD": np.nan, "Turnover": np.nan,
+        "Status": "failed",
+        "Error": f"{type(exc).__name__}: {exc}",
+    }
 
 
 def print_results_table(results_list):
@@ -255,6 +271,9 @@ if __name__ == "__main__":
     # Load data
     logger.info("[1/4] Loading data...")
     prices, returns, benchmark, sector_map, turnover = load_data()
+    data_start = str(prices.index[0].date())
+    data_end = str(prices.index[-1].date())
+    logger.info("Data window: %s → %s (requested end %s)", data_start, data_end, END_DATE)
 
     # Compute factors
     logger.info("[2/4] Computing factors...")
@@ -285,8 +304,7 @@ if __name__ == "__main__":
             metrics = extract_metrics(bt_results, signal_ic)
         except Exception as e:
             logger.error("  Backtest failed: %s", e)
-            metrics = {"IC": signal_ic.get("mean_ic", 0), "ICIR": signal_ic.get("icir", 0),
-                       "Sharpe": 0, "MDD": 0, "Turnover": 0}
+            metrics = failed_metrics(signal_ic, e)
 
         metrics["Experiment"] = exp_name
         results_list.append(metrics)
@@ -306,6 +324,7 @@ if __name__ == "__main__":
     print("  === END RAW DATA: RQ2_RAW ===")
     print()
 
+    df_raw = stamp_provenance(df_raw, data_start, data_end)
     output_path = Path("results/rq2_cluster_sign_flip.csv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df_raw.to_csv(output_path, index=False)

@@ -38,6 +38,11 @@ from quant_platform.factors.registry import get_registry
 from quant_platform.factors.technical import register_all as register_technical
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import (
+    resolve_end_date,
+    stamp_provenance,
+    year_windows,
+)
 
 setup_logging()
 logger = get_logger("rq3")
@@ -48,7 +53,8 @@ logger = get_logger("rq3")
 ALPHA_STRENGTH = 0.06
 N_STOCKS = 500
 START_DATE = "2021-01-01"
-END_DATE = "2025-12-31"
+# Resolved at run time; the old hardcoded 2025-12-31 aged silently.
+END_DATE = resolve_end_date()
 INITIAL_CAPITAL = 10_000_000
 
 TOP8_FACTORS = [
@@ -66,14 +72,8 @@ CLUSTERS = {
 CLUSTER_NAMES = list(CLUSTERS.keys())
 ALL_NAME = "ALL"
 
-# Experiment 3.1: Fixed yearly windows
-YEAR_WINDOWS = [
-    ("2021", "2021-01-01", "2021-12-31"),
-    ("2022", "2022-01-01", "2022-12-31"),
-    ("2023", "2023-01-01", "2023-12-31"),
-    ("2024", "2024-01-01", "2024-12-31"),
-    ("2025", "2025-01-01", "2025-12-31"),
-]
+# Experiment 3.1: Fixed yearly windows, clipped at the resolved end date.
+YEAR_WINDOWS = year_windows(2021, END_DATE)
 
 # Experiment 3.2: Regime thresholds (protocol frozen)
 REGIME_THRESHOLDS = {
@@ -313,6 +313,9 @@ if __name__ == "__main__":
     # Load data
     logger.info("[1/5] Loading data...")
     prices, returns, benchmark, sector_map, turnover = load_data()
+    data_start = str(prices.index[0].date())
+    data_end = str(prices.index[-1].date())
+    logger.info("Data window: %s → %s (requested end %s)", data_start, data_end, END_DATE)
 
     # Compute factors
     logger.info("[2/5] Computing factors...")
@@ -345,20 +348,24 @@ if __name__ == "__main__":
             ic_s = compute_ic(year_sig, year_returns)
 
             # Backtest
+            status, error = "ok", ""
             try:
                 bt = run_backtest(year_sig, year_prices, year_returns, benchmark, sector_map)
                 summary = bt.get("summary", {})
-                sharpe = summary.get("sharpe_ratio", 0)
-                mdd = summary.get("max_drawdown", 0)
+                sharpe = summary.get("sharpe_ratio", np.nan)
+                mdd = summary.get("max_drawdown", np.nan)
             except Exception as e:
                 logger.warning("  Backtest failed for %s %s: %s", sig_name, year_name, e)
-                sharpe = 0
-                mdd = 0
+                # NaN, never 0: a failed calculation must not read as "no edge".
+                sharpe = np.nan
+                mdd = np.nan
+                status, error = "failed", f"{type(e).__name__}: {e}"
 
             row = {
                 "Cluster": sig_name, "Year": year_name,
-                "IC": ic_s.get("mean_ic", 0), "ICIR": ic_s.get("icir", 0),
+                "IC": ic_s.get("mean_ic", np.nan), "ICIR": ic_s.get("icir", np.nan),
                 "Sharpe": sharpe, "MDD": mdd,
+                "Status": status, "Error": error,
             }
             yearly_records.append(row)
             logger.info("    %-18s → IC=%.4f  ICIR=%.4f  Sharpe=%.4f",
@@ -421,27 +428,37 @@ if __name__ == "__main__":
             ic_s = compute_ic(regime_sig, regime_ret)
 
             # For Sharpe: run full backtest but extract returns only on regime dates
+            status, error = "ok", ""
             try:
                 bt = run_backtest(sig, prices, returns_aligned, benchmark, sector_map)
                 bt_returns = bt.get("daily_returns", pd.Series(dtype=float))
                 # Filter to regime dates
                 regime_bt = bt_returns[bt_returns.index.isin(regime_dates)]
                 if len(regime_bt) < 5:
-                    sharpe = 0
+                    sharpe = np.nan
                 else:
-                    regime_metrics = all_metrics(regime_bt, benchmark)
-                    sharpe = regime_metrics.get("sharpe_ratio", 0)
+                    # Regime subsets are daily returns on a sparse calendar;
+                    # infer_periods_per_year would infer ~20-82 from the
+                    # filtered span. State the daily basis explicitly.
+                    regime_metrics = all_metrics(
+                        regime_bt, benchmark, periods_per_year=252
+                    )
+                    sharpe = regime_metrics.get("sharpe_ratio", np.nan)
+                    if not regime_metrics:
+                        sharpe = np.nan
             except Exception as e:
                 logger.warning("  Regime BT failed for %s %s: %s", sig_name, regime_name, e)
-                sharpe = 0
+                sharpe = np.nan
+                status, error = "failed", f"{type(e).__name__}: {e}"
 
             # Denominator is actual *labelled* trading days, not calendar days
             # (the old 1826-day denominator made regime shares sum to ~70%).
             pct_time = regime_pct_time(common_dates, daily_regime)
             row = {
                 "Cluster": sig_name, "Regime": regime_name,
-                "IC": ic_s.get("mean_ic", 0), "ICIR": ic_s.get("icir", 0),
+                "IC": ic_s.get("mean_ic", np.nan), "ICIR": ic_s.get("icir", np.nan),
                 "Sharpe": sharpe, "%Time": round(pct_time, 1),
+                "Status": status, "Error": error,
             }
             regime_records.append(row)
             logger.info("    %-18s %-10s → IC=%.4f  ICIR=%.4f  Sharpe=%.4f  (%4.1f%% of days)",
@@ -454,6 +471,8 @@ if __name__ == "__main__":
     output_dir = Path("results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    df_yearly = stamp_provenance(df_yearly, data_start, data_end)
+    df_regime = stamp_provenance(df_regime, data_start, data_end)
     df_yearly.to_csv(output_dir / "rq3_yearly_stability.csv", index=False)
     df_regime.to_csv(output_dir / "rq3_regime_decomposition.csv", index=False)
 

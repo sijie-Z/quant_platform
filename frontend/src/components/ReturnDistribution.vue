@@ -78,15 +78,25 @@ function renderChart() {
   // Build bar data: midpoint of each bin
   const barData = []
   const normalData = []
-  const totalArea = counts.reduce((s, c) => s + c, 0)
-  const binWidth = edges.length > 1 ? edges[1] - edges[0] : 1
+  const cleanCounts = counts.map(Number).filter(Number.isFinite)
+  const totalArea = cleanCounts.reduce((s, c) => s + c, 0)
+  const binWidth = edges.length > 1 ? Number(edges[1]) - Number(edges[0]) : 1
+  const mean = Number(d.mean)
+  const std = Number(d.std)
+  // A constant return series legitimately yields std === 0; dividing by it
+  // produced an Infinity normal-overlay series.
+  const canOverlayNormal = Number.isFinite(mean) && Number.isFinite(std) && std > 0 &&
+    Number.isFinite(binWidth) && binWidth > 0
 
   for (let i = 0; i < counts.length; i++) {
-    const mid = (edges[i] + edges[i + 1]) / 2
-    barData.push([mid, counts[i]])
-    // Normal distribution overlay (scaled to match histogram area)
-    const pdf = normalPDF(mid, d.mean, d.std)
-    normalData.push([mid, pdf * totalArea * binWidth])
+    const mid = (Number(edges[i]) + Number(edges[i + 1])) / 2
+    if (!Number.isFinite(mid)) continue
+    barData.push([mid, Number(counts[i]) || 0])
+    if (canOverlayNormal) {
+      // Normal distribution overlay (scaled to match histogram area)
+      const pdf = normalPDF(mid, mean, std)
+      normalData.push([mid, pdf * totalArea * binWidth])
+    }
   }
 
   chartInstance.setOption({
@@ -136,36 +146,39 @@ function renderChart() {
           ]),
           borderRadius: [1, 1, 0, 0],
         },
-        markLine: {
+        markLine: Number.isFinite(mean) ? {
           silent: true,
           symbol: 'none',
           data: [
             {
-              xAxis: d.mean,
+              xAxis: mean,
               lineStyle: { color: '#34d399', width: 1, type: 'solid' },
               label: {
                 show: true,
-                formatter: 'μ ' + d.mean?.toFixed(2) + '%',
+                formatter: 'μ ' + mean.toFixed(2) + '%',
                 color: '#34d399',
                 fontSize: 9,
                 position: 'insideEndTop',
               },
             },
           ],
-        },
+        } : { silent: true, symbol: 'none', data: [] },
       },
-      {
+      ...(canOverlayNormal ? [{
         name: 'Normal',
         type: 'line',
         data: normalData,
         smooth: 0.4,
         lineStyle: { color: '#fbbf24', width: 1.5, type: 'dashed' },
         symbol: 'none',
-      },
+      }] : []),
     ],
   })
 
   if (window.ResizeObserver) {
+    // renderChart recreates the chart on every data change; disconnect the
+    // previous observer instead of accumulating one per render.
+    if (resizeObserver) resizeObserver.disconnect()
     resizeObserver = new ResizeObserver(() => chartInstance?.resize())
     resizeObserver.observe(chartRef.value)
   }
