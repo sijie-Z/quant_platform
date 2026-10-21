@@ -197,6 +197,9 @@ markers = [
     "asyncio: marks tests as async",
 ]
 asyncio_mode = "auto"
+# A hung test must fail with a stack dump instead of eating the job timeout.
+timeout = 300
+timeout_method = "thread"
 filterwarnings = [
     "ignore::DeprecationWarning:dateutil.*",
     "ignore::DeprecationWarning:pytz.*",
