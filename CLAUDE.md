@@ -816,13 +816,13 @@ cd frontend && npm run dev
 | | `POST /api/monitor/config` | 风控限额更新 |
 | | `POST /api/monitor/kill-switch` | Kill Switch触发 |
 | **PostgreSQL** | `GET /api/postgres/stats` | PostgreSQL存储统计(SQLite回退) |
-| **WebSocket行情** | `GET /api/ws-quotes/start` | 启动WebSocket行情服务 |
-| | `GET /api/ws-quotes/stop` | 停止WebSocket行情服务 |
+| **WebSocket行情** | `POST /api/ws-quotes/start` | 启动WebSocket行情服务 |
+| | `POST /api/ws-quotes/stop` | 停止WebSocket行情服务 |
 | | `GET /api/ws-quotes/stats` | WebSocket连接统计 |
 | | `GET /api/ws-quotes/{code}` | 个股实时报价 |
 | | `GET /api/ws-quotes` | 所有缓存报价 |
-| **Level 2盘口** | `GET /api/l2/start` | 启动Level 2数据服务 |
-| | `GET /api/l2/stop` | 停止Level 2服务 |
+| **Level 2盘口** | `POST /api/l2/start` | 启动Level 2数据服务 |
+| | `POST /api/l2/stop` | 停止Level 2服务 |
 | | `GET /api/l2/stats` | Level 2统计 |
 | | `GET /api/l2/book/{code}` | 10档订单簿 |
 | | `GET /api/l2/ticks/{code}` | 逐笔成交数据 |
