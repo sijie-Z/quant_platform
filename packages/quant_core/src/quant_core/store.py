@@ -874,11 +874,10 @@ class Store:
         daily_pnl = (
             total_equity - previous_equity if previous_equity is not None else 0.0
         )
-        daily_pnl_pct = (
-            daily_pnl / previous_equity
-            if previous_equity not in (None, 0.0)
-            else 0.0
-        )
+        if previous_equity is not None and previous_equity != 0.0:
+            daily_pnl_pct = daily_pnl / previous_equity
+        else:
+            daily_pnl_pct = 0.0
         cumulative_pnl = (
             total_equity - first_equity if previous_equity is not None else 0.0
         )
