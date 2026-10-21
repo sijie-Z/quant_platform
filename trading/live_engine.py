@@ -27,12 +27,81 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant_platform.data.providers.base import normalize_corporate_actions
+from quant_platform.shared.symbols import normalize_symbol, price_limit_threshold
+
 logger = logging.getLogger(__name__)
 
 # Bases that describe a return-generating (adjusted) series.  A paper/live
 # fill or mark must never use them: shares and cash are denominated in the
 # traded CNY price, and a split/dividend would silently re-scale the book.
 ADJUSTED_PRICE_BASES = frozenset({"qfq", "hfq", "adjusted"})
+
+
+def normalize_corporate_action_feed(actions) -> pd.DataFrame:
+    """Normalize a provider feed and pin ex-dates to naive exchange days.
+
+    ``normalize_corporate_actions`` parses the contract but leaves a
+    timezone-aware ``ex_date`` tz-aware (and its vectorised ``to_datetime``
+    coerces *naive* rows to ``NaT`` when a column mixes aware and naive
+    values).  A paper engine advances with naive ``YYYY-MM-DD`` exchange
+    dates, so a tz-aware value can raise or silently mis-date an action.
+
+    Ex-dates are therefore pinned **element-wise before** the contract
+    parser: a tz-aware timestamp is converted to Asia/Shanghai and its
+    timezone dropped, then normalized to midnight; a naive value is only
+    normalized; an unparseable value becomes ``NaT`` (dropped by the
+    contract parser, like before).  Mixed-timezone feeds therefore keep
+    every row.
+    """
+    if actions is None:
+        return normalize_corporate_actions(None)
+    frame = (
+        actions.copy() if isinstance(actions, pd.DataFrame)
+        else pd.DataFrame(actions)
+    )
+    if "ex_date" in frame.columns and len(frame):
+        frame["ex_date"] = frame["ex_date"].map(_pin_corporate_action_date)
+    return normalize_corporate_actions(frame)
+
+
+def _pin_corporate_action_date(value) -> pd.Timestamp:
+    """One ex-date -> naive midnight in the exchange timezone (``NaT`` on junk)."""
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return pd.NaT
+    if timestamp is pd.NaT:
+        return pd.NaT
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("Asia/Shanghai").tz_localize(None)
+    return timestamp.normalize()
+
+
+def summarize_corporate_action_events(
+    events, source: str = "",
+) -> dict[str, Any]:
+    """Provenance summary for a run/session report.
+
+    ``events`` is the list of audit dicts returned by an action application
+    (one entry per ``(asset, ex_date)`` event).  The summary answers "were
+    corporate actions applied in this run?", with the count, the latest
+    ex-date seen and where the feed came from (``"pipeline:baostock"``,
+    ``"synthetic"``, ``"manual"``, ...).  An empty/absent feed yields
+    ``{"count": 0, "last_ex_date": None, "source": source}`` rather than
+    disappearing from the report.
+    """
+    applied = [event for event in (events or []) if isinstance(event, dict)]
+    dates = [
+        str(event.get("date") or "")[:10]
+        for event in applied
+        if str(event.get("date") or "")
+    ]
+    return {
+        "count": len(applied),
+        "last_ex_date": max(dates) if dates else None,
+        "source": str(source or ""),
+    }
 
 
 def ensure_raw_price_basis(
@@ -97,7 +166,7 @@ class LiveEngine:
         engine.run()
     """
 
-    def __init__(self, data_provider=None, broker=None):
+    def __init__(self, data_provider=None, broker=None, cash_dividend_tax_rate: float = 0.0):
         self.data_provider = data_provider
         self.broker = broker
         self.state = State()
@@ -107,6 +176,194 @@ class LiveEngine:
         # Basis of `self._prices`; money paths require "raw" (or an explicitly
         # acknowledged legacy panel).
         self._price_basis: str = "unknown"
+        # Corporate actions (paper runtime only).  Markers persist inside the
+        # engine snapshot, so a daemon restart never re-applies an ex-date.
+        self._cash_dividend_tax_rate = max(0.0, float(cash_dividend_tax_rate))
+        self._corporate_actions: pd.DataFrame | None = None
+        self._applied_corporate_actions: set[tuple[str, str]] = set()
+        self.cash_ledger: list[dict[str, Any]] = []
+        self.corporate_action_events: list[dict[str, Any]] = []
+        #: asset -> (ex_date, ratio) for a split applied on that session; used
+        #: to value a suspended ex-date at the post-split reference instead of
+        #: the stale pre-split close the panel repeats that day.
+        self._split_valuation_override: dict[str, tuple[str, float]] = {}
+
+    def set_corporate_actions(self, actions) -> int:
+        """Load the cash/split feed applied as exchange days advance.
+
+        Real brokers (QMT/XTP) settle corporate actions on their side; when
+        one is wired to this engine the feed is stored but never applied
+        locally, matching the "no double accounting" rule.  Returns the
+        number of actions loaded.
+        """
+        frame = normalize_corporate_actions(actions)
+        self._corporate_actions = frame
+        if not self._corporate_actions_supported():
+            logger.warning(
+                "Broker %s settles corporate actions remotely; the feed is "
+                "stored but will NOT be applied to the local book",
+                type(self.broker).__name__,
+            )
+        return len(frame)
+
+    def _corporate_actions_supported(self) -> bool:
+        """Whether this engine owns the book (paper) or a broker does."""
+        if self.broker is None:
+            return True
+        return bool(getattr(self.broker, "supports_corporate_actions", False))
+
+    def apply_corporate_actions(
+        self, actions=None, date: pd.Timestamp | str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Apply actions with ``ex_date <= date`` once (paper book only).
+
+        A split multiplies ``shares`` and divides ``entry_price`` (position
+        value unchanged); a cash dividend credits
+        ``shares * cash_per_share * (1 - tax)`` to ``state.cash``.  The
+        adjusted research price panel already carries the ex-date drop, so
+        equity is continuous across the action.  Applied ``(asset, ex_date)``
+        markers make replays no-ops; they travel in
+        :meth:`to_snapshot`.
+        """
+        if not self._corporate_actions_supported():
+            return []
+        if actions is not None:
+            frame = normalize_corporate_actions(actions)
+        else:
+            frame = self._corporate_actions
+        if frame is None or frame.empty:
+            return []
+        cutoff = pd.Timestamp(date).normalize() if date is not None else None
+        rows = frame.copy()
+        rows["_order"] = rows["kind"].map(
+            lambda kind: 0 if kind == "cash" else 1
+        )
+        rows = rows.sort_values(["ex_date", "asset", "_order"], kind="stable")
+        applied: list[dict[str, Any]] = []
+        # One marker per (asset, ex_date) event; a combined cash+split pair
+        # shares the key and both components are applied before recording it.
+        for (group_date, group_asset), group in rows.groupby(
+            ["ex_date", "asset"], sort=False,
+        ):
+            action_date = pd.Timestamp(group_date).normalize()
+            if cutoff is not None and action_date > cutoff:
+                continue
+            asset = normalize_symbol(group_asset)
+            marker = (asset, action_date.date().isoformat())
+            if marker in self._applied_corporate_actions:
+                continue
+            self._applied_corporate_actions.add(marker)
+            event = self._apply_action_group(asset, marker, group)
+            if event is not None:
+                self.corporate_action_events.append(event)
+                applied.append(event)
+        return applied
+
+    def _apply_action_group(
+        self, asset: str, marker: tuple[str, str], group: pd.DataFrame,
+    ) -> dict[str, Any] | None:
+        """Apply all components sharing one ``(asset, ex_date)`` marker.
+
+        Only positions held *before* the ex-date are entitled: a position
+        entered on or after the ex-date must not receive a caught-up past
+        action (the daemon replays the latest date, so the window can be
+        wide).  An empty ``entry_date`` (legacy/imported book) is treated as
+        pre-existing.
+        """
+        ex_date = marker[1]
+        matches = [
+            position for position in self.state.positions
+            if normalize_symbol(position.asset) == asset
+            and str(position.entry_date or "") < ex_date
+        ]
+        cash_total = 0.0
+        tax_total = 0.0
+        cash_per_share_total = 0.0
+        split_ratio_total = 1.0
+        components: list[dict[str, Any]] = []
+        timestamp = datetime.now().isoformat(timespec="seconds")
+
+        # Cash first: a 送转+派息 dividend is declared per pre-split share.
+        for _, row in group.iterrows():
+            if str(row["kind"]) != "cash":
+                continue
+            cash_per_share = float(row["cash_per_share"])
+            if not (cash_per_share > 0):
+                continue
+            quantity = sum(p.shares for p in matches)
+            gross = quantity * cash_per_share
+            tax = gross * self._cash_dividend_tax_rate
+            net = gross - tax
+            cash_total += net
+            tax_total += tax
+            cash_per_share_total += cash_per_share
+            components.append({
+                "kind": "cash",
+                "cash_per_share": cash_per_share,
+                "cash_delta": net,
+                "tax": tax,
+            })
+            if quantity > 0:
+                self.cash_ledger.append({
+                    "date": ex_date,
+                    "asset": asset,
+                    "kind": "cash_dividend",
+                    "quantity": quantity,
+                    "cash_per_share": cash_per_share,
+                    "tax": round(tax, 6),
+                    "cash_delta": round(net, 6),
+                    "description": f"{quantity} shares x {cash_per_share}/share",
+                    "timestamp": timestamp,
+                })
+        if cash_total:
+            self.state.cash += cash_total
+
+        for _, row in group.iterrows():
+            if str(row["kind"]) != "split":
+                continue
+            ratio = float(row["split_ratio"])
+            if not (ratio > 0) or ratio == 1.0:
+                continue
+            split_ratio_total *= ratio
+            components.append({"kind": "split", "split_ratio": ratio})
+            for position in matches:
+                position.shares = int(round(position.shares * ratio))
+                position.entry_price = (
+                    position.entry_price / ratio
+                    if position.entry_price > 0 else 0.0
+                )
+            if matches:
+                self._split_valuation_override[asset] = (ex_date, ratio)
+
+        if not components:
+            return None
+        kinds = sorted({component["kind"] for component in components})
+        event: dict[str, Any] = {
+            "date": ex_date,
+            "asset": asset,
+            "kind": "+".join(kinds),
+            "positions": len(matches),
+            "quantity": sum(p.shares for p in matches),
+            "cash_delta": cash_total,
+            "tax": tax_total,
+            "cash_per_share": cash_per_share_total,
+            "split_ratio": split_ratio_total,
+            "components": components,
+            "timestamp": timestamp,
+        }
+        self._publish_corporate_action(event)
+        return event
+
+    @staticmethod
+    def _publish_corporate_action(event: dict[str, Any]) -> None:
+        try:
+            from quant_platform.core.events import get_event_bus
+
+            get_event_bus().publish(
+                "corporate_action", event, source="live_engine",
+            )
+        except Exception:  # monitoring must never break the runtime
+            pass
 
     # ── 初始化 ──
 
@@ -221,6 +478,12 @@ class LiveEngine:
             "status": self.state.status,
             "last_processed_date": self.state.last_processed_date,
             "day_count": self._day_count,
+            # Additive (v2 stays readable): applied corporate-action markers
+            # must survive a restart so a replayed ex-date is a no-op.
+            "applied_corporate_actions": sorted(
+                [asset, date_text]
+                for asset, date_text in self._applied_corporate_actions
+            ),
         }
 
     def restore_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -256,6 +519,10 @@ class LiveEngine:
         self.state.status = snapshot.get("status", "init")
         self.state.last_processed_date = snapshot.get("last_processed_date", "")
         self._day_count = int(snapshot.get("day_count", 0))
+        self._applied_corporate_actions = {
+            (normalize_symbol(asset), str(date_text))
+            for asset, date_text in snapshot.get("applied_corporate_actions", [])
+        }
 
     # ── 核心循环 ──
 
@@ -285,6 +552,13 @@ class LiveEngine:
 
         self._day_count += 1
         result: dict[str, Any] = {"date": date_str, "action": "none"}
+
+        # 0. Corporate actions: every pending ex-date up to this session is
+        #    applied once (markers persisted in snapshots).  Done before the
+        #    equity mark so cash and shares move together on the ex-date.
+        applied_actions = self.apply_corporate_actions(date=date)
+        if applied_actions:
+            result["corporate_actions"] = len(applied_actions)
 
         # 1. 更新权益
         self._update_equity(date)
@@ -348,17 +622,65 @@ class LiveEngine:
     # ── 内部方法 ──
 
     def _update_equity(self, date: pd.Timestamp):
-        """计算当日总权益 (逐日盯市)."""
+        """计算当日总权益 (逐日盯市).
+
+        On a split's ex-date a suspended stock keeps feeding its stale
+        pre-split close; valuing the doubled share count at that level would
+        double the position.  The quote is therefore validated against the
+        post-split reference (previous close / ratio): a move larger than the
+        board's daily limit cannot be a real one-session return and the
+        reference price is used for that mark instead.
+        """
+        date_str = str(date)[:10]
+        for asset, (override_date, _ratio) in list(
+            self._split_valuation_override.items()
+        ):
+            if override_date != date_str:
+                del self._split_valuation_override[asset]
+
         pos_value = 0.0
         if self._prices is not None and date in self._prices.index:
             px = self._prices.loc[date]
             for pos in self.state.positions:
                 if pos.asset in px.index and not pd.isna(px[pos.asset]):
-                    pos_value += pos.shares * px[pos.asset]
+                    price = float(px[pos.asset])
+                    asset = normalize_symbol(pos.asset)
+                    override = self._split_valuation_override.get(asset)
+                    if override is not None and override[0] == date_str:
+                        reference = self._post_split_reference(
+                            pos.asset, date, override[1],
+                        )
+                        limit = price_limit_threshold(asset)
+                        if (
+                            reference is not None
+                            and price > reference * (1 + limit + 1e-9)
+                        ):
+                            logger.warning(
+                                "[%s] %s split ex-date: stale pre-split quote "
+                                "%.4f ignored for valuation (post-split "
+                                "reference %.4f)",
+                                date_str, pos.asset, price, reference,
+                            )
+                            price = reference
+                        else:
+                            del self._split_valuation_override[asset]
+                    pos_value += pos.shares * price
 
         self.state.current_equity = self.state.cash + pos_value
         if self.state.current_equity > self.state.equity_peak:
             self.state.equity_peak = self.state.current_equity
+
+    def _post_split_reference(
+        self, asset: str, date: pd.Timestamp, ratio: float,
+    ) -> float | None:
+        """Previous observable close divided by the split ratio."""
+        if self._prices is None or asset not in self._prices.columns:
+            return None
+        history = self._prices[asset].loc[:date]
+        history = history.iloc[:-1].dropna()
+        if history.empty or not (ratio > 0):
+            return None
+        return float(history.iloc[-1]) / ratio
 
     def _execute_rebalance(self, date: pd.Timestamp) -> str:
         """执行调仓."""

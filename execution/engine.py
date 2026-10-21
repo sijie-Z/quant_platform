@@ -14,7 +14,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+import pandas as pd
+
 from quant_platform.core.events import get_event_bus
+from quant_platform.data.providers.base import normalize_corporate_actions
 from quant_platform.execution.models import (
     Fill,
     Order,
@@ -23,6 +26,7 @@ from quant_platform.execution.models import (
     Position,
 )
 from quant_platform.execution.oms import require_raw_price_basis
+from quant_platform.shared.symbols import normalize_symbol
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -257,7 +261,11 @@ class ExecutionEngine:
         engine.process_fill(order, price=150.0, quantity=100)
     """
 
-    def __init__(self, initial_cash: float | None = None):
+    def __init__(
+        self,
+        initial_cash: float | None = None,
+        cash_dividend_tax_rate: float = 0.0,
+    ):
         self._orders: dict[str, Order] = {}
         self._positions: dict[str, Position] = {}
         self._executed_orders: list[Order] = []
@@ -275,6 +283,16 @@ class ExecutionEngine:
         #: `new_trading_day()`. 0 disables the lock (buy fills immediately
         #: become available).
         self.t_plus: int = 1
+
+        #: Corporate-action state (paper/backtest book only).  Markers are
+        #: keyed on ``(canonical_ticker, ex_date)``; call
+        #: :meth:`restore_corporate_action_markers` after a restart.
+        self._cash_dividend_tax_rate = max(0.0, float(cash_dividend_tax_rate))
+        self._applied_corporate_actions: set[tuple[str, str]] = set()
+        self._corporate_action_events: list[dict[str, Any]] = []
+        self._cash_ledger: list[dict[str, Any]] = []
+        #: Optional feed applied by dated :meth:`new_trading_day` calls.
+        self._corporate_actions: pd.DataFrame | None = None
 
     @property
     def cash_tracking_enabled(self) -> bool:
@@ -442,14 +460,25 @@ class ExecutionEngine:
         if order.status in (OrderStatus.SUBMITTED, OrderStatus.PARTIAL):
             transition_order(order, OrderStatus.EXPIRED)
 
-    def new_trading_day(self) -> None:
-        """Roll T+1: everything held overnight becomes sellable today.
+    def new_trading_day(self, date: str | None = None) -> list[dict[str, Any]]:
+        """Roll T+1 and apply corporate actions on an exchange-day advance.
+
+        Everything held overnight becomes sellable today.  When ``date`` is
+        given and a feed was loaded with :meth:`set_corporate_actions`, every
+        action with ``ex_date <= date`` that has not been applied yet is
+        applied exactly once.  Omitting ``date`` preserves the historical
+        T+1-only behaviour.
 
         Must be called once per trading session before orders are placed
         (the orchestrator does this when the exchange date advances).
         """
         for position in self._positions.values():
             position.available = position.quantity
+        if date is None or self._corporate_actions is None:
+            return []
+        return self.apply_corporate_actions(
+            self._corporate_actions, ex_date=date,
+        )
 
     def mark_to_market(
         self, prices: dict[str, float], price_basis: str = "raw",
@@ -464,12 +493,226 @@ class ExecutionEngine:
             if price > 0:
                 position.update_price(price)
 
+    # ── Corporate actions (paper/backtest book only) ──
+
+    @property
+    def corporate_action_markers(self) -> list[tuple[str, str]]:
+        """Applied ``(ticker, ex_date)`` markers for external persistence."""
+        return sorted(self._applied_corporate_actions)
+
+    def restore_corporate_action_markers(self, markers) -> None:
+        """Rehydrate applied markers after a restart (idempotent).
+
+        Accepts any iterable of ``(ticker, ex_date)`` pairs (or a dict with
+        an ``"applied"`` list, the shape SimulatedBroker persists).
+        """
+        if isinstance(markers, dict):
+            markers = markers.get("applied", [])
+        for item in markers or []:
+            try:
+                ticker, date_text = item
+                self._applied_corporate_actions.add(
+                    (normalize_symbol(ticker), str(date_text))
+                )
+            except (TypeError, ValueError):
+                continue
+
+    def get_corporate_action_events(self) -> list[dict[str, Any]]:
+        return [dict(event) for event in self._corporate_action_events]
+
+    def get_cash_ledger(self) -> list[dict[str, Any]]:
+        return [dict(entry) for entry in self._cash_ledger]
+
+    def set_corporate_actions(self, actions) -> int:
+        """Load the pending cash/split feed applied on exchange-day advances."""
+        self._corporate_actions = normalize_corporate_actions(actions)
+        return len(self._corporate_actions)
+
+    def apply_corporate_actions(
+        self,
+        actions,
+        ex_date: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Apply split/cash actions to positions and cash exactly once.
+
+        Same contract and conventions as
+        :meth:`quant_platform.trading.broker.SimulatedBroker.apply_corporate_actions`:
+        a split scales ``quantity``/``available`` and divides ``avg_cost`` and
+        the mark (market value unchanged); a cash dividend credits
+        ``quantity * cash_per_share * (1 - tax)``, adds it to the position's
+        realised P&L and lowers the cached mark by the per-share amount so
+        equity stays continuous.  Applied ``(ticker, ex_date)`` markers make
+        replays no-ops; persist them with
+        :attr:`corporate_action_markers` / :meth:`restore_corporate_action_markers`
+        to survive a restart.
+        """
+        frame = normalize_corporate_actions(actions)
+        if frame.empty:
+            return []
+        cutoff = (
+            pd.Timestamp(ex_date).normalize() if ex_date is not None else None
+        )
+        rows = frame.copy()
+        rows["_order"] = rows["kind"].map(
+            lambda kind: 0 if kind == "cash" else 1
+        )
+        rows = rows.sort_values(["ex_date", "asset", "_order"], kind="stable")
+        applied: list[dict[str, Any]] = []
+        # One marker per (asset, ex_date) event: a combined cash+split pair
+        # shares the key and both components are applied before it is
+        # recorded, so the second row is never skipped as a replay.
+        for (group_date, group_asset), group in rows.groupby(
+            ["ex_date", "asset"], sort=False,
+        ):
+            action_date = pd.Timestamp(group_date).normalize()
+            if cutoff is not None and action_date > cutoff:
+                continue
+            marker = (
+                normalize_symbol(group_asset),
+                action_date.date().isoformat(),
+            )
+            if marker in self._applied_corporate_actions:
+                continue
+            self._applied_corporate_actions.add(marker)
+            event = self._apply_action_group(marker, group)
+            if event is not None:
+                self._corporate_action_events.append(event)
+                applied.append(event)
+        return applied
+
+    def _position_for_ticker(self, ticker: str) -> Position | None:
+        for key, position in self._positions.items():
+            if normalize_symbol(key) == ticker:
+                return position
+        return None
+
+    def _apply_action_group(
+        self, marker: tuple[str, str], group: pd.DataFrame,
+    ) -> dict[str, Any] | None:
+        """Apply all components sharing one ``(ticker, ex_date)`` marker."""
+        ticker = marker[0]
+        position = self._position_for_ticker(ticker)
+        quantity_before = int(position.quantity) if position is not None else 0
+        quantity_after = quantity_before
+        avg_cost_after = position.avg_cost if position is not None else 0.0
+        cash_total = 0.0
+        tax_total = 0.0
+        cash_per_share_total = 0.0
+        split_ratio_total = 1.0
+        components: list[dict[str, Any]] = []
+        timestamp = datetime.now().isoformat(timespec="seconds")
+
+        # Cash first: a 送转+派息 dividend is declared per pre-split share.
+        for _, row in group.iterrows():
+            if str(row["kind"]) != "cash":
+                continue
+            cash_per_share = float(row["cash_per_share"])
+            if not (cash_per_share > 0):
+                continue
+            gross = quantity_before * cash_per_share
+            tax = gross * self._cash_dividend_tax_rate
+            net = gross - tax
+            cash_total += net
+            tax_total += tax
+            cash_per_share_total += cash_per_share
+            components.append({
+                "kind": "cash",
+                "cash_per_share": cash_per_share,
+                "cash_delta": net,
+                "tax": tax,
+            })
+            if quantity_before > 0:
+                if position is not None:
+                    position.realized_pnl += net
+                    if position.current_price > 0:
+                        position.update_price(
+                            max(position.current_price - cash_per_share, 0.0)
+                        )
+                self._cash_ledger.append({
+                    "date": marker[1],
+                    "ticker": ticker,
+                    "kind": "cash_dividend",
+                    "quantity": quantity_before,
+                    "cash_per_share": cash_per_share,
+                    "tax": round(tax, 6),
+                    "cash_delta": round(net, 6),
+                    "description": (
+                        f"{quantity_before} shares x {cash_per_share}/share"
+                    ),
+                    "timestamp": timestamp,
+                })
+        if quantity_before > 0 and cash_total:
+            # Cash is only tracked when the engine was given an initial
+            # balance or `enable_cash_tracking` was called; an untracked
+            # engine's `cash` must not silently become a dividend-only
+            # balance while its trades are not debited.
+            if self._cash_tracked:
+                self.cash += cash_total
+
+        for _, row in group.iterrows():
+            if str(row["kind"]) != "split":
+                continue
+            ratio = float(row["split_ratio"])
+            if not (ratio > 0) or ratio == 1.0:
+                continue
+            split_ratio_total *= ratio
+            components.append({"kind": "split", "split_ratio": ratio})
+            if position is not None:
+                new_quantity = int(round(position.quantity * ratio))
+                position.quantity = new_quantity
+                position.available = min(
+                    new_quantity, int(round(position.available * ratio)),
+                )
+                if position.avg_cost > 0:
+                    position.avg_cost = position.avg_cost / ratio
+                if position.current_price > 0:
+                    position.update_price(position.current_price / ratio)
+                quantity_after = new_quantity
+                avg_cost_after = position.avg_cost
+
+        if not components:
+            return None
+        kinds = sorted({component["kind"] for component in components})
+        event: dict[str, Any] = {
+            "date": marker[1],
+            "ticker": ticker,
+            "kind": "+".join(kinds),
+            "quantity_before": quantity_before,
+            "quantity_after": quantity_after,
+            "cash_delta": cash_total,
+            "tax": tax_total,
+            "cash_per_share": cash_per_share_total,
+            "split_ratio": split_ratio_total,
+            "components": components,
+            "timestamp": timestamp,
+        }
+        if position is not None:
+            event["avg_cost_after"] = avg_cost_after
+        self._publish_corporate_action(event)
+        return event
+
+    @staticmethod
+    def _publish_corporate_action(event: dict[str, Any]) -> None:
+        try:
+            get_event_bus().publish(
+                "corporate_action", event, source="execution_engine",
+            )
+        except Exception:  # monitoring must never break the book
+            pass
+
     def reset(self) -> None:
-        """Clear all orders and positions, restoring the initial cash."""
+        """Clear all orders and positions, restoring the initial cash.
+
+        Corporate-action markers are deliberately kept: they record external
+        events already reflected in the book, and replaying them after a reset
+        would double-apply the action.
+        """
         self._orders.clear()
         self._positions.clear()
         self._executed_orders.clear()
         self.cash = self._initial_cash
+        self._cash_ledger.clear()
+        self._corporate_action_events.clear()
 
     def portfolio_snapshot(
         self, prices: dict[str, float], price_basis: str = "raw",

@@ -136,11 +136,113 @@ def test_sweep_and_parallel_grid_are_bounded():
     with pytest.raises(ValidationError):
         SweepRequest(n_stocks_list=[10**9])
     with pytest.raises(ValidationError):
+        SweepRequest(optimizers=["equal_weight"] * 100_000)
+    with pytest.raises(ValidationError):
+        SweepRequest(optimizers=[])
+    with pytest.raises(ValidationError):
         ParallelSweepRequest(param_grid={"x": list(range(21))})
     with pytest.raises(ValidationError):
         ParallelSweepRequest(param_grid={"a": [1] * 10, "b": [1] * 10, "c": [1, 2]})
     with pytest.raises(ValidationError):
         ParallelSweepRequest(max_workers=100000)
+
+
+def test_sweep_dedupes_repeated_optimizers():
+    req = SweepRequest(
+        optimizers=["equal_weight", "equal_weight", "risk_parity"],
+    )
+    assert req.optimizers == ["equal_weight", "risk_parity"]
+
+
+def test_parallel_sweep_overrides_are_validated():
+    """The audit sent n_stocks=10,000,000 and 1900..2100 straight to workers."""
+    grid = {"n_stocks": [100]}
+
+    with pytest.raises(ValidationError):
+        ParallelSweepRequest(param_grid={"n_stocks": [10_000_000]})
+    with pytest.raises(ValidationError):
+        ParallelSweepRequest(
+            param_grid=grid, base_overrides={"n_stocks": 10_000_000},
+        )
+    with pytest.raises(ValidationError):
+        ParallelSweepRequest(
+            param_grid=grid, base_overrides={"data.provider": "tushare"},
+        )
+    with pytest.raises(ValidationError):
+        ParallelSweepRequest(
+            param_grid=grid, base_overrides={"data.start_date": "1900-01-01"},
+        )
+    with pytest.raises(ValidationError):
+        ParallelSweepRequest(param_grid=grid, base_overrides={
+            "data.start_date": "2020-01-01", "data.end_date": "2100-01-01",
+        })
+    # A single one-sided override is checked against the configured window.
+    with pytest.raises(ValidationError):
+        ParallelSweepRequest(
+            param_grid=grid,
+            base_overrides={"data.end_date": "2040-01-01"},
+        )
+    with pytest.raises(ValidationError):
+        ParallelSweepRequest(param_grid={"portfolio.optimizer": ["evil"]})
+    with pytest.raises(ValidationError):
+        ParallelSweepRequest(param_grid={"portfolio.path": ["/etc/passwd"]})
+    with pytest.raises(ValidationError):
+        ParallelSweepRequest(
+            param_grid=grid, base_overrides={"alpha.method": {"nested": 1}},
+        )
+
+    ok = ParallelSweepRequest(
+        param_grid={"n_stocks": [100, 200]},
+        base_overrides={
+            "data.start_date": "2022-01-01", "data.end_date": "2024-12-31",
+        },
+    )
+    assert ok.param_grid == {"n_stocks": [100, 200]}
+
+
+def test_sweep_endpoints_reject_oversized_requests(local_client):
+    resp = local_client.post(
+        "/api/sweep",
+        json={"optimizers": ["equal_weight"] * 50_000},
+    )
+    assert resp.status_code == 422
+
+    resp = local_client.post(
+        "/api/parallel/sweep",
+        json={"param_grid": {"n_stocks": [10_000_000]}},
+    )
+    assert resp.status_code == 422
+
+
+def test_research_windows_are_bounded(local_client):
+    from quant_platform.api.research_context import parse_window
+
+    with pytest.raises(ValueError):
+        parse_window("0001-01-01", "9999-12-31")
+    with pytest.raises(ValueError):
+        parse_window("1900-01-01", "1901-01-01")
+    with pytest.raises(ValueError):
+        parse_window("2020-01-01", "2100-01-01")
+
+    for params in (
+        {"start_date": "0001-01-01", "end_date": "9999-12-31"},
+        {"start_date": "1900-01-01", "end_date": "1901-01-01"},
+        {"start_date": "2020-01-01", "end_date": "2100-01-01"},
+    ):
+        resp = local_client.get("/api/analysis/ic-decay", params=params)
+        assert resp.status_code == 422, (params, resp.text[:200])
+
+
+def test_trading_start_rejects_qmt_password_in_body(local_client, monkeypatch):
+    """Credentials must come from the server environment, never a body."""
+    monkeypatch.setattr(routes, "_live_engine", None)
+    resp = local_client.post(
+        "/api/trading/start",
+        json={"broker": "qmt", "password": "super-secret"},
+    )
+    assert resp.status_code == 422
+    assert "QMT_PASSWORD" in resp.json()["detail"]
+    assert "super-secret" not in resp.text
 
 
 def test_store_limits_are_clamped():

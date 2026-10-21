@@ -66,6 +66,13 @@ _KEY_LOCK_ENTRIES = 8
 #: ``window_sessions``/``panel_start``.
 ANALYSIS_WINDOW_SESSIONS = 252
 
+#: Bounds for request-supplied date overrides. Without them a single query
+#: (``start_date=0001-01-01&end_date=9999-12-31``) built a multi-million-row
+#: panel before any cap and could OOM the process.
+_MIN_WINDOW_DATE = date(2000, 1, 1)
+_MAX_WINDOW_DATE = date(2100, 12, 31)
+_MAX_WINDOW_DAYS = 3653  # 10 years
+
 
 @dataclass(frozen=True)
 class ResearchContext:
@@ -281,7 +288,9 @@ def parse_window(
     """Validate optional ISO date overrides from a request.
 
     Raises ``ValueError`` with a client-safe message; the endpoints translate
-    it to HTTP 422.
+    it to HTTP 422. Dates are bounded to 2000-01-01..2100-12-31 and a window
+    to at most 10 years: ``?start_date=0001-01-01&end_date=9999-12-31`` used
+    to build a multi-million-row panel before any cap (OOM).
     """
     parsed: list[str | None] = []
     for label, value in (("start_date", start_date), ("end_date", end_date)):
@@ -289,12 +298,21 @@ def parse_window(
             parsed.append(None)
             continue
         try:
-            parsed.append(date.fromisoformat(str(value)).isoformat())
+            parsed_date = date.fromisoformat(str(value))
         except ValueError:
             raise ValueError(f"{label} must be an ISO date (YYYY-MM-DD)") from None
+        if not _MIN_WINDOW_DATE <= parsed_date <= _MAX_WINDOW_DATE:
+            raise ValueError(
+                f"{label} must be between {_MIN_WINDOW_DATE.isoformat()} and "
+                f"{_MAX_WINDOW_DATE.isoformat()}"
+            )
+        parsed.append(parsed_date.isoformat())
     start, end = parsed
-    if start is not None and end is not None and start >= end:
-        raise ValueError("start_date must be earlier than end_date")
+    if start is not None and end is not None:
+        if start >= end:
+            raise ValueError("start_date must be earlier than end_date")
+        if (date.fromisoformat(end) - date.fromisoformat(start)).days > _MAX_WINDOW_DAYS:
+            raise ValueError("date span must be at most 10 years")
     return start, end
 
 

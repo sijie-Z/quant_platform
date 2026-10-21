@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import inspect
 import signal
 import sys
 from pathlib import Path
@@ -2813,8 +2814,23 @@ def cmd_trade(args) -> int:
     # (which completes the session row), then this cleanup flushes the WAL
     # and closes the store. Installed only from this CLI entry point.
     cleanup_once = _install_shutdown_handlers(_cleanup_runner)
+    run_kwargs: dict = {"days": days, "seed": args.seed}
+    # Simulated/paper runs generate a deterministic split/dividend demo feed
+    # consistent with their synthetic price path; real brokers settle
+    # corporate actions on the broker side and never get a local feed (the
+    # runner refuses one).  `inspect` keeps injected/test-double runners
+    # whose `run` predates the keyword working.
     try:
-        report = runner.run(days=days, seed=args.seed)
+        accepts_actions = (
+            "simulate_corporate_actions"
+            in inspect.signature(runner.run).parameters
+        )
+    except (TypeError, ValueError):
+        accepts_actions = False
+    if accepts_actions and broker_type in ("simulated", "paper"):
+        run_kwargs["simulate_corporate_actions"] = True
+    try:
+        report = runner.run(**run_kwargs)
     except (RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -2836,6 +2852,12 @@ def cmd_trade(args) -> int:
     print(f"  Sharpe:         {d['sharpe_ratio']:.2f}")
     print(f"  Max Drawdown:   {d['max_drawdown_pct']:.2f}%")
     print(f"  Avg Volume:     {d['avg_daily_volume']:,.0f} CNY")
+    ca = d.get("corporate_actions_applied") or {}
+    print(
+        f"  Corp actions:   {ca.get('count', 0)} applied"
+        f" (last ex-date {ca.get('last_ex_date') or '-'}, "
+        f"source {ca.get('source') or '-'})"
+    )
 
     # Never report success for a session that did not trade.
     if d.get("failed_cycles", 0) > 0:

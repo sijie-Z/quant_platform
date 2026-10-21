@@ -27,7 +27,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from quant_platform.data.providers.base import DataProvider
+from quant_platform.data.providers.base import (
+    CORPORATE_ACTION_COLUMNS,
+    DataProvider,
+    empty_corporate_actions,
+)
 from quant_platform.data.schema import SECTOR_WEIGHTS, SECTORS
 from quant_platform.utils.exchange_calendar import trading_days
 from quant_platform.utils.logging import get_logger
@@ -63,6 +67,9 @@ class SyntheticDataProvider(DataProvider):
     price_adjustment = "raw"
     adjusted_price_basis = "qfq"
     adjustment_factor_available = True
+    #: The generator emits an explicit cash/split feed consistent with the
+    #: ``adj_factor`` divisor (see :meth:`get_corporate_actions`).
+    corporate_actions_available = True
 
     #: Synthetic data is regenerated deterministically for the requested
     #: range; there is no cached panel to append to, and regenerating is
@@ -112,6 +119,11 @@ class SyntheticDataProvider(DataProvider):
         self._industry_changes_cache: pd.DataFrame | None = None
         # asset -> generated corporate-action dates (diagnostics for tests)
         self._corporate_action_days: dict[str, set[pd.Timestamp]] = {}
+        #: Explicit cash/split feed generated alongside ``adj_factor``.
+        self._corporate_actions_frame: pd.DataFrame | None = None
+        #: Pre-adjustment continuous close (the generated research path),
+        #: exposed for consistency tests; never part of the data contract.
+        self._continuous_close: pd.DataFrame | None = None
 
     # ------------------------------------------------------------------
     # Public interface (DataProvider contract)
@@ -166,6 +178,29 @@ class SyntheticDataProvider(DataProvider):
         if self._metadata is None:
             self._generate_all()
         return self._metadata
+
+    def get_corporate_actions(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """Cash dividends and splits consistent with the generated ``adj_factor``.
+
+        The generator draws ~5% action-events per asset-year.  Each event is
+        either a cash dividend (0.3%-2.5% of the pre-event raw price, rounded
+        to the cent) or a split (2:1, 3:1 or 3:2).  The raw close is adjusted
+        on the ex-date (``quantity * ratio`` shares, price ``/ ratio``; cash
+        dividend subtracted from the raw price) and the ``adj_factor`` divisor
+        absorbs exactly the same event, so ``close / adj_factor`` -- the
+        research path -- stays continuous.  Fully deterministic per seed.
+        """
+        if self._prices is None or self._corporate_actions_frame is None:
+            self._generate_all()
+        frame = self._corporate_actions_frame
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+        mask = (frame["ex_date"] >= start) & (frame["ex_date"] <= end)
+        return frame.loc[mask].reset_index(drop=True).copy()
 
     # ------------------------------------------------------------------
     # Generation
@@ -442,25 +477,102 @@ class SyntheticDataProvider(DataProvider):
         # VWAP: average of OHLC
         vwap = (open_prices + high_prices + low_prices + close_prices) / 4
 
-        # Adj factor (random corporate actions: ~5% of stocks per year)
-        adj_factor = np.ones((n_dates, n_assets))
-        # Diagnostic ledger of the generated action dates, keyed by asset.
-        # Used by regression tests that need to know when an action fell on a
-        # suspension day; it does not affect any generated value.
-        self._corporate_action_days = {}
+        # Corporate actions: discrete splits and cash dividends.
+        #
+        # The action *dates* are drawn exactly as before (same RNG draws in
+        # the same order), so existing seeds keep their schedules.  Event
+        # parameters use a dedicated RNG: adding them must not shift the
+        # benchmark/financials random streams that follow this method.
+        action_days: dict[int, np.ndarray] = {}
         for i in range(n_assets):
             n_actions = self.rng.poisson(0.05 * n_dates / 252)
             if n_actions > 0:
                 action_dates = self.rng.choice(n_dates, size=n_actions, replace=False)
                 action_dates.sort()
-                self._corporate_action_days[self._assets[i]] = {
-                    self._dates[int(d)] for d in action_dates
-                }
-                factor = 1.0
-                for d in range(n_dates):
-                    if d in action_dates:
-                        factor *= self.rng.uniform(0.8, 1.2)
-                    adj_factor[d, i] = factor
+                action_days[i] = action_dates.astype(int)
+                # Preserve the legacy RNG stream: the pre-explicit-action
+                # generator drew one ``uniform(0.8, 1.2)`` per action date
+                # inside this loop.  Those draws are gone, but every later
+                # generator (suspension sampling, benchmark, financials) must
+                # see the same stream or seed-pinned expectations shift.
+                self.rng.uniform(0.8, 1.2, size=len(action_dates))
+
+        # The pre-adjustment close matrix is the generated continuous path;
+        # `adj_factor` is exactly the divisor that maps it to the raw price.
+        self._continuous_close = pd.DataFrame(
+            close_prices.copy(), index=self._dates, columns=self._assets,
+        )
+
+        adj_factor = np.ones((n_dates, n_assets))
+        # Diagnostic ledger of the generated action dates, keyed by asset.
+        # Used by regression tests that need to know when an action fell on a
+        # suspension day; it does not affect any generated value.
+        self._corporate_action_days = {}
+        action_rows: list[dict] = []
+        rng_actions = np.random.default_rng(self.seed + 977)
+        for i in sorted(action_days):
+            asset = self._assets[i]
+            factor = 1.0
+            days = action_days[i]
+            cursor = 0
+            for d in range(n_dates):
+                if cursor < len(days) and d == int(days[cursor]):
+                    cursor += 1
+                    continuation = close_prices[d, i]
+                    # Pre-listing rows have no price; an action before the
+                    # listing date is meaningless and is skipped (the date
+                    # also stays out of the diagnostic ledger).
+                    if np.isfinite(continuation) and continuation > 0:
+                        ex_date = self._dates[d]
+                        if rng_actions.random() < 0.55:
+                            # Cash dividend: subtract the per-share amount
+                            # from the raw close.  The amount is a fraction
+                            # of the pre-event raw price, rounded to cents,
+                            # and the divisor falls by exactly cash / C_d so
+                            # close_adj = close / adj_factor stays continuous.
+                            pre_raw = float(continuation) * factor
+                            cash = round(
+                                pre_raw * float(rng_actions.uniform(0.003, 0.025)),
+                                2,
+                            )
+                            cash = max(cash, 0.01)
+                            factor = factor - cash / float(continuation)
+                            action_rows.append({
+                                "ex_date": ex_date,
+                                "asset": asset,
+                                "kind": "cash",
+                                "cash_per_share": cash,
+                                "split_ratio": 1.0,
+                            })
+                        else:
+                            # Split: raw price divides by the ratio and the
+                            # divisor divides by the same ratio.
+                            ratio = float(rng_actions.choice(
+                                [2.0, 3.0, 1.5], p=[0.6, 0.15, 0.25],
+                            ))
+                            factor = factor / ratio
+                            action_rows.append({
+                                "ex_date": ex_date,
+                                "asset": asset,
+                                "kind": "split",
+                                "cash_per_share": 0.0,
+                                "split_ratio": ratio,
+                            })
+                        self._corporate_action_days.setdefault(asset, set()).add(
+                            ex_date
+                        )
+                adj_factor[d, i] = factor
+
+        self._corporate_actions_frame = (
+            pd.DataFrame(action_rows, columns=list(CORPORATE_ACTION_COLUMNS))
+            if action_rows else empty_corporate_actions()
+        )
+        if not self._corporate_actions_frame.empty:
+            self._corporate_actions_frame = (
+                self._corporate_actions_frame
+                .sort_values(["ex_date", "asset", "kind"], kind="stable")
+                .reset_index(drop=True)
+            )
 
         # A corporate action must move the RAW price path by the adjustment
         # factor: P_adj = P_raw / adj_factor. Previously only adj_factor moved,
@@ -503,19 +615,62 @@ class SyntheticDataProvider(DataProvider):
         for col in ["open", "high", "low", "close", "volume", "turnover", "vwap"]:
             df.iloc[flat_idx, df.columns.get_loc(col)] = np.nan
 
-        # The adjustment factor is part of the stale mark: a corporate action
-        # whose ex-date falls on a suspension day must not re-scale a close
-        # that was carried over from the previous session. Leaving the new
-        # factor in place made close_adj jump on the suspension day (e.g.
-        # 65.50 -> 76.56) even though the clean adjusted path was continuous.
-        # Freeze the factor on suspended rows, then forward-fill it without a
-        # limit (it is defined on every non-suspended row) so a long gap
-        # cannot leave it NaN.
+        # The adjustment factor is part of the stale mark.  Start by freezing
+        # it on every suspended row (a forward-filled close must pair with the
+        # factor it was carried over with, or close_adj jumps: e.g. 65.50 ->
+        # 76.56).  Action rows are then restored with a compensating raw-price
+        # scale below, which keeps close_adj continuous *and* gives the paper
+        # book a post-action stale mark.
         df.iloc[flat_idx, df.columns.get_loc("adj_factor")] = np.nan
         df["adj_factor"] = df.groupby("asset")["adj_factor"].ffill()
 
         # Forward-fill suspension gaps (max 30 days)
         df = df.groupby("asset").ffill(limit=30)
+
+        # A corporate action whose ex-date is suspended: the stale RAW mark
+        # must be the *post-action* level (previous traded raw * F_action /
+        # F_previous) while `close / adj_factor` stays at the last clean
+        # close.  Freezing the action factor (the old behaviour) left the raw
+        # price at its pre-action level; a paper book that then doubles the
+        # share count values the position at twice its worth until the resume
+        # session (and a cash dividend leaves the mark un-reduced while the
+        # cash is credited).  Restore the action factor on those rows and
+        # scale the forwarded raw prices by the same ratio.
+        if (
+            self._corporate_actions_frame is not None
+            and not self._corporate_actions_frame.empty
+        ):
+            asset_index = {asset: i for i, asset in enumerate(self._assets)}
+            date_index = {date: d for d, date in enumerate(self._dates)}
+            suspended_grid = np.zeros((n_dates, n_assets), dtype=bool)
+            for position in flat_idx:
+                row_date, row_asset = df.index[int(position)]
+                suspended_grid[
+                    date_index[pd.Timestamp(row_date)], asset_index[row_asset]
+                ] = True
+            for _, action in self._corporate_actions_frame.iterrows():
+                d = date_index.get(pd.Timestamp(action["ex_date"]))
+                i = asset_index.get(action["asset"])
+                if d is None or i is None or not suspended_grid[d, i]:
+                    continue
+                traded_before = [
+                    t for t in range(d) if not suspended_grid[t, i]
+                ]
+                if not traded_before:
+                    continue
+                factor_reference = adj_factor[traded_before[-1], i]
+                factor_action = adj_factor[d, i]
+                if not (factor_reference > 0 and factor_action > 0):
+                    continue
+                scale = factor_action / factor_reference
+                row_position = int(df.index.get_loc(
+                    (self._dates[d], self._assets[i]),
+                ))
+                for column in ("open", "high", "low", "close", "vwap"):
+                    df.iloc[row_position, df.columns.get_loc(column)] *= scale
+                df.iloc[
+                    row_position, df.columns.get_loc("adj_factor")
+                ] = factor_action
 
         # Mark the stale rows. Forward-filling keeps the price path realistic,
         # but downstream return computation must not difference across the

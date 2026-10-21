@@ -32,6 +32,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -54,10 +55,35 @@ REDACTED = "***REDACTED***"
 #: Keys whose values must never be persisted in plaintext. Matched
 #: case-insensitively against the mapping key, at any nesting depth.
 _SECRET_KEYS = frozenset({
-    "password", "passwd", "secret", "token", "api_key", "apikey",
+    "password", "passwd", "pass", "secret", "token", "api_key", "apikey",
     "api_secret", "access_key", "access_token", "private_key",
     "secret_key", "client_secret", "auth_token", "credential",
 })
+
+#: Substring patterns for secret-shaped keys. Exact matching missed
+#: ``tushare_token``, ``deepseek_api_key`` and ``postgres_dsn``, which were
+#: written to ``.quant_versions/vN/version.yaml`` in plaintext.
+_SECRET_KEY_PATTERNS = (
+    "password", "passwd", "secret", "token", "api_key", "apikey",
+    "api-key", "access_key", "private_key", "credential", "dsn",
+)
+
+#: ``scheme://user:password@host/...`` -- a URL with embedded credentials.
+_CREDENTIAL_URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/\s@]+@")
+
+
+def _is_secret_key(key: str) -> bool:
+    lowered = key.lower()
+    if lowered in _SECRET_KEYS:
+        return True
+    if any(pattern in lowered for pattern in _SECRET_KEY_PATTERNS):
+        return True
+    return lowered == "auth" or lowered.endswith("_auth")
+
+
+def _is_credential_url(value: str) -> bool:
+    """Whether a string is a URL of the form ``scheme://user:pass@host``."""
+    return bool(_CREDENTIAL_URL_RE.match(value))
 
 
 class _FileLock:
@@ -120,9 +146,12 @@ def redact_secrets(value: Any) -> Any:
         for key, item in value.items():
             if (
                 isinstance(key, str)
-                and key.lower() in _SECRET_KEYS
                 and isinstance(item, (str, int, float))
                 and str(item) != ""
+                and (
+                    _is_secret_key(key)
+                    or (isinstance(item, str) and _is_credential_url(item))
+                )
             ):
                 out[key] = REDACTED
             else:

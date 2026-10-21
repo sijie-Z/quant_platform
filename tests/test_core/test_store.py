@@ -49,8 +49,15 @@ class TestStorePositions:
 
     def test_delete_position(self, store):
         store.save_position({"code": "600519", "quantity": 100, "avg_cost": 1800.0})
-        store.delete_position("600519")
+        store.delete_position("600519", tenant_id="default")
         assert len(store.get_positions()) == 0
+
+    def test_delete_position_requires_a_tenant(self, store):
+        """An unscoped delete used to remove every tenant's row."""
+        store.save_position({"code": "600519", "quantity": 100, "avg_cost": 1800.0})
+        with pytest.raises(ValueError):
+            store.delete_position("600519")
+        assert len(store.get_positions()) == 1
 
     def test_update_position(self, store):
         store.save_position({"code": "600519", "quantity": 100, "avg_cost": 1800.0})

@@ -210,7 +210,7 @@ quant_platform/
 ├── tools/                  # 研究工具：common_runner / sanity_check / attribution
 │
 ├── docs/                   # 文档：架构 / 里程碑 / 研究报告 / 协议
-├── tests/                  # 单元测试（222 个测试文件，3,160 条用例，覆盖全部模块）
+├── tests/                  # 单元测试（234 个测试文件，3,285 条用例，覆盖全部模块）
 ├── config/                 # YAML 配置（零硬编码）
 └── requirements.txt        # Python 依赖（版本锁定；adata 例外见下文）
 ```
@@ -230,7 +230,7 @@ quant_platform/
 | ML CV 按 (日期, 股票) 拍平、训练/测试共享日期（BUG-23） | 已修复：按日期切分 + purge/embargo | `alpha/ml_signal.py` |
 | 成本模型系统性减半（BUG-03） | 已修复：印花税仅卖出、按资产拆分买卖名义额 | `backtest/cost_model.py`、`backtest/engine.py` |
 
-当前仍然存在的限制（不属于上述历史缺陷）：多租户隔离（#75 产品定位未定）、WebSocket token 的旧版查询串回退、Adata 不提供价格面板（仅作 metadata/财务的跨源校验，价格路径明确 fail closed）、增量更新仅对支持 `update()` 的真实数据源生效（合成数据源会回退全量）。
+当前仍然存在的限制（不属于上述历史缺陷）：多租户隔离（#75 产品定位未定；共享 token 不是租户边界，`X-Tenant-Id` 是可信头约定）、Adata 不提供价格面板（仅作 metadata/财务的跨源校验，价格路径明确 fail closed）、增量更新仅对支持 `update()` 的真实数据源生效（合成数据源会回退全量）。
 
 > `docs/VALIDATION_REPORT.md` 是 2026-06-20 的历史报告，数字早于上述修复，已标注 SUPERSEDED，不应作为当前证据引用。当前状态以 `docs/HANDOVER.md` 的第十轮记录为准。
 
@@ -263,7 +263,7 @@ quant_platform/
 | 生产存储 | 默认 SQLite；PostgreSQL 由 `data/providers/postgres_provider.py` 支持，需自行部署（docker-compose 不包含数据库） |
 | 多租户隔离 | API 不提供租户隔离（#75 产品定位未定） |
 | 分析端点计算量 | 7 个分析/监控端点使用有界研究上下文现算（TTL 缓存、并发饱和 429）；默认配置首次调用需构建上下文，可能耗时数十秒 |
-| WebSocket token 回退 | 当前前端用 `bearer.<token>` 子协议；`?token=` 仅为旧客户端保留 |
+| WebSocket token 传输 | 仅接受 `bearer.<token>` 子协议（时序安全比较）；`?token=` 查询串已移除，非 RFC-7230 字符的 token 需更换 |
 | 价格基准 | 已统一：provider 交付 raw OHLCV + 复权因子（Tushare/Baostock 同一约定），`get_raw_close()` 供成交/估值，`get_adjusted_close()` 供研究；仅 Postgres/Adata 尚未声明基准，货币路径 fail closed |
 | 数据更新 | `run --incremental` / `cache refresh --incremental` 增量追加（边界去重、复权因子全量刷新、完成标记与新鲜度门禁）；Tushare/Baostock 支持，合成数据源回退全量 |
 | 交易所日历 | 内置休市表覆盖至 2026 年；2027 年休市日需通过 `QUANT_EXCHANGE_HOLIDAYS` 追加 |

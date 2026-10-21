@@ -75,6 +75,15 @@ def test_sensitive_endpoints_are_loopback_only_without_a_token(monkeypatch):
     assert health.status_code == 200
 
 
+def test_non_ascii_token_does_not_crash_the_gate(monkeypatch):
+    """compare_digest(str, str) raises on non-ASCII; tokens are env strings."""
+    monkeypatch.setenv("QUANT_API_TOKEN", "sécret")
+    app = create_app(serve_frontend=False)
+    client = TestClient(app)
+
+    assert client.get("/api/config").status_code == 401
+
+
 def test_websocket_requires_the_token_when_configured(monkeypatch):
     monkeypatch.setenv("QUANT_API_TOKEN", "secret")
     app = create_app(serve_frontend=False)
@@ -84,7 +93,15 @@ def test_websocket_requires_the_token_when_configured(monkeypatch):
         with client.websocket_connect("/api/ws"):
             pass
 
-    with client.websocket_connect("/api/ws?token=secret") as ws:
+    # The legacy ?token= query transport was removed (it leaked the token
+    # into access logs); only the bearer.<token> subprotocol is accepted.
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/api/ws?token=secret"):
+            pass
+
+    with client.websocket_connect(
+        "/api/ws", subprotocols=["bearer.secret"],
+    ) as ws:
         ws.send_text("ping")
 
 

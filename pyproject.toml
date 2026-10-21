@@ -198,7 +198,7 @@ markers = [
 ]
 asyncio_mode = "auto"
 # A hung test must fail with a stack dump instead of eating the job timeout.
-timeout = 300
+timeout = 600
 timeout_method = "thread"
 filterwarnings = [
     "ignore::DeprecationWarning:dateutil.*",

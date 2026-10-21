@@ -43,6 +43,7 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import (
+    CORPORATE_ACTION_COLUMNS,
     INCREMENTAL_OVERLAP_SESSIONS,
     DataFetchIncompleteError,
     DataProvider,
@@ -50,10 +51,12 @@ from quant_platform.data.providers.base import (
     canonicalize_panel_index,
     complete_panel_marker,
     deduplicate_panel,
+    empty_corporate_actions,
     exchange_sessions,
     incremental_fetch_start,
     incremental_marker_extra,
     last_day_missing_symbols,
+    normalize_corporate_actions,
     panel_last_date,
     provider_cache_lock,
     read_cache_manifest,
@@ -63,6 +66,7 @@ from quant_platform.data.providers.base import (
     write_cache_manifest,
     write_incremental_status,
 )
+from quant_platform.shared.symbols import normalize_symbol
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -338,6 +342,16 @@ class BaostockDataProvider(DataProvider):
         self._fallback_range: tuple[str, str] | None = None
         #: Sidecar of the latest incremental attempt (for data_status).
         self._last_status_path: Path | None = None
+
+        #: Corporate-action feed (``query_dividend_data``).  Fetched lazily;
+        #: ``corporate_actions_available`` is True only after at least one
+        #: successful query.  ``corporate_action_codes`` optionally restricts
+        #: the (per-symbol, per-year) fetch; None means the same sample the
+        #: price fetch would use.
+        self.corporate_action_codes: list[str] | None = None
+        self._corporate_actions: pd.DataFrame | None = None
+        self._corporate_actions_key: tuple[str, str] | None = None
+        self.corporate_actions_available = False
 
     # ------------------------------------------------------------------
     # Cache identity / versioning (D12/D13)
@@ -1051,6 +1065,154 @@ class BaostockDataProvider(DataProvider):
         return pd.DataFrame(
             columns=["asset", "trigger_date", "announce_date", "end_date", "is_st"]
         )
+
+    # ------------------------------------------------------------------
+    # Corporate actions (best effort)
+    # ------------------------------------------------------------------
+
+    def get_corporate_actions(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """Cash dividends and bonus/transfer shares from ``query_dividend_data``.
+
+        Baostock exposes dividends only per symbol and operating year, so the
+        fetch is inherently N-symbols x Y-years of calls: it uses the pinned
+        price sample when available (``cache_universe``), otherwise the same
+        stratified universe the price fetch would use, and callers can pin a
+        narrower list via ``corporate_action_codes``.  ``dividOperateDate`` is
+        the ex-date, ``dividCashPsBeforeTax`` the pre-tax amount per share
+        (the engine withholds tax per its config) and
+        ``dividStocksPs + dividReserveToStockPs`` the bonus/transfer ratio
+        (``split_ratio = 1 + bonus``).  A combined event becomes two rows.
+
+        Best effort: per-symbol failures are logged and skipped; if every
+        query fails (baostock missing, login refused, network down) the
+        documented empty frame is returned and
+        ``corporate_actions_available`` stays False.  Amounts are never
+        inferred or fabricated.
+        """
+        start = pd.Timestamp(start_date).normalize()
+        end = pd.Timestamp(end_date).normalize()
+        key = self._normalise_range(start_date, end_date)
+        if self._corporate_actions is not None and self._corporate_actions_key == key:
+            frame = self._corporate_actions
+            mask = (frame["ex_date"] >= start) & (frame["ex_date"] <= end)
+            return frame.loc[mask].reset_index(drop=True).copy()
+
+        try:
+            self._login()
+        except Exception as exc:  # baostock not installed / login refused
+            logger.warning(
+                "Baostock unavailable for corporate actions: %s", exc,
+            )
+            self.corporate_actions_available = False
+            self._corporate_actions = empty_corporate_actions()
+            self._corporate_actions_key = key
+            return empty_corporate_actions()
+
+        bs = self._bs
+        codes = self.corporate_action_codes
+        if codes is None:
+            codes = self._pinned_codes(start_date, end_date, financial=False)
+        if codes is None:
+            codes = self._get_major_stocks_list(
+                start_date=start_date, end_date=end_date,
+            )
+
+        records: list[dict] = []
+        successes = 0
+        queried = 0
+        for code in codes:
+            bs_code = _to_bs_code(code)
+            for year in range(start.year, end.year + 1):
+                queried += 1
+                try:
+                    rs = self._call_with_retries(
+                        f"query_dividend_data[{code}:{year}]",
+                        bs.query_dividend_data,
+                        code=bs_code,
+                        year=str(year),
+                        yearType="operate",
+                    )
+                except Exception as exc:  # noqa: BLE001 - best effort feed
+                    logger.warning(
+                        "Baostock dividend query failed for %s/%d: %s",
+                        code, year, exc,
+                    )
+                    continue
+                if getattr(rs, "error_code", "0") != "0":
+                    logger.warning(
+                        "Baostock dividend query error for %s/%d: %s",
+                        code, year, getattr(rs, "error_msg", ""),
+                    )
+                    continue
+                successes += 1
+                fields = list(getattr(rs, "fields", []) or [])
+                while rs.next():
+                    rec = dict(zip(fields, rs.get_row_data(), strict=False))
+                    records.extend(
+                        self._dividend_records(rec, code),
+                    )
+
+        if queried and successes == 0:
+            logger.warning(
+                "Baostock dividend queries all failed (%d call(s)); "
+                "corporate actions are unavailable", queried,
+            )
+            self.corporate_actions_available = False
+            self._corporate_actions = empty_corporate_actions()
+            self._corporate_actions_key = key
+            return empty_corporate_actions()
+
+        self.corporate_actions_available = True
+        if not records:
+            frame = empty_corporate_actions()
+        else:
+            frame = normalize_corporate_actions(
+                pd.DataFrame(records, columns=list(CORPORATE_ACTION_COLUMNS))
+            )
+            mask = (frame["ex_date"] >= start) & (frame["ex_date"] <= end)
+            frame = frame.loc[mask].reset_index(drop=True)
+        self._corporate_actions = frame
+        self._corporate_actions_key = key
+        return frame.copy()
+
+    @staticmethod
+    def _dividend_records(rec: dict, code: str) -> list[dict]:
+        """Contract rows for one Baostock dividend record (cash and/or split)."""
+        ex_date = _as_date(rec.get("dividOperateDate"))
+        if pd.isna(ex_date):
+            return []
+        asset = normalize_symbol(_to_bs_code(code))
+        cash = _as_float(rec.get("dividCashPsBeforeTax"))
+        if not math.isfinite(cash) or cash <= 0:
+            cash = _as_float(rec.get("dividCashPsAfterTax"))
+        cash = cash if math.isfinite(cash) and cash > 0 else 0.0
+        bonus = 0.0
+        for key in ("dividStocksPs", "dividReserveToStockPs"):
+            value = _as_float(rec.get(key))
+            if math.isfinite(value) and value > 0:
+                bonus += value
+        rows: list[dict] = []
+        if cash > 0:
+            rows.append({
+                "ex_date": ex_date,
+                "asset": asset,
+                "kind": "cash",
+                "cash_per_share": round(cash, 6),
+                "split_ratio": 1.0,
+            })
+        if bonus > 0:
+            rows.append({
+                "ex_date": ex_date,
+                "asset": asset,
+                "kind": "split",
+                "cash_per_share": 0.0,
+                "split_ratio": round(1.0 + bonus, 6),
+            })
+        return rows
 
     def _get_industry_map(self) -> dict[str, str]:
         """Get industry classification for all stocks."""

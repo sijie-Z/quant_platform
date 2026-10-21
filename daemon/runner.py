@@ -37,9 +37,14 @@ from quant_platform.core.exchange_calendar import is_trading_day
 from quant_platform.core.store import Store
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
+from quant_platform.data.schema import provider_label
 from quant_platform.risk.healthcheck import emit_alert, install_alert_handler
 from quant_platform.risk.safety import SafetyLimits, SafetySystem
-from quant_platform.trading.live_engine import LiveEngine
+from quant_platform.trading.live_engine import (
+    LiveEngine,
+    normalize_corporate_action_feed,
+    summarize_corporate_action_events,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +196,37 @@ class Daemon:
             return result
         self.engine.load_history(pipeline.returns, history_prices)
 
+        # Corporate actions: the same provider/pipeline that produced the
+        # price panel supplies the feed.  LiveEngine applies it as exchange
+        # days advance (paper book only; a real broker would refuse the feed).
+        # An unavailable/empty feed is "no actions", never fabricated, and it
+        # never aborts the daily run.
+        ca_source = ""
+        ca_rows = 0
+        try:
+            loader = getattr(pipeline, "get_corporate_actions", None)
+            if callable(loader):
+                ca_source = (
+                    "pipeline:"
+                    + provider_label(getattr(pipeline, "provider", provider))
+                )
+                ca_rows = int(self.engine.set_corporate_actions(
+                    normalize_corporate_action_feed(loader()),
+                ) or 0)
+                if ca_rows:
+                    logger.info(
+                        "Corporate-action feed loaded: %d row(s) from %s",
+                        ca_rows, ca_source,
+                    )
+        except Exception as exc:
+            logger.warning("Corporate-action feed unavailable: %s", exc)
+            ca_source = ""
+            ca_rows = 0
+        result["corporate_actions_feed_rows"] = ca_rows
+        result["corporate_actions_applied"] = summarize_corporate_action_events(
+            [], source=ca_source,
+        )
+
         previous_equity: float | None = None
         try:
             snapshot = self.store.get_engine_state(self.strategy_id)
@@ -233,6 +269,11 @@ class Daemon:
             logger.info("No unprocessed exchange days since the watermark")
             self.last_run_date = datetime.now(self._tz).strftime("%Y-%m-%d")
             self._save_state()
+            result["corporate_actions_applied"] = (
+                summarize_corporate_action_events(
+                    self.engine.corporate_action_events, source=ca_source,
+                )
+            )
             return result
         if len(pending) > MAX_CATCHUP_DAYS:
             logger.warning(
@@ -301,10 +342,14 @@ class Daemon:
 
         self.last_run_date = datetime.now(self._tz).strftime("%Y-%m-%d")
         self._save_state()
+        result["corporate_actions_applied"] = summarize_corporate_action_events(
+            self.engine.corporate_action_events, source=ca_source,
+        )
         logger.info(
-            "Run complete: days=%d equity=%.2f alerts=%d",
+            "Run complete: days=%d equity=%.2f alerts=%d actions=%d",
             result["days_processed"], self.engine.state.current_equity,
             len(result["alerts"]),
+            result["corporate_actions_applied"]["count"],
         )
         return result
 

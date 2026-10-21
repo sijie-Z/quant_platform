@@ -128,6 +128,150 @@ def exchange_sessions(start, end) -> pd.DatetimeIndex:
     return trading_days(start, end)
 
 
+# ---------------------------------------------------------------------------
+# Corporate-action contract (paper-engine input)
+# ---------------------------------------------------------------------------
+
+#: One row per action.  ``kind`` is ``"cash"`` (``cash_per_share`` > 0,
+#: ``split_ratio`` == 1) or ``"split"`` (``split_ratio`` > 0,
+#: ``cash_per_share`` == 0).  ``asset`` is canonical ``CODE.EXCHANGE`` form.
+CORPORATE_ACTION_COLUMNS: tuple[str, ...] = (
+    "ex_date",
+    "asset",
+    "kind",
+    "cash_per_share",
+    "split_ratio",
+)
+
+#: Supported action kinds (one per row; a combined 送转+派息 event is two rows).
+CORPORATE_ACTION_KINDS: tuple[str, ...] = ("cash", "split")
+
+
+def empty_corporate_actions() -> pd.DataFrame:
+    """The documented empty corporate-action frame (never ``None``).
+
+    Schema: ``(ex_date, asset, kind, cash_per_share, split_ratio)`` with
+    typed columns, so a caller can concatenate/filter it without special
+    casing "provider has no feed".
+    """
+    return pd.DataFrame({
+        "ex_date": pd.Series(dtype="datetime64[ns]"),
+        "asset": pd.Series(dtype="object"),
+        "kind": pd.Series(dtype="object"),
+        "cash_per_share": pd.Series(dtype="float64"),
+        "split_ratio": pd.Series(dtype="float64"),
+    })
+
+
+def normalize_corporate_actions(actions) -> pd.DataFrame:
+    """Validate and canonicalise a provider corporate-action frame.
+
+    Contract (see :data:`CORPORATE_ACTION_COLUMNS`):
+
+    * ``ex_date`` is parsed to ``Timestamp`` (unparseable rows are dropped);
+    * ``asset`` is rewritten to canonical ``CODE.EXCHANGE`` form;
+    * ``kind`` must be ``cash`` or ``split`` (unknown rows are dropped with a
+      warning -- never guessed into an action);
+    * a combined event shipped as one row (both ``cash_per_share`` > 0 and
+      ``split_ratio`` > 1) is expanded into two rows so a consumer applies
+      each component exactly once and in a defined order;
+    * a ``cash`` row carries ``split_ratio == 1.0`` and a ``split`` row
+      carries ``cash_per_share == 0.0``.
+
+    Missing columns raise ``ValueError`` (a broken contract must not look
+    like "no actions").  Returns a sorted, de-duplicated copy.
+    """
+    from quant_platform.shared.symbols import normalize_symbol
+
+    if actions is None:
+        return empty_corporate_actions()
+    if not isinstance(actions, pd.DataFrame):
+        actions = pd.DataFrame(actions)
+    if actions.empty and not len(actions.columns):
+        return empty_corporate_actions()
+    missing = [c for c in CORPORATE_ACTION_COLUMNS if c not in actions.columns]
+    if missing:
+        raise ValueError(
+            "corporate-action frame is missing required column(s): "
+            f"{missing} (expected {list(CORPORATE_ACTION_COLUMNS)})"
+        )
+
+    frame = actions.loc[:, list(CORPORATE_ACTION_COLUMNS)].copy()
+    frame["ex_date"] = pd.to_datetime(frame["ex_date"], errors="coerce")
+    frame["asset"] = frame["asset"].map(
+        lambda value: normalize_symbol(value) if pd.notna(value) else ""
+    )
+    frame["kind"] = frame["kind"].astype(str).str.strip().str.lower()
+    frame["cash_per_share"] = pd.to_numeric(
+        frame["cash_per_share"], errors="coerce",
+    ).fillna(0.0)
+    frame["split_ratio"] = pd.to_numeric(
+        frame["split_ratio"], errors="coerce",
+    )
+
+    invalid_kind = ~frame["kind"].isin(CORPORATE_ACTION_KINDS)
+    if bool(invalid_kind.any()):
+        logger.warning(
+            "Dropping %d corporate-action row(s) with unknown kind: %s",
+            int(invalid_kind.sum()),
+            sorted(frame.loc[invalid_kind, "kind"].unique().tolist())[:5],
+        )
+    frame = frame.loc[~invalid_kind & frame["ex_date"].notna() & (frame["asset"] != "")]
+
+    cash_rows = frame.loc[frame["kind"] == "cash"].copy()
+    split_rows = frame.loc[frame["kind"] == "split"].copy()
+
+    # A combined 送转+派息 row carries both components; split it into the two
+    # contract rows.  A plain cash row gets split_ratio=1 so it is never
+    # mistaken for a split.
+    cash_mask = cash_rows["cash_per_share"].notna() & (cash_rows["cash_per_share"] > 0)
+    cash_rows = cash_rows.loc[cash_mask].copy()
+    extra_splits = frame.loc[
+        (frame["kind"] == "cash")
+        & frame["split_ratio"].notna()
+        & (frame["split_ratio"] > 1.0 + 1e-12)
+    ].copy()
+    cash_rows["split_ratio"] = 1.0
+
+    split_rows = split_rows.loc[
+        split_rows["split_ratio"].notna() & (split_rows["split_ratio"] > 0)
+    ].copy()
+    extra_cash = frame.loc[
+        (frame["kind"] == "split")
+        & frame["cash_per_share"].notna()
+        & (frame["cash_per_share"] > 0)
+    ].copy()
+    split_rows["cash_per_share"] = 0.0
+
+    if not extra_splits.empty:
+        extra_splits = extra_splits.loc[
+            extra_splits["split_ratio"] > 1.0 + 1e-12,
+            list(CORPORATE_ACTION_COLUMNS),
+        ]
+        extra_splits["kind"] = "split"
+        extra_splits["cash_per_share"] = 0.0
+        split_rows = pd.concat([split_rows, extra_splits], ignore_index=True)
+    if not extra_cash.empty:
+        extra_cash = extra_cash.loc[
+            extra_cash["cash_per_share"] > 0,
+            list(CORPORATE_ACTION_COLUMNS),
+        ]
+        extra_cash["kind"] = "cash"
+        extra_cash["split_ratio"] = 1.0
+        cash_rows = pd.concat([cash_rows, extra_cash], ignore_index=True)
+
+    combined = pd.concat([cash_rows, split_rows], ignore_index=True)
+    if combined.empty:
+        return empty_corporate_actions()
+    combined = combined.drop_duplicates(
+        subset=["ex_date", "asset", "kind"], keep="last",
+    )
+    combined = combined.sort_values(
+        ["ex_date", "asset", "kind"], kind="stable",
+    ).reset_index(drop=True)
+    return combined
+
+
 def incremental_fetch_start(
     last_complete_date,
     requested_end,
@@ -596,6 +740,35 @@ class DataProvider(ABC):
     #: "nothing new": stale data is reported by the freshness gate, not
     #: assumed fresh because an append was skipped.
     supports_incremental: bool = False
+
+    #: Whether this provider can supply a corporate-action feed.  Providers
+    #: that do not (or whose source is currently unavailable) inherit the
+    #: default :meth:`get_corporate_actions`, which returns the documented
+    #: empty frame -- never ``None`` and never fabricated amounts.
+    corporate_actions_available: bool = False
+
+    def get_corporate_actions(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """Return corporate actions with ex-dates in ``[start_date, end_date]``.
+
+        Contract: a frame with columns
+        ``(ex_date, asset, kind, cash_per_share, split_ratio)`` where
+        ``asset`` is canonical ``CODE.EXCHANGE`` form, ``kind`` is ``cash``
+        or ``split``, ``cash_per_share`` is the pre-tax cash dividend per
+        share (CNY) and ``split_ratio`` the shares-after/shares-before ratio
+        (2.0 == 2:1 split).  A combined 送转+派息 event is returned as two
+        rows.  ``ex_date`` is the exchange session on which the raw price is
+        adjusted and the entitlement is applied.
+
+        Providers without a feed, or whose API is unavailable right now,
+        return :func:`empty_corporate_actions` and leave
+        ``corporate_actions_available`` False.  Callers must treat an empty
+        frame as "no actions", never as permission to invent them.
+        """
+        return empty_corporate_actions()
 
     def update(self, start_date: str, end_date: str) -> dict[str, Any]:
         """Append the sessions after the cached completion marker, if any.

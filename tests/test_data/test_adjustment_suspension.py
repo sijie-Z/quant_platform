@@ -102,6 +102,39 @@ def test_no_suspension_row_jumps_in_the_adjusted_path(provider):
         )
 
 
+def test_suspended_action_raw_mark_is_post_action(provider):
+    """The stale raw mark must be the post-action level, not the pre-action one.
+
+    A paper book holding this stock applies the split/dividend on the ex-date.
+    If the feed kept the pre-action raw close while the share count doubled,
+    the position's market value would double until the resume session.
+    `close_adj` staying continuous (tests above) is not sufficient: the raw
+    close itself must be scaled by the action factor (F_ex / F_previous
+    traded day), which is exactly what a real exchange's adjusted reference
+    price does for a suspended stock.
+    """
+    prices = provider.get_prices(START, END)
+    close = prices["close"].unstack("asset")
+    factor = prices["adj_factor"].unstack("asset")
+    suspended = prices["is_suspended"].unstack("asset").fillna(False).astype(bool)
+
+    collisions = _action_suspension_collisions(provider, prices)
+    assert collisions
+    for asset, day in collisions:
+        position = close.index.get_loc(day)
+        prior = close[asset].iloc[:position][~suspended[asset].iloc[:position]]
+        prior_factor = factor[asset].iloc[:position][
+            ~suspended[asset].iloc[:position]
+        ]
+        if prior.dropna().empty:
+            continue
+        prev_raw = prior.dropna().iloc[-1]
+        prev_factor = prior_factor.dropna().iloc[-1]
+        assert close.loc[day, asset] == pytest.approx(
+            prev_raw * factor.loc[day, asset] / prev_factor, rel=1e-9,
+        )
+
+
 def test_pipeline_valuation_mark_is_the_last_clean_close(pipeline, provider):
     """`get_close()` is what the daemon marks positions with."""
     close = pipeline.get_close()

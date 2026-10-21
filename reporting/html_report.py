@@ -25,6 +25,7 @@ report their coverage.
 
 from __future__ import annotations
 
+import html as html_lib
 import json
 import math
 from datetime import UTC, datetime
@@ -38,6 +39,30 @@ logger = get_logger(__name__)
 #: empty mapping. The report must say n/a instead of rendering the 0.0
 #: defaults as if they had been measured.
 MIN_OBSERVATIONS = 10
+
+
+def _h(value) -> str:
+    """Escape a data-derived string for HTML text/attribute context."""
+    return html_lib.escape(str(value), quote=True)
+
+
+def _json_for_script(value) -> str:
+    """JSON that is safe inside a ``<script>`` block.
+
+    Plain ``json.dumps`` leaves ``</script>`` intact, so a provider or run
+    field containing ``</script><img src=x onerror=...>`` broke out of the
+    block (and a value with ``</title>`` broke out of the title). Escaping
+    ``<``/``>``/``&`` as unicode escapes keeps the payload inert while the
+    decoded JSON value is unchanged.
+    """
+    return (
+        json.dumps(value)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace(" ", "\\u2028")
+        .replace(" ", "\\u2029")
+    )
 
 
 def _finite(value) -> float | None:
@@ -425,7 +450,7 @@ def generate_html_report(
             color = "#ef4444"
         factor_rows += f"""
         <tr>
-          <td style="font-weight:600;color:#4da6ff">{name}</td>
+          <td style="font-weight:600;color:#4da6ff">{_h(name)}</td>
           <td style="font-family:monospace">{_format_signed(ic, 4)}</td>
           <td style="font-family:monospace;color:{color};font-weight:700">{_format_signed(icir, 3)}</td>
           <td style="font-family:monospace">{_format_ratio_pct(ic_positive)}</td>
@@ -443,7 +468,7 @@ def generate_html_report(
         bar_width = min(weight_value * 300, 100)
         sector_rows += f"""
         <tr>
-          <td>{sector}</td>
+          <td>{_h(sector)}</td>
           <td style="font-family:monospace">{_format_unsigned_pct(weight)}</td>
           <td><div style="background:#4da6ff;height:6px;width:{bar_width}%;border-radius:3px"></div></td>
         </tr>"""
@@ -456,22 +481,22 @@ def generate_html_report(
         ret_color = "#ef4444" if ret is not None and ret < 0 else "#22c55e"
         stress_rows += f"""
         <tr>
-          <td>{s.get('scenario', '')}</td>
+          <td>{_h(s.get('scenario', ''))}</td>
           <td style="font-family:monospace;color:{ret_color}">{_format_pct(ret)}</td>
           <td style="font-family:monospace;color:#ef4444">{_format_pct(dd)}</td>
         </tr>"""
 
-    dates_json = json.dumps(dates)
-    equity_json = json.dumps(equity)
-    benchmark_json = json.dumps(benchmark)
-    drawdown_json = json.dumps(drawdown)
-    sharpe_json = json.dumps(rolling_sharpe)
-    rolling_dates_json = json.dumps(rolling_axis)
-    monthly_json = json.dumps(monthly)
+    dates_json = _json_for_script(dates)
+    equity_json = _json_for_script(equity)
+    benchmark_json = _json_for_script(benchmark)
+    drawdown_json = _json_for_script(drawdown)
+    sharpe_json = _json_for_script(rolling_sharpe)
+    rolling_dates_json = _json_for_script(rolling_axis)
+    monthly_json = _json_for_script(monthly)
 
     generated_at = datetime.now(UTC).isoformat(timespec="seconds")
-    period_start = dates[0] if dates else "n/a"
-    period_end = dates[-1] if dates else "n/a"
+    period_start = _h(dates[0]) if dates else "n/a"
+    period_end = _h(dates[-1]) if dates else "n/a"
     observations = "n/a" if n_obs is None else str(n_obs)
 
     benchmark_legend = ", 'Benchmark'" if has_benchmark else ""
@@ -526,7 +551,7 @@ shChart.setOption({
         sharpe_placeholder = ""
     else:
         sharpe_js = "const shChart = null;"
-        sharpe_placeholder = f'<div class="empty-state">{rolling_note}</div>'
+        sharpe_placeholder = f'<div class="empty-state">{_h(rolling_note)}</div>'
 
     if has_monthly:
         monthly_js = """const mChart = echarts.init(document.getElementById('monthlyChart'));
@@ -550,7 +575,11 @@ mChart.setOption({
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title}</title>
+<!-- Defense in depth: the report escapes all data-derived strings, but a CSP
+     still blocks external exfiltration and plugin/object loads if an embedding
+     site ever injects content. Inline scripts are required by the charts. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+<title>{_h(title)}</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -587,14 +616,14 @@ mChart.setOption({
 <body>
 
 <div class="header">
-  <h1>{title}</h1>
+  <h1>{_h(title)}</h1>
   <div class="meta">
     Generated: {generated_at}<br>
     Period: {period_start} → {period_end}<br>
     Observations: {observations}<br>
-    Optimizer: {optimizer_line}<br>
-    Provider: {provider_label} (requested: {requested_provider})<br>
-    Data: {data_range or 'n/a'}{f'<br>Windows: {window_note}' if window_note else ''}</div>
+    Optimizer: {_h(optimizer_line)}<br>
+    Provider: {_h(provider_label)} (requested: {_h(requested_provider)})<br>
+    Data: {_h(data_range or 'n/a')}{f'<br>Windows: {_h(window_note)}' if window_note else ''}</div>
 </div>
 
 {notice}
@@ -606,7 +635,7 @@ mChart.setOption({
 <div class="two-col">
   <div class="section">
     <div class="section-title">Equity Curve</div>
-    {f'<div class="notice">{benchmark_note}</div>' if benchmark_note else ''}
+    {f'<div class="notice">{_h(benchmark_note)}</div>' if benchmark_note else ''}
     <div id="equityChart" class="chart">{'' if dates and equity else '<div class="empty-state">No equity series available.</div>'}</div>
   </div>
   <div class="section">

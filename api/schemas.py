@@ -2,13 +2,53 @@
 
 from __future__ import annotations
 
+import itertools
+import math
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+#: Research/sweep windows: bounded like ``RunRequest`` so a caller cannot
+#: turn one request into a multi-decade panel (or a 9999-12-31 OOM).
+_MIN_REQUEST_DATE = date(2000, 1, 1)
+_MAX_REQUEST_DATE = date(2100, 12, 31)
+_MAX_REQUEST_SPAN_DAYS = 3653  # 10 years
+
+#: Parallel-sweep overrides may reach these config roots only. ``data.*`` is
+#: rejected (provider/path injection) except the two date keys, which are
+#: validated and span-bounded.
+_SWEEP_ALLOWED_ROOTS = frozenset({"universe", "portfolio", "backtest", "costs", "alpha"})
+_SWEEP_DATA_DATE_KEYS = frozenset({"data.start_date", "data.end_date"})
+_SWEEP_ENUMS = {
+    "portfolio.optimizer": frozenset({"equal_weight", "mean_variance", "risk_parity"}),
+    "alpha.method": frozenset({"equal_weight", "ic_weighted", "icir_weighted"}),
+    "backtest.rebalance_frequency": frozenset({"daily", "weekly", "monthly"}),
+    "portfolio.covariance.method": frozenset({"sample", "ledoit_wolf", "ewma"}),
+    "costs.slippage_model": frozenset({"fixed", "proportional", "impact"}),
+}
+_SWEEP_RANGES: dict[str, tuple[float, float]] = {
+    "universe.n_stocks": (50, 1000),
+    "portfolio.constraints.max_weight": (0.0, 1.0),
+    "portfolio.constraints.max_sector_exposure": (0.0, 1.0),
+    "portfolio.constraints.max_turnover": (0.0, 1.0),
+    "portfolio.constraints.lot_size": (1, 10_000),
+    "portfolio.risk_aversion": (0.0, 100.0),
+    "portfolio.covariance.lookback": (20, 2520),
+    "portfolio.covariance.ewma_half_life": (5, 504),
+    "backtest.initial_capital": (10_000.0, 1e12),
+    "costs.commission": (0.0, 0.01),
+    "costs.stamp_tax": (0.0, 0.01),
+    "costs.slippage": (0.0, 0.05),
+}
+_SWEEP_KEY_PART_RE = re.compile(r"[a-z_][a-z0-9_]*\Z")
+_SWEEP_FORBIDDEN_KEY_PARTS = (
+    "path", "dir", "file", "url", "dsn", "token", "password", "passwd",
+    "secret", "credential", "provider", "cache", "host", "port", "proxy", "env",
+)
 
 
 def _validate_date(v: str) -> str:
@@ -19,6 +59,107 @@ def _validate_date(v: str) -> str:
     except ValueError as exc:
         raise ValueError(f"Invalid date: {exc}") from exc
     return v
+
+
+def _parse_bounded_date(value: Any, label: str) -> date:
+    """A YYYY-MM-DD date inside the supported research range."""
+    if not isinstance(value, str) or not _DATE_RE.match(value):
+        raise ValueError(f"{label} must be a YYYY-MM-DD string")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} is not a valid date: {exc}") from exc
+    if not _MIN_REQUEST_DATE <= parsed <= _MAX_REQUEST_DATE:
+        raise ValueError(
+            f"{label} must be between {_MIN_REQUEST_DATE.isoformat()} and "
+            f"{_MAX_REQUEST_DATE.isoformat()}"
+        )
+    return parsed
+
+
+def _default_sweep_window() -> tuple[date, date]:
+    """The configured data window, used when only one side is overridden."""
+    from quant_platform.utils.config import load_config
+
+    config = load_config()
+    return (
+        date.fromisoformat(str(config.data.start_date)),
+        date.fromisoformat(str(config.data.end_date)),
+    )
+
+
+def _check_sweep_date_span(overrides: dict[str, Any]) -> None:
+    from quant_platform.backtest.distributed import PARAM_ALIASES
+
+    dates: dict[str, date] = {}
+    for key, value in overrides.items():
+        canonical = PARAM_ALIASES.get(key, key)
+        if canonical in _SWEEP_DATA_DATE_KEYS:
+            dates[canonical] = _parse_bounded_date(value, canonical)
+    if not dates:
+        return
+    default_start, default_end = _default_sweep_window()
+    start = dates.get("data.start_date", default_start)
+    end = dates.get("data.end_date", default_end)
+    if start >= end:
+        raise ValueError("start_date must be before end_date")
+    if (end - start).days > _MAX_REQUEST_SPAN_DAYS:
+        raise ValueError("date span must be at most 10 years")
+
+
+def _validate_sweep_override(key: Any, value: Any) -> None:
+    """Validate one parallel-sweep override key/value pair.
+
+    Unknown ``data.*``/path-like keys, non-scalar values and out-of-range
+    numbers are rejected before any worker process starts (the audit
+    reproduced ``n_stocks=10,000,000`` and 1900..2100 windows passing
+    straight through to ``_load_data``).
+    """
+    from quant_platform.backtest.distributed import PARAM_ALIASES
+
+    if not isinstance(key, str):
+        raise ValueError("sweep override keys must be strings")
+    canonical = PARAM_ALIASES.get(key, key)
+    if canonical in _SWEEP_DATA_DATE_KEYS:
+        _parse_bounded_date(value, canonical)
+        return
+    parts = canonical.split(".")
+    if len(parts) < 2 or not all(_SWEEP_KEY_PART_RE.fullmatch(part) for part in parts):
+        raise ValueError(f"invalid sweep override key {key!r}")
+    root = parts[0]
+    if root == "data":
+        raise ValueError(
+            "data.* overrides are not allowed; only data.start_date/data.end_date"
+        )
+    if root not in _SWEEP_ALLOWED_ROOTS:
+        raise ValueError(
+            f"sweep override {key!r} must be under one of "
+            f"{sorted(_SWEEP_ALLOWED_ROOTS)}"
+        )
+    lowered_parts = canonical.lower().split(".")
+    if any(part in _SWEEP_FORBIDDEN_KEY_PARTS for part in lowered_parts):
+        raise ValueError(f"sweep override {key!r} is not allowed")
+    if canonical in _SWEEP_ENUMS:
+        if not isinstance(value, str) or value not in _SWEEP_ENUMS[canonical]:
+            raise ValueError(
+                f"{key!r} must be one of {sorted(_SWEEP_ENUMS[canonical])}"
+            )
+        return
+    if canonical in _SWEEP_RANGES:
+        low, high = _SWEEP_RANGES[canonical]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key!r} must be a number between {low} and {high}")
+        number = float(value)
+        if not math.isfinite(number) or not low <= number <= high:
+            raise ValueError(f"{key!r} must be between {low} and {high}")
+        return
+    if value is None or isinstance(value, (dict, list, tuple)):
+        raise ValueError(f"{key!r} must be a scalar value")
+    if isinstance(value, str) and len(value) > 64:
+        raise ValueError(f"{key!r} value is too long (max 64 characters)")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{key!r} must be finite")
+
 
 
 # --- Request schemas ---
@@ -65,7 +206,7 @@ class CompareRequest(BaseModel):
 
 class SweepRequest(BaseModel):
     optimizers: list[Literal["equal_weight", "mean_variance", "risk_parity"]] = Field(
-        default=["equal_weight", "mean_variance", "risk_parity"]
+        default=["equal_weight", "mean_variance", "risk_parity"], max_length=3,
     )
     frequencies: list[Literal["daily", "weekly", "monthly"]] = Field(
         default=["monthly", "weekly"], max_length=3
@@ -79,6 +220,25 @@ class SweepRequest(BaseModel):
             if not 50 <= value <= 1000:
                 raise ValueError("each universe size must be between 50 and 1000")
         return values
+
+    @model_validator(mode="after")
+    def _bound_the_product(self):
+        """Dedupe and cap the grid: 100k optimizers meant 400k pipeline cells."""
+        for name in ("optimizers", "frequencies", "n_stocks_list"):
+            values = getattr(self, name)
+            if not values:
+                raise ValueError(f"{name} must not be empty")
+            deduped = list(dict.fromkeys(values))
+            if len(deduped) != len(values):
+                setattr(self, name, deduped)
+        combinations = (
+            len(self.optimizers) * len(self.frequencies) * len(self.n_stocks_list)
+        )
+        if combinations > 200:
+            raise ValueError(
+                f"sweep expands to {combinations} combinations; the maximum is 200"
+            )
+        return self
 
 
 # --- Response schemas ---
@@ -378,22 +538,41 @@ class ParallelSweepRequest(BaseModel):
         ),
     )
     base_overrides: dict[str, Any] = Field(default_factory=dict, description="Base config overrides")
-    metric: str = Field(default="sharpe_ratio", description="Optimization metric")
-    max_workers: int | None = Field(
-        default=None, ge=1, le=16, description="Max parallel workers",
+    metric: str = Field(
+        default="sharpe_ratio", max_length=64, pattern=r"^[a-z_][a-z0-9_]{0,63}$",
+        description="Optimization metric",
+    )
+    max_workers: int = Field(
+        default=4, ge=1, le=4, description="Max parallel workers (hard cap: 4)",
     )
 
     @model_validator(mode="after")
     def _bound_the_grid(self):
+        if not self.param_grid:
+            raise ValueError("param_grid must not be empty")
         if len(self.param_grid) > 10:
             raise ValueError("param_grid may have at most 10 parameters")
         combinations = 1
         for values in self.param_grid.values():
+            if not isinstance(values, list) or not values:
+                raise ValueError("each parameter must be a non-empty list of values")
             if len(values) > 20:
                 raise ValueError("each parameter may have at most 20 values")
-            combinations *= max(len(values), 1)
+            combinations *= len(values)
         if combinations > 100:
             raise ValueError("param_grid expands to more than 100 combinations")
+
+        # Every key/value (grid and base) must be a bounded scalar override,
+        # and every effective combination must keep the date window sane.
+        for key, value in self.base_overrides.items():
+            _validate_sweep_override(key, value)
+        for key, values in self.param_grid.items():
+            for value in values:
+                _validate_sweep_override(key, value)
+        for combo in itertools.product(*self.param_grid.values()):
+            merged = dict(self.base_overrides)
+            merged.update(dict(zip(self.param_grid.keys(), combo, strict=False)))
+            _check_sweep_date_span(merged)
         return self
 
 

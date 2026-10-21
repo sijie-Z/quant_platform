@@ -47,7 +47,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 import numpy as np
+import pandas as pd
 
+from quant_platform.data.providers.base import (
+    empty_corporate_actions,
+    normalize_corporate_actions,
+)
 from quant_platform.execution.order_book import (
     BookOrder,
     OrderBook,
@@ -58,6 +63,7 @@ from quant_platform.execution.order_book import (
 from quant_platform.execution.order_book import (
     Side as BookSide,
 )
+from quant_platform.shared.symbols import normalize_symbol
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -145,6 +151,10 @@ class PaperBroker:
     stochastic partial fills, cancel failures, and L2 replay capabilities.
     """
 
+    #: The dual-track TCA shadow keeps its own paper book, so splits and
+    #: cash dividends must be applied locally to that book on their ex-date.
+    supports_corporate_actions = True
+
     def __init__(
         self,
         initial_cash: float = 10_000_000,
@@ -152,6 +162,7 @@ class PaperBroker:
         latency: LatencyModel | LatencyConfig = LatencyModel.LOW,
         partial_fill_rate: float = 0.10,
         cancel_fail_rate: float = 0.02,
+        cash_dividend_tax_rate: float = 0.0,
     ):
         self._cash = initial_cash
         self._initial_cash = initial_cash
@@ -172,7 +183,11 @@ class PaperBroker:
         self._books: dict[str, OrderBook] = {}
         self._pending_orders: dict[str, BookOrder] = {}
 
-        # Positions (existing from SimulatedBroker port)
+        # Comparison book: canonical symbol -> {quantity, avg_cost,
+        # current_price}.  Kept from this broker's own fills so the TCA
+        # shadow survives corporate actions (a split scales quantity and
+        # divides cost; a dividend credits cash).  It is a shadow ledger, not
+        # an accounting-grade book: fees are not modelled here.
         self._positions: dict[str, dict] = {}
         self._market_prices: dict[str, float] = {}
         self._today_bought: set[str] = set()
@@ -191,6 +206,14 @@ class PaperBroker:
 
         # RNG
         self._rng = np.random.default_rng()
+
+        # Corporate actions (comparison book only).  Markers are keyed on
+        # ``(canonical_asset, ex_date)`` so a replayed day never double-applies.
+        self._cash_dividend_tax_rate = max(0.0, float(cash_dividend_tax_rate))
+        self._corporate_actions: pd.DataFrame = empty_corporate_actions()
+        self._applied_corporate_actions: set[tuple[str, str]] = set()
+        self._corporate_action_events: list[dict] = []
+        self._cash_ledger: list[dict] = []
 
     # ── Order Book Access ──
 
@@ -488,6 +511,14 @@ class PaperBroker:
         else:
             avg_price = price
 
+        # Keep the comparison book in step with this broker's own fills so a
+        # later split/dividend can be applied to the book the TCA shadow
+        # represents.
+        if total_filled > 0:
+            self._update_comparison_book(
+                symbol, side_str, total_filled, avg_price,
+            )
+
         # Exchange processing latency
         self._wait_latency(symbol)
 
@@ -572,6 +603,228 @@ class PaperBroker:
         )
         self._record_fill(record)
         return record
+
+    # ── Comparison book / corporate actions ──
+
+    def _update_comparison_book(
+        self, symbol: str, side: str, quantity: int, price: float,
+    ) -> None:
+        """Record a fill in the shadow position ledger (best effort)."""
+        asset = normalize_symbol(symbol)
+        position = self._positions.setdefault(
+            asset, {"quantity": 0, "avg_cost": 0.0, "current_price": 0.0},
+        )
+        if side == "buy":
+            previous_cost = position["avg_cost"] * position["quantity"]
+            position["quantity"] += int(quantity)
+            position["avg_cost"] = (
+                (previous_cost + price * quantity) / position["quantity"]
+                if position["quantity"] > 0 else 0.0
+            )
+            self._cash -= price * quantity
+        else:
+            # The TCA shadow mirrors the primary book's sell sizes; a sell
+            # larger than what this shadow actually holds must not credit
+            # cash for shares it never bought (that minted fictitious cash
+            # and skewed the shadow's dividend entitlement).  Credit only
+            # the held quantity; the excess fill is a shadow artifact.
+            held = max(0, int(position["quantity"]))
+            sold = min(int(quantity), held)
+            position["quantity"] = held - sold
+            self._cash += price * sold
+        position["current_price"] = float(price)
+
+    def get_positions(self) -> dict[str, dict]:
+        """The comparison book: ``{canonical_symbol: {quantity, avg_cost, ...}}``."""
+        return {
+            asset: dict(position)
+            for asset, position in self._positions.items()
+        }
+
+    def get_cash(self) -> float:
+        return float(self._cash)
+
+    def set_corporate_actions(self, actions) -> int:
+        """Replace the comparison book's pending corporate-action feed.
+
+        ``actions`` follows the provider contract
+        ``(ex_date, asset, kind, cash_per_share, split_ratio)``.  Nothing is
+        applied until :meth:`apply_corporate_actions` (or a dated
+        :meth:`new_trading_day`) runs.  Returns the number of feed rows.
+        """
+        frame = normalize_corporate_actions(actions)
+        self._corporate_actions = frame
+        return len(frame)
+
+    def new_trading_day(self, date: str | None = None) -> list[dict]:
+        """Advance the comparison book's exchange day.
+
+        ``date`` applies every action with ``ex_date <= date`` exactly once;
+        omitting it is a no-op (the shadow has no T+1 lock bookkeeping here).
+        """
+        if date is None:
+            return []
+        return self.apply_corporate_actions(ex_date=date)
+
+    @staticmethod
+    def _naive_action_date(value) -> pd.Timestamp:
+        """Pin a feed/advance date to a naive Asia/Shanghai exchange day.
+
+        Providers may stamp ex-dates with a UTC or exchange-local timezone;
+        the broker compares them with ``YYYY-MM-DD`` strings.  Converting to
+        the exchange zone and dropping the tz keeps the comparison valid
+        (and prevents a naive/aware ``TypeError``).
+        """
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert("Asia/Shanghai").tz_localize(None)
+        return timestamp.normalize()
+
+    def apply_corporate_actions(
+        self, actions=None, ex_date: str | None = None,
+    ) -> list[dict]:
+        """Apply split/cash actions to the comparison book exactly once.
+
+        A split scales quantity and divides the average cost and cached mark
+        (market value unchanged); a cash dividend credits
+        ``quantity * cash_per_share * (1 - tax)`` to cash and lowers the
+        cached mark so the shadow NAV stays continuous.  Cash components run
+        before splits (a 送转+派息 dividend is declared per pre-split share).
+        """
+        frame = (
+            self._corporate_actions if actions is None
+            else normalize_corporate_actions(actions)
+        )
+        if frame is None or frame.empty:
+            return []
+        cutoff = (
+            self._naive_action_date(ex_date) if ex_date is not None else None
+        )
+        rows = frame.copy()
+        rows["_order"] = rows["kind"].map(
+            lambda kind: 0 if kind == "cash" else 1
+        )
+        rows = rows.sort_values(["ex_date", "asset", "_order"], kind="stable")
+        applied: list[dict] = []
+        for (group_date, group_asset), group in rows.groupby(
+            ["ex_date", "asset"], sort=False,
+        ):
+            action_date = self._naive_action_date(group_date)
+            if cutoff is not None and action_date > cutoff:
+                continue
+            asset = normalize_symbol(group_asset)
+            marker = (asset, action_date.date().isoformat())
+            if marker in self._applied_corporate_actions:
+                continue
+            event = self._apply_action_group(asset, marker, group)
+            self._applied_corporate_actions.add(marker)
+            if event is not None:
+                self._corporate_action_events.append(event)
+                applied.append(event)
+        return applied
+
+    def _apply_action_group(
+        self, asset: str, marker: tuple[str, str], group: pd.DataFrame,
+    ) -> dict | None:
+        position = self._positions.get(asset)
+        quantity_before = int(position["quantity"]) if position else 0
+        quantity_after = quantity_before
+        cash_total = 0.0
+        tax_total = 0.0
+        cash_per_share_total = 0.0
+        split_ratio_total = 1.0
+        components: list[dict] = []
+        timestamp = time.time_ns()
+
+        for _, row in group.iterrows():
+            if str(row["kind"]) != "cash":
+                continue
+            cash_per_share = float(row["cash_per_share"])
+            if not (cash_per_share > 0):
+                continue
+            gross = quantity_before * cash_per_share
+            tax = gross * self._cash_dividend_tax_rate
+            net = gross - tax
+            cash_total += net
+            tax_total += tax
+            cash_per_share_total += cash_per_share
+            components.append({
+                "kind": "cash",
+                "cash_per_share": cash_per_share,
+                "cash_delta": net,
+                "tax": tax,
+            })
+            if quantity_before > 0:
+                self._cash += net
+                if position and position["current_price"] > 0:
+                    position["current_price"] = max(
+                        position["current_price"] - cash_per_share, 0.0,
+                    )
+                self._cash_ledger.append({
+                    "date": marker[1],
+                    "asset": asset,
+                    "kind": "cash_dividend",
+                    "quantity": quantity_before,
+                    "cash_per_share": cash_per_share,
+                    "tax": round(tax, 6),
+                    "cash_delta": round(net, 6),
+                    "description": (
+                        f"{quantity_before} shares x {cash_per_share}/share"
+                    ),
+                    "timestamp": timestamp,
+                })
+
+        for _, row in group.iterrows():
+            if str(row["kind"]) != "split":
+                continue
+            ratio = float(row["split_ratio"])
+            if not (ratio > 0) or ratio == 1.0:
+                continue
+            split_ratio_total *= ratio
+            components.append({"kind": "split", "split_ratio": ratio})
+            if position is not None:
+                position["quantity"] = int(
+                    round(int(position["quantity"]) * ratio)
+                )
+                if position["avg_cost"] > 0:
+                    position["avg_cost"] = position["avg_cost"] / ratio
+                if position["current_price"] > 0:
+                    position["current_price"] = (
+                        position["current_price"] / ratio
+                    )
+                quantity_after = position["quantity"]
+
+        if not components:
+            return None
+        # The resting LOB ladder was seeded at the pre-action price; a sell at
+        # the new level must not trade against a stale bid.  The next cycle
+        # re-seeds it (LiveRunner seeds liquidity before every paper order).
+        for key in list(self._books):
+            if normalize_symbol(key) == asset:
+                del self._books[key]
+
+        return {
+            "date": marker[1],
+            "asset": asset,
+            "kind": "+".join(sorted({c["kind"] for c in components})),
+            "quantity_before": quantity_before,
+            "quantity_after": quantity_after,
+            "cash_delta": cash_total,
+            "tax": tax_total,
+            "cash_per_share": cash_per_share_total,
+            "split_ratio": split_ratio_total,
+            "components": components,
+            "timestamp": timestamp,
+        }
+
+    def get_applied_corporate_actions(self) -> list[tuple[str, str]]:
+        return sorted(self._applied_corporate_actions)
+
+    def get_corporate_action_events(self) -> list[dict]:
+        return [dict(event) for event in self._corporate_action_events]
+
+    def get_cash_ledger(self) -> list[dict]:
+        return [dict(entry) for entry in self._cash_ledger]
 
     # ── Metrics ──
 

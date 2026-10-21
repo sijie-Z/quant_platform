@@ -15,6 +15,7 @@ import pytest
 import yaml
 
 from quant_platform.utils.version_manager import (
+    REDACTED,
     ConfigVersion,
     VersionManager,
 )
@@ -370,6 +371,46 @@ class TestSecretRedaction:
         restored = yaml.safe_load(target.read_text(encoding="utf-8"))
         assert "password" not in restored["execution"]["qmt"]
         assert restored["execution"]["qmt"]["account"] == "123456"
+
+
+class TestSuffixedSecretRedaction:
+    """Suffix/pattern keys leaked: tushare_token, deepseek_api_key and
+    postgres_dsn were written to version.yaml in plaintext because only an
+    exact-name list was matched."""
+
+    def _config(self):
+        return {
+            "data": {"provider": "tushare"},
+            "tushare_token": "ts-secret-value",
+            "agent": {"deepseek_api_key": "sk-secret-value"},
+            "database": {"postgres_dsn": "postgresql://quant:pw@db:5432/market"},
+            "notify": {"webhook": "https://alerts:token@hooks.example/quant"},
+            "unrelated": {"max_depth": 5, "benchmark": "equal_weight"},
+        }
+
+    def test_suffixed_keys_and_credential_urls_are_not_written(self, vm):
+        vid = vm.save(self._config())
+
+        stored = (vm._root / vid / "version.yaml").read_text(encoding="utf-8")
+
+        for secret in (
+            "ts-secret-value", "sk-secret-value", "quant:pw",
+            "alerts:token",
+        ):
+            assert secret not in stored, secret
+
+    def test_show_redacts_suffixed_keys(self, vm):
+        vid = vm.save(self._config())
+
+        shown = vm.show(vid)
+
+        assert shown["tushare_token"] == REDACTED
+        assert shown["agent"]["deepseek_api_key"] == REDACTED
+        assert shown["database"]["postgres_dsn"] == REDACTED
+        assert shown["notify"]["webhook"] == REDACTED
+        # Non-secret neighbours keep their values.
+        assert shown["unrelated"]["max_depth"] == 5
+        assert shown["data"]["provider"] == "tushare"
 
 
 class TestConcurrentSaves:

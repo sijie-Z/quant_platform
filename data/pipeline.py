@@ -63,7 +63,9 @@ import pandas as pd
 
 from quant_platform.data.providers.base import (
     DataProvider,
+    empty_corporate_actions,
     expected_data_end,
+    normalize_corporate_actions,
     panel_last_date,
     sessions_after,
 )
@@ -244,6 +246,16 @@ class DataPipeline:
         # measured in exchange sessions, not calendar days.
         self.data_freshness: dict = {}
 
+        # Corporate-action feed (paper-engine input).  ``get_corporate_actions``
+        # is lazy: the provider is queried on first use and the result is
+        # aligned to this run's date window and asset sample.  The flag mirrors
+        # the provider's own declaration; a provider with no feed returns the
+        # documented empty frame.
+        self.corporate_actions_available: bool = bool(
+            getattr(provider, "corporate_actions_available", False)
+        )
+        self._corporate_actions: pd.DataFrame | None = None
+
     def run(self) -> None:
         """Execute the full ETL pipeline.
 
@@ -267,6 +279,10 @@ class DataPipeline:
         self.price_basis = "unknown"
         self.adjusted_price_basis = "unknown"
         self.adjustment_factor_available = False
+        self._corporate_actions = None
+        self.corporate_actions_available = bool(
+            getattr(self.provider, "corporate_actions_available", False)
+        )
 
         self.metadata = self.provider.get_metadata()
         validate_metadata(self.metadata, provider=self.provider)
@@ -1615,6 +1631,66 @@ class DataPipeline:
             )
         close = self.prices["close"].unstack("asset")
         return self._tag_price_panel(close, "raw")
+
+    def get_corporate_actions(self) -> pd.DataFrame:
+        """Corporate actions aligned to the loaded sample (paper-engine input).
+
+        Returns the provider feed (``ex_date, asset, kind, cash_per_share,
+        split_ratio``) filtered to this pipeline's ``[start_date, end_date]``
+        and to the assets in the loaded price panel, with canonical
+        ``CODE.EXCHANGE`` symbols.  The frame is cached after the first call.
+
+        ``corporate_actions_available`` reports whether a real feed backed
+        the result.  A provider without one (or whose API failed) yields the
+        documented empty frame -- never ``None``, and never fabricated rows;
+        callers must not then apply any action locally.
+        """
+        if self._corporate_actions is not None:
+            return self._corporate_actions.copy()
+
+        available = bool(
+            getattr(self.provider, "corporate_actions_available", False)
+        )
+        frame = empty_corporate_actions()
+        hook = getattr(self.provider, "get_corporate_actions", None)
+        if callable(hook):
+            try:
+                raw = hook(
+                    str(self.start_date.date()), str(self.end_date.date()),
+                )
+                frame = normalize_corporate_actions(raw)
+                available = available or not frame.empty
+            except Exception as exc:  # a broken feed is "unavailable", not fatal
+                logger.warning(
+                    "%s: corporate-action feed failed: %s",
+                    provider_label(self.provider), exc,
+                )
+                frame = empty_corporate_actions()
+                available = False
+
+        # Align to the sample: date window first, then the assets the panel
+        # actually carries.  `self.prices` is filtered to the valid universe
+        # (listing window, ST policy) by run(); before run() the metadata
+        # sample is the best available definition.
+        if not frame.empty:
+            frame = frame.loc[
+                (frame["ex_date"] >= self.start_date)
+                & (frame["ex_date"] <= self.end_date)
+            ]
+            assets = None
+            if self.prices is not None:
+                assets = set(
+                    self.prices.index.get_level_values("asset").unique()
+                )
+            elif self.metadata is not None:
+                assets = set(self.metadata.index)
+            if assets is not None:
+                frame = frame.loc[frame["asset"].isin(assets)]
+            frame = frame.reset_index(drop=True)
+
+        self._corporate_actions = frame
+        self.corporate_actions_available = available
+        return frame.copy()
 
     def get_factor_prices(self) -> pd.DataFrame:
         """Adjusted close with suspension rows blanked for research inputs.

@@ -129,7 +129,9 @@ def test_parallel_sweep_invalid_param_is_422(app_client, monkeypatch):
     )
 
     assert resp.status_code == 422
-    assert "bogus_key" in resp.json()["detail"]
+    # The schema now rejects the unknown key before a worker starts, so the
+    # 422 detail is Pydantic's error list rather than the endpoint's string.
+    assert "bogus_key" in resp.text
 
 
 def test_regime_with_short_history_is_409(app_client, monkeypatch):

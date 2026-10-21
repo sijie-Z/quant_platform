@@ -395,7 +395,7 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
    `/api/monitor/factor-status`、`/api/monitor/capacity-gauge` 现在从有界 TTL 缓存的
    研究上下文现算（真实 validator / Barra / IC 衰减 / 相关矩阵 / TCA / 容量），
    并发饱和返回 429；确实无数据时仍返回 `available:false` 及精确原因。
-3. **WebSocket token**：当前前端用 `bearer.<token>` 子协议；`?token=` 仅为旧客户端保留。
+3. **WebSocket token**：仅接受 `bearer.<token>` 子协议（时序安全比较）；`?token=` 查询串已移除。
 4. **回测整手限制**：执行层（TWAP/VWAP/Iceberg、paper broker、OMS）强制整手，
    向量化日频回测仍是权重层面（已明确标注，未隐藏）。
 5. **交易所日历**：内置休市表覆盖至 2026 年；2027 年休市日需通过
@@ -403,7 +403,7 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
 6. **价格基准**：已统一。provider 交付 raw OHLCV + 复权因子（Tushare `adj_factor=1/native_cum`、
    Baostock raw+hfq 双取），`get_raw_close()` 供成交/估值、`get_adjusted_close()` 供研究，
    货币路径在只有复权价时 fail closed；符号统一为 `CODE.EXCHANGE`（含北交所 30% 限价）。
-   残余：Adata 不提供价格面板（仅跨源校验，价格路径 fail closed）；paper 引擎未做公司行动股数/分红记账。
+   残余：Adata 不提供价格面板（仅跨源校验，价格路径 fail closed）；公司行动已在 paper 引擎实现并接线（见本轮“公司行动”）。
 7. **增量数据**：已实现（D32）。`run --incremental` / `cache refresh --incremental` 只追加新交易日，边界重叠一天并 `keep="last"` 去重；每次更新全量刷新复权因子（除权日不产生假跳变）；数据写成功后才推进完成标记；部分响应不推进并保留旧缓存；`data.max_staleness_days` 对研究告警、对决定性运行 fail closed。边界：合成数据源 `supports_incremental=False`（回退全量）；财务/基准在追加时仍全量刷新；停牌与截断的区分偏保守。
 8. **ST 历史**：Tushare/Baostock 不提供 ST 公告历史（`st_available=False`，
    不伪造全 False 列）；合成数据提供，用于 PIT 验证。
@@ -433,12 +433,15 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
 | 研究残留 | R11：因子库 writer 以面板实际最后观测日为 `signal_date`，稳定性指标由真实 walk-forward 折计算，无折时写 NULL+`stability_unavailable`（不再伪造 0）；R85/R87 热力图与 RQ3 统一同期月份标签/实现日收益；R86/R74 成本进入日收益序列（净口径名副其实）、终期不可执行调仓一致跳过、`metric_basis` 记录；RQ1-3 输出带 provider/seed/窗口 manifest |
 | provider 基准 | Postgres 显式声明 raw+`adj_factor`（可配置 `close_adjustment`，双重复权/非法因子报错）；ValidatedProvider 转发主源基准并保留 `adj_factor`，基准不一致拒绝融合；Adata 价格路径明确不支持 |
 | 报告一致性 | R90 总收益口径统一（全历史 headline，公共窗口/覆盖单列）；R91 基准按日期对齐；R92 滚动 Sharpe 用日期轴且 <252 显示空态；R93 <10 样本显示 n/a；R97 VaR/CVaR 标注配置置信度；R89/R96/R98–R105 标签、优化器回退、PNG 月末分桶、空数据横幅、格式化一致、恢复期、归因截距、UTC 时间戳等 |
-| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **3,157 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
+| 安全修复（P0） | 修复 Host 头鉴权绕过（Starlette BadHost：`Host: x/..` 使 `request.url.path` 变为 `/../api/config`，绕过 token/loopback）：鉴权改用 ASGI `scope["path"]` 并归一化 `root_path`/斜杠/编码，新增最外层 `RequestGuardMiddleware` 校验 Host（可配 `QUANT_ALLOWED_HOSTS`）、10MB 请求体上限、计算端点每客户端令牌桶 429；token 比较改为 `secrets.compare_digest`；修复 422 序列化 500。新增 31 条 Host 变体/WS/root_path 回归测试（旧代码 200 泄漏，新代码 403/401） |
+| 安全加固（P1/P2） | sweep/parallel-sweep/研究窗口全部有界（组合 ≤200、n_stocks 50–1000、日期 2000–2100/≤10 年、workers≤4）；`/api/core/store/*` 与审计按租户过滤（`X-Tenant-Id`/`tenant_id`，跨租户需 loopback+显式 `all_tenants`），`delete_position` 必须有租户；HTML 报告转义+CSP、保留归档 CSV 公式注入中和、配置版本后缀密钥脱敏、WS 查询 token 移除、指标标签基数有界、QMT 密码禁止请求体、Tushare 客户端强制 HTTPS；`python-multipart`/`lightgbm` 升级到修复版本 |
+| 公司行动 | provider 契约 `get_corporate_actions`（送转/派息，规范化/组合事件拆分）、pipeline 访问器、Synthetic/Tushare/Baostock 数据源；paper broker/ExecutionEngine/LiveEngine/LiveRunner/dual-track PaperBroker 按除权日幂等应用（拆股数量/成本、现金分红入账、T+1、持久化 `(asset, ex_date)` 标记），真实券商不本地应用；Web 引擎/CLI trade/daemon 全部接线，报告 `corporate_actions_applied` |
+| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **3,282 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
 
-**当前计数（2026-10-21 实测）**：2,883 个测试函数、3,160 条用例
-（3,157 passed / 3 skipped）、222 个测试文件、约 233 个非测试 Python 文件、
+**当前计数（2026-10-21 实测）**：2,989 个测试函数、3,285 条用例
+（3,282 passed / 3 skipped）、234 个测试文件、约 233 个非测试 Python 文件、
 99 HTTP + 1 WebSocket、21 个 CLI 命令、37 个 Vue 组件。
 
 **仍未处理（诚实清单）**：多租户隔离（#75）；
-WS `?token=` 旧回退；Postgres/Adata 价格基准声明；
-paper 引擎公司行动股数/分红记账；交易所日历 2027 年需通过 `QUANT_EXCHANGE_HOLIDAYS` 追加。
+Postgres/Adata 价格基准声明（Postgres 已声明、Adata 价格不支持）；
+交易所日历 2027 年需通过 `QUANT_EXCHANGE_HOLIDAYS` 追加。

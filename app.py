@@ -13,9 +13,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
+import re
+import secrets
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -35,6 +39,316 @@ from quant_platform.api.routes import router as api_router
 _FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 _DIST_DIR = _FRONTEND_DIR / "dist"
 
+#: Hard cap for request bodies. Parsing happens inside FastAPI/Starlette, so
+#: the limit must be enforced before the app sees the stream. 10 MB is well
+#: above every documented request (holdings imports and parallel grids are
+#: the largest) while bounding memory a single client can pin.
+_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
+
+#: Expensive compute endpoints get a simple per-client token bucket. The
+#: analytics pool already rejects concurrent saturation with 429; this stops
+#: one client from queueing a rapid-fire series that keeps the pool busy.
+_RATE_LIMITED_PATHS = frozenset({
+    "/api/run",
+    "/api/compare",
+    "/api/sweep",
+    "/api/parallel/sweep",
+    "/api/walkforward",
+    "/api/montecarlo",
+    "/api/risk/decompose",
+    "/api/barra/decompose",
+    "/api/barra/covariance",
+    "/api/ml/train",
+    "/api/ml/predict",
+    "/api/ic-monitor/compute",
+    "/api/data/quality",
+    "/api/report/html",
+    "/api/screen",
+    "/api/fundamentals/screen",
+    "/api/fundamentals/bulk",
+    "/api/fundamentals/rank",
+    "/api/portfolio/import",
+})
+_RATE_LIMIT_CAPACITY = 20.0        # burst
+_RATE_LIMIT_REFILL_PER_SECOND = 1.0
+
+
+def _scope_header(scope, name: str) -> str | None:
+    """Case-insensitive ASGI header lookup.
+
+    Starlette 0.40's ``Headers.__getitem__`` compares raw header bytes
+    case-sensitively, so a hand-built scope (or a server that preserves case)
+    can hide ``Content-Length``. The security checks must not depend on that.
+    """
+    wanted = name.lower().encode("latin-1")
+    for header_name, value in scope.get("headers") or []:
+        if header_name.lower() == wanted:
+            return value.decode("latin-1")
+    return None
+
+
+async def _send_json(
+    send, status: int, payload: dict, headers: dict[str, str] | None = None,
+) -> None:
+    """Send a minimal JSON response from a pure-ASGI middleware."""
+    body = json.dumps(payload).encode("utf-8")
+    raw_headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    for name, value in (headers or {}).items():
+        raw_headers.append((name.encode("latin-1"), value.encode("latin-1")))
+    await send({"type": "http.response.start", "status": status, "headers": raw_headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+#: Hostnames are compared as ASCII labels; unicode hosts must arrive as punycode.
+_HOST_LABEL_RE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?\Z")
+_IPV6_LITERAL_RE = re.compile(r"[0-9A-Fa-f:.]+\Z")
+
+
+def _scope_host(scope) -> str:
+    """Raw Host header from the ASGI scope ('' when absent)."""
+    for name, value in scope.get("headers") or []:
+        if name.lower() == b"host":
+            return value.decode("latin-1")
+    return ""
+
+
+def _valid_host_header(value: str) -> bool:
+    """Whether ``value`` is a well-formed ``host`` or ``host:port``.
+
+    Starlette 0.40's bad-host parsing (GHSA-86qp-5c8j-p5mr) let
+    ``Host: x/..`` rewrite the URL path and strip the auth prefix. Only a
+    syntactically valid host reaches the application; anything containing
+    path delimiters, credentials, whitespace/control characters, ``..`` or
+    malformed ports is rejected before routing.
+    """
+    if not value or len(value) > 255:
+        return False
+    if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
+        return False
+    if any(ch in value for ch in "/\\@?#,;%"):
+        return False
+    if ".." in value:
+        return False
+    port = ""
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return False
+        inner = value[1:end]
+        rest = value[end + 1:]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                return False
+            port = rest[1:]
+        if not inner or not _IPV6_LITERAL_RE.fullmatch(inner):
+            return False
+    else:
+        host = value
+        if host.count(":") > 1:
+            return False
+        if ":" in host:
+            host, _, port = host.partition(":")
+        if not host or len(host) > 253:
+            return False
+        labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
+        for label in labels:
+            if not label or len(label) > 63 or not _HOST_LABEL_RE.fullmatch(label):
+                return False
+    if not port:
+        return True
+    return port.isdigit() and 0 < int(port) <= 65535
+
+
+def _host_name(value: str) -> str:
+    """Host part of a Host header, lowercased, without the port."""
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end].lower() if end > 0 else ""
+    return (value.rsplit(":", 1)[0] if ":" in value else value).lower()
+
+
+def _host_is_allowed(value: str) -> bool:
+    """Optional ``QUANT_ALLOWED_HOSTS`` allowlist (default: any valid host).
+
+    Comma-separated hostnames, case-insensitive; ``*.example.com`` matches
+    subdomains and ``*`` disables the allowlist. The port is ignored.
+    """
+    raw = os.environ.get("QUANT_ALLOWED_HOSTS", "")
+    entries = [entry.strip().lower().rstrip(".") for entry in raw.split(",") if entry.strip()]
+    if not entries:
+        return True
+    host = _host_name(value).rstrip(".")
+    for entry in entries:
+        if entry == "*" or host == entry:
+            return True
+        if entry.startswith("*.") and host.endswith(entry[1:]):
+            return True
+    return False
+
+
+def _normalized_route_path(scope) -> str | None:
+    """Normalize ``scope["path"]`` for the authorization decision.
+
+    Never use ``request.url.path``: on Starlette 0.40 a crafted Host header
+    re-parses the URL and yields ``/../api/config`` while routing still matched
+    ``/api/config``. The ASGI ``path`` is what the router matches; it is
+    adjusted here for ``root_path`` deployments and collapsed (duplicate
+    slashes, ``.`` segments, trailing slash). ``None`` means the path is
+    ambiguous (dot-dot segments, percent-encoded or backslash/NUL bytes) and
+    the request must be denied.
+    """
+    path = scope.get("path") or "/"
+    root = (scope.get("root_path") or "").rstrip("/")
+    if root and path.startswith(root) and (
+        len(path) == len(root) or path[len(root):len(root) + 1] == "/"
+    ):
+        path = path[len(root):] or "/"
+    if "%" in path or "\\" in path or "\x00" in path:
+        return None
+    segments = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment.startswith(".."):
+            return None
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in segment):
+            return None
+        segments.append(segment)
+    return "/" + "/".join(segments)
+
+
+class RequestGuardMiddleware:
+    """Outermost, pure-ASGI guard: Host validation, body cap, rate limit.
+
+    It runs before routing, static files, docs, metrics and authentication, so
+    a malformed Host can never reach the router (the P0 was that the auth
+    middleware and the router disagreed about the path), a giant body is
+    rejected before it is parsed, and one client cannot hammer expensive
+    compute endpoints. Pure ASGI, so it also covers WebSocket handshakes,
+    which ``BaseHTTPMiddleware`` never sees.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self._buckets: dict[str, list[float]] = {}
+
+    def _rate_limited(self, scope, path: str) -> tuple[bool, float]:
+        if scope.get("method") != "POST" or path not in _RATE_LIMITED_PATHS:
+            return False, 0.0
+        client = scope.get("client")
+        key = client[0] if client else "unknown"
+        now = time.monotonic()
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            if len(self._buckets) > 1024:  # bound per-instance state
+                self._buckets.clear()
+            bucket = [_RATE_LIMIT_CAPACITY, now]
+            self._buckets[key] = bucket
+        tokens = min(
+            _RATE_LIMIT_CAPACITY,
+            bucket[0] + (now - bucket[1]) * _RATE_LIMIT_REFILL_PER_SECOND,
+        )
+        bucket[0], bucket[1] = tokens, now
+        if tokens >= 1.0:
+            bucket[0] = tokens - 1.0
+            return False, 0.0
+        return True, (1.0 - tokens) / _RATE_LIMIT_REFILL_PER_SECOND
+
+    async def __call__(self, scope, receive, send):
+        scope_type = scope.get("type")
+        if scope_type not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        host = _scope_host(scope)
+        if host and (not _valid_host_header(host) or not _host_is_allowed(host)):
+            if scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            else:
+                await _send_json(
+                    send, 403, {"detail": "Invalid or untrusted Host header"},
+                )
+            return
+
+        if scope_type == "websocket":
+            await self.app(scope, receive, send)
+            return
+
+        path = _normalized_route_path(scope)
+        if path is not None:
+            limited, retry_after = self._rate_limited(scope, path)
+            if limited:
+                wait = max(1, int(round(retry_after)))
+                await _send_json(
+                    send,
+                    429,
+                    {
+                        "detail": "Rate limit exceeded for a compute endpoint",
+                        "retry_after_s": wait,
+                    },
+                    headers={"Retry-After": str(wait)},
+                )
+                return
+
+        content_length = _scope_header(scope, "content-length")
+        if content_length is not None:
+            try:
+                declared = int(content_length)
+            except ValueError:
+                await _send_json(send, 400, {"detail": "Invalid Content-Length"})
+                return
+            if declared < 0:
+                await _send_json(send, 400, {"detail": "Invalid Content-Length"})
+                return
+            if declared > _MAX_REQUEST_BODY_BYTES:
+                await _send_json(
+                    send,
+                    413,
+                    {"detail": f"Request body exceeds {_MAX_REQUEST_BODY_BYTES} bytes"},
+                )
+                return
+
+        # Buffer the body up to the cap, then replay it downstream. A lazy
+        # receive-wrapper cannot work here: FastAPI converts any exception
+        # raised while parsing the body into a generic 400, so a streaming
+        # oversize body would not surface as 413.
+        chunks: list[bytes] = []
+        received = 0
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                break
+            chunk = message.get("body", b"")
+            received += len(chunk)
+            if received > _MAX_REQUEST_BODY_BYTES:
+                await _send_json(
+                    send,
+                    413,
+                    {"detail": f"Request body exceeds {_MAX_REQUEST_BODY_BYTES} bytes"},
+                )
+                return
+            chunks.append(chunk)
+            if not message.get("more_body", False):
+                break
+        buffered = b"".join(chunks)
+        replayed = False
+
+        async def replay_receive():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {
+                    "type": "http.request",
+                    "body": buffered,
+                    "more_body": False,
+                }
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
 
 class APITokenMiddleware(BaseHTTPMiddleware):
     """Require a token (or loopback) for every non-health API route.
@@ -43,6 +357,12 @@ class APITokenMiddleware(BaseHTTPMiddleware):
     the trading/OMS subset: the shipped default (`main.py web` binds 0.0.0.0)
     let remote anonymous clients read orders, trades, signals, audit rows and
     trigger every compute endpoint. Health stays public for probes.
+
+    The authorization decision uses the ASGI ``scope["path"]`` (normalized for
+    ``root_path``), never ``request.url.path``: on Starlette 0.40 a Host header
+    containing a path segment (``Host: x/..``, GHSA-86qp-5c8j-p5mr) rewrote the
+    parsed URL path while the router still matched ``/api/...``, bypassing this
+    entire gate in token and loopback-only modes alike.
     """
 
     PUBLIC_PATHS = {
@@ -61,16 +381,30 @@ class APITokenMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         token = os.environ.get("QUANT_API_TOKEN", "")
-        path = request.url.path
+        path = _normalized_route_path(request.scope)
+        if path is None:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Ambiguous request path"},
+            )
         protected = (
-            (path.startswith("/api") and path not in self.PUBLIC_PATHS)
-            or path in self.DOC_PATHS
-        )
+            (path == "/api" or path.startswith("/api/"))
+            and path not in self.PUBLIC_PATHS
+        ) or path in self.DOC_PATHS
         if protected:
             if token:
-                auth = request.headers.get("Authorization", "")
-                api_key = request.headers.get("X-API-Key", "")
-                if api_key != token and auth != f"Bearer {token}":
+                auth = _scope_header(request.scope, "authorization") or ""
+                api_key = _scope_header(request.scope, "x-api-key") or ""
+                # Compare bytes: compare_digest(str, str) raises TypeError for
+                # non-ASCII tokens, and env tokens are not charset-restricted.
+                token_bytes = token.encode("utf-8")
+                if not (
+                    secrets.compare_digest(api_key.encode("utf-8"), token_bytes)
+                    or secrets.compare_digest(
+                        auth.encode("utf-8"),
+                        f"Bearer {token}".encode(),
+                    )
+                ):
                     return JSONResponse(
                         status_code=401,
                         content={"detail": "Invalid or missing API token"},
@@ -170,7 +504,13 @@ async def _shutdown_resources(api_routes, bus) -> None:
 
 
 def _json_safe(value):
-    """Replace non-finite floats so Starlette's strict encoder accepts them."""
+    """Replace non-finite floats so Starlette's strict encoder accepts them.
+
+    Pydantic v2 puts the original exception object in ``ctx.error`` for
+    ``model_validator`` failures; that made the 422 body itself fail to
+    serialise (an empty optimizer list returned a 500). Exceptions and any
+    other non-JSON object become strings.
+    """
     import math
 
     if isinstance(value, dict):
@@ -179,7 +519,11 @@ def _json_safe(value):
         return [_json_safe(v) for v in value]
     if isinstance(value, float) and not math.isfinite(value):
         return None
-    return value
+    if isinstance(value, BaseException):
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 def create_app(serve_frontend: bool = True) -> FastAPI:
@@ -219,6 +563,11 @@ def create_app(serve_frontend: bool = True) -> FastAPI:
     from quant_platform.utils.metrics import install_http_middleware
 
     install_http_middleware(app)
+    # Outermost guard (Starlette inserts middleware at position 0, so this is
+    # the first code to run): Host validation before routing/static/docs, the
+    # request-body cap before parsing, and the compute rate limit. Security
+    # middleware must run before any handler that could reflect input.
+    app.add_middleware(RequestGuardMiddleware)
 
     # API routes
     app.include_router(api_router)

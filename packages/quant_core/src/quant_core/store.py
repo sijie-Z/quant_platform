@@ -82,6 +82,38 @@ def _clamp_days(days, default: int = 30, maximum: int = 3650) -> int:
     return max(1, min(value, maximum))
 
 
+#: Control characters openpyxl-style exporters strip; kept in sync with
+#: ``compliance/exporter._ILLEGAL_XML_CHARS`` for the standalone fallback.
+_ILLEGAL_CELL_CHARS = {
+    code: None
+    for code in list(range(0x00, 0x09)) + [0x0B, 0x0C] + list(range(0x0E, 0x20))
+}
+_DANGEROUS_CELL_PREFIXES = frozenset("=+-@\t\r")
+
+
+def _sanitize_archive_cell(value):
+    """Neutralize spreadsheet formula injection in retention archives.
+
+    The retention CSV writer echoed stored values verbatim, so a symbol or
+    error message beginning with ``=``/``+``/``-``/``@`` executed on open
+    (CWE-1236). Reuse the compliance exporter's neutralizer when it is
+    importable; the fallback mirrors it for standalone ``quant_core`` use.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        from quant_platform.compliance.exporter import _sanitize_cell
+
+        return _sanitize_cell(value)
+    except Exception:  # pragma: no cover - quant_core used without quant_platform
+        text = value.translate(_ILLEGAL_CELL_CHARS)
+        if not text:
+            return ""
+        if text[0] in _DANGEROUS_CELL_PREFIXES or ord(text[0]) < 0x20:
+            return "'" + text
+        return text
+
+
 @dataclass(frozen=True)
 class RetentionPolicy:
     """Per-table maximum age for the retention job (S10).
@@ -279,6 +311,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS pnl_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT DEFAULT 'default',
                     timestamp TEXT NOT NULL,
                     total_equity REAL NOT NULL,
                     cash REAL NOT NULL,
@@ -305,6 +338,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
+                    tenant_id TEXT DEFAULT 'default',
                     strategy_id TEXT DEFAULT '',
                     broker TEXT DEFAULT 'simulated',
                     status TEXT DEFAULT 'active',
@@ -424,7 +458,10 @@ class Store:
 
     def _migrate_tenant_id(self, conn: sqlite3.Connection) -> None:
         """Add tenant_id column to existing tables if missing."""
-        for table in ("orders", "trades", "positions", "signals", "events"):
+        for table in (
+            "orders", "trades", "positions", "signals", "events",
+            "pnl_history", "sessions",
+        ):
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if "tenant_id" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT DEFAULT 'default'")
@@ -700,15 +737,20 @@ class Store:
                     )
 
     def delete_position(self, code: str, tenant_id: str = ""):
-        """Remove a position."""
+        """Remove one tenant's position (``tenant_id`` is required).
+
+        An unscoped delete removed every tenant's row for the ticker; callers
+        must now name the tenant (``core.audit`` resolves it from
+        ``TenantContext``).
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required to delete a position")
         with self._lock, self._conn() as conn:
-            if tenant_id:
-                conn.execute(
-                    "DELETE FROM positions WHERE code = ? AND tenant_id = ?",
-                    (code, tenant_id),
-                )
-            else:
-                conn.execute("DELETE FROM positions WHERE code = ?", (code,))
+            cursor = conn.execute(
+                "DELETE FROM positions WHERE code = ? AND tenant_id = ?",
+                (code, tenant_id),
+            )
+            return cursor.rowcount
 
     def get_positions(self, tenant_id: str = "") -> list[dict]:
         """Get current positions.
@@ -862,9 +904,12 @@ class Store:
         total_equity = float(snapshot["total_equity"])
         cash = float(snapshot["cash"])
         market_value = float(snapshot["market_value"])
+        tenant_id = snapshot.get("tenant_id") or "default"
 
         rows = conn.execute(
-            "SELECT total_equity FROM pnl_history ORDER BY timestamp, id"
+            "SELECT total_equity FROM pnl_history WHERE tenant_id = ? "
+            "ORDER BY timestamp, id",
+            (tenant_id,),
         ).fetchall()
         equity = [float(r[0]) for r in rows]
         previous_equity = equity[-1] if equity else None
@@ -908,10 +953,11 @@ class Store:
 
         conn.execute("""
                 INSERT INTO pnl_history
-                (timestamp, total_equity, cash, market_value, daily_pnl,
+                (tenant_id, timestamp, total_equity, cash, market_value, daily_pnl,
                  daily_pnl_pct, cumulative_pnl, n_positions, max_drawdown, sharpe_ratio)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
+            tenant_id,
             snapshot.get('timestamp', exchange_now_iso()),
             total_equity, cash, market_value,
             _or_default('daily_pnl', daily_pnl),
@@ -949,17 +995,24 @@ class Store:
             return True
 
     def get_pnl_history(self, days: int = 30,
-                        start_date: str = "", end_date: str = "") -> list[dict]:
+                        start_date: str = "", end_date: str = "",
+                        tenant_id: str = "") -> list[dict]:
         """Get P&L history.
 
         `days` is the default window. Explicit `start_date`/`end_date`
         (YYYY-MM-DD) override it, so a compliance export can request a
-        period older than the default window.
+        period older than the default window. With `tenant_id` only that
+        tenant's snapshots are returned; without it (the default) every
+        tenant's rows are returned, which is the Store-level API contract --
+        the HTTP layer always names a tenant.
         """
         days = _clamp_days(days)
         with self._conn() as conn:
             query = "SELECT * FROM pnl_history WHERE 1=1"
             params: list = []
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
             if start_date:
                 query += " AND timestamp >= ?"
                 params.append(start_date)
@@ -1097,6 +1150,7 @@ class Store:
             "config": json.dumps(session.get("config", {})),
         }
         session_id = session["session_id"]
+        tenant_id = session.get("tenant_id") or "default"
 
         with self._lock, self._conn() as conn:
             existing = conn.execute(
@@ -1105,10 +1159,10 @@ class Store:
 
             if existing is None:
                 conn.execute(
-                    "INSERT INTO sessions (session_id, strategy_id, broker, status, "
-                    "started_at, stopped_at, total_trades, total_pnl, config) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (session_id, *(values[f] for f in self._SESSION_FIELDS)),
+                    "INSERT INTO sessions (session_id, tenant_id, strategy_id, broker, "
+                    "status, started_at, stopped_at, total_trades, total_pnl, config) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (session_id, tenant_id, *(values[f] for f in self._SESSION_FIELDS)),
                 )
                 return
 
@@ -1123,14 +1177,20 @@ class Store:
                 (*(merged[f] for f in self._SESSION_FIELDS), session_id),
             )
 
-    def get_sessions(self, limit: int = 20) -> list[dict]:
-        """Get trading session history."""
+    def get_sessions(self, limit: int = 20, tenant_id: str = "") -> list[dict]:
+        """Get trading session history, optionally for one tenant."""
         # SQLite treats LIMIT -1 as unlimited; the API used to forward -1 raw.
         limit = _clamp_limit(limit, default=20, maximum=1000)
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?",
-                (limit,)).fetchall()
+            if tenant_id:
+                rows = conn.execute(
+                    "SELECT * FROM sessions WHERE tenant_id = ? "
+                    "ORDER BY started_at DESC LIMIT ?",
+                    (tenant_id, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?",
+                    (limit,)).fetchall()
             return [dict(r) for r in rows]
 
     # ── Events (Audit Trail) ──
@@ -1403,7 +1463,13 @@ class Store:
                         fh, fieldnames=list(rows[0].keys()),
                     )
                     writer.writeheader()
-                    writer.writerows(rows)
+                    writer.writerows(
+                        {
+                            key: _sanitize_archive_cell(value)
+                            for key, value in row.items()
+                        }
+                        for row in rows
+                    )
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp_path, archive_path)
@@ -1470,21 +1536,29 @@ class Store:
 
     # ── Stats ──
 
-    def get_stats(self) -> dict:
-        """Get store statistics."""
+    def get_stats(self, tenant_id: str = "") -> dict:
+        """Get store statistics (optionally scoped to one tenant)."""
+        where = " WHERE tenant_id = ?" if tenant_id else ""
+        params = (tenant_id,) if tenant_id else ()
         with self._conn() as conn:
+            def _count(sql: str) -> int:
+                return conn.execute(sql, params).fetchone()[0]
+
             return {
                 # The real backend, not a hardcoded label. `/api/postgres/stats`
                 # always claimed "sqlite" because it never looked at the store
                 # it had constructed.
                 "backend": "sqlite",
-                "orders": conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
-                "positions": conn.execute("SELECT COUNT(*) FROM positions WHERE quantity > 0").fetchone()[0],
-                "trades": conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0],
-                "pnl_snapshots": conn.execute("SELECT COUNT(*) FROM pnl_history").fetchone()[0],
-                "signals": conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0],
-                "sessions": conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
-                "events": conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+                "orders": _count("SELECT COUNT(*) FROM orders" + where),
+                "positions": _count(
+                    "SELECT COUNT(*) FROM positions WHERE quantity > 0"
+                    + (" AND tenant_id = ?" if tenant_id else "")
+                ),
+                "trades": _count("SELECT COUNT(*) FROM trades" + where),
+                "pnl_snapshots": _count("SELECT COUNT(*) FROM pnl_history" + where),
+                "signals": _count("SELECT COUNT(*) FROM signals" + where),
+                "sessions": _count("SELECT COUNT(*) FROM sessions" + where),
+                "events": _count("SELECT COUNT(*) FROM events" + where),
                 "db_path": self._db_path,
                 "db_size_bytes": self.size_bytes(),
             }

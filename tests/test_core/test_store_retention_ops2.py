@@ -371,3 +371,21 @@ class TestExchangeTimestampBasis:
                                      end_date="2023-11-15")
         assert len(rows) == 1
         assert rows[0]["timestamp"] == "2023-11-15T06:13:20"
+
+    def test_archive_csv_neutralizes_formula_injection(self, tmp_path):
+        """The retention archiver wrote stored values verbatim (CWE-1236)."""
+        store = _store(tmp_path)
+        payload = "=cmd|' /C calc'!A0"
+        store.save_signal({
+            "signal_id": "evil-signal", "code": payload, "direction": "buy",
+            "strength": 1.0, "generated_at": OLD_ISO,
+        })
+
+        result = store.run_retention(
+            _policy(), archive_dir=tmp_path / "archive", now=NOW,
+        )
+
+        archive = Path(result["tables"]["signals"]["archive_path"])
+        with open(archive, encoding="utf-8", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        assert rows[0]["code"] == "'" + payload

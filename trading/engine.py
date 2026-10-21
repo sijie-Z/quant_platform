@@ -51,6 +51,10 @@ from quant_platform.trading.broker import (
     OrderStatus,
     SimulatedBroker,
 )
+from quant_platform.trading.live_engine import (
+    normalize_corporate_action_feed,
+    summarize_corporate_action_events,
+)
 from quant_platform.trading.signal_generator import LiveSignalGenerator
 from quant_platform.trading.signals import (
     DEFAULT_MIN_SIGNAL_SCORE,
@@ -155,6 +159,8 @@ class LiveTradingEngine:
         min_trade_value: float = 1000,
         min_signal_score: float = DEFAULT_MIN_SIGNAL_SCORE,
         tenant_id: str = "default",
+        corporate_actions=None,
+        data_provider=None,
     ):
         self._broker = broker
         self._store = store or Store()
@@ -256,6 +262,39 @@ class LiveTradingEngine:
         # D4/D5: engine-state snapshot key (tenant-scoped so two tenants on
         # one Store cannot clobber each other's cash/kill-switch row).
         self._engine_state_key = f"live_engine:{tenant_id}"
+        # Corporate actions (paper books only).  A feed can be supplied
+        # directly (DataFrame, or a callable returning one) and/or loaded
+        # lazily from an injected ``data_provider`` on the first trading-day
+        # advance.  Real brokers (QMT/XTP) settle actions on their side:
+        # ``supports_corporate_actions`` is False for them and the engine
+        # never hands them a local feed (no double accounting).
+        self._corporate_action_feed = corporate_actions
+        self._corporate_action_provider = data_provider
+        # True only once a paper book accepted a feed (a real broker never
+        # does).  A callable/provider feed stays dynamic and is re-queried on
+        # every day advance.
+        self._corporate_actions_loaded = False
+        self._corporate_actions_source = ""
+        self._corporate_action_feed_rows = 0
+        self._corporate_action_events: list[dict] = []
+        if self._broker_supports_corporate_actions():
+            # Applied (asset, ex_date) markers must survive a same-day
+            # restart: a fresh SimulatedBroker re-loads them from the Store.
+            configure = getattr(
+                self._broker, "configure_corporate_action_persistence", None,
+            )
+            if callable(configure):
+                try:
+                    configure(
+                        self._store, f"paper_corporate_actions:{tenant_id}",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not wire corporate-action marker persistence: %s",
+                        exc,
+                    )
+        if corporate_actions is not None and not callable(corporate_actions):
+            self.set_corporate_actions(corporate_actions, source="constructor")
         # D14: how long stop() waits for the loop thread and for an in-flight
         # cycle to release the cycle lock before giving up loudly.
         self._stop_join_timeout = 30.0
@@ -282,6 +321,183 @@ class LiveTradingEngine:
     def set_universe(self, codes: list[str]):
         self._universe = codes
         self._bus.publish("engine.universe_set", {"codes": codes, "count": len(codes)}, source="engine")
+
+    # ── Corporate actions (paper books only) ──
+
+    def _broker_supports_corporate_actions(self) -> bool:
+        """Whether this engine owns the book (paper) or the broker does."""
+        return bool(
+            getattr(self._broker, "supports_corporate_actions", False)
+        )
+
+    def set_corporate_actions(self, actions, source: str = "manual") -> int:
+        """Load the paper book's cash/split feed.
+
+        ``actions`` is a provider-contract frame
+        ``(ex_date, asset, kind, cash_per_share, split_ratio)`` or a callable
+        returning one (a zero-argument callable, or one taking
+        ``(start_date, end_date)``).  A callable is resolved lazily on the
+        next trading-day advance over a lookback window ending on that day.
+
+        Nothing is applied here: actions are applied exactly once as the
+        exchange day advances (before marking/sizing), so an ex-date that
+        already passed is caught up on the next cycle.  Real brokers settle
+        corporate actions remotely; for them the feed is refused (returns 0)
+        and nothing is applied locally.
+
+        Returns the number of feed rows loaded (0 for a deferred callable or
+        an unsupported/real broker).
+        """
+        if callable(actions):
+            self._corporate_action_feed = actions
+            self._corporate_actions_loaded = False
+            self._corporate_actions_source = (
+                f"callable:{getattr(actions, '__name__', 'callable')}"
+            )
+            return 0
+        if not self._broker_supports_corporate_actions():
+            logger.warning(
+                "Broker %s settles corporate actions remotely; the feed is "
+                "NOT applied to the local book",
+                type(self._broker).__name__,
+            )
+            return 0
+        setter = getattr(self._broker, "set_corporate_actions", None)
+        if not callable(setter):
+            return 0
+        # Pin tz-aware ex-dates to naive exchange days before the broker
+        # compares them with the engine's YYYY-MM-DD advance date.
+        frame = normalize_corporate_action_feed(actions)
+        count = int(setter(frame) or 0)
+        self._corporate_actions_loaded = True
+        self._corporate_actions_source = str(source or "manual")
+        self._corporate_action_feed_rows = count
+        return count
+
+    @staticmethod
+    def _invoke_action_loader(loader, start_date: str, end_date: str):
+        """Call a feed callable with ``(start, end)`` or no arguments."""
+        try:
+            parameters = inspect.signature(loader).parameters.values()
+        except (TypeError, ValueError):  # builtins / exotic callables
+            parameters = ()
+        required = [
+            parameter for parameter in parameters
+            if parameter.default is inspect.Parameter.empty
+            and parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        if len(required) >= 2:
+            return loader(start_date, end_date)
+        return loader()
+
+    def _refresh_corporate_action_feed(self, date: str, since: str = "") -> None:
+        """(Re)load a dynamic feed for the advance window ending on ``date``.
+
+        A callable ``corporate_actions`` feed or an injected
+        ``data_provider`` is queried on *every* exchange-day advance over
+        ``[last processed day, date]`` (400-day lookback when there is no
+        previous day), so a long-running engine still sees dividends/splits
+        announced after startup.  Applied markers make replacing the feed
+        idempotent.  A static DataFrame is loaded once and never re-queried.
+        A failing or malformed feed is logged and never aborts the cycle.
+        """
+        feed = self._corporate_action_feed
+        provider = self._corporate_action_provider
+        feed_is_callable = callable(feed)
+        if feed is not None and not feed_is_callable:
+            return  # an explicit static feed is authoritative
+        if not feed_is_callable and provider is None:
+            return
+        if not self._broker_supports_corporate_actions():
+            return
+        try:
+            end = pd.Timestamp(date).normalize()
+        except (TypeError, ValueError):
+            end = pd.Timestamp(self._exchange_trading_date())
+        first = None
+        if since:
+            try:
+                first = pd.Timestamp(since).normalize()
+            except (TypeError, ValueError):
+                first = None
+        if first is None or first > end:
+            first = end - pd.Timedelta(days=400)
+        start = first.date().isoformat()
+        end_text = end.date().isoformat()
+
+        if feed_is_callable:
+            try:
+                frame = self._invoke_action_loader(feed, start, end_text)
+            except Exception as exc:
+                logger.error("Corporate-action feed callable failed: %s", exc)
+                return
+            source = f"callable:{getattr(feed, '__name__', 'callable')}"
+        else:
+            hook = getattr(provider, "get_corporate_actions", None)
+            if not callable(hook):
+                return
+            try:
+                # Provider accessors and pipelines differ in arity
+                # (``(start, end)`` vs ``()``); invoke whichever fits.
+                frame = self._invoke_action_loader(hook, start, end_text)
+            except Exception as exc:
+                logger.error("Corporate-action provider failed: %s", exc)
+                return
+            source = f"provider:{type(provider).__name__}"
+        try:
+            self.set_corporate_actions(frame, source=source)
+        except Exception as exc:
+            logger.error(
+                "Corporate-action feed returned an invalid frame: %s", exc,
+            )
+
+    def _advance_trading_day(self, date: str, since: str = "") -> list[dict]:
+        """Release T+1 locks and apply the day's corporate actions.
+
+        Replaces the bare ``new_trading_day()`` call: the paper broker is
+        given the exchange date so every pending ``ex_date <= date`` is
+        applied exactly once, before the cycle sizes orders or marks the
+        book.  ``since`` is the previously processed exchange day; a lazily
+        loaded provider feed only asks for actions after it.  Applied events
+        are kept for the run report.  Real brokers only get the legacy no-op
+        rollover.
+        """
+        self._refresh_corporate_action_feed(date, since=since)
+        new_day = getattr(self._broker, "new_trading_day", None)
+        if not callable(new_day):
+            return []
+        applied: list[dict] = []
+        if self._broker_supports_corporate_actions():
+            try:
+                applied = new_day(date=date) or []
+            except TypeError:  # compatible custom broker signature
+                new_day()
+                applied = []
+        else:
+            try:
+                new_day(date=date)
+            except TypeError:
+                new_day()
+        if not isinstance(applied, (list, tuple)):
+            applied = []
+        applied = [event for event in applied if isinstance(event, dict)]
+        if applied:
+            self._corporate_action_events.extend(applied)
+            logger.info(
+                "Applied %d corporate-action event(s) on %s",
+                len(applied), date,
+            )
+        return applied
+
+    def get_corporate_actions_applied(self) -> dict:
+        """Run-report provenance: count, latest ex-date and feed source."""
+        return summarize_corporate_action_events(
+            self._corporate_action_events,
+            source=self._corporate_actions_source,
+        )
 
     def start(self):
         if self._running:
@@ -652,6 +868,15 @@ class LiveTradingEngine:
             "market_status": self._scheduler.get_market_session().status,
             "scheduler": self._scheduler.get_state(),
             "risk": self._risk.get_status(),
+            # Run-report provenance: did this engine apply a corporate-action
+            # feed, from where, and how many events (with the latest ex-date)?
+            "corporate_actions_applied": self.get_corporate_actions_applied(),
+            "corporate_actions_feed": {
+                "loaded": bool(self._corporate_actions_loaded),
+                "rows": int(self._corporate_action_feed_rows),
+                "source": self._corporate_actions_source,
+                "broker_supports_local": self._broker_supports_corporate_actions(),
+            },
         }
 
     def get_positions(self) -> list[dict]:
@@ -1424,9 +1649,10 @@ class LiveTradingEngine:
         exchange_now = self._exchange_now()
         today = exchange_now.strftime("%Y-%m-%d")
         if today != self._trading_day and is_trading_day(exchange_now.date()):
+            previous_trading_day = self._trading_day
             self._trading_day = today
             self._day_start_equity = None
-            self._broker.new_trading_day()
+            self._advance_trading_day(today, since=previous_trading_day)
             logger.info("Exchange trading day advanced to %s; T+1 released", today)
 
         # Recover once the kill switch has been cleared. HALTED only reaches

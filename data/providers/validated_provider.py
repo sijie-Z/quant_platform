@@ -34,7 +34,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from quant_platform.data.providers.base import DataProvider
+from quant_platform.data.providers.base import (
+    DataProvider,
+    empty_corporate_actions,
+    normalize_corporate_actions,
+)
 from quant_platform.data.schema import PRICE_COLUMNS, DataQualityError
 
 logger = logging.getLogger(__name__)
@@ -105,6 +109,17 @@ class ValidatedProvider(DataProvider):
         self.adjustment_factor_available = getattr(
             primary_provider, "adjustment_factor_available", None,
         )
+        # Corporate actions follow the primary source only.  Unlike prices,
+        # an action is a discrete corporate event and cannot be averaged:
+        # secondary feeds may carry different announcement dates, amounts or
+        # symbol conventions, and fusing them would invent events.  The
+        # wrapper therefore forwards the primary's feed and availability flag
+        # unchanged; if the primary has no feed, the wrapper has none even
+        # when a secondary could supply one.
+        self.corporate_actions_available = bool(
+            getattr(primary_provider, "corporate_actions_available", False)
+        )
+        self._corporate_actions_primary = primary_provider
 
     # ------------------------------------------------------------------
     # DataProvider interface
@@ -178,6 +193,45 @@ class ValidatedProvider(DataProvider):
 
     def get_metadata(self) -> pd.DataFrame:
         return self.providers[self.primary].get_metadata()
+
+    def get_corporate_actions(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """Forward the primary source's corporate-action feed, unabridged.
+
+        The primary defines the price panel's basis, so its action feed is
+        the only one consistent with the raw closes a paper book trades.
+        Secondary providers are deliberately ignored (see ``__init__``): a
+        secondary-only feed is not used, and mismatched feeds are not
+        silently merged.  A failing feed fails closed as the documented empty
+        frame with ``corporate_actions_available = False`` -- never as
+        fabricated actions.
+        """
+        getter = getattr(
+            self._corporate_actions_primary, "get_corporate_actions", None,
+        )
+        if not callable(getter):
+            self.corporate_actions_available = False
+            return empty_corporate_actions()
+        try:
+            frame = normalize_corporate_actions(getter(start_date, end_date))
+        except Exception as exc:  # a broken feed is unavailable, not fatal
+            logger.warning(
+                "Primary corporate-action feed failed for %s..%s: %s",
+                start_date, end_date, exc,
+            )
+            self.corporate_actions_available = False
+            return empty_corporate_actions()
+        declared = bool(
+            getattr(
+                self._corporate_actions_primary,
+                "corporate_actions_available", False,
+            )
+        )
+        self.corporate_actions_available = declared or bool(len(frame))
+        return frame
 
     # ------------------------------------------------------------------
     # Cross-validation logic

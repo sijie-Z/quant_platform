@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import (
+    CORPORATE_ACTION_COLUMNS,
     INCREMENTAL_OVERLAP_SESSIONS,
     DataFetchIncompleteError,
     DataProvider,
@@ -38,10 +39,12 @@ from quant_platform.data.providers.base import (
     canonicalize_panel_index,
     complete_panel_marker,
     deduplicate_panel,
+    empty_corporate_actions,
     exchange_sessions,
     incremental_fetch_start,
     incremental_marker_extra,
     last_day_missing_symbols,
+    normalize_corporate_actions,
     panel_last_date,
     provider_cache_lock,
     read_cache_manifest,
@@ -51,6 +54,7 @@ from quant_platform.data.providers.base import (
     write_cache_manifest,
     write_incremental_status,
 )
+from quant_platform.shared.symbols import normalize_symbol
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -130,6 +134,13 @@ class TushareProvider(DataProvider):
         #: from the cache manifest on load and after every successful fetch.
         self._data_status: dict = {}
 
+        #: Corporate-action feed (``dividend`` endpoint).  Fetched lazily by
+        #: :meth:`get_corporate_actions`; ``corporate_actions_available`` is
+        #: True only after at least one successful API call.
+        self._corporate_actions: pd.DataFrame | None = None
+        self._corporate_actions_range: tuple[pd.Timestamp, pd.Timestamp] | None = None
+        self.corporate_actions_available = False
+
         # No point-in-time ST history is available from this source.
         self.st_available = False
         # Where get_benchmark() data came from: "index_daily" or
@@ -158,9 +169,17 @@ class TushareProvider(DataProvider):
         if self._ts_api is None and self._has_token:
             try:
                 import tushare as ts
+
+                # tushare 1.4.x posts the token and payload over plain HTTP
+                # (`http://api.waditu.com/dataapi`). Force TLS before the
+                # client is built so credentials never travel in clear text.
+                from tushare.pro.client import DataApi
+
+                if not getattr(DataApi, "_DataApi__http_url", "").startswith("https://"):
+                    DataApi._DataApi__http_url = "https://api.waditu.com/dataapi"
                 ts.set_token(self.token)
                 self._ts_api = ts.pro_api()
-                logger.info("Tushare Pro API connected")
+                logger.info("Tushare Pro API connected (https)")
             except Exception as e:
                 logger.error("Failed to connect Tushare: %s", e)
                 self._has_token = False
@@ -291,6 +310,203 @@ class TushareProvider(DataProvider):
         """
         return pd.DataFrame(
             columns=["asset", "trigger_date", "announce_date", "end_date", "is_st"]
+        )
+
+    # ------------------------------------------------------------------
+    # Corporate actions (best effort)
+    # ------------------------------------------------------------------
+
+    def get_corporate_actions(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """Cash dividends and splits from Tushare's ``dividend`` endpoint.
+
+        Best effort: the request window is widened by 400 calendar days on
+        the left because ``start_date``/``end_date`` are interpreted against
+        the announcement date, then rows are filtered on ``ex_date``.  Only
+        implemented plans (``div_proc`` containing 实施) are kept, so a
+        proposal is never paid twice.  ``cash_div_tax`` (pre-tax, per share)
+        is the contract amount -- the paper engine withholds tax per its own
+        config.  If the API is unavailable, returns the documented empty
+        frame and leaves ``corporate_actions_available`` False; no amount is
+        ever inferred.
+        """
+        start = pd.Timestamp(start_date).normalize()
+        end = pd.Timestamp(end_date).normalize()
+        if (
+            self._corporate_actions is not None
+            and self._corporate_actions_range is not None
+            and self._corporate_actions_range[0] <= start
+            and end <= self._corporate_actions_range[1]
+        ):
+            frame = self._corporate_actions
+            mask = (frame["ex_date"] >= start) & (frame["ex_date"] <= end)
+            return frame.loc[mask].reset_index(drop=True).copy()
+
+        frame = self._fetch_corporate_actions(start, end)
+        self._corporate_actions = frame
+        self._corporate_actions_range = (start, end)
+        return frame.copy()
+
+    def _dividend_code_batches(self) -> list[str | None]:
+        """Symbol batches for the dividend call (``None`` = market-wide).
+
+        Per-code batches avoid the endpoint's per-call row cap truncating a
+        multi-year market-wide response.  When the constituent panel has not
+        been loaded yet (the accessor is deliberately usable before a price
+        fetch), fall back to one market-wide call.
+        """
+        codes: list[str] = []
+        if self._metadata is not None and len(self._metadata):
+            codes = sorted(str(code) for code in self._metadata.index)
+        elif self._constituent_history is not None and len(self._constituent_history):
+            codes = sorted(
+                self._constituent_history["ts_code"].astype(str).unique()
+            )
+        if not codes:
+            return [None]
+        return [
+            ",".join(codes[i:i + 50]) for i in range(0, len(codes), 50)
+        ]
+
+    def _fetch_corporate_actions(
+        self, start: pd.Timestamp, end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        api = self.ts_api
+        if api is None:
+            logger.warning(
+                "Tushare API unavailable; corporate actions are unavailable"
+            )
+            self.corporate_actions_available = False
+            return empty_corporate_actions()
+
+        fields = (
+            "ts_code,ex_date,cash_div,cash_div_tax,stk_div,"
+            "stk_bo_rate,stk_co_rate,div_proc"
+        )
+        fetch_start = (start - pd.Timedelta(days=400)).strftime("%Y%m%d")
+        fetch_end = end.strftime("%Y%m%d")
+        batches = self._dividend_code_batches()
+        frames: list[pd.DataFrame] = []
+        failures = 0
+        for batch in batches:
+            kwargs = {
+                "start_date": fetch_start,
+                "end_date": fetch_end,
+                "fields": fields,
+            }
+            if batch is not None:
+                kwargs["ts_code"] = batch
+            try:
+                df = self._call_with_retries(
+                    "dividend", api.dividend, **kwargs,
+                )
+            except Exception as exc:  # noqa: BLE001 - best effort feed
+                failures += 1
+                logger.warning(
+                    "Tushare dividend fetch failed for %s: %s",
+                    "market" if batch is None else f"{len(batch.split(','))} codes",
+                    exc,
+                )
+                continue
+            if df is not None and len(df):
+                if len(df) >= 2000 and batch is None:
+                    logger.warning(
+                        "Tushare dividend returned %d rows in one market-wide "
+                        "call (endpoint cap ~2000); the feed may be truncated. "
+                        "Load the constituent panel first for per-code batches.",
+                        len(df),
+                    )
+                frames.append(df)
+
+        if batches and failures == len(batches):
+            self.corporate_actions_available = False
+            return empty_corporate_actions()
+        self.corporate_actions_available = True
+
+        if not frames:
+            return empty_corporate_actions()
+        raw = pd.concat(frames, ignore_index=True)
+        return self._parse_dividend_rows(raw, start, end)
+
+    @staticmethod
+    def _parse_dividend_rows(
+        raw: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Map Tushare ``dividend`` rows to the corporate-action contract."""
+        records: list[dict] = []
+        post_tax_fallbacks = 0
+        has_process = "div_proc" in raw.columns
+        for _, row in raw.iterrows():
+            if has_process:
+                process = str(row.get("div_proc") or "").strip()
+                if process and "实施" not in process:
+                    continue
+            ex_date = pd.to_datetime(
+                row.get("ex_date"), format="%Y%m%d", errors="coerce",
+            )
+            if pd.isna(ex_date) or ex_date < start or ex_date > end:
+                continue
+            ts_code = row.get("ts_code")
+            if ts_code is None or pd.isna(ts_code):
+                continue
+            asset = normalize_symbol(ts_code)
+            cash = pd.to_numeric(
+                pd.Series([row.get("cash_div_tax")]), errors="coerce",
+            ).iloc[0]
+            if pd.isna(cash) or cash <= 0:
+                # `cash_div` is the *after-tax* per-share amount.  Falling
+                # back to it keeps the feed usable where the pre-tax column
+                # is absent, but a non-zero withholding config would then
+                # withhold twice; warn instead of silently changing basis.
+                cash = pd.to_numeric(
+                    pd.Series([row.get("cash_div")]), errors="coerce",
+                ).iloc[0]
+                if pd.notna(cash) and cash > 0:
+                    post_tax_fallbacks += 1
+            cash = float(cash) if pd.notna(cash) and cash > 0 else 0.0
+            bonus = pd.to_numeric(
+                pd.Series([row.get("stk_div")]), errors="coerce",
+            ).iloc[0]
+            if pd.isna(bonus) or bonus <= 0:
+                parts = [
+                    pd.to_numeric(pd.Series([row.get(key)]), errors="coerce").iloc[0]
+                    for key in ("stk_bo_rate", "stk_co_rate")
+                ]
+                parts = [float(p) for p in parts if pd.notna(p) and p > 0]
+                bonus = sum(parts) if parts else 0.0
+            bonus = float(bonus) if pd.notna(bonus) and bonus > 0 else 0.0
+            if cash <= 0 and bonus <= 0:
+                continue
+            if cash > 0:
+                records.append({
+                    "ex_date": ex_date,
+                    "asset": asset,
+                    "kind": "cash",
+                    "cash_per_share": round(cash, 6),
+                    "split_ratio": 1.0,
+                })
+            if bonus > 0:
+                records.append({
+                    "ex_date": ex_date,
+                    "asset": asset,
+                    "kind": "split",
+                    "cash_per_share": 0.0,
+                    "split_ratio": round(1.0 + bonus, 6),
+                })
+        if post_tax_fallbacks:
+            logger.warning(
+                "Tushare dividend: %d row(s) had no pre-tax amount; using the "
+                "after-tax cash_div. Configure cash_dividend_tax_rate=0 for "
+                "those rows or the tax is withheld twice",
+                post_tax_fallbacks,
+            )
+        if not records:
+            return empty_corporate_actions()
+        return normalize_corporate_actions(
+            pd.DataFrame(records, columns=list(CORPORATE_ACTION_COLUMNS))
         )
 
     def get_index_membership_mask(

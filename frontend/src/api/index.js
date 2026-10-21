@@ -463,9 +463,11 @@ export function triggerMonitorKillSwitch(params) {
 // Token transport: browsers cannot set handshake headers, so the token travels
 // as the `bearer.<token>` WebSocket subprotocol (never in the URL, which
 // uvicorn's access log records). A WebSocket subprotocol must be an HTTP token
-// (RFC 7230): base64 tokens containing `=` or `/` make `new WebSocket(...)`
-// throw. In that case only, fall back to the backend's legacy `?token=` form,
-// percent-encoded. The token is re-read on every connect, so changing it in
+// (RFC 7230): tokens containing `=` or `/` cannot be sent at all. The legacy
+// `?token=` query fallback was removed because it leaked the token into access
+// logs; such a token is rejected locally with an auth error until
+// QUANT_API_TOKEN is changed to RFC-7230-safe characters.
+// The token is re-read on every connect, so changing it in
 // Settings applies to the next reconnect.
 //
 // Lifecycle: exponential backoff with jitter, capped at 30 s, reset on a
@@ -487,7 +489,7 @@ function buildSocketTarget() {
   if (WS_TOKEN_RE.test(token)) {
     return { url, protocols: [`bearer.${token}`] }
   }
-  return { url: `${url}?token=${encodeURIComponent(token)}`, protocols: [] }
+  return { url, protocols: [], invalidToken: true }
 }
 
 export function createStatusSocket(onMessage, onError) {
@@ -518,6 +520,19 @@ export function createStatusSocket(onMessage, onError) {
       timer = null
     }
     const target = buildSocketTarget()
+    if (target.invalidToken) {
+      // There is no safe transport for this token shape: the legacy query
+      // fallback leaked it into access logs and was removed.
+      disposed = true
+      notify({
+        type: 'auth',
+        message:
+          'API token contains characters not allowed in a WebSocket ' +
+          'subprotocol; use an RFC 7230 token (letters, digits, -._~) or ' +
+          'leave QUANT_API_TOKEN unset',
+      })
+      return
+    }
     let ws
     try {
       ws = target.protocols.length

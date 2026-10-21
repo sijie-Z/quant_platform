@@ -22,7 +22,9 @@ seaborn==0.13.2
 fastapi==0.128.0
 uvicorn==0.40.0
 pydantic==2.12.5
-python-multipart==0.0.6
+# 0.0.6 carried 9 HIGH advisories (ReDoS/boundary DoS; no Form/File endpoints
+# today, but the pin was stale). 0.0.32 is the installed, fixed line.
+python-multipart==0.0.32
 websocket-client==1.9.0
 httpx==0.28.1
 
@@ -33,7 +35,8 @@ httpx==0.28.1
 # adds ~350 MB of download to every CI install. Same version, same `xgboost`
 # module, same API.
 xgboost-cpu==2.1.4
-lightgbm==4.5.0
+# 4.5.0 has a HIGH RCE advisory (GHSA-2586-f3p4-hq84); fixed in 4.6.0.
+lightgbm==4.6.0
 shap==0.46.0
 
 # Config

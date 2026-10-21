@@ -72,15 +72,27 @@ def test_returns_in_range(synthetic_provider):
 
     A resume day's change spans the forward-filled suspension and is not a
     one-day return; the pipeline masks those rows (issue #58), so the test
-    must too.
+    must too.  Raw-price returns on a corporate-action ex-date are mechanical
+    (a 2:1 split halves the price; a dividend subtracts its amount), not
+    economic returns -- the adjusted series in ``close / adj_factor`` is the
+    return-generating path and is checked for continuity separately.
     """
     prices = synthetic_provider.get_prices("2023-01-01", "2024-12-31")
     close = prices["close"].unstack("asset")
     suspended = (
         prices["is_suspended"].unstack("asset").fillna(False).astype(bool)
     )
+    action_days = synthetic_provider.get_corporate_actions(
+        "2023-01-01", "2024-12-31",
+    )
+    action_mask = pd.DataFrame(False, index=close.index, columns=close.columns)
+    for asset, ex_date in zip(
+        action_days["asset"], action_days["ex_date"], strict=False,
+    ):
+        if asset in action_mask.columns and ex_date in action_mask.index:
+            action_mask.loc[ex_date, asset] = True
     returns = close.pct_change(fill_method=None).mask(
-        suspended | suspended.shift(1)
+        suspended | suspended.shift(1) | action_mask,
     )
     valid = returns.dropna()
     assert (valid >= -0.11).all().all()  # Allow small numerical error

@@ -208,7 +208,7 @@ class TestErrorSanitization:
 
 
 # ---------------------------------------------------------------------------
-# U1: WebSocket token via subprotocol, query fallback preserved
+# U1: WebSocket token via subprotocol; legacy ?token= fallback removed
 # ---------------------------------------------------------------------------
 
 class TestWebSocketTokenTransport:
@@ -235,14 +235,16 @@ class TestWebSocketTokenTransport:
             ):
                 pass
 
-    def test_query_token_fallback_still_works(self, monkeypatch):
+    def test_query_token_fallback_is_refused(self, monkeypatch):
+        """The legacy ?token= transport leaked the token into access logs."""
         monkeypatch.setenv("QUANT_API_TOKEN", "secret")
         app = FastAPI()
         app.include_router(routes.router)
         client = TestClient(app)
 
-        with client.websocket_connect("/api/ws?token=secret") as ws:
-            ws.send_text("ping")
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/api/ws?token=secret"):
+                pass
 
 
 # ---------------------------------------------------------------------------

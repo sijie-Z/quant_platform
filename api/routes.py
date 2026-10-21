@@ -6,6 +6,8 @@ import asyncio
 import json
 import math
 import os
+import re
+import secrets
 import threading
 import time
 import traceback
@@ -17,7 +19,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from starlette.concurrency import run_in_threadpool
 
 from quant_platform.api.research_context import (
@@ -80,6 +82,7 @@ from quant_platform.api.schemas import (
     WalkForwardRequest,
     WebSocketStatsResponse,
 )
+from quant_platform.core.context import TenantContext
 from quant_platform.core.instrument import normalize_symbol
 from quant_platform.execution.oms import OrderManager
 from quant_platform.main import (
@@ -587,6 +590,49 @@ def _bounded_limit(value: int, default: int = 100, maximum: int = 1000) -> int:
     return max(0, min(number, maximum))
 
 
+#: Tenant ids accepted from the API: bounded, path-safe-looking identifiers.
+_TENANT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def _resolve_tenant(
+    request: Request, tenant_id: str = "", all_tenants: bool = False,
+) -> str:
+    """Resolve the tenant scope of a core-store/audit read.
+
+    Precedence: explicit ``tenant_id`` query/value, ``X-Tenant-Id`` header,
+    then the current :class:`TenantContext` (``"default"`` when unset). The
+    API deliberately never falls back to "every tenant": a cross-tenant read
+    requires ``all_tenants=true`` and a loopback client. The shared
+    ``QUANT_API_TOKEN`` authenticates a consumer, it is **not** a tenant
+    boundary -- tenants are an explicit, trusted-header convention.
+
+    Returns ``""`` for the explicit cross-tenant ("all") scope.
+    """
+    header_tenant = (request.headers.get("X-Tenant-Id") or "").strip()
+    candidate = (
+        (tenant_id or "").strip()
+        or header_tenant
+        or TenantContext.get_current().tenant_id
+        or "default"
+    )
+    if not _TENANT_ID_RE.fullmatch(candidate):
+        raise HTTPException(
+            422,
+            "tenant_id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+        )
+    if all_tenants:
+        host = request.client.host if request.client else ""
+        if host not in _LOOPBACK_HOSTS:
+            raise HTTPException(
+                403,
+                "all_tenants=true is loopback-only; pass a tenant_id or "
+                "X-Tenant-Id to read a single tenant",
+            )
+        return ""
+    return candidate
+
+
+
 def _error_code_header(code: str) -> dict[str, str]:
     """Stable machine-readable code for a 5xx response.
 
@@ -946,22 +992,24 @@ async def readiness():
 # ---------------------------------------------------------------------------
 
 @router.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket, token: str = ""):
+async def websocket_endpoint(ws: WebSocket):
     # BaseHTTPMiddleware never sees WebSocket scopes, so the HTTP token guard
     # does not cover this stream (which carries order.filled and risk events).
     #
-    # Preferred transport: the `bearer.<token>` subprotocol, because browsers
-    # cannot set handshake headers and a `?token=` query string is written to
-    # the uvicorn access log. The query parameter remains accepted for older
-    # clients.
+    # The token travels only in the `bearer.<token>` subprotocol: browsers
+    # cannot set handshake headers, and a `?token=` query string was written
+    # verbatim to the uvicorn access log (and every proxy log on the path).
+    # The legacy query fallback was removed -- a breaking change documented in
+    # the security report; tokens must be RFC 7230 token characters.
     offered = list((getattr(ws, "scope", None) or {}).get("subprotocols") or [])
     bearer = next((p for p in offered if p.startswith("bearer.")), "")
-    protocol_token = bearer[len("bearer."):] if bearer else ""
-    effective_token = protocol_token or token
+    effective_token = bearer[len("bearer."):] if bearer else ""
 
     expected = os.environ.get("QUANT_API_TOKEN", "")
     if expected:
-        if effective_token != expected:
+        if not effective_token or not secrets.compare_digest(
+            effective_token.encode("utf-8"), expected.encode("utf-8"),
+        ):
             await ws.close(code=1008)
             return
     else:
@@ -4584,6 +4632,15 @@ def _start_live_engine(req: dict) -> dict:
         broker = SimulatedBroker(initial_cash=initial_cash)
     else:
         from quant_platform.trading.broker import QMTBroker
+        # Credentials never travel in request bodies: a body password would be
+        # logged, cached and forwarded to the broker by any intermediary.
+        # QMTBroker itself reads QMT_PASSWORD from the environment.
+        if "password" in req:
+            raise HTTPException(
+                422,
+                "QMT credentials must not be sent in the request body; set "
+                "QMT_PASSWORD in the server environment.",
+            )
         # `QMTBroker.__init__` takes account/server/password/mode/data_server.
         # This passed `qmt_path` and `account_id`, neither of which exists, so
         # selecting the QMT broker raised TypeError and the endpoint returned
@@ -4593,7 +4650,7 @@ def _start_live_engine(req: dict) -> dict:
             broker = QMTBroker(
                 account=req.get("account_id", ""),
                 server=req.get("server", "localhost:58610"),
-                password=req.get("password", "") or os.environ.get("QMT_PASSWORD", ""),
+                password=os.environ.get("QMT_PASSWORD", ""),
                 mode=req.get("mode", "sim"),
             )
         except Exception as e:
@@ -4871,60 +4928,97 @@ async def core_events_metrics():
 
 
 @router.get("/core/store/stats")
-async def core_store_stats():
-    """Get SQLite store statistics."""
-    return await run_in_threadpool(_core_store.get_stats)
+async def core_store_stats(
+    request: Request, tenant_id: str = "", all_tenants: bool = False,
+):
+    """Get SQLite store statistics for one tenant (explicit ``all_tenants``
+    is loopback-only)."""
+    tenant = _resolve_tenant(request, tenant_id, all_tenants)
+    stats = await run_in_threadpool(_core_store.get_stats, tenant_id=tenant)
+    return {**stats, "tenant_id": tenant or "all", "all_tenants": not tenant}
 
 
 @router.get("/core/store/orders")
-async def core_store_orders(status: str = "", code: str = "", limit: int = 100):
-    """Get orders from persistent store."""
+async def core_store_orders(
+    request: Request, status: str = "", code: str = "", limit: int = 100,
+    tenant_id: str = "", all_tenants: bool = False,
+):
+    """Get orders from the persistent store for one tenant."""
+    tenant = _resolve_tenant(request, tenant_id, all_tenants)
     return {
+        "tenant_id": tenant or "all",
+        "all_tenants": not tenant,
         "orders": await run_in_threadpool(
             _core_store.get_orders, status=status, code=code, limit=limit,
+            tenant_id=tenant,
         ),
     }
 
 
 @router.get("/core/store/trades")
-async def core_store_trades(code: str = "", limit: int = 100):
-    """Get trade history from persistent store."""
+async def core_store_trades(
+    request: Request, code: str = "", limit: int = 100,
+    tenant_id: str = "", all_tenants: bool = False,
+):
+    """Get trade history from the persistent store for one tenant."""
+    tenant = _resolve_tenant(request, tenant_id, all_tenants)
     return {
+        "tenant_id": tenant or "all",
+        "all_tenants": not tenant,
         "trades": await run_in_threadpool(
-            _core_store.get_trades, code=code, limit=limit,
+            _core_store.get_trades, code=code, limit=limit, tenant_id=tenant,
         ),
     }
 
 
 @router.get("/core/store/pnl")
-async def core_store_pnl(days: int = 30):
-    """Get P&L history from persistent store."""
+async def core_store_pnl(
+    request: Request, days: int = 30,
+    tenant_id: str = "", all_tenants: bool = False,
+):
+    """Get P&L history from the persistent store for one tenant."""
+    tenant = _resolve_tenant(request, tenant_id, all_tenants)
     return {
+        "tenant_id": tenant or "all",
+        "all_tenants": not tenant,
         "history": await run_in_threadpool(
-            _core_store.get_pnl_history, days=days,
+            _core_store.get_pnl_history, days=days, tenant_id=tenant,
         ),
     }
 
 
 @router.get("/core/store/signals")
-async def core_store_signals(consumed: int = -1, limit: int = 100):
-    """Get signal history from persistent store."""
+async def core_store_signals(
+    request: Request, consumed: int = -1, limit: int = 100,
+    tenant_id: str = "", all_tenants: bool = False,
+):
+    """Get signal history from the persistent store for one tenant."""
+    tenant = _resolve_tenant(request, tenant_id, all_tenants)
     return {
+        "tenant_id": tenant or "all",
+        "all_tenants": not tenant,
         "signals": await run_in_threadpool(
             _core_store.get_signals, consumed=consumed, limit=limit,
+            tenant_id=tenant,
         ),
     }
 
 
 @router.get("/core/store/sessions")
-async def core_store_sessions(limit: int = 20):
-    """Get trading session history."""
+async def core_store_sessions(
+    request: Request, limit: int = 20,
+    tenant_id: str = "", all_tenants: bool = False,
+):
+    """Get trading session history for one tenant."""
     # The store re-clamps too; this makes limit=-1 / 0 / 1e9 explicit at the
     # API boundary (SQLite treats LIMIT -1 as unlimited).
     limit = _bounded_limit(limit, default=20, maximum=1000)
+    tenant = _resolve_tenant(request, tenant_id, all_tenants)
     return {
+        "tenant_id": tenant or "all",
+        "all_tenants": not tenant,
         "sessions": await run_in_threadpool(
-            _core_store.get_sessions, limit=limit,
+            _core_store.get_sessions, limit=limit, tenant_id=tenant,
         ),
     }
 
@@ -4944,12 +5038,19 @@ def _core_state_payload() -> dict:
 
 
 @router.get("/core/audit")
-async def core_audit(action: str = "", limit: int = 50):
-    """Get recent audit log entries."""
+async def core_audit(
+    request: Request, action: str = "", limit: int = 50,
+    tenant_id: str = "", all_tenants: bool = False,
+):
+    """Get recent audit log entries for one tenant."""
     limit = _bounded_limit(limit, default=50, maximum=1000)
+    tenant = _resolve_tenant(request, tenant_id, all_tenants)
     return {
+        "tenant_id": tenant or "all",
+        "all_tenants": not tenant,
         "events": await run_in_threadpool(
             _core_audit.get_recent, action=action, limit=limit,
+            tenant_id=tenant,
         ),
     }
 

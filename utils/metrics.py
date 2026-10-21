@@ -361,6 +361,28 @@ def instrument_pipeline_stage(stage_name: str):
     return decorator
 
 
+#: Label used for requests the router did not match (404s, auth rejections).
+#: Never use the raw request path: it is attacker-controlled and the metrics
+#: middleware runs outside authentication, so ``/api/<random>`` probes used to
+#: create one counter + histogram series per URL.
+_UNMATCHED_PATH_LABEL = "unmatched"
+
+
+def path_label(scope) -> str:
+    """Bounded ``path`` label: matched route template or ``"unmatched"``.
+
+    Starlette resolves dynamic segments to the route template (``/api/run/{id}``)
+    before the endpoint runs, so matched requests stay informative. Everything
+    else -- 404 probes and requests rejected before routing -- shares one
+    label, which keeps the series cardinality bounded.
+    """
+    route = scope.get("route")
+    template = getattr(route, "path", None)
+    if isinstance(template, str) and template:
+        return template
+    return _UNMATCHED_PATH_LABEL
+
+
 class HTTPMetricsMiddleware:
     """Pure-ASGI middleware recording request counts and latency.
 
@@ -398,8 +420,7 @@ class HTTPMetricsMiddleware:
             raise
         finally:
             elapsed = time.perf_counter() - started
-            route = scope.get("route")
-            path = getattr(route, "path", None) or scope.get("path", "unknown")
+            path = path_label(scope)
             method = scope.get("method", "UNKNOWN")
             status = status_holder["status"] or (500 if error_name else 0)
 

@@ -33,6 +33,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
+import pandas as pd
 
 from quant_platform.core.audit import AuditAction, AuditLog
 from quant_platform.core.events import get_event_bus
@@ -52,7 +53,11 @@ from quant_platform.trading.broker import (
     SimulatedBroker,
     create_broker,
 )
-from quant_platform.trading.live_engine import ensure_raw_price_basis
+from quant_platform.trading.live_engine import (
+    ensure_raw_price_basis,
+    normalize_corporate_action_feed,
+    summarize_corporate_action_events,
+)
 from quant_platform.trading.signals import (
     DEFAULT_MIN_SIGNAL_SCORE,
     SIGNAL_HISTORY_SESSIONS,
@@ -144,6 +149,10 @@ class SessionReport:
     failed_cycles: int = 0
     daily_reports: list[dict] = field(default_factory=list)
     price_basis: str = "raw"
+    #: Run-report provenance for the paper book: ``{"count", "last_ex_date",
+    #: "source"}`` from :func:`summarize_corporate_action_events`.  An empty
+    #: feed reports ``count == 0`` rather than disappearing from the report.
+    corporate_actions_applied: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -164,6 +173,7 @@ class SessionReport:
             "price_basis": self.price_basis,
             "status": self.status,
             "failed_cycles": self.failed_cycles,
+            "corporate_actions_applied": self.corporate_actions_applied,
         }
 
 
@@ -256,6 +266,13 @@ class LiveRunner:
         self._store = store or Store()
         self._bus = get_event_bus()
         self._audit = AuditLog(self._store, self._bus)
+        # Paper books apply splits/dividends locally.  Store-backed markers
+        # are wired when an *explicit* feed is set (see
+        # `set_corporate_actions`), not at construction: `LiveRunner` always
+        # builds a fresh broker book and never restores positions, so a
+        # marker row from a previous run must not suppress actions in a new
+        # account.  The synthetic demo feed (fresh book, generated per run)
+        # deliberately keeps its markers in memory only.
         self._sm = PortfolioStateMachine()
         if getattr(self._sm, "_on_transition", None) is None:
             self._sm.set_transition_callback(
@@ -293,6 +310,15 @@ class LiveRunner:
         # Basis of every quote this runner accepts; live/paper marks are raw
         # traded CNY prices only (D15).
         self._price_basis: str = "raw"
+        # Corporate-action provenance for the run report.  Events are the
+        # paper book's applied audit dicts, one per (asset, ex_date) group.
+        self._corporate_action_events: list[dict] = []
+        self._corporate_actions_source: str = ""
+        self._corporate_action_feed_set = False
+        # Simulated runs: ex-date -> {code: [components]} and a matching
+        # price adjustment applied to the random walk.  Populated by
+        # :meth:`_install_simulated_corporate_actions`.
+        self._simulated_action_adjustments: dict[str, dict[str, list[dict]]] = {}
 
     # ── Setup ──
 
@@ -414,6 +440,130 @@ class LiveRunner:
             # Keep the same trailing window the web engine scores.
             if len(history) > SIGNAL_HISTORY_SESSIONS:
                 del history[:-SIGNAL_HISTORY_SESSIONS]
+
+    def set_corporate_actions(
+        self, actions, source: str = "manual", persist_markers: bool = True,
+    ) -> bool:
+        """Load the paper book's cash/split feed (ex-date entitlement).
+
+        The primary book applies actions locally only for the simulated
+        broker; a real broker (QMT/XTP) performs them on the broker side, so
+        feeding a local book there would double-count.  The dual-track
+        comparison book is always a paper book and always receives the feed.
+
+        ``persist_markers`` wires Store-backed ``(asset, ex_date)`` marker
+        persistence for the primary paper book.  Explicit/caller feeds keep
+        the restart semantics from the corporate-actions wave.  The synthetic
+        demo feed passes ``False``: it is generated for a fresh book on every
+        run, so markers from a previous run (same Store) must not suppress
+        its actions (the price path is adjusted regardless).
+
+        Returns True when at least one paper book accepted the feed.
+        """
+        accepted = False
+        # Pin tz-aware ex-dates to naive exchange days once, so both books
+        # compare them consistently with the runner's date strings.
+        frame = normalize_corporate_action_feed(actions)
+        if self._is_simulated:
+            setter = getattr(self._broker, "set_corporate_actions", None)
+            if callable(setter):
+                if persist_markers:
+                    configure = getattr(
+                        self._broker,
+                        "configure_corporate_action_persistence", None,
+                    )
+                    if callable(configure):
+                        configure(self._store)
+                setter(frame)
+                accepted = True
+        if self._paper_broker is not None:
+            try:
+                self._paper_broker.set_corporate_actions(frame)
+                accepted = True
+            except Exception as exc:
+                logger.error(
+                    "Dual-track paper book rejected the corporate-action "
+                    "feed: %s", exc,
+                )
+        if not accepted:
+            logger.warning(
+                "Broker %s settles corporate actions remotely; feed not "
+                "applied locally", type(self._broker).__name__,
+            )
+            return False
+        if not self._is_simulated:
+            logger.info(
+                "Broker %s settles corporate actions remotely; the feed is "
+                "applied only to the dual-track paper book",
+                type(self._broker).__name__,
+            )
+        self._corporate_action_feed_set = True
+        self._corporate_actions_source = str(source or "manual")
+        return True
+
+    def _advance_exchange_day(self, date: str, *, first_cycle: bool = False) -> None:
+        """Roll the paper broker to ``date`` and apply that day's actions.
+
+        On a date change the broker releases T+1 locks and applies every
+        action with ``ex_date <= date`` exactly once (markers persisted in the
+        Store).  The first cycle after a restart does not release locks (the
+        restored ``available`` already reflects the snapshot), but it does
+        catch up any ex-date that passed while the process was down.  Real
+        brokers only get the no-op rollover.  The dual-track TCA shadow is a
+        paper book and follows the same schedule.
+        """
+        applied: list[dict] = []
+        if self._is_simulated:
+            if first_cycle:
+                apply = getattr(self._broker, "apply_corporate_actions", None)
+                if callable(apply):
+                    applied = apply(ex_date=date) or []
+            else:
+                try:
+                    applied = self._broker.new_trading_day(date=date) or []
+                except TypeError:  # compatible custom broker signature
+                    self._broker.new_trading_day()
+                    applied = []
+            self._record_corporate_actions(applied)
+        elif not first_cycle:
+            self._broker.new_trading_day()
+
+        if self._paper_broker is not None:
+            try:
+                if first_cycle:
+                    self._paper_broker.apply_corporate_actions(ex_date=date)
+                else:
+                    self._paper_broker.new_trading_day(date=date)
+            except Exception as exc:
+                logger.error(
+                    "Dual-track paper-book corporate-action rollover failed: %s",
+                    exc,
+                )
+
+    def _record_corporate_actions(self, applied: list[dict]) -> None:
+        """Persist applied-action events for reconciliation (best effort)."""
+        for event in applied or []:
+            self._corporate_action_events.append(dict(event))
+            try:
+                self._store.log_event({
+                    "event_id": uuid.uuid4().hex[:12],
+                    "topic": "corporate_action",
+                    "data": event,
+                    "source": "live_runner",
+                    "timestamp": datetime.now().timestamp(),
+                })
+            except Exception as exc:
+                logger.error(
+                    "Failed to persist corporate-action event %s: %s",
+                    event.get("asset"), exc,
+                )
+
+    def get_corporate_actions_applied(self) -> dict:
+        """Run-report provenance: count, latest ex-date and feed source."""
+        return summarize_corporate_action_events(
+            self._corporate_action_events,
+            source=self._corporate_actions_source,
+        )
 
     # ── Signal Generation ──
 
@@ -673,10 +823,16 @@ class LiveRunner:
         self._cycle_count += 1
         previous_date = self._current_date
         self._current_date = date or datetime.now().strftime("%Y-%m-%d")
-        if previous_date and self._current_date != previous_date:
-            # A new trading day releases T+1-locked shares.
-            self._broker.new_trading_day()
-            self._day_start_equity = None
+        if self._current_date != previous_date:
+            # A new trading day releases T+1-locked shares and applies the
+            # ex-date's corporate actions (paper book only).  The first cycle
+            # only catches up pending actions; it must not release locks that
+            # were restored from a same-day snapshot.
+            self._advance_exchange_day(
+                self._current_date, first_cycle=not previous_date,
+            )
+            if previous_date:
+                self._day_start_equity = None
 
         if prices:
             self.set_prices(prices)
@@ -805,15 +961,27 @@ class LiveRunner:
             return f"{self._current_date}T15:00:00"
         return datetime.now(_EXCHANGE_TZ).strftime("%Y-%m-%dT%H:%M:%S")
 
-    def run(self, days: int = 30, seed: int = 42):
+    def run(
+        self,
+        days: int = 30,
+        seed: int = 42,
+        simulate_corporate_actions: bool = False,
+    ):
         """Run the trading loop over exchange sessions.
 
         Simulated/paper brokers replay the last ``days`` *exchange* sessions
         (weekends and closures skipped) with a reproducible random walk.
+        With ``simulate_corporate_actions`` (used by ``main.py trade`` for
+        simulated/paper brokers) a deterministic demo feed of splits and cash
+        dividends is generated for the run window and the synthetic price
+        path is adjusted on each ex-date, so the equity curve and the
+        factor history stay continuous.  An explicitly supplied feed
+        (``set_corporate_actions``) always wins.
 
         Real brokers (QMT/XTP) execute a single live exchange day and require
         a fresh quote feed (``set_price_provider`` or ``broker.get_quotes``):
-        synthetic prices are never fed into real orders.
+        synthetic prices are never fed into real orders, and no corporate
+        action feed is ever applied locally for them.
         """
         if not self._universe:
             raise ValueError("Universe not set. Call set_universe() first.")
@@ -856,6 +1024,10 @@ class LiveRunner:
         # a run that starts cold never scores the long-horizon factors.
         if self._is_simulated:
             self._warmup_simulated_history(base_prices, rng)
+            if simulate_corporate_actions and not self._corporate_action_feed_set:
+                self._install_simulated_corporate_actions(
+                    dates, seed, base_prices,
+                )
         else:
             self._load_signal_history()
 
@@ -874,6 +1046,13 @@ class LiveRunner:
                             daily_ret = rng.normal(0.0003, 0.01)
                             base_prices[code] *= (1 + daily_ret)
                             base_prices[code] = max(base_prices[code], 0.5)
+                            # A split/dividend replaces the pre-action level
+                            # with the exchange's adjusted reference; the
+                            # paper book applies the matching share/cash
+                            # change on the same day.
+                            self._apply_simulated_action_to_path(
+                                code, date, base_prices,
+                            )
                             prices[code] = round(base_prices[code], 2)
                     else:
                         prices = self._fresh_prices()
@@ -928,6 +1107,103 @@ class LiveRunner:
             self.set_prices({
                 code: round(base_prices[code], 2) for code in self._universe
             })
+
+    def _install_simulated_corporate_actions(
+        self,
+        dates: list[str],
+        seed: int,
+        base_prices: dict[str, float],
+    ) -> int:
+        """Generate the simulated run's demo split/dividend feed.
+
+        Real A-share action rates are low, but ``main.py trade`` should show
+        the wiring: each stock-session draws an action with p=0.02 from a
+        *dedicated* RNG stream, so the existing price path for a given seed
+        is identical unless an action is drawn.  A split uses 2:1/3:1/3:2 and
+        a cash dividend pays 0.3%-2% of the then-current synthetic price.
+        Returns 1 when a feed was installed, 0 otherwise.
+        """
+        if not dates or not self._universe:
+            return 0
+        rng = np.random.default_rng((int(seed) + 104_729) % (2**32))
+        rows: list[dict] = []
+        adjustments: dict[str, dict[str, list[dict]]] = {}
+        for code in self._universe:
+            for date in dates:
+                if rng.random() >= 0.02:
+                    continue
+                if rng.random() < 0.5:
+                    ratio = float(rng.choice([2.0, 3.0, 1.5]))
+                    rows.append({
+                        "ex_date": date, "asset": code, "kind": "split",
+                        "cash_per_share": 0.0, "split_ratio": ratio,
+                    })
+                    adjustments.setdefault(date, {}).setdefault(
+                        code, [],
+                    ).append({"kind": "split", "ratio": ratio})
+                else:
+                    price = max(float(base_prices.get(code, 10.0)), 0.5)
+                    cash = max(
+                        0.01,
+                        round(
+                            price * float(rng.uniform(0.003, 0.02)), 2,
+                        ),
+                    )
+                    rows.append({
+                        "ex_date": date, "asset": code, "kind": "cash",
+                        "cash_per_share": cash, "split_ratio": 1.0,
+                    })
+                    adjustments.setdefault(date, {}).setdefault(
+                        code, [],
+                    ).append({"kind": "cash", "cash_per_share": cash})
+        if not rows:
+            return 0
+        self._simulated_action_adjustments = adjustments
+        accepted = self.set_corporate_actions(
+            pd.DataFrame(rows), source="synthetic", persist_markers=False,
+        )
+        logger.info(
+            "Simulated corporate-action feed: %d event(s) over %d session(s)",
+            len(rows), len(dates),
+        )
+        return 1 if accepted else 0
+
+    def _apply_simulated_action_to_path(
+        self,
+        code: str,
+        date: str,
+        base_prices: dict[str, float],
+    ) -> None:
+        """Apply the ex-date price adjustment to the synthetic path.
+
+        A split divides the synthetic price by the ratio and a cash dividend
+        subtracts the per-share amount, exactly as the exchange adjusts the
+        raw reference on the ex-date.  The stored signal history is
+        back-adjusted by the same factor, so a split does not appear as a
+        -50% return to the momentum factors (the research convention: raw
+        prices for fills/marks, adjusted history for scores).
+        """
+        components = self._simulated_action_adjustments.get(date, {}).get(code)
+        if not components:
+            return
+        history = self._price_history.get(code)
+        for component in components:
+            if component["kind"] == "split":
+                ratio = float(component["ratio"])
+                if not (ratio > 0):
+                    continue
+                base_prices[code] = max(base_prices[code] / ratio, 0.01)
+                if history:
+                    self._price_history[code] = [
+                        value / ratio for value in history
+                    ]
+            else:
+                cash = float(component["cash_per_share"])
+                base_prices[code] = max(base_prices[code] - cash, 0.01)
+                if history:
+                    self._price_history[code] = [
+                        max(value - cash, 0.0) for value in history
+                    ]
 
     def _load_signal_history(self) -> None:
         """Preload daily closes for a real-broker run via the history feed.
@@ -1166,6 +1442,7 @@ class LiveRunner:
                 status=self._session_status,
                 failed_cycles=self._failed_cycles,
                 price_basis=self._price_basis,
+                corporate_actions_applied=self.get_corporate_actions_applied(),
             )
 
         # Calculate metrics
@@ -1215,6 +1492,7 @@ class LiveRunner:
             failed_cycles=self._failed_cycles,
             daily_reports=[r.to_dict() for r in self._daily_reports],
             price_basis=self._price_basis,
+            corporate_actions_applied=self.get_corporate_actions_applied(),
         )
 
     def get_state(self) -> dict:
@@ -1228,4 +1506,5 @@ class LiveRunner:
             "broker": type(self._broker).__name__,
             "risk_level": self._risk.get_status().get("risk_level", "GREEN"),
             "price_basis": self._price_basis,
+            "corporate_actions_applied": self.get_corporate_actions_applied(),
         }
