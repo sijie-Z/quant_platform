@@ -91,7 +91,7 @@ class HandlerStats:
     # Buckets for histogram (in microseconds)
     latency_buckets: list[int] = field(default_factory=lambda: [0] * 13)
     # Bucket boundaries: 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, inf μs
-    BUCKET_BOUNDARIES_NS: list[int] = field(
+    BUCKET_BOUNDARIES_NS: list[float] = field(
         default_factory=lambda: [1000, 2000, 5000, 10_000, 20_000, 50_000,
                                   100_000, 200_000, 500_000, 1_000_000,
                                   2_000_000, 5_000_000, float('inf')]
@@ -291,7 +291,7 @@ class EventStore:
         wal_path: str | None = None,
         wal_sync_interval: float = 1.0,  # seconds
     ):
-        self._buffer: list[Event] = [None] * buffer_size
+        self._buffer: list[Event | None] = [None] * buffer_size
         self._buffer_size = buffer_size
         self._write_pos = 0
         self._total_events = 0
@@ -346,11 +346,12 @@ class EventStore:
             count = min(limit, self._write_pos, self._buffer_size)
             if count == 0:
                 return []
-            result = []
+            result: list[Event] = []
             for i in range(count):
                 idx = (self._write_pos - count + i) % self._buffer_size
-                if self._buffer[idx] is not None:
-                    result.append(self._buffer[idx])
+                event = self._buffer[idx]
+                if event is not None:
+                    result.append(event)
             return result
 
     def get_by_topic(self, topic: str, limit: int = 100) -> list[Event]:
@@ -524,8 +525,10 @@ class AsyncEventBus:
         # Auto-detect: if handler is a coroutine function, treat as async
         if asyncio.iscoroutinefunction(handler):
             q_size = queue_size or self._default_queue_size
-            queue = asyncio.Queue(maxsize=q_size)
-            handler_name = name or getattr(handler, '__name__', str(id(handler)))
+            queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=q_size)
+            handler_name = str(
+                name or getattr(handler, '__name__', str(id(handler)))
+            )
             stats = HandlerStats(handler_name=handler_name, topic=topic)
             with self._lock:
                 self._handlers[topic].append((handler, queue, stats, 'async'))
@@ -534,7 +537,12 @@ class AsyncEventBus:
             self._ensure_consumer(topic, handler, queue, stats, 'async')
         else:
             # Sync handler — delegate to subscribe_sync
-            self.subscribe_sync(topic, handler, queue_size=queue_size, name=name)
+            self.subscribe_sync(
+                topic,
+                handler,  # type: ignore[arg-type]
+                queue_size=queue_size,
+                name=name,
+            )
 
     def subscribe_sync(
         self,
@@ -546,8 +554,10 @@ class AsyncEventBus:
     ):
         """Subscribe a sync handler (will be run in thread pool)."""
         q_size = queue_size or self._default_queue_size
-        queue = asyncio.Queue(maxsize=q_size)
-        handler_name = name or getattr(handler, '__name__', str(id(handler)))
+        queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=q_size)
+        handler_name = str(
+            name or getattr(handler, '__name__', str(id(handler)))
+        )
         stats = HandlerStats(handler_name=handler_name, topic=topic)
 
         with self._lock:
@@ -972,7 +982,7 @@ class AsyncEventBus:
     def get_metrics(self) -> dict:
         """Get bus-level metrics."""
         with self._metrics_lock:
-            metrics = dict(self._metrics)
+            metrics: dict[str, Any] = dict(self._metrics)
 
         with self._lock:
             metrics["active_handlers"] = sum(len(h) for h in self._handlers.values())

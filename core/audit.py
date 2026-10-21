@@ -16,6 +16,7 @@ import time
 import uuid
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from quant_platform.core.events import EventBus, get_event_bus
 from quant_platform.core.store import Store
@@ -96,7 +97,7 @@ class AuditLog:
 
         tenant = tenant_id or self._tenant()
         actor = self._tenant()
-        record = {
+        record: dict[str, Any] = {
             "event_id": event_id,
             "tenant_id": tenant,
             "topic": f"audit.{action.value}",
