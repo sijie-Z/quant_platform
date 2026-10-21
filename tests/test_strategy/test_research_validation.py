@@ -55,13 +55,17 @@ class TestResearchValidator:
         assert v.n_stocks == 100
         assert v.start_date == "2021-01-01"
 
-    def test_quick_mode_structure(self):
+    def test_quick_mode_structure(self, tmp_path):
         """Verify quick mode produces a report with correct structure."""
         v = ResearchValidator(
             n_stocks=50,
             start_date="2021-01-01",
             end_date="2022-01-01",
             timeout_seconds=120,
+            # A quick synthetic sprint must not append rows to the real
+            # research database: this test used to write 2022-01-01-dated
+            # rows into data/factor_research.db on every suite run.
+            factor_store_path=str(tmp_path / "factor_research.db"),
         )
         report = v.run_quick(max_factors=2, max_folds=1, n_symbols=50)
         assert isinstance(report, ValidationReport)

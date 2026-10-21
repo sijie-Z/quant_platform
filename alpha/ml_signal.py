@@ -1037,11 +1037,20 @@ class MLSignalGenerator:
             booster = getattr(self.model, "booster_", None)
             if booster is None:
                 raise RuntimeError("LightGBM model has no fitted booster_")
-            booster.save_model(str(model_path))
+            # LightGBM's C++ writer cannot open non-ASCII paths on Windows
+            # ("Model file ... is not available for writes"). Serialize in
+            # memory and let Python write the bytes -- write_text would
+            # translate \n to \r\n and corrupt the text model format. The
+            # text format loads via model_str; legacy binary artifacts still
+            # load through model_file in load_model().
+            model_path.write_bytes(booster.model_to_string().encode("utf-8"))
         elif self.config.model_type == "xgboost":
             if not HAS_XGB:
                 raise ImportError("xgboost not installed")
-            self.model.save_model(str(model_path))
+            # Same non-ASCII path constraint: serialize to bytes and write
+            # them from Python instead of letting the C API open the path.
+            raw = self.model.get_booster().save_raw()
+            model_path.write_bytes(bytes(raw))
         else:
             raise ValueError(
                 f"Cannot save model_type={self.config.model_type!r}"
@@ -1092,13 +1101,25 @@ class MLSignalGenerator:
             if not HAS_LGB:
                 raise ImportError("lightgbm not installed")
             # A raw Booster predicts on the same feature matrix as the
-            # sklearn wrapper.
-            self.model = lgb.Booster(model_file=str(model_path))
+            # sklearn wrapper. Load from the in-memory text so a non-ASCII
+            # path never reaches LightGBM's C++ file opener; binary/legacy
+            # artifacts fall back to the file path.
+            payload = model_path.read_bytes()
+            try:
+                self.model = lgb.Booster(model_str=payload.decode("utf-8"))
+            except UnicodeDecodeError:
+                self.model = lgb.Booster(model_file=str(model_path))
         elif model_type == "xgboost":
             if not HAS_XGB:
                 raise ImportError("xgboost not installed")
             model = xgb.XGBRegressor(**self.config.xgb_params)
-            model.load_model(str(model_path))
+            raw = model_path.read_bytes()
+            try:
+                model.load_model(bytearray(raw))
+            except Exception:
+                # Older xgboost versions only accept a path (ASCII-safe
+                # callers); keep the legacy fallback.
+                model.load_model(str(model_path))
             self.model = model
         else:
             raise ValueError(f"Cannot load model_type={model_type!r}")

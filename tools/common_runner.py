@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -38,7 +39,7 @@ from quant_platform.factors.technical import (  # noqa: E402
     Volatility20D,
     Volatility60D,
 )
-from quant_platform.lab.registry import DEFAULT_DB, RunStore  # noqa: E402
+from quant_platform.lab.registry import RunStore  # noqa: E402
 from quant_platform.lab.reports import generate_report  # noqa: E402
 from quant_platform.utils.research_window import (  # noqa: E402
     compact_date,
@@ -49,6 +50,12 @@ START_DATE = "2021-01-01"
 #: Below this many cross-sectional IC observations a run has not been
 #: meaningfully evaluated; record it as failed, not success (R5).
 MIN_IC_OBS = 20
+
+#: Outputs and the registry DB are anchored to the repo root so running the
+#: script from another directory cannot scatter artifacts (R76).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DB_PATH = str(REPO_ROOT / "data" / "trading.db")
+REPORT_DIR = str(REPO_ROOT / "data" / "reports")
 
 # ---------------------------------------------------------------------------
 # 因子目录 — 每个因子是一个 compute(prices, rets) -> (date x asset) DataFrame 的函数
@@ -141,7 +148,22 @@ def _fetch_csi300_prices(end_date: str | None = None) -> pd.DataFrame:
 
     panel = pd.DataFrame(frames)
     panel.index.name = "date"
+    # Actual vs requested width: per-symbol fetch failures used to be dropped
+    # silently while the requested CSI300 count was reported (R70).
+    panel.attrs["n_stocks_requested"] = len(codes)
+    panel.attrs["n_fetch_failures"] = len(codes) - panel.shape[1]
     return panel
+
+
+def _json_safe(value):
+    """Replace non-finite floats with None so the registry stays valid JSON."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def run_single_factor(factor_key: str, end_date: str | None = None) -> str:
@@ -162,7 +184,7 @@ def run_single_factor(factor_key: str, end_date: str | None = None) -> str:
         "description": "CSI300 current constituents applied to full history (NOT PIT)",
     }
 
-    store = RunStore(DEFAULT_DB)
+    store = RunStore(DB_PATH)
     inputs = {
         "slice": slice_name, "data_source": "akshare", "data_meta": DATA_META,
         "universe_provider": UNIVERSE_META["provider"], "universe_meta": UNIVERSE_META,
@@ -170,12 +192,19 @@ def run_single_factor(factor_key: str, end_date: str | None = None) -> str:
     }
     run_id = store.begin_run(slice_name, inputs)
 
+    evaluation: dict | None = None
     try:
         # ---- 1. 数据 -----
         t0 = time.time()
         prices = _fetch_csi300_prices(end_date)
-        print(f"[{slice_name}] price panel: {prices.shape} (t={int(time.time() - t0)}s)", flush=True)
-        if prices.shape[1] < 50:
+        n_stocks_actual = int(prices.shape[1])
+        n_stocks_requested = int(prices.attrs.get("n_stocks_requested", n_stocks_actual))
+        n_fetch_failures = int(prices.attrs.get("n_fetch_failures", 0))
+        print(f"[{slice_name}] price panel: {prices.shape} "
+              f"({n_stocks_actual}/{n_stocks_requested} symbols, "
+              f"{n_fetch_failures} fetch failures) (t={int(time.time() - t0)}s)",
+              flush=True)
+        if prices.shape[1] < 50 or len(prices) < 2:
             raise RuntimeError(f"price panel too narrow: {prices.shape}")
         data_start = str(prices.index[0].date())
         data_end = str(prices.index[-1].date())
@@ -229,13 +258,27 @@ def run_single_factor(factor_key: str, end_date: str | None = None) -> str:
             "icir": round(float(stats.get("icir", float("nan"))), 4) if stats else None,
             "ic_positive_ratio": round(float(stats.get("ic_positive_ratio", float("nan"))), 4) if stats else None,
             "long_short_sharpe_proxy": ls_sharpe,
+            # The proxy is an IC/quantile diagnostic on forward returns, not a
+            # costed portfolio: state the basis so it cannot be read as net
+            # performance (R86). No terminal rebalance is simulated here.
+            "metric_basis": {
+                "long_short_sharpe_proxy": "gross_no_costs",
+                "note": "gross of transaction costs: IC/quantile diagnostic on "
+                        "forward returns; not a costed portfolio backtest",
+            },
             "dsr": {"status": "insufficient_trials", "reason": "single_research_run",
                      "observed_sharpe_proxy": ls_sharpe, "note": "Do not read this as formal validation."},
             "bh_fdr": "n/a (single factor)",
             "fetch_duration_s": int(time.time() - t0),
+            "provider": "akshare", "adjust": "hfq",
+            "universe_provider": UNIVERSE_META["provider"], "pit": False,
+            "n_stocks": n_stocks_actual,
+            "n_stocks_requested": n_stocks_requested,
+            "n_fetch_failures": n_fetch_failures,
             "data_start": data_start, "data_end": data_end,
             "requested_end": end_date,
         }
+        evaluation = _json_safe(evaluation)
         n_ic_obs = int(len(ic_series))
         status = "success" if n_ic_obs >= MIN_IC_OBS else "failed"
         reason = None if status == "success" else (
@@ -245,17 +288,23 @@ def run_single_factor(factor_key: str, end_date: str | None = None) -> str:
         store.finish_run(run_id, status=status, evaluation=evaluation,
                          report_path=None, reason=reason, warnings=status_warnings)
         final_run = store.get_run(run_id)
-        report_path = generate_report(final_run, out_dir="data/reports")
+        report_path = generate_report(final_run, out_dir=REPORT_DIR)
         store.finish_run(run_id, status=status, evaluation=evaluation,
                          report_path=report_path, reason=reason, warnings=status_warnings)
-        print(f"[{slice_name}] SUCCESS  IC={evaluation['ic_mean']}  ICIR={evaluation['icir']}  report={report_path}", flush=True)
+        print(f"[{slice_name}] {status.upper()}  IC={evaluation['ic_mean']}  "
+              f"ICIR={evaluation['icir']}  report={report_path}"
+              + (f"  reason={reason}" if reason else ""), flush=True)
         return run_id
 
     except Exception as e:
         tb = traceback.format_exc()
         reason = f"{type(e).__name__}: {e}"
-        store.finish_run(run_id, status="failed", reason=reason, warnings=[f"traceback_excerpt: {tb[-400:]}"])
-        rp = generate_report(store.get_run(run_id), out_dir="data/reports")
+        # Preserve any evaluation already built: a report-generation failure
+        # must not wipe the metrics of a completed measurement.
+        store.finish_run(run_id, status="failed", evaluation=evaluation,
+                         reason=reason,
+                         warnings=[f"traceback_excerpt: {tb[-400:]}"])
+        rp = generate_report(store.get_run(run_id), out_dir=REPORT_DIR)
         store.finish_run(run_id, status="failed", reason=reason, report_path=rp)
         print(f"[{slice_name}] FAILED run_id={run_id}: {e}", flush=True)
         raise

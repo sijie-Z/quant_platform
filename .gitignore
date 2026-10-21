@@ -77,3 +77,5 @@ baostock_run_err.log
 
 # Generated data
 frontend/data/
+
+.scratch/

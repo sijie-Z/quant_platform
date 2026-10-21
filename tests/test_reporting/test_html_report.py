@@ -17,6 +17,9 @@ def sample_results():
             "max_drawdown": -0.12,
             "volatility": 0.15,
             "optimizer": "equal_weight",
+            # A real run carries the sample size; below 10 observations the
+            # report renders n/a instead of the 0.0 defaults (R93).
+            "total_days": 500,
         },
         "factors": [
             {"name": "momentum_1m", "mean_ic": 0.04, "icir": 2.1, "ic_positive_ratio": 0.65, "std_ic": 0.02},

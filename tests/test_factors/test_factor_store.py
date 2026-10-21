@@ -1,13 +1,15 @@
 """Factor research store: health-score sign, lineage columns, ordering.
 
 Covers R1 (abs(ICIR) promoted wrong-sign factors), R10 (no provenance /
-validity columns on any table) and R25 (naive local timestamps and a
-latest-row join on timestamp text).
+validity columns on any table), R25 (naive local timestamps and a
+latest-row join on timestamp text) and the R11 follow-up (NULL stability is
+missing evidence, not a measured zero).
 """
 
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 
 import pytest
@@ -172,3 +174,56 @@ class TestLatestRowSelection:
 
         ranking = {r["factor_name"]: r for r in store.get_factor_ranking()}
         assert ranking["f"]["icir"] == pytest.approx(0.3)
+
+
+class TestStabilityAvailability:
+    """R11 follow-up: NULL stability must not look like a measured zero."""
+
+    def test_null_consistency_is_unavailable_and_not_scored_as_zero(self, store):
+        # A factor that WAS validated and scored consistency=0 ...
+        store.save_stability(_stability("measured_zero", 0.2, consistency=0.0))
+        # ... versus one whose run had no walk-forward folds (NULL).
+        store.save_stability(FactorStabilityRecord(
+            factor_name="no_walk_forward", ic_mean=0.02, ic_std=0.1, icir=0.2,
+            sharpe_mean=float("nan"), sharpe_std=float("nan"),
+            sharpe_consistency=float("nan"), positive_folds=None,
+            total_folds=None, coverage=0.9,
+        ))
+
+        ranking = {r["factor_name"]: r for r in store.get_factor_ranking()}
+        assert ranking["no_walk_forward"]["stability_status"] == "unavailable"
+        assert ranking["no_walk_forward"]["consistency"] is None
+        assert ranking["measured_zero"]["stability_status"] == "measured"
+        assert ranking["measured_zero"]["consistency"] == 0.0
+
+        # Missing stability is excluded and the measured terms renormalized
+        # (ICIR 40% + coverage 30% -> /0.7) instead of counting as a zero.
+        no_wf_health = (0.2 / 0.5 * 0.4 + 0.9 * 0.3) / 0.7
+        assert ranking["no_walk_forward"]["health_score"] == pytest.approx(
+            no_wf_health, abs=1e-4
+        )
+        measured_health = 0.2 / 0.5 * 0.4 + 0.9 * 0.3 + 0.0 * 0.3
+        assert ranking["measured_zero"]["health_score"] == pytest.approx(
+            measured_health, abs=1e-4
+        )
+        assert (ranking["no_walk_forward"]["health_score"]
+                > ranking["measured_zero"]["health_score"])
+
+    def test_null_evaluation_metrics_read_back_as_nan(self, store, tmp_path):
+        db = str(tmp_path / "factor_research.db")
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO factor_evaluation_history "
+            "(factor_name, signal_date, rank_ic, pearson_ic, icir, coverage, "
+            " n_assets, run_id, timestamp) "
+            "VALUES ('unmeasured', '2024-01-02', NULL, NULL, NULL, NULL, 0, "
+            "        'run_x', '2024-01-02T00:00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        row = store.get_evaluation_history("unmeasured")[0]
+        # The DB stores NULL; the reader must not turn it into measured 0.0.
+        assert math.isnan(row.rank_ic)
+        assert math.isnan(row.icir)
+        assert math.isnan(row.coverage)

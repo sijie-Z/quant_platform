@@ -18,6 +18,7 @@ label (e.g. before the benchmark starts) are explicitly skipped and counted.
 只记录结果，不解释。
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -52,6 +53,7 @@ logger = get_logger("rq3")
 # ---------------------------------------------------------------------------
 ALPHA_STRENGTH = 0.06
 N_STOCKS = 500
+SEED = 42
 START_DATE = "2021-01-01"
 # Resolved at run time; the old hardcoded 2025-12-31 aged silently.
 END_DATE = resolve_end_date()
@@ -89,6 +91,7 @@ def load_data():
         n_stocks=N_STOCKS,
         start_date=START_DATE,
         end_date=END_DATE,
+        seed=SEED,
         embedded_alpha=True,
         alpha_strength=ALPHA_STRENGTH,
     )
@@ -135,8 +138,13 @@ def compute_all_factors(prices, returns, sector_map, turnover):
 
     processed = {}
     for name, factor in raw_factors.items():
+        # R79: market_cap=None means winsorize + standardize + sector
+        # neutralization only — NO size neutralization. The synthetic pipeline
+        # does expose a market-cap panel, but adding it would change this
+        # protocol-frozen experiment's universe of results, so the deviation is
+        # declared here (and in the run log) instead of being applied silently.
         processed[name] = process_factor(factor, sector_map=sector_map, market_cap=None)
-    logger.info("Computed %d factors", len(processed))
+    logger.info("Processed %d factors (sector-neutralized; market-cap neutralization NOT applied: R79)", len(processed))
     return processed
 
 
@@ -201,13 +209,23 @@ def compute_ic(signal, returns):
 def classify_regimes(benchmark_returns, trading_days=None):
     """Label each trading day with the regime of its OWN calendar month.
 
-    Month M's compounded benchmark return is computed from the benchmark rows
-    inside M and applied to the trading days inside M (contemporaneous, ex-post
-    decomposition). No forward-fill into the next month: that made February
-    trade on January's label and mislabelled 62.7% of trading days.
+    Month M's compounded benchmark return is computed from the returns
+    *realised inside M* and applied to the trading days inside M
+    (contemporaneous, ex-post decomposition).
+
+    The pipeline benchmark is in forward convention: the value labelled t is
+    the return from close t to close t+1, so it is realised on t+1. The old
+    implementation compounded the value labelled on the last trading day of M
+    into month M although it is realised in M+1 — a one-day cross-month leak
+    in a label explicitly said to be ex-post. Each return is therefore
+    attributed to its realised date before the monthly compound (R87).
+
+    No forward-fill into the next month: that made February trade on January's
+    label and mislabelled 62.7% of trading days.
 
     Args:
-        benchmark_returns: Series of benchmark returns (pipeline convention).
+        benchmark_returns: Series of benchmark returns in the pipeline's
+            forward convention (``benchmark[t]`` spans t -> t+1).
         trading_days: index of actual trading days to label. Defaults to the
             benchmark's own index. Days whose month has no benchmark data get
             NaN and are excluded by callers.
@@ -223,14 +241,22 @@ def classify_regimes(benchmark_returns, trading_days=None):
         logger.warning("No benchmark returns — regime labels unavailable")
         return pd.Series(np.nan, index=trading_days, name="regime", dtype=object)
 
-    benchmark_returns = benchmark_returns.dropna()
-    if benchmark_returns.empty:
+    benchmark_returns = benchmark_returns.sort_index()
+    if benchmark_returns.dropna().empty:
         logger.warning("Benchmark series is empty after dropping NaN — regime labels unavailable")
         return pd.Series(np.nan, index=trading_days, name="regime", dtype=object)
 
+    # Forward returns are realised one trading day later: shift positionally
+    # so month M's compound uses exactly the returns realised inside M.
+    # (A return labelled on the first sample day has no prior close and is
+    # dropped; the label for that day still comes from its month's compound.)
+    # Shifting happens BEFORE any dropna so an internal gap keeps its
+    # positional offset; prod(min_count=1) then skips NaNs within a month.
+    realised = benchmark_returns.shift(1)
+
     # min_count=1 keeps an all-NaN month as NaN instead of silently compounding
     # it to 0% (which would become a spurious "Sideways" label).
-    monthly = benchmark_returns.resample(pd.offsets.MonthEnd()).apply(
+    monthly = realised.resample(pd.offsets.MonthEnd()).apply(
         lambda x: (1 + x).prod(min_count=1) - 1
     ).dropna()
 
@@ -270,6 +296,22 @@ def regime_pct_time(regime_dates, daily_regime):
     if total_labelled == 0:
         return 0.0
     return len(regime_dates) / total_labelled * 100.0
+
+
+def regime_return_subset(daily_returns, regime_dates):
+    """Portfolio returns realised on ``regime_dates`` (R87 alignment).
+
+    Backtest daily returns follow the pipeline's forward convention: the value
+    labelled t spans t -> t+1 and is realised on t+1. The monthly regime label
+    now refers to the month in which its return was realised, so the return
+    series is shifted onto realised dates before filtering. Without this, the
+    last trading day of a month contributed a return realised in the NEXT
+    month to the previous month's regime statistics — the same one-day
+    cross-month displacement as the month-label compound.
+    """
+    series = pd.Series(daily_returns).sort_index()
+    realised = series.shift(1)
+    return realised[realised.index.isin(regime_dates)].dropna()
 
 
 def print_yearly_results(results):
@@ -405,6 +447,15 @@ if __name__ == "__main__":
         # Dates carrying this regime label (NaN days are never matched)
         regime_dates = daily_regime.index[daily_regime == regime_name]
 
+        # IC is computed at the signal date, but its forward return is
+        # realised one trading day later. Label each signal date with the
+        # regime of its realised date (the next trading day) so the IC is
+        # attributed to the month the return actually belongs to (R87).
+        next_day_regime = daily_regime.sort_index().shift(-1)
+        signal_regime_dates = next_day_regime.index[
+            next_day_regime == regime_name
+        ]
+
         # Filter returns/prices to regime dates
         # IC: compute only on regime dates
         # For backtest: we need to run on continuous data but can segment the P&L
@@ -415,8 +466,12 @@ if __name__ == "__main__":
             sig = all_signals[sig_name]
             returns_aligned = returns
 
-            # IC: subset to regime dates that exist in returns
-            common_dates = sorted(set(sig.index) & set(returns_aligned.index) & set(regime_dates))
+            # IC: subset to regime dates that exist in returns. The signal
+            # date is paired with the regime of the day its return is
+            # realised on (see `signal_regime_dates`).
+            common_dates = sorted(
+                set(sig.index) & set(returns_aligned.index) & set(signal_regime_dates)
+            )
             if len(common_dates) < 10:
                 logger.info("    %-18s %-10s → too few dates (%d), skipping (regime covers %.1f%% of labelled days)",
                             sig_name, regime_name, len(common_dates),
@@ -432,8 +487,10 @@ if __name__ == "__main__":
             try:
                 bt = run_backtest(sig, prices, returns_aligned, benchmark, sector_map)
                 bt_returns = bt.get("daily_returns", pd.Series(dtype=float))
-                # Filter to regime dates
-                regime_bt = bt_returns[bt_returns.index.isin(regime_dates)]
+                # Attribute each return to its realised date before filtering
+                # by regime (R87), so a month's last t -> t+1 return is not
+                # counted under the previous month's regime.
+                regime_bt = regime_return_subset(bt_returns, regime_dates)
                 if len(regime_bt) < 5:
                     sharpe = np.nan
                 else:
@@ -467,14 +524,37 @@ if __name__ == "__main__":
     df_regime = pd.DataFrame(regime_records)
     print_regime_results(regime_records)
 
-    # Save raw data
-    output_dir = Path("results")
+    # Save raw data. Outputs are anchored to the repo root (not the cwd) and
+    # stamped with the as-of window and provider so a stale artifact is
+    # distinguishable from a current one.
+    output_dir = _project_root / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     df_yearly = stamp_provenance(df_yearly, data_start, data_end)
     df_regime = stamp_provenance(df_regime, data_start, data_end)
+    for frame in (df_yearly, df_regime):
+        frame["provider"] = "synthetic"
+        frame["alpha_strength"] = ALPHA_STRENGTH
+        frame["seed"] = SEED
     df_yearly.to_csv(output_dir / "rq3_yearly_stability.csv", index=False)
     df_regime.to_csv(output_dir / "rq3_regime_decomposition.csv", index=False)
+    manifest = {
+        "script": "run_rq3_stability.py",
+        "generated_at": pd.Timestamp.now("UTC").isoformat(),
+        "provider": "synthetic",
+        "seed": SEED,
+        "alpha_strength": ALPHA_STRENGTH,
+        "n_stocks": N_STOCKS,
+        "requested_end": END_DATE,
+        "data_start": data_start,
+        "data_end": data_end,
+        "regime_label_convention": "contemporaneous month; %Time over labelled trading days; "
+                                   "returns attributed to realised dates",
+        "artifacts": ["rq3_yearly_stability.csv", "rq3_regime_decomposition.csv"],
+    }
+    (output_dir / "rq3_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
 
     # Print raw data
     print()

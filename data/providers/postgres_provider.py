@@ -59,9 +59,17 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import DataProvider
-from quant_platform.data.schema import FINANCIAL_COLUMNS
+from quant_platform.data.schema import FINANCIAL_COLUMNS, DataQualityError
 
 Base = declarative_base() if HAS_SQLALCHEMY else None
+
+#: Close bases ``daily_prices.close`` may carry.
+_PRICE_BASES = ("raw", "qfq", "hfq")
+
+#: Columns the ``daily_prices`` query exposes (the provider's field universe).
+_PIVOT_COLUMNS = (
+    "open", "high", "low", "close", "volume", "turnover", "adj_factor",
+)
 
 
 class OrderRow(Base if HAS_SQLALCHEMY else object):
@@ -437,12 +445,22 @@ class PostgresDataProvider(DataProvider):
 
     Reads OHLCV data from a PostgreSQL/TimescaleDB database.
 
-    Adjustment contract: ``daily_prices.close`` must be the **raw**
-    (unadjusted) close and ``daily_prices.adj_factor`` the cumulative
+    Adjustment contract: by default ``daily_prices.close`` must be the
+    **raw** (unadjusted) close and ``daily_prices.adj_factor`` the cumulative
     adjustment divisor, so the pipeline computes
-    ``close_adj = close / adj_factor`` exactly once.  A factor that is NULL,
-    non-positive or non-finite would silently corrupt the return series, so
-    such rows are rejected with an actionable error instead of being divided.
+    ``close_adj = close / adj_factor`` exactly once.  This provider declares
+    that contract explicitly (``price_adjustment="raw"``,
+    ``adjusted_price_basis="hfq"``, ``adjustment_factor_available=True``) and
+    stamps the matching ``attrs`` on every panel it returns, so the pipeline
+    never has to infer the basis from factor variance.
+
+    A database that only stores an already-adjusted close must say so with
+    ``close_adjustment="qfq"``/``"hfq"``; its ``adj_factor`` column is then
+    required to be a placeholder ``1.0``.  A non-constant (or non-unit)
+    factor alongside an adjusted close is rejected with
+    :class:`~quant_platform.data.schema.DataQualityError`: dividing that
+    panel by the factor would double-adjust it.  A NULL, zero, negative or
+    non-finite divisor is always rejected, never silently divided.
 
     ``st_available`` is False: this provider has no ST history (the static
     ``stock_metadata.is_st`` flag is all it carries), so callers must treat
@@ -450,12 +468,37 @@ class PostgresDataProvider(DataProvider):
     coalesced to False for the static flag only.
 
     Args:
-        dsn: PostgreSQL connection string
+        dsn: PostgreSQL connection string.
+        close_adjustment: Basis of ``daily_prices.close``: ``"raw"``
+            (default; OHLCV plus a divisor) or ``"qfq"``/``"hfq"`` when the
+            table stores an already-adjusted close with ``adj_factor=1``.
     """
 
-    def __init__(self, dsn: str = "postgresql://quant:quant@localhost:5432/quant"):
+    # Explicit price-basis declaration, resolved by DataPipeline.  ``raw``
+    # close + a divisor column is the shared contract; the pipeline's own
+    # ``close / adj_factor`` series is the back-adjusted (hfq) one.
+    price_adjustment = "raw"
+    adjusted_price_basis = "hfq"
+    adjustment_factor_available = True
+
+    def __init__(
+        self,
+        dsn: str = "postgresql://quant:quant@localhost:5432/quant",
+        close_adjustment: str = "raw",
+    ):
         if not HAS_SQLALCHEMY:
             raise ImportError("sqlalchemy required")
+
+        basis = str(close_adjustment).strip().lower()
+        if basis not in _PRICE_BASES:
+            raise ValueError(
+                "close_adjustment must be one of "
+                f"{_PRICE_BASES}, got {close_adjustment!r}"
+            )
+        self.price_adjustment = basis
+        # raw close + divisor is the shared back-adjustment (hfq) contract.
+        self.adjusted_price_basis = "hfq" if basis == "raw" else basis
+        self.adjustment_factor_available = basis == "raw"
 
         self._engine = create_engine(dsn, pool_pre_ping=True)
         self._connected = False
@@ -474,6 +517,16 @@ class PostgresDataProvider(DataProvider):
             logger.warning("PostgreSQL not available: %s", e)
             raise ConnectionError(f"PostgreSQL not available: {e}") from e
 
+    def _basis_attrs(self) -> dict:
+        """The explicit basis declaration this provider stamps on its panels."""
+        return {
+            "price_basis": self.price_adjustment,
+            "adjusted_price_basis": self.adjusted_price_basis,
+            "adjustment_factor_available": bool(
+                self.adjustment_factor_available
+            ),
+        }
+
     def get_prices(
         self,
         start_date: str,
@@ -490,12 +543,22 @@ class PostgresDataProvider(DataProvider):
             ORDER BY date, code
         """
         df = pd.read_sql(query, self._engine, params={"start": start_date, "end": end_date})
-        pivot_cols = fields or ["open", "high", "low", "close", "volume", "turnover", "adj_factor"]
+        pivot_cols = list(fields) if fields else list(_PIVOT_COLUMNS)
+        # The fields projection contract applies to empty results too: an
+        # unknown name must raise, not silently materialise a column that
+        # no data backed.
+        unknown_fields = [c for c in pivot_cols if c not in _PIVOT_COLUMNS]
+        if unknown_fields:
+            raise ValueError(f"Unknown price fields: {unknown_fields}")
         if df.empty:
             # Empty results must still satisfy the MultiIndex contract:
             # downstream code calls get_level_values("asset") unconditionally.
+            # The basis declaration travels on the empty frame too so a run
+            # with no rows still resolves the provider's contract explicitly.
             index = pd.MultiIndex.from_arrays([[], []], names=["date", "asset"])
-            return pd.DataFrame(index=index, columns=list(pivot_cols), dtype=float)
+            empty = pd.DataFrame(index=index, columns=list(pivot_cols), dtype=float)
+            empty.attrs.update(self._basis_attrs())
+            return empty
 
         df["date"] = pd.to_datetime(df["date"])
         missing = [c for c in pivot_cols if c not in df.columns]
@@ -509,16 +572,31 @@ class PostgresDataProvider(DataProvider):
         factor_values = factors.to_numpy(dtype=float)
         valid = np.isfinite(factor_values) & (factor_values > 0)
         if not bool(valid.all()):
-            raise ValueError(
-                "daily_prices.adj_factor must be a positive finite cumulative "
-                f"adjustment divisor (close must be raw); {int((~valid).sum())} "
-                "row(s) violate the contract"
+            raise DataQualityError(
+                "daily_prices.adj_factor must be a positive finite value "
+                f"(declared close basis {self.price_adjustment!r}); "
+                f"{int((~valid).sum())} row(s) violate the contract"
             )
+        if self.price_adjustment in {"qfq", "hfq"}:
+            # The DB stores an already-adjusted close, so the factor is a
+            # placeholder.  Anything else means the panel would be divided
+            # again by the pipeline -- the classic double-adjustment error.
+            non_unit = int((np.abs(factor_values - 1.0) > 1e-12).sum())
+            if non_unit:
+                raise DataQualityError(
+                    "daily_prices.close is declared "
+                    f"{self.price_adjustment!r} but adj_factor is not 1.0 on "
+                    f"{non_unit} row(s). The pipeline divides close by "
+                    "adj_factor, so this panel would be double-adjusted. "
+                    "Store raw close plus a divisor, or an already-adjusted "
+                    "close with adj_factor=1."
+                )
 
         # Contract (data/providers/base.py): MultiIndex (date, asset) with one
         # column per field.
         result = df.set_index(["date", "code"])[pivot_cols].sort_index()
         result.index = result.index.set_names(["date", "asset"])
+        result.attrs.update(self._basis_attrs())
         return result
 
     def get_financials(

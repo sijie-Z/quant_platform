@@ -636,10 +636,13 @@ class FactorResearchStore:
             return [FactorEvalRecord(
                 factor_name=r["factor_name"],
                 signal_date=r["signal_date"],
-                rank_ic=r["rank_ic"] or 0.0,
-                pearson_ic=r["pearson_ic"] or 0.0,
-                icir=r["icir"] or 0.0,
-                coverage=r["coverage"] or 0.0,
+                # NULL metrics (a run that could not measure them) stay
+                # missing on read: coercing to 0.0 made `factor-store history`
+                # print measured-looking zeros for unmeasured rows.
+                rank_ic=float(r["rank_ic"]) if r["rank_ic"] is not None else float("nan"),
+                pearson_ic=float(r["pearson_ic"]) if r["pearson_ic"] is not None else float("nan"),
+                icir=float(r["icir"]) if r["icir"] is not None else float("nan"),
+                coverage=float(r["coverage"]) if r["coverage"] is not None else float("nan"),
                 n_assets=r["n_assets"] or 0,
                 run_id=r["run_id"] if r["run_id"] else "",
                 timestamp=r["timestamp"],
@@ -830,15 +833,28 @@ class FactorResearchStore:
                 # scored 0.59: wrong-direction factors ranked first.
                 icir_score = max(0.0, min(1.0, (d["icir"] or 0.0) / 0.5))
                 coverage_score = d["coverage"] or 0
-                consistency_score = d["sharpe_consistency"] or 0
-                health = (icir_score * 0.4 + coverage_score * 0.3
-                          + consistency_score * 0.3)
+                consistency = d["sharpe_consistency"]
+                if consistency is None:
+                    # Stability was not computed for the latest run (no
+                    # walk-forward folds). Scoring it as a measured zero made
+                    # 30% of the health score structurally zero for factors
+                    # that were simply never validated; renormalize the
+                    # measured terms and surface the missing status instead.
+                    health = (icir_score * 0.4 + coverage_score * 0.3) / 0.7
+                    consistency_out = None
+                    stability_status = "unavailable"
+                else:
+                    health = (icir_score * 0.4 + coverage_score * 0.3
+                              + float(consistency) * 0.3)
+                    consistency_out = round(float(consistency), 4)
+                    stability_status = "measured"
                 ranked.append({
                     "factor_name": d["factor_name"],
                     "ic_mean": round(d["ic_mean"], 6) if d["ic_mean"] else 0,
                     "icir": round(d["icir"], 4) if d["icir"] else 0,
                     "coverage": round(d["coverage"], 4) if d["coverage"] else 0,
-                    "consistency": round(d["sharpe_consistency"], 4) if d["sharpe_consistency"] else 0,
+                    "consistency": consistency_out,
+                    "stability_status": stability_status,
                     "health_score": round(health, 4),
                 })
 

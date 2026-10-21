@@ -5,13 +5,20 @@ dragon-tiger lists, and sentiment data. Multi-source failover.
 
 Contract status
 ---------------
-Adata's stock API is not shaped like the platform's ``DataProvider`` panel.
-This provider therefore implements the parts it can map reliably
-(``get_prices`` / ``get_benchmark`` / ``get_metadata``) and raises
-:class:`NotImplementedError` for ``get_financials`` rather than returning a
-wide close-only frame that looks like a valid financial panel.  Every fetch
-is sliced to the requested date range and a failed symbol raises
-:class:`DataFetchIncompleteError` instead of silently shrinking the universe.
+Adata's stock API is not shaped like the platform's ``DataProvider`` price
+panel.  Its K-line endpoint does not declare a price basis and does not
+expose the raw-close + ``adj_factor`` divisor pair the pipeline divides by,
+so returning its OHLCV frame would hand out levels that look like traded
+CNY prices while possibly carrying adjusted (qfq/hfq) values.  This
+provider therefore **fails closed for prices**: ``get_prices`` raises
+:class:`NotImplementedError` with an actionable message instead of
+returning that frame.  It remains usable as a secondary/validation source
+for metadata and benchmark data, and for its Adata-specific research
+helpers (capital flow, dragon-tiger list, concepts, north flow).
+
+``get_financials`` likewise raises :class:`NotImplementedError` rather than
+returning a wide close-only frame that looks like a valid financial panel.
+Supporting fetches that take a date range are sliced to ``end_date``.
 
 Install: pip install adata
 """
@@ -20,26 +27,16 @@ from __future__ import annotations
 
 import pandas as pd
 
-from quant_platform.data.providers.base import DataFetchIncompleteError, DataProvider
+from quant_platform.data.providers.base import DataProvider
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Columns adata may return; mapped to the provider contract names.
+# Date-column aliases adata may return; the benchmark fetch normalises them.
 _COLUMN_ALIASES = {
     "trade_date": "date",
     "trade_time": "date",
-    "stock_code": "asset",
-    "vol": "volume",
-    "turnover_rate": "turnover",
 }
-
-_REQUIRED_PRICE_COLUMNS = ("open", "high", "low", "close", "volume")
-
-
-def _empty_prices(columns=None) -> pd.DataFrame:
-    index = pd.MultiIndex.from_arrays([[], []], names=["date", "asset"])
-    return pd.DataFrame(index=index, columns=list(columns or []))
 
 
 class AdataProvider(DataProvider):
@@ -47,16 +44,24 @@ class AdataProvider(DataProvider):
 
     Features:
     - Stock codes, concepts, industry classification
-    - Daily/weekly/monthly K-line (mapped to the (date, asset) panel)
     - Real-time quotes and 5-level order book
     - Capital flow (individual stock + concept)
     - Dragon-tiger list
     - North-bound capital flow
     - ETF data
 
+    Prices are deliberately unsupported (see the module docstring): the
+    K-line endpoint has no declared raw/adjusted basis and no divisor.
+    ``get_prices`` raises :class:`NotImplementedError` so this source can
+    never feed a money path or a research return series by accident.
+
     ``st_available`` is False: adata's stock list does not expose an ST
     history, so no ``is_st`` column is fabricated.
     """
+
+    #: Explicit contract declaration: no price basis is offered at all.
+    price_adjustment = "unsupported"
+    adjustment_factor_available = False
 
     def __init__(self):
         self._adata = None
@@ -72,94 +77,29 @@ class AdataProvider(DataProvider):
     # DataProvider interface
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _project_fields(df: pd.DataFrame, fields: list[str] | None) -> pd.DataFrame:
-        if not fields:
-            return df
-        unknown = [col for col in fields if col not in df.columns]
-        if unknown:
-            raise ValueError(f"Unknown price fields: {unknown}")
-        return df[list(fields)]
-
-    def _fetch_one(self, code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """Fetch one stock's K-line and normalise it to the contract."""
-        kwargs = {
-            "stock_code": code,
-            "k_type": 1,
-            "start_date": start_date,
-        }
-        try:
-            df = self._adata.stock.market.get_market(end_date=end_date, **kwargs)
-        except TypeError:
-            # Older adata versions do not accept end_date; slice locally.
-            df = self._adata.stock.market.get_market(**kwargs)
-        if df is None or df.empty:
-            raise ValueError(f"adata returned no rows for {code}")
-
-        df = df.rename(columns=_COLUMN_ALIASES).copy()
-        if "date" not in df.columns or "close" not in df.columns:
-            raise ValueError(f"adata K-line for {code} has no date/close columns")
-        missing = [col for col in _REQUIRED_PRICE_COLUMNS if col not in df.columns]
-        if missing:
-            raise ValueError(
-                f"adata K-line for {code} is missing contract columns: {missing}"
-            )
-
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"])
-        df["asset"] = code
-        for col in ("open", "high", "low", "close", "volume", "amount", "turnover"):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # Enforce the requested end date even when the API ignores it.
-        end = pd.Timestamp(end_date)
-        df = df[df["date"] <= end]
-        return df
-
     def get_prices(
         self,
         start_date: str,
         end_date: str,
         fields: list[str] | None = None,
     ) -> pd.DataFrame:
-        """Get daily OHLCV prices as a (date, asset) MultiIndex panel.
+        """Not supported: fail closed instead of returning a look-alike panel.
 
-        Every symbol failure is retried once; if any symbol still fails the
-        request raises instead of returning a close-only/truncated frame.
+        Adata's K-line frame carries no declared price basis and no
+        ``adj_factor`` divisor column, so a caller (or the validated
+        wrapper) could fuse qfq levels into a raw-marked panel.  The
+        platform's contract is raw OHLCV plus a divisor; this source must
+        not pretend to satisfy it.
         """
-        self._lazy_import()
-        codes = self._list_codes()
-        all_data = []
-        failed: list[str] = []
-
-        for code in codes[:200]:  # Limit universe for performance
-            try:
-                df = self._fetch_one(code, start_date, end_date)
-                if not df.empty:
-                    all_data.append(df)
-            except Exception as exc:  # noqa: BLE001 - provider-specific errors
-                logger.warning("adata fetch failed for %s: %s", code, exc)
-                try:
-                    df = self._fetch_one(code, start_date, end_date)
-                    if not df.empty:
-                        all_data.append(df)
-                except Exception as retry_exc:  # noqa: BLE001
-                    logger.error("adata retry failed for %s: %s", code, retry_exc)
-                    failed.append(code)
-
-        if failed:
-            raise DataFetchIncompleteError(
-                "Adata price fetch incomplete: "
-                f"{len(failed)} symbol(s) failed (e.g. {failed[:10]})"
-            )
-        if not all_data:
-            return self._project_fields(_empty_prices(_REQUIRED_PRICE_COLUMNS), fields)
-
-        result = pd.concat(all_data, ignore_index=True)
-        result = result.set_index(["date", "asset"]).sort_index()
-        result.index = result.index.set_names(["date", "asset"])
-        return self._project_fields(result, fields)
+        raise NotImplementedError(
+            "AdataProvider.get_prices cannot supply the platform's price "
+            "contract (raw OHLCV + adj_factor divisor): adata's K-line "
+            "endpoint does not declare whether its close is raw, qfq or hfq, "
+            "so any panel returned here could be mistaken for traded CNY "
+            "prices. Use AdataProvider only as a secondary/validation "
+            "source (metadata, benchmark, research helpers); configure "
+            "Tushare, Baostock or Postgres for prices and money paths."
+        )
 
     def get_financials(
         self,
@@ -212,12 +152,6 @@ class AdataProvider(DataProvider):
         except Exception as e:
             logger.warning("Failed to get benchmark: %s", e)
             return pd.Series(dtype=float, name="benchmark")
-
-    def _list_codes(self) -> list[str]:
-        metadata = self.get_metadata()
-        if metadata.empty:
-            return []
-        return [str(code) for code in metadata.index]
 
     def get_metadata(self) -> pd.DataFrame:
         """Get A-share stock metadata mapped to the platform contract."""

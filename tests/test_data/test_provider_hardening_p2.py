@@ -16,7 +16,6 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 from quant_platform.data.providers.adata_provider import AdataProvider
-from quant_platform.data.providers.base import DataFetchIncompleteError
 from quant_platform.data.providers.connection_pool import (
     CACHE_SCHEMA_VERSION,
     DataProviderPool,
@@ -121,26 +120,16 @@ def adata_provider(**kwargs) -> AdataProvider:
     return provider
 
 
-def test_adata_prices_are_a_multiindex_panel_and_sliced():
-    provider = adata_provider(ignore_end_date=True)
+def test_adata_prices_fail_closed_instead_of_looking_like_ohlcv():
+    """Adata cannot declare a raw/adjusted basis, so prices are unsupported.
 
-    prices = provider.get_prices("2024-01-02", "2024-01-04")
+    The old implementation returned a wide OHLCV frame with an undeclared
+    adjustment basis and no adj_factor; that frame could silently feed an
+    adjusted level into a money path.  The provider must refuse instead.
+    """
+    provider = adata_provider()
 
-    assert isinstance(prices.index, pd.MultiIndex)
-    assert list(prices.index.names) == ["date", "asset"]
-    assert {"open", "high", "low", "close", "volume"} <= set(prices.columns)
-    # The fake ignored end_date; the provider must slice locally.
-    assert prices.index.get_level_values("date").max() == pd.Timestamp("2024-01-04")
-
-    sub = provider.get_prices("2024-01-02", "2024-01-04", fields=["close"])
-    assert list(sub.columns) == ["close"]
-    with pytest.raises(ValueError, match="Unknown price fields"):
-        provider.get_prices("2024-01-02", "2024-01-04", fields=["nope"])
-
-
-def test_adata_symbol_failure_raises_incomplete():
-    provider = adata_provider(fail_codes={"600002"})
-    with pytest.raises(DataFetchIncompleteError):
+    with pytest.raises(NotImplementedError, match="raw OHLCV"):
         provider.get_prices("2024-01-02", "2024-01-04")
 
 

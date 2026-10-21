@@ -14,15 +14,195 @@ Output: Evidence quality report with per-factor and per-strategy scores.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from quant_platform.utils.logging import get_logger
+from quant_platform.utils.research_window import resolve_end_date
 
 logger = get_logger(__name__)
+
+
+def _finite(value: Any) -> float:
+    """Coerce a metric to float without inventing a zero for missing data."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def signal_date_for_panel(factor: pd.DataFrame | None) -> str | None:
+    """Last date on which the factor panel has an observed value.
+
+    The old writer stamped every evaluation row with ``self.end_date`` (a
+    configured constant, not data), so the factor store was not a time series
+    — the live database held 154 rows all dated 2022-01-01. The evaluation
+    date must come from the panel that was actually evaluated.
+    """
+    if factor is None or len(factor) == 0:
+        return None
+    observed = factor.notna().any(axis=1)
+    if not bool(observed.any()):
+        return None
+    last = factor.index[observed.to_numpy()][-1]
+    try:
+        return str(pd.Timestamp(last).date())
+    except (TypeError, ValueError):
+        return str(last)
+
+
+def stability_from_fold_metrics(fold_metrics: list[dict] | None) -> dict:
+    """Walk-forward stability statistics computed from real fold metrics.
+
+    The old writer persisted ``sharpe_mean/std/consistency/positive_folds``
+    as zeros for every factor. That made 30% of the factor health score
+    structurally zero and made a factor that was never walk-forward validated
+    look like one that was measured and found unstable. When there are no
+    usable folds the statistics are NaN/None and ``status="unavailable"`` —
+    the caller stores that flag in the row warnings, so missing data never
+    masquerades as a measured zero.
+    """
+    sharpes: list[float] = []
+    skipped = 0
+    for metric in fold_metrics or []:
+        value = metric.get("sharpe_ratio")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if math.isfinite(value):
+            sharpes.append(value)
+        else:
+            skipped += 1
+
+    if not sharpes:
+        return {
+            "status": "unavailable",
+            "sharpe_mean": float("nan"),
+            "sharpe_std": float("nan"),
+            "sharpe_consistency": float("nan"),
+            "positive_folds": None,
+            "total_folds": None,
+            "n_skipped_folds": skipped,
+        }
+
+    values = np.asarray(sharpes, dtype=float)
+    return {
+        "status": "computed",
+        "sharpe_mean": float(values.mean()),
+        "sharpe_std": float(values.std()),
+        "sharpe_consistency": float((values > 0).mean()),
+        "positive_folds": int((values > 0).sum()),
+        "total_folds": int(values.size),
+        "n_skipped_folds": skipped,
+    }
+
+
+def persist_validation_results(
+    ic_results: dict,
+    processed_factors: dict,
+    wf_results: dict | None = None,
+    *,
+    store=None,
+    data_source: str = "synthetic",
+    adjust: str = "qfq",
+    pit: bool | None = False,
+    validity: str = "valid",
+    warnings: list[str] | None = None,
+) -> dict:
+    """Persist factor evaluations and stability diagnostics honestly (R11).
+
+    Each row carries the last *observed* date of its factor panel (so repeated
+    runs form a real time series and different panels produce distinct dates),
+    walk-forward statistics computed from the actual fold metrics, and the
+    lineage columns added by R10 (data source, adjustment, PIT, validity,
+    warnings). Returns a summary of what was written/skipped.
+    """
+    from quant_platform.factors.store import (
+        FactorEvalRecord,
+        FactorResearchStore,
+        FactorStabilityRecord,
+    )
+
+    store = store if store is not None else FactorResearchStore()
+    wf_results = wf_results or {}
+    base_warnings = list(warnings or [])
+
+    saved = 0
+    skipped: list[str] = []
+    stability_status: dict[str, str] = {}
+    signal_dates: dict[str, str] = {}
+
+    for fname, summary in ic_results.items():
+        signal_date = signal_date_for_panel(processed_factors.get(fname))
+        if signal_date is None:
+            skipped.append(f"{fname}: no dated factor observations")
+            continue
+
+        signal_dates[fname] = signal_date
+        run_id = f"research_validation_{signal_date}"
+        stability = stability_from_fold_metrics(
+            (wf_results.get(fname) or {}).get("fold_metrics")
+        )
+        stability_status[fname] = stability["status"]
+
+        row_warnings = list(base_warnings)
+        if stability["status"] != "computed":
+            row_warnings.append(
+                "stability_unavailable: no usable walk-forward folds"
+            )
+        elif stability["n_skipped_folds"]:
+            row_warnings.append(
+                f"stability_skipped_folds: {stability['n_skipped_folds']}"
+            )
+
+        store.save_evaluation(FactorEvalRecord(
+            factor_name=fname,
+            signal_date=signal_date,
+            rank_ic=_finite(summary.get("mean_ic")),
+            pearson_ic=_finite(summary.get("pearson_ic", 0)),
+            icir=_finite(summary.get("icir")),
+            coverage=_finite(summary.get("coverage", 0)),
+            n_assets=int(summary.get("n_assets") or 0),
+            run_id=run_id,
+            data_source=data_source,
+            adjust=adjust,
+            pit=pit,
+            validity=validity,
+            warnings=row_warnings,
+        ))
+        store.save_stability(FactorStabilityRecord(
+            factor_name=fname,
+            ic_mean=_finite(summary.get("mean_ic")),
+            ic_std=_finite(summary.get("std_ic", 0)),
+            icir=_finite(summary.get("icir")),
+            sharpe_mean=stability["sharpe_mean"],
+            sharpe_std=stability["sharpe_std"],
+            sharpe_consistency=stability["sharpe_consistency"],
+            positive_folds=stability["positive_folds"],
+            total_folds=stability["total_folds"],
+            coverage=_finite(summary.get("coverage", 0)),
+            run_id=run_id,
+            data_source=data_source,
+            adjust=adjust,
+            pit=pit,
+            validity=validity,
+            warnings=row_warnings,
+        ))
+        saved += 1
+
+    return {
+        "records_saved": saved,
+        "signal_dates": signal_dates,
+        "stability_status": stability_status,
+        "skipped": skipped,
+    }
 
 
 @dataclass
@@ -132,13 +312,20 @@ class ResearchValidator:
         self,
         n_stocks: int = 500,
         start_date: str = "2021-01-01",
-        end_date: str = "2025-12-31",
+        end_date: str | None = None,
         timeout_seconds: float = 600,
+        factor_store_path: str | None = None,
     ):
         self.n_stocks = n_stocks
         self.start_date = start_date
-        self.end_date = end_date
+        # Resolved at run time (QUANT_RESEARCH_END_DATE or today): the old
+        # hardcoded 2025-12-31 default silently described a stale window.
+        self.end_date = resolve_end_date(end_date)
         self.timeout_seconds = timeout_seconds
+        #: None keeps the historical default (data/factor_research.db). Tests
+        #: and scratch runs must point this at a temporary database: a quick
+        #: validation sprint is a synthetic smoke test, not research evidence.
+        self.factor_store_path = factor_store_path
 
     def run_quick(
         self,
@@ -230,7 +417,14 @@ class ResearchValidator:
         steps.append(step4)
 
         # Step 5: Save to Factor Store
-        step5 = self._step_save_to_store(ic_results, processed_factors)
+        step5 = self._step_save_to_store(
+            ic_results, processed_factors,
+            step4.details.get("wf_results", {}),
+            data_source=step1.details.get("data_source", "synthetic"),
+            adjust=step1.details.get("adjust", "qfq"),
+            pit=step1.details.get("pit", False),
+            warnings=step1.details.get("provenance_warnings", []),
+        )
         steps.append(step5)
 
         # Step 6: Run Strategy Gates
@@ -335,6 +529,14 @@ class ResearchValidator:
                 "financials": fin, "turnover": turn,
                 "config": config,
                 "n_assets": len(prices.columns), "n_dates": len(prices),
+                # Provenance written into every factor-store row. Synthetic
+                # data is not market data and the simulated universe is not
+                # point-in-time, so downstream readers can never mistake a
+                # validation-sprint row for a real-data result.
+                "data_source": "synthetic",
+                "adjust": "qfq",
+                "pit": False,
+                "provenance_warnings": ["synthetic_data_not_market_data"],
             }
         except Exception as e:
             step.status = "failed"
@@ -434,10 +636,11 @@ class ResearchValidator:
                     try:
                         p_ic = pearson_ic(factor, returns)
                         pearson_mean = (
-                            float(p_ic.mean()) if len(p_ic) else 0.0
+                            float(p_ic.mean()) if len(p_ic) else float("nan")
                         )
                     except Exception:
-                        pearson_mean = 0.0
+                        # A failed Pearson computation is missing data, not 0.
+                        pearson_mean = float("nan")
                     coverage = (
                         float(factor.notna().mean().mean())
                         if factor.size else 0.0
@@ -496,12 +699,13 @@ class ResearchValidator:
             if not top_factors:
                 step.status = "skipped"
                 step.runtime_seconds = time.time() - t0
-                step.details = {"wf_result": None}
+                step.details = {"wf_result": None, "wf_results": {}}
                 return step
 
             from quant_platform.backtest.walkforward import WalkForwardValidator
 
             wf_aggregate = None
+            wf_results: dict[str, dict] = {}
             for fname in top_factors:
                 factor_data = processed_factors.get(fname)
                 if factor_data is None:
@@ -526,14 +730,25 @@ class ResearchValidator:
                 )
                 if wf_aggregate is None:
                     wf_aggregate = wf_result
+                # Keep the fold metrics (plain dicts) so the store writer can
+                # compute real stability statistics; the old writer discarded
+                # them and persisted zeros instead.
+                wf_results[fname] = {
+                    "fold_metrics": list(wf_result.get("fold_metrics", [])),
+                    "stability": dict(wf_result.get("stability", {})),
+                    "n_folds": len(wf_result.get("fold_metrics", [])),
+                }
                 step.details[f"wf_{fname}"] = {
                     "n_folds": len(wf_result.get("fold_metrics", [])),
-                    "oos_sharpe": wf_result.get("aggregate_metrics", {}).get("sharpe_ratio", 0),
+                    "oos_sharpe": wf_result.get("aggregate_metrics", {}).get(
+                        "sharpe_ratio", float("nan")
+                    ),
                 }
 
             step.status = "completed"
             step.runtime_seconds = time.time() - t0
             step.details["wf_result"] = wf_aggregate
+            step.details["wf_results"] = wf_results
         except Exception as e:
             step.status = "failed"
             step.error = str(e)
@@ -542,6 +757,9 @@ class ResearchValidator:
 
     def _step_save_to_store(
         self, ic_results: dict, processed_factors: dict,
+        wf_results: dict | None = None,
+        *, data_source: str = "synthetic", adjust: str = "qfq",
+        pit: bool | None = False, warnings: list[str] | None = None,
     ) -> ValidationStep:
         """Save evaluation results to Factor Research Store."""
         step = ValidationStep(
@@ -550,53 +768,27 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            from quant_platform.factors.store import (
-                FactorEvalRecord,
-                FactorResearchStore,
-                FactorStabilityRecord,
+            from quant_platform.factors.store import FactorResearchStore
+
+            store = (
+                FactorResearchStore(self.factor_store_path)
+                if self.factor_store_path else FactorResearchStore()
+            )
+            result = persist_validation_results(
+                ic_results, processed_factors, wf_results,
+                store=store, data_source=data_source, adjust=adjust,
+                pit=pit, warnings=warnings,
             )
 
-            store = FactorResearchStore()
-            saved = 0
-            run_id = f"research_validation_{self.end_date}"
-            for fname, summary in ic_results.items():
-                mean_ic = summary.get("mean_ic", 0) or 0
-                std_ic = summary.get("std_ic", 0) or 0
-                icir = summary.get("icir", 0) or 0
-                coverage = summary.get("coverage", 0) or 0
-
-                store.save_evaluation(FactorEvalRecord(
-                    factor_name=fname,
-                    signal_date=self.end_date,
-                    rank_ic=mean_ic,
-                    pearson_ic=summary.get("pearson_ic", 0),
-                    icir=icir,
-                    coverage=coverage,
-                    n_assets=summary.get("n_assets", 0),
-                    run_id=run_id,
-                ))
-                # Ranking reads `factor_stability_history`; nothing ever
-                # wrote it, so `_step_factor_ranking` always returned [].
-                # Walk-forward Sharpe statistics are not known at this point
-                # and stay 0; ICIR and coverage are real.
-                store.save_stability(FactorStabilityRecord(
-                    factor_name=fname,
-                    ic_mean=mean_ic,
-                    ic_std=std_ic,
-                    icir=icir,
-                    sharpe_mean=0.0,
-                    sharpe_std=0.0,
-                    sharpe_consistency=0.0,
-                    positive_folds=0,
-                    total_folds=0,
-                    coverage=coverage,
-                    run_id=run_id,
-                ))
-                saved += 1
-
-            step.status = "completed"
+            if result["records_saved"]:
+                step.status = "completed"
+            else:
+                step.status = "skipped"
+                step.warnings.append(
+                    "no factor evaluations could be dated; nothing persisted"
+                )
             step.runtime_seconds = time.time() - t0
-            step.details = {"records_saved": saved}
+            step.details = result
         except Exception as e:
             step.status = "failed"
             step.error = str(e)
@@ -651,7 +843,10 @@ class ResearchValidator:
         try:
             from quant_platform.factors.store import FactorResearchStore
 
-            store = FactorResearchStore()
+            store = (
+                FactorResearchStore(self.factor_store_path)
+                if self.factor_store_path else FactorResearchStore()
+            )
             rankings = store.get_factor_ranking()
 
             step.status = "completed"

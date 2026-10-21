@@ -403,7 +403,7 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
 6. **价格基准**：已统一。provider 交付 raw OHLCV + 复权因子（Tushare `adj_factor=1/native_cum`、
    Baostock raw+hfq 双取），`get_raw_close()` 供成交/估值、`get_adjusted_close()` 供研究，
    货币路径在只有复权价时 fail closed；符号统一为 `CODE.EXCHANGE`（含北交所 30% 限价）。
-   残余：Postgres/Adata 尚未声明基准，paper 引擎未做公司行动股数/分红记账。
+   残余：Adata 不提供价格面板（仅跨源校验，价格路径 fail closed）；paper 引擎未做公司行动股数/分红记账。
 7. **增量数据**：已实现（D32）。`run --incremental` / `cache refresh --incremental` 只追加新交易日，边界重叠一天并 `keep="last"` 去重；每次更新全量刷新复权因子（除权日不产生假跳变）；数据写成功后才推进完成标记；部分响应不推进并保留旧缓存；`data.max_staleness_days` 对研究告警、对决定性运行 fail closed。边界：合成数据源 `supports_incremental=False`（回退全量）；财务/基准在追加时仍全量刷新；停牌与截断的区分偏保守。
 8. **ST 历史**：Tushare/Baostock 不提供 ST 公告历史（`st_available=False`，
    不伪造全 False 列）；合成数据提供，用于 PIT 验证。
@@ -430,10 +430,13 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
 | 研究数字/lab | P1 因子报告最大回撤（复利权益，旧公式显示 -0.00%）、P1 回撤 PNG 缺 `cumprod`；健康分改为带符号 ICIR；报告/比较展示 validity/affected_by；`is_trusted` 要求完整 lineage；零 IC 运行不再 success；run_id 用 uuid；迁移补齐全部列；脚本前视/买卖双边换手/硬编码结束日期/TOP8 重复/失败写成 0/成交量字段等修正 |
 | LLM 诚实性 | 请求后端与实际后端一致并可观测；真实 LLM 无新闻时 fail closed（演示路径显式 `is_synthetic`）；调用方新闻入口；缓存 v4 校验/TTL；关键词去重；LLM JSON（数组/包装/围栏）解析与字段校验；输入长度上限 |
 | 合规/运营 | 租户过滤（默认取 TenantContext，跨租户需显式）；风险日志 P&L 五列真实计算；CSV/XLSX 公式注入中和；导出审计；NAV 读取失败 fail closed、零净值不落库、回溯日期不继承未来费率；对账缺失腿按价格估值；投资者口径统一 |
-| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **3,062 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
+| 研究残留 | R11：因子库 writer 以面板实际最后观测日为 `signal_date`，稳定性指标由真实 walk-forward 折计算，无折时写 NULL+`stability_unavailable`（不再伪造 0）；R85/R87 热力图与 RQ3 统一同期月份标签/实现日收益；R86/R74 成本进入日收益序列（净口径名副其实）、终期不可执行调仓一致跳过、`metric_basis` 记录；RQ1-3 输出带 provider/seed/窗口 manifest |
+| provider 基准 | Postgres 显式声明 raw+`adj_factor`（可配置 `close_adjustment`，双重复权/非法因子报错）；ValidatedProvider 转发主源基准并保留 `adj_factor`，基准不一致拒绝融合；Adata 价格路径明确不支持 |
+| 报告一致性 | R90 总收益口径统一（全历史 headline，公共窗口/覆盖单列）；R91 基准按日期对齐；R92 滚动 Sharpe 用日期轴且 <252 显示空态；R93 <10 样本显示 n/a；R97 VaR/CVaR 标注配置置信度；R89/R96/R98–R105 标签、优化器回退、PNG 月末分桶、空数据横幅、格式化一致、恢复期、归因截距、UTC 时间戳等 |
+| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **3,157 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
 
-**当前计数（2026-10-21 实测）**：2,791 个测试函数、3,065 条用例
-（3,062 passed / 3 skipped）、217 个测试文件、约 233 个非测试 Python 文件、
+**当前计数（2026-10-21 实测）**：2,883 个测试函数、3,160 条用例
+（3,157 passed / 3 skipped）、222 个测试文件、约 233 个非测试 Python 文件、
 99 HTTP + 1 WebSocket、21 个 CLI 命令、37 个 Vue 组件。
 
 **仍未处理（诚实清单）**：多租户隔离（#75）；

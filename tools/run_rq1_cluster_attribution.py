@@ -14,6 +14,7 @@ renamed diagnostic column because it mostly measures coverage and warm-up
 noise, not asset-level co-movement.
 """
 
+import json
 import sys
 from itertools import combinations
 from pathlib import Path
@@ -48,6 +49,7 @@ logger = get_logger("rq1")
 # ---------------------------------------------------------------------------
 ALPHA_STRENGTH = 0.06       # "normal" strength per protocol
 N_STOCKS = 500
+SEED = 42
 START_DATE = "2021-01-01"
 # Resolved at run time (QUANT_RESEARCH_END_DATE or today); the old hardcoded
 # "2025-12-31" made every artifact silently stale.
@@ -98,6 +100,7 @@ def load_data():
         n_stocks=N_STOCKS,
         start_date=START_DATE,
         end_date=END_DATE,
+        seed=SEED,
         embedded_alpha=True,
         alpha_strength=ALPHA_STRENGTH,
     )
@@ -145,12 +148,17 @@ def compute_all_factors(prices, returns, sector_map, turnover):
         except Exception as e:
             logger.warning("Factor %s failed: %s", name, e)
 
-    # Process (winsorize → standardize → neutralize)
+    # Process (winsorize → standardize → neutralize). R79: market_cap=None
+    # means NO size neutralization — only sector neutralization is applied.
+    # The comment used to claim market-cap neutralization unconditionally.
+    # Supplying a market-cap panel would change this protocol-frozen
+    # experiment's results, so the deviation is declared, not applied.
     processed = {}
     for name, factor in raw_factors.items():
         processed[name] = process_factor(factor, sector_map=sector_map, market_cap=None)
 
-    logger.info("Computed %d factors: %s", len(processed), list(processed.keys()))
+    logger.info("Computed %d factors: %s (sector-neutralized; market-cap "
+                "neutralization NOT applied: R79)", len(processed), list(processed.keys()))
     return processed
 
 
@@ -570,21 +578,49 @@ if __name__ == "__main__":
     df_raw = pd.DataFrame(raw_records)
     print_raw_section("RQ1_RAW", df_raw)
 
-    # Save to CSV (with the actual data window as provenance columns)
+    # Save to CSV (with the actual data window and provider as provenance).
+    # Outputs are anchored to the repo root, not the cwd (R76).
+    output_dir = _project_root / "results"
+    output_dir.mkdir(parents=True, exist_ok=True)
     df_raw = stamp_provenance(df_raw, data_start, data_end)
-    output_path = Path("results/rq1_cluster_attribution.csv")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df_raw["provider"] = "synthetic"
+    df_raw["alpha_strength"] = ALPHA_STRENGTH
+    df_raw["seed"] = SEED
+    output_path = output_dir / "rq1_cluster_attribution.csv"
     df_raw.to_csv(output_path, index=False)
     logger.info("Raw results saved to: %s", output_path)
 
-    # Save correlation outputs
-    xs_corr_path = Path("results/rq1_cluster_cross_sectional_correlation.csv")
+    # Save correlation outputs. The summary is long-format and can carry the
+    # provenance columns; the two matrices are square date-free panels, so a
+    # sidecar manifest records their window/provider instead.
+    xs_corr_summary = stamp_provenance(xs_corr_summary, data_start, data_end)
+    xs_corr_summary["provider"] = "synthetic"
+    xs_corr_summary["alpha_strength"] = ALPHA_STRENGTH
+    xs_corr_summary["seed"] = SEED
+    xs_corr_path = output_dir / "rq1_cluster_cross_sectional_correlation.csv"
     xs_corr_summary.to_csv(xs_corr_path, index=False)
-    pearson_path = Path("results/rq1_cluster_correlation_pearson.csv")
-    spearman_path = Path("results/rq1_cluster_correlation_spearman.csv")
+    pearson_path = output_dir / "rq1_cluster_correlation_pearson.csv"
+    spearman_path = output_dir / "rq1_cluster_correlation_spearman.csv"
     pearson_corr.to_csv(pearson_path)
     spearman_corr.to_csv(spearman_path)
-    logger.info("Cross-sectional correlation summary and daily-mean diagnostic matrices saved.")
+    manifest = {
+        "script": "run_rq1_cluster_attribution.py",
+        "generated_at": pd.Timestamp.now("UTC").isoformat(),
+        "provider": "synthetic",
+        "seed": SEED,
+        "alpha_strength": ALPHA_STRENGTH,
+        "n_stocks": N_STOCKS,
+        "requested_end": END_DATE,
+        "data_start": data_start,
+        "data_end": data_end,
+        "artifacts": [p.name for p in (
+            output_path, xs_corr_path, pearson_path, spearman_path,
+        )],
+    }
+    (output_dir / "rq1_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    logger.info("Cross-sectional correlation summary, diagnostic matrices and manifest saved.")
 
     logger.info("RQ1 complete. %d experiments run.", len(results_list))
     logger.info("End of RQ1. Awaiting RQ2.")

@@ -313,7 +313,15 @@ def test_cross_sectional_corr_matches_the_old_daily_mean_only_by_coincidence(rq1
 
 
 def _benchmark_with_monthly_targets(trading_days, monthly_targets):
-    """Daily benchmark returns compounding to the target in each covered month."""
+    """Daily benchmark returns whose *realised* monthly return hits the target.
+
+    The pipeline benchmark is in forward convention: ``benchmark[t]`` spans
+    t -> t+1 and is realised on t+1. Construct trailing daily returns that
+    compound to each month's target, then shift them back one trading day so
+    the forward-labelled series carries them into the right realised month
+    (R87: compounding the forward values by their label month put the last
+    day's return into the previous month).
+    """
     values = {}
     for date in trading_days:
         target = monthly_targets.get(date.month)
@@ -321,7 +329,9 @@ def _benchmark_with_monthly_targets(trading_days, monthly_targets):
             continue  # month intentionally absent from the benchmark
         n_days = int((trading_days.month == date.month).sum())
         values[date] = (1.0 + target) ** (1.0 / n_days) - 1.0
-    return pd.Series(values, name="benchmark")
+    trailing = pd.Series(values, name="benchmark")
+    # trailing[t] = P_t/P_{t-1}-1  ->  forward[t] = trailing[t+1]
+    return trailing.sort_index().shift(-1)
 
 
 def test_regime_label_is_contemporaneous_not_forward_filled(rq3):
@@ -380,7 +390,11 @@ def test_regime_pct_time_uses_labelled_trading_days(rq3):
 
 def test_regime_label_thresholds_match_own_month_return(rq3):
     trading_days = pd.bdate_range("2021-01-01", "2021-04-30")
-    targets = {1: 0.021, 2: 0.019, 3: -0.021, 4: -0.019}
+    # Margins are 0.5pp rather than 0.1pp: the sample's first month cannot
+    # include the return realised on its first day (there is no prior close in
+    # the benchmark), so its compounded return is very slightly below the
+    # per-day-implied target. A 0.1pp margin straddled the +/-2% threshold.
+    targets = {1: 0.025, 2: 0.019, 3: -0.025, 4: -0.019}
     benchmark = _benchmark_with_monthly_targets(trading_days, targets)
 
     daily_regime = rq3.classify_regimes(benchmark, trading_days=trading_days)

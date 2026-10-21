@@ -7,6 +7,7 @@ Protocol-frozen experiment: 哪些 Alpha 方向错了？
 只记录结果，不解释。
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -36,6 +37,7 @@ logger = get_logger("rq2")
 # ---------------------------------------------------------------------------
 ALPHA_STRENGTH = 0.06
 N_STOCKS = 500
+SEED = 42
 START_DATE = "2021-01-01"
 # Resolved at run time (QUANT_RESEARCH_END_DATE or today); never hardcoded.
 END_DATE = resolve_end_date()
@@ -71,6 +73,7 @@ def load_data():
         n_stocks=N_STOCKS,
         start_date=START_DATE,
         end_date=END_DATE,
+        seed=SEED,
         embedded_alpha=True,
         alpha_strength=ALPHA_STRENGTH,
     )
@@ -115,11 +118,16 @@ def compute_all_factors(prices, returns, sector_map, turnover):
         except Exception as e:
             logger.warning("Factor %s failed: %s", name, e)
 
+    # Process with winsorize + standardize + SECTOR neutralization only.
+    # R79: market_cap=None disables market-cap neutralization; claimed
+    # otherwise in the old comments. Declared rather than silently changed
+    # because this experiment's protocol is frozen.
     processed = {}
     for name, factor in raw_factors.items():
         processed[name] = process_factor(factor, sector_map=sector_map, market_cap=None)
 
-    logger.info("Computed %d factors: %s", len(processed), list(processed.keys()))
+    logger.info("Computed %d factors: %s (sector-neutralized; market-cap "
+                "neutralization NOT applied: R79)", len(processed), list(processed.keys()))
     return processed
 
 
@@ -325,8 +333,27 @@ if __name__ == "__main__":
     print()
 
     df_raw = stamp_provenance(df_raw, data_start, data_end)
-    output_path = Path("results/rq2_cluster_sign_flip.csv")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df_raw["provider"] = "synthetic"
+    df_raw["alpha_strength"] = ALPHA_STRENGTH
+    df_raw["seed"] = SEED
+    output_dir = _project_root / "results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "rq2_cluster_sign_flip.csv"
     df_raw.to_csv(output_path, index=False)
+    manifest = {
+        "script": "run_rq2_cluster_sign_flip.py",
+        "generated_at": pd.Timestamp.now("UTC").isoformat(),
+        "provider": "synthetic",
+        "seed": SEED,
+        "alpha_strength": ALPHA_STRENGTH,
+        "n_stocks": N_STOCKS,
+        "requested_end": END_DATE,
+        "data_start": data_start,
+        "data_end": data_end,
+        "artifacts": [output_path.name],
+    }
+    (output_dir / "rq2_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
     logger.info("Raw results saved to: %s", output_path)
     logger.info("RQ2 complete. Awaiting RQ3.")

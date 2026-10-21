@@ -302,6 +302,26 @@ class TestMLSignalGenerator:
         signal = gen2.predict(sample_factors)
         assert signal.isna().to_numpy().all()
 
+    def test_save_load_model_handles_non_ascii_paths(
+        self, sample_factors, sample_forward_returns, tmp_path,
+    ):
+        """LightGBM's C++ writer cannot open a non-ASCII path on Windows.
+
+        The artifact is serialized in memory and written by Python, so a
+        model under a Chinese directory must round-trip on every platform.
+        """
+        cfg = MLSignalConfig(model_type="lightgbm", n_splits=2)
+        gen = MLSignalGenerator(config=cfg)
+        gen.train(sample_factors, sample_forward_returns)
+
+        model_path = tmp_path / "模型" / "model.lgb"
+        gen.save_model(str(model_path))
+        assert model_path.exists()
+
+        gen2 = MLSignalGenerator(config=cfg)
+        gen2.load_model(str(model_path))
+        assert gen2.model is not None
+
     def test_save_untrained_model_is_an_error(self, tmp_path):
         gen = MLSignalGenerator()
         with pytest.raises(RuntimeError, match="not trained"):
