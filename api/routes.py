@@ -92,6 +92,7 @@ from quant_platform.main import (
     _load_data,
     _run_backtest,
 )
+from quant_platform.research.holdout import sweep_guard_message
 from quant_platform.utils.config import load_config
 from quant_platform.utils.logging import get_logger
 
@@ -2280,6 +2281,16 @@ def _run_compare(req: CompareRequest) -> CompareResult:
 @router.post("/sweep", response_model=SweepResult)
 async def sweep_parameters(req: SweepRequest):
     """Grid search over parameters."""
+    # Holdout discipline: a sweep selects/tunes parameters, so its data window
+    # must not touch the final-evaluation holdout. Refuse before any analytics
+    # work is scheduled. An empty holdout keeps the old behaviour unchanged.
+    config = load_config(None)
+    try:
+        holdout_violation = sweep_guard_message(config)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if holdout_violation is not None:
+        raise HTTPException(status_code=422, detail=holdout_violation)
     return await _run_analytics(_run_sweep, req)
 
 

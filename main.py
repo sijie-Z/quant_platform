@@ -1819,7 +1819,21 @@ def cmd_sweep(args) -> int:
     import numpy as np
     import pandas as pd
 
+    from quant_platform.research.holdout import sweep_guard_message
+
     config = load_config(args.config)
+
+    # Holdout discipline: a sweep selects/tunes parameters, so its data window
+    # must not touch the final-evaluation holdout. Refuse before running any
+    # backtest; an empty holdout keeps the old behaviour unchanged.
+    try:
+        holdout_violation = sweep_guard_message(config)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    if holdout_violation is not None:
+        print(f"Error: {holdout_violation}", file=sys.stderr)
+        return 2
 
     optimizers = args.optimizers.split(",") if args.optimizers else [
         "equal_weight", "mean_variance", "risk_parity"
