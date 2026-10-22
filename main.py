@@ -3324,6 +3324,8 @@ def cmd_walkforward(args) -> int:
     print(f"  Folds:     {args.folds}")
     print(f"  Train:     {args.train_days} days")
     print(f"  Test:      {args.test_days} days")
+    print(f"  Purge gap: {args.purge_gap} days")
+    print(f"  Embargo:   {args.embargo} days")
     print("=" * 70)
 
     # Load data
@@ -3349,6 +3351,8 @@ def cmd_walkforward(args) -> int:
         step_size=args.test_days,
         mode=args.method,
         n_folds=args.folds,
+        purge_gap=args.purge_gap,
+        embargo=args.embargo,
     )
 
     from quant_platform.backtest.cost_model import CostModel
@@ -3750,6 +3754,12 @@ def main() -> int:
                            help="Training window length in days")
     wf_parser.add_argument("--test-days", type=int, default=126,
                            help="Test window length in days")
+    wf_parser.add_argument("--purge-gap", type=int, default=0,
+                           help="Trading days between the train window end and the "
+                                "test window start (neither trained nor tested)")
+    wf_parser.add_argument("--embargo", type=int, default=0,
+                           help="Trading days after a prior fold's test window that "
+                                "are excluded from later training samples")
     wf_parser.add_argument("--use-baostock", action="store_true",
                            help="Use Baostock data")
 
