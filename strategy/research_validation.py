@@ -22,10 +22,102 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from quant_platform.research.holdout import HoldoutSpec, load_configured_holdout
 from quant_platform.utils.logging import get_logger
 from quant_platform.utils.research_window import resolve_end_date
 
 logger = get_logger(__name__)
+
+# Walk-forward window used by :meth:`ResearchValidator._step_walk_forward`.
+# Held as constants so the "holdout left too little data" check can never
+# drift from the validator configuration it protects.
+_WF_TRAIN_PERIOD = 504
+_WF_TEST_PERIOD = 126
+
+# Sentinel: "holdout not passed explicitly -> resolve it from the platform
+# configuration". An explicit ``None`` means the caller disabled it.
+_HOLDOUT_UNSET = object()
+
+
+def mask_research_inputs(
+    spec: HoldoutSpec,
+    *,
+    prices: pd.DataFrame | None,
+    returns: pd.DataFrame | None,
+    benchmark: pd.Series | None,
+    financials: pd.DataFrame | None,
+    turnover: pd.DataFrame | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Drop holdout dates from every date-indexed research input.
+
+    The holdout must never take part in a choice, so it is removed *before*
+    factor computation, IC evaluation, factor screening and walk-forward —
+    not merely before the final metrics. Index order of the remaining rows is
+    preserved (the mask keeps the original sequence). ``financials`` is a
+    ``(date, asset)`` MultiIndex panel, hence the ``level="date"`` mask;
+    ``None`` inputs pass through.
+
+    Returns ``(masked_inputs, holdout_info)`` where ``holdout_info`` is the
+    ``{"spec": {...}, "excluded_days": N}`` record written into the report.
+    """
+    excluded = int(spec.excluded_days(returns.index)) if returns is not None else 0
+    masked = {
+        "prices": spec.mask_frame(prices),
+        "returns": spec.mask_frame(returns),
+        "benchmark": spec.mask_frame(benchmark),
+        "financials": spec.mask_frame(financials, level="date"),
+        "turnover": spec.mask_frame(turnover),
+    }
+    info = {"spec": spec.to_dict(), "excluded_days": excluded}
+    return masked, info
+
+
+def _panel_ic_results(
+    processed_factors: dict, returns: pd.DataFrame | None,
+) -> tuple[dict, list[str]]:
+    """IC moments for each processed factor panel (shared by step 3 and R3).
+
+    Returns ``(ic_results, warnings)``; a factor whose evaluation fails is
+    reported as a warning and omitted rather than stored as a fake zero.
+    """
+    from quant_platform.factors.evaluation import (
+        ic_summary,
+        pearson_ic,
+        rank_ic,
+    )
+
+    ic_results: dict = {}
+    warnings: list[str] = []
+    for name, factor in processed_factors.items():
+        try:
+            ic = rank_ic(factor, returns)
+            summary = ic_summary(ic)
+            # `ic_summary` only sees the IC series; pearson IC and coverage
+            # need the factor panel. The old code read keys ic_summary never
+            # returns, so every saved evaluation row carried pearson_ic=0
+            # and coverage=0.
+            try:
+                p_ic = pearson_ic(factor, returns)
+                pearson_mean = (
+                    float(p_ic.mean()) if len(p_ic) else float("nan")
+                )
+            except Exception:
+                # A failed Pearson computation is missing data, not 0.
+                pearson_mean = float("nan")
+            coverage = (
+                float(factor.notna().mean().mean()) if factor.size else 0.0
+            )
+            ic_results[name] = {
+                "mean_ic": summary["mean_ic"],
+                "std_ic": summary.get("std_ic", 0.0),
+                "icir": summary["icir"],
+                "pearson_ic": pearson_mean,
+                "coverage": coverage,
+                "n_assets": int(factor.notna().any().sum()),
+            }
+        except Exception as exc:
+            warnings.append(f"IC evaluation failed for {name}: {exc}")
+    return ic_results, warnings
 
 
 def _finite(value: Any) -> float:
@@ -363,9 +455,12 @@ class ValidationReport:
     gate_result: dict | None = None
     summary: dict[str, Any] = field(default_factory=dict)
     warnings_global: list[str] = field(default_factory=list)
+    #: ``{"spec": {...}, "excluded_days": N}`` when a holdout was active for
+    #: this run, else ``None`` (disabled runs keep their exact old shape).
+    holdout: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
-        return {
+        report = {
             "mode": self.mode,
             "start_time": self.start_time,
             "end_time": self.end_time,
@@ -380,6 +475,11 @@ class ValidationReport:
             "summary": self.summary,
             "warnings_global": self.warnings_global,
         }
+        # Only present when a holdout was actually applied: a disabled run
+        # must serialise exactly as it did before this feature existed.
+        if self.holdout is not None:
+            report["holdout"] = self.holdout
+        return report
 
     def print_report(self) -> str:
         lines = []
@@ -388,6 +488,13 @@ class ValidationReport:
         lines.append(f"  Research Validation ({self.mode} mode)")
         lines.append(f"  Runtime: {runtime_str}")
         lines.append(f"  Steps:   {len(self.steps)}")
+        if self.holdout is not None:
+            spec = self.holdout.get("spec", {})
+            lines.append(
+                f"  Holdout: {spec.get('start_date')}..{spec.get('end_date')} "
+                f"({self.holdout.get('excluded_days', 0)} trading days excluded "
+                "from selection and walk-forward)"
+            )
         lines.append(f"{'='*60}")
 
         for s in self.steps:
@@ -436,6 +543,8 @@ class ResearchValidator:
         end_date: str | None = None,
         timeout_seconds: float = 600,
         factor_store_path: str | None = None,
+        *,
+        holdout: HoldoutSpec | None | object = _HOLDOUT_UNSET,
     ):
         self.n_stocks = n_stocks
         self.start_date = start_date
@@ -447,6 +556,20 @@ class ResearchValidator:
         #: and scratch runs must point this at a temporary database: a quick
         #: validation sprint is a synthetic smoke test, not research evidence.
         self.factor_store_path = factor_store_path
+        #: Final-evaluation window. ``_HOLDOUT_UNSET`` (the default) means
+        #: "resolve from the platform configuration" so the CLI research path
+        #: is protected without extra wiring; an explicit ``None`` disables
+        #: the holdout regardless of config; a spec applies it directly.
+        self._holdout_explicit = holdout is not _HOLDOUT_UNSET
+        self.holdout: HoldoutSpec | None = (
+            None if holdout is _HOLDOUT_UNSET else holdout  # type: ignore[assignment]
+        )
+
+    def _resolved_holdout(self) -> HoldoutSpec | None:
+        """The holdout in force for this run (see ``__init__``)."""
+        if self._holdout_explicit:
+            return self.holdout
+        return load_configured_holdout()
 
     def run_quick(
         self,
@@ -506,6 +629,38 @@ class ResearchValidator:
         turnover = step1.details.get("turnover")
         config = step1.details.get("config")
 
+        # ── Holdout discipline ───────────────────────────────────────────
+        # A configured holdout is reserved for the final evaluation only.
+        # Remove its dates from every research input *now*, before any factor
+        # is computed: the factor panels, the IC moments that drive selection
+        # and the walk-forward folds then cannot see holdout data at all.
+        holdout_spec = self._resolved_holdout()
+        holdout_info = None
+        if holdout_spec is not None:
+            masked, holdout_info = mask_research_inputs(
+                holdout_spec,
+                prices=prices, returns=returns, benchmark=benchmark,
+                financials=financials, turnover=turnover,
+            )
+            prices = masked["prices"]
+            returns = masked["returns"]
+            benchmark = masked["benchmark"]
+            financials = masked["financials"]
+            turnover = masked["turnover"]
+            # Keep the load step's payload holdout-free as well, so the report
+            # itself cannot carry the reserved window into later analysis.
+            step1.details.update(masked)
+            step1.details["holdout_excluded_days"] = holdout_info["excluded_days"]
+            if returns is not None:
+                step1.details["n_dates"] = len(returns)
+            step1.warnings.append(
+                "holdout_excluded_days: "
+                f"{holdout_info['excluded_days']} "
+                f"({holdout_info['spec']['start_date']}.."
+                f"{holdout_info['spec']['end_date']})"
+            )
+        report.holdout = holdout_info
+
         # Step 2: Register and get factors
         step2 = self._step_register_factors()
         steps.append(step2)
@@ -529,11 +684,41 @@ class ResearchValidator:
         sector_map = step3.details.get("sector_map")
         fin_unstacked = step3.details.get("fin_unstacked")
 
+        # Defence in depth: factor panels were computed from masked prices
+        # already, but strip any holdout rows again before selection so a
+        # holdout date can never reach the screening step. The IC moments that
+        # drive selection are then recomputed from the masked panels: the
+        # scalars stored by step 3 must describe exactly what selection sees,
+        # never a full-sample evaluation that might have touched the holdout.
+        # Index order is preserved; a disabled holdout skips this block.
+        if (
+            holdout_spec is not None
+            and holdout_info["excluded_days"] > 0
+            and processed_factors
+            and returns is not None
+        ):
+            processed_factors = {
+                name: holdout_spec.mask_frame(panel)
+                for name, panel in processed_factors.items()
+            }
+            step3.details["processed_factors"] = processed_factors
+            ic_results, ic_warnings = _panel_ic_results(
+                processed_factors, returns,
+            )
+            step3.details["ic_results"] = ic_results
+            step3.warnings.extend(ic_warnings)
+            step3.warnings.append(
+                "ic_moments_recomputed_after_holdout_exclusion"
+            )
+
         # Step 4: Run walk-forward on each factor (up to max_folds)
         step4 = self._step_walk_forward(
             processed_factors, ic_results, prices, returns,
             benchmark, sector_map, fin_unstacked,
             factor_names[:max_factors], max_folds,
+            holdout_excluded_days=(
+                holdout_info["excluded_days"] if holdout_info is not None else 0
+            ),
         )
         steps.append(step4)
 
@@ -586,6 +771,10 @@ class ResearchValidator:
             "n_factors_evaluated": len(ic_results),
             "overall": "needs_review" if needs_review else "pass",
         }
+        if holdout_info is not None:
+            # Mirrored into the summary so the report reader can tell this run
+            # never looked at the holdout. Disabled runs keep the old shape.
+            report.summary["holdout"] = holdout_info
 
         report.steps = steps
         report.end_time = datetime.now().isoformat()
@@ -702,11 +891,6 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            from quant_platform.factors.evaluation import (
-                ic_summary,
-                pearson_ic,
-                rank_ic,
-            )
             from quant_platform.factors.processing import process_factor
             from quant_platform.factors.registry import get_registry
 
@@ -745,37 +929,8 @@ class ResearchValidator:
                     factor, sector_map=sector_map, market_cap=mcap,
                 )
 
-            ic_results = {}
-            for name, factor in processed.items():
-                try:
-                    ic = rank_ic(factor, returns)
-                    summary = ic_summary(ic)
-                    # `ic_summary` only sees the IC series; pearson IC and
-                    # coverage need the factor panel. The old code read keys
-                    # ic_summary never returns, so every saved evaluation row
-                    # carried pearson_ic=0 and coverage=0.
-                    try:
-                        p_ic = pearson_ic(factor, returns)
-                        pearson_mean = (
-                            float(p_ic.mean()) if len(p_ic) else float("nan")
-                        )
-                    except Exception:
-                        # A failed Pearson computation is missing data, not 0.
-                        pearson_mean = float("nan")
-                    coverage = (
-                        float(factor.notna().mean().mean())
-                        if factor.size else 0.0
-                    )
-                    ic_results[name] = {
-                        "mean_ic": summary["mean_ic"],
-                        "std_ic": summary.get("std_ic", 0.0),
-                        "icir": summary["icir"],
-                        "pearson_ic": pearson_mean,
-                        "coverage": coverage,
-                        "n_assets": int(factor.notna().any().sum()),
-                    }
-                except Exception as e:
-                    step.warnings.append(f"IC evaluation failed for {name}: {e}")
+            ic_results, ic_warnings = _panel_ic_results(processed, returns)
+            step.warnings.extend(ic_warnings)
 
             step.status = "completed"
             step.runtime_seconds = time.time() - t0
@@ -797,6 +952,8 @@ class ResearchValidator:
         self, processed_factors, ic_results, prices, returns,
         benchmark, sector_map, fin_unstacked,
         factor_names, max_folds: int,
+        *,
+        holdout_excluded_days: int = 0,
     ) -> ValidationStep:
         """Run walk-forward validation on top factors."""
         step = ValidationStep(
@@ -805,6 +962,35 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
+            # If the holdout left fewer days than a single walk-forward window
+            # needs, say so and skip: never fabricate OOS metrics, and never
+            # report a "completed" walk-forward that measured nothing.
+            required_days = _WF_TRAIN_PERIOD + _WF_TEST_PERIOD
+            if (
+                holdout_excluded_days > 0
+                and returns is not None
+                and len(returns) < required_days
+            ):
+                step.status = "skipped"
+                step.warnings.append(
+                    f"holdout excluded {holdout_excluded_days} trading days; "
+                    f"only {len(returns)} days remain, fewer than the "
+                    f"{required_days} required for walk-forward "
+                    f"({_WF_TRAIN_PERIOD} train + {_WF_TEST_PERIOD} test). "
+                    "No walk-forward was run."
+                )
+                step.details = {
+                    "wf_result": None,
+                    "wf_results": {},
+                    "holdout_skip": {
+                        "excluded_days": int(holdout_excluded_days),
+                        "remaining_days": int(len(returns)),
+                        "required_days": required_days,
+                    },
+                }
+                step.runtime_seconds = time.time() - t0
+                return step
+
             # Pick walk-forward factors by ICIR, but only among factors whose
             # full-sample IC series is significant after a t-test and BH-FDR
             # control. Selection details are kept for audit.
@@ -842,8 +1028,8 @@ class ResearchValidator:
                     continue
 
                 validator = WalkForwardValidator(
-                    train_period=504,
-                    test_period=126,
+                    train_period=_WF_TRAIN_PERIOD,
+                    test_period=_WF_TEST_PERIOD,
                     step_size=126,
                     mode="expanding",
                 )
