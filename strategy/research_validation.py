@@ -984,21 +984,40 @@ class ResearchValidator:
         *,
         holdout_excluded_days: int = 0,
     ) -> ValidationStep:
-        """Run walk-forward validation on top factors."""
+        """Run walk-forward validation with per-fold factor selection."""
         step = ValidationStep(
             name="walk_forward", category="walk_forward", target="top_factors",
             status="running",
         )
         t0 = time.time()
+        #: fold id -> factor names that fold's signal was built from. Filled
+        #: by the selector closure below and re-checked against the walk-
+        #: forward result's own fold_details before it is reported.
+        per_fold_selection: dict[int, list[str]] = {}
+        selection_warnings: list[str] = []
         try:
-            # Pick walk-forward factors by ICIR, but only among factors whose
-            # full-sample IC series is significant after a t-test and BH-FDR
-            # control. Selection details are kept for audit.
+            # ── Full-sample audit summary (NOT the walk-forward input) ──────
+            # The old code selected factors once on full-sample IC moments and
+            # passed that fixed set into every fold. The test windows were
+            # therefore part of the selection, so the "OOS" metrics still
+            # carried selection bias. Selection now happens inside each fold
+            # on that fold's training window only (see the selector closure
+            # below). The full-sample moments are kept as an audit summary so
+            # a reader can compare what a global selector would have said --
+            # they never feed the OOS signal.
             factor_selection = select_walk_forward_factors(
                 ic_results, processed_factors, returns,
             )
+            global_method = factor_selection.get("method")
+            factor_selection["method"] = (
+                "per-fold train-window ICIR two-sided t-test + BH-FDR; the "
+                "full-sample moments in this summary are informational only"
+            )
+            factor_selection["global_summary"] = {
+                "method": global_method,
+                "used_for_walk_forward": False,
+            }
             step.details["factor_selection"] = factor_selection
-            top_factors = factor_selection["selected"]
 
             # If the holdout left fewer days than a single walk-forward window
             # needs, say so and skip: never fabricate OOS metrics, and never
@@ -1022,6 +1041,7 @@ class ResearchValidator:
                 )
                 step.details["wf_result"] = None
                 step.details["wf_results"] = {}
+                step.details["per_fold_selection"] = {}
                 step.details["holdout_skip"] = {
                     "excluded_days": int(holdout_excluded_days),
                     "remaining_days": int(len(returns)),
@@ -1030,41 +1050,132 @@ class ResearchValidator:
                 step.runtime_seconds = time.time() - t0
                 return step
 
-            if top_factors:
+            if processed_factors:
                 step.warnings.append(
-                    "walk-forward factors were selected by full-sample ICIR "
-                    f"({', '.join(top_factors)}); their OOS metrics are "
-                    "selection-biased"
+                    "walk-forward factors are selected per fold on train-window "
+                    "ICs with BH-FDR; OOS metrics are free of full-sample "
+                    "selection bias（逐 fold 选择仍有有限样本噪声）"
                 )
             if factor_selection["fallback"]:
-                step.warnings.append(factor_selection["selection_warning"])
+                step.warnings.append(
+                    "global full-sample audit summary (not used for "
+                    f"walk-forward): {factor_selection['selection_warning']}"
+                )
 
-            if not top_factors:
+            if not processed_factors:
                 step.status = "skipped"
                 step.runtime_seconds = time.time() - t0
                 step.details = {
                     "wf_result": None,
                     "wf_results": {},
                     "factor_selection": factor_selection,
+                    "per_fold_selection": {},
                 }
                 return step
 
+            from quant_platform.factors.evaluation import ic_summary, rank_ic
+
+            def _select_on_train_window(fold_info, factors_panel, forward_returns):
+                """R2 selection run on this fold's training window only.
+
+                ``train_positions`` already excludes embargo days; the factor
+                panels and the forward-return labels are sliced with exactly
+                those positions, so no test-window row can influence the
+                chosen set. The returned names feed the fold's signal
+                recomputation.
+                """
+                train_positions = fold_info["train_positions"]
+                fold_id = int(fold_info["fold"])
+                train_factors = {
+                    name: panel.iloc[train_positions]
+                    for name, panel in factors_panel.items()
+                }
+                train_returns = forward_returns.iloc[train_positions]
+                train_ic: dict[str, dict] = {}
+                for name, panel in train_factors.items():
+                    try:
+                        summary = ic_summary(rank_ic(panel, train_returns))
+                    except Exception as exc:
+                        # One broken panel must not silently become "good":
+                        # report it and leave the factor out of this fold.
+                        selection_warnings.append(
+                            f"fold {fold_id}: IC evaluation failed for "
+                            f"{name}: {exc}"
+                        )
+                        continue
+                    train_ic[name] = {
+                        "mean_ic": summary["mean_ic"],
+                        "std_ic": summary["std_ic"],
+                        "icir": summary["icir"],
+                    }
+                selection = select_walk_forward_factors(
+                    train_ic, train_factors, train_returns,
+                )
+                selected = list(selection["selected"])
+                per_fold_selection[fold_id] = selected
+                if selection["fallback"]:
+                    selection_warnings.append(
+                        f"fold {fold_id}: no factor survives BH-FDR on the "
+                        "train window; fell back to top-|ICIR| "
+                        f"({', '.join(selected) or 'none'})"
+                    )
+                return selected
+
             from quant_platform.backtest.walkforward import WalkForwardValidator
 
-            wf_aggregate = None
+            # One pooled walk-forward: every fold selects its own factors
+            # from its training window and recomputes the signal from that
+            # subset. ``signal`` only carries the timeline here.
+            validator = WalkForwardValidator(
+                train_period=_WF_TRAIN_PERIOD,
+                test_period=_WF_TEST_PERIOD,
+                step_size=126,
+                mode="expanding",
+            )
+            wf_result = validator.run(
+                signal=returns,
+                prices=prices,
+                returns=returns,
+                benchmark_returns=benchmark,
+                sector_map=sector_map,
+                financials=fin_unstacked,
+                engine_kwargs={},
+                factors=processed_factors,
+                alpha_kwargs={"method": "equal_weight"},
+                factor_selector=_select_on_train_window,
+            )
+
+            # The validator records what each fold actually used; trust that
+            # transport over the closure's own log (they must agree, and the
+            # fold_details entries also cover skipped folds).
+            wf_fold_details = wf_result.get("fold_details") or []
+            if wf_fold_details:
+                per_fold_selection = {
+                    int(detail["fold"]): list(detail.get("selected_factors", []))
+                    for detail in wf_fold_details
+                }
+
+            # Factor-level stability evidence for the store: validate each
+            # factor that was selected in at least one fold standalone, as
+            # before. Membership of this set is derived only from train-window
+            # selections, never from the test windows.
+            selected_anywhere = [
+                name for name in processed_factors
+                if any(name in selected for selected in per_fold_selection.values())
+            ]
             wf_results: dict[str, dict] = {}
-            for fname in top_factors:
+            for fname in selected_anywhere:
                 factor_data = processed_factors.get(fname)
                 if factor_data is None:
                     continue
 
-                validator = WalkForwardValidator(
+                stability_validator = WalkForwardValidator(
                     train_period=_WF_TRAIN_PERIOD,
                     test_period=_WF_TEST_PERIOD,
                     step_size=126,
                     mode="expanding",
                 )
-                wf_result = validator.run(
+                factor_result = stability_validator.run(
                     signal=factor_data,
                     prices=prices,
                     returns=returns,
@@ -1075,27 +1186,28 @@ class ResearchValidator:
                     factors={fname: factor_data},
                     alpha_kwargs={"method": "equal_weight"},
                 )
-                if wf_aggregate is None:
-                    wf_aggregate = wf_result
                 # Keep the fold metrics (plain dicts) so the store writer can
                 # compute real stability statistics; the old writer discarded
                 # them and persisted zeros instead.
                 wf_results[fname] = {
-                    "fold_metrics": list(wf_result.get("fold_metrics", [])),
-                    "stability": dict(wf_result.get("stability", {})),
-                    "n_folds": len(wf_result.get("fold_metrics", [])),
+                    "fold_metrics": list(factor_result.get("fold_metrics", [])),
+                    "stability": dict(factor_result.get("stability", {})),
+                    "n_folds": len(factor_result.get("fold_metrics", [])),
                 }
                 step.details[f"wf_{fname}"] = {
-                    "n_folds": len(wf_result.get("fold_metrics", [])),
-                    "oos_sharpe": wf_result.get("aggregate_metrics", {}).get(
+                    "n_folds": len(factor_result.get("fold_metrics", [])),
+                    "oos_sharpe": factor_result.get("aggregate_metrics", {}).get(
                         "sharpe_ratio", float("nan")
                     ),
                 }
 
             step.status = "completed"
             step.runtime_seconds = time.time() - t0
-            step.details["wf_result"] = wf_aggregate
+            step.details["wf_result"] = wf_result
             step.details["wf_results"] = wf_results
+            step.details["per_fold_selection"] = per_fold_selection
+            if selection_warnings:
+                step.warnings.extend(selection_warnings)
         except Exception as e:
             step.status = "failed"
             step.error = str(e)
