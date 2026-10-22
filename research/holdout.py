@@ -40,8 +40,6 @@ import pandas as pd
 ENV_START = "QUANT_HOLDOUT_START"
 ENV_END = "QUANT_HOLDOUT_END"
 
-_EMPTY = (None, "")
-
 
 def _parse_date(value: Any, *, source: str) -> date:
     """Parse an ISO date (allow a ``date``/``datetime``/``Timestamp``)."""

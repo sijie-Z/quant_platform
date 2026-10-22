@@ -326,6 +326,11 @@ class TestHoldoutResearchIsolation:
             "spec": spec.to_dict(), "excluded_days": 0,
         }
         assert _selected(report) == ["clean", "holdout_alpha"]
+        # No false "rows after the holdout" warning: nothing was excluded.
+        load_step = _step(report, "load_data")
+        assert not any(
+            "holdout_not_at_tail" in warning for warning in load_step.warnings
+        )
 
     def test_holdout_in_the_middle_warns_about_remaining_rows(self, monkeypatch):
         # A non-tail holdout is allowed but documented as a risk: rows after

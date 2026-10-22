@@ -677,7 +677,8 @@ class ResearchValidator:
             # (removed) holdout price path. The documented usage is a final
             # evaluation window at the tail; say so instead of hiding it.
             if (
-                returns is not None
+                holdout_info["excluded_days"] > 0
+                and returns is not None
                 and len(returns) > 0
                 and pd.Timestamp(returns.index.max())
                 > pd.Timestamp(holdout_spec.end_date)
@@ -726,7 +727,9 @@ class ResearchValidator:
             and returns is not None
         ):
             processed_factors = {
-                name: holdout_spec.mask_frame(panel)
+                name: holdout_spec.mask_frame(
+                    panel, drop_forward_labels=True,
+                )
                 for name, panel in processed_factors.items()
             }
             step3.details["processed_factors"] = processed_factors
@@ -1011,7 +1014,8 @@ class ResearchValidator:
                 step.status = "skipped"
                 step.warnings.append(
                     f"holdout excluded {holdout_excluded_days} trading days; "
-                    f"only {len(returns)} days remain, fewer than the "
+                    "after also dropping the forward-label boundary row, only "
+                    f"{len(returns)} days remain, fewer than the "
                     f"{required_days} required for walk-forward "
                     f"({_WF_TRAIN_PERIOD} train + {_WF_TEST_PERIOD} test). "
                     "No walk-forward was run."
