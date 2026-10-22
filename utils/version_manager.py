@@ -144,21 +144,32 @@ def redact_secrets(value: Any) -> Any:
     if isinstance(value, dict):
         out: dict[Any, Any] = {}
         for key, item in value.items():
+            non_empty = item not in (None, "", [], {}, ())
             if (
                 isinstance(key, str)
-                and isinstance(item, (str, int, float))
-                and str(item) != ""
-                and (
-                    _is_secret_key(key)
-                    or (isinstance(item, str) and _is_credential_url(item))
-                )
+                and non_empty
+                and _is_secret_key(key)
+            ):
+                # Secret-shaped keys are redacted regardless of value shape:
+                # ``api_tokens: ["a", "b"]`` used to recurse into the list and
+                # leak every element because list items have no key.
+                out[key] = REDACTED
+            elif (
+                isinstance(key, str)
+                and isinstance(item, str)
+                and item != ""
+                and _is_credential_url(item)
             ):
                 out[key] = REDACTED
             else:
                 out[key] = redact_secrets(item)
         return out
     if isinstance(value, list):
-        return [redact_secrets(item) for item in value]
+        return [
+            REDACTED if isinstance(item, str) and _is_credential_url(item)
+            else redact_secrets(item)
+            for item in value
+        ]
     if isinstance(value, tuple):
         return tuple(redact_secrets(item) for item in value)
     return value

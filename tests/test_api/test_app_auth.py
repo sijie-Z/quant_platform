@@ -17,7 +17,7 @@ def _request(path: str, host: str) -> Request:
         "method": "GET",
         "path": path,
         "client": (host, 12345),
-        "headers": [],
+        "headers": [(b"host", b"localhost")],
         "scheme": "http",
         "server": ("testserver", 80),
         "query_string": b"",

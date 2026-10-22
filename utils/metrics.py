@@ -421,7 +421,13 @@ class HTTPMetricsMiddleware:
         finally:
             elapsed = time.perf_counter() - started
             path = path_label(scope)
-            method = scope.get("method", "UNKNOWN")
+            # uvicorn accepts arbitrary method tokens; an allowlist keeps an
+            # unauthenticated client from minting unbounded Prometheus series.
+            method = str(scope.get("method", "")).upper()
+            if method not in {
+                "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+            }:
+                method = "OTHER"
             status = status_holder["status"] or (500 if error_name else 0)
 
             m = get_metrics()

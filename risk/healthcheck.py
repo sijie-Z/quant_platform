@@ -120,7 +120,16 @@ class WebhookAlertSink(AlertSink):
                 "alerts_webhook_failures_total",
                 help="Alert webhook deliveries that failed",
             ).inc()
-            logger.error("Alert webhook delivery failed (%s): %s", self._url, exc)
+            # The URL may carry credentials or a token in its query string;
+            # never write those to the log or a log aggregator.
+            from urllib.parse import urlsplit
+
+            parts = urlsplit(self._url)
+            safe_url = f"{parts.scheme}://{parts.hostname or '?'}"
+            if parts.port:
+                safe_url += f":{parts.port}"
+            safe_url += parts.path or "/"
+            logger.error("Alert webhook delivery failed (%s): %s", safe_url, exc)
             return
         metrics.counter(
             "alerts_webhook_delivered_total",

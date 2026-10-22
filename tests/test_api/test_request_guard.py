@@ -15,7 +15,7 @@ async def _call(
     app, *, path="/api/health", method="GET", body=b"", client=REMOTE,
     headers: dict[str, str] | None = None, declare_length: bool = True,
 ):
-    raw_headers = [(b"host", b"good.example")]
+    raw_headers = [(b"host", b"localhost")]
     if body and declare_length:
         raw_headers.append((b"content-length", str(len(body)).encode()))
     for name, value in (headers or {}).items():

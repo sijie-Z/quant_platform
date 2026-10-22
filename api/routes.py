@@ -4641,6 +4641,15 @@ def _start_live_engine(req: dict) -> dict:
                 "QMT credentials must not be sent in the request body; set "
                 "QMT_PASSWORD in the server environment.",
             )
+        # A body-supplied `server` let any token holder point the broker
+        # connection at an arbitrary internal host:port (SSRF). The QMT
+        # terminal address is operator configuration, not request data.
+        if "server" in req:
+            raise HTTPException(
+                422,
+                "QMT server must be configured server-side "
+                "(QMT_SERVER environment variable).",
+            )
         # `QMTBroker.__init__` takes account/server/password/mode/data_server.
         # This passed `qmt_path` and `account_id`, neither of which exists, so
         # selecting the QMT broker raised TypeError and the endpoint returned
@@ -4649,7 +4658,7 @@ def _start_live_engine(req: dict) -> dict:
         try:
             broker = QMTBroker(
                 account=req.get("account_id", ""),
-                server=req.get("server", "localhost:58610"),
+                server=os.environ.get("QMT_SERVER", "localhost:58610"),
                 password=os.environ.get("QMT_PASSWORD", ""),
                 mode=req.get("mode", "sim"),
             )
@@ -4914,11 +4923,16 @@ def market_sectors():
 async def core_events(topic: str = "", limit: int = 50):
     """Get event bus history (bounded; the ring buffer holds 100k events)."""
     limit = _bounded_limit(limit, default=50, maximum=1000)
-    return {
-        "events": await run_in_threadpool(
-            _core_bus.get_history, topic=topic, limit=limit,
-        ),
-    }
+    events = await run_in_threadpool(
+        _core_bus.get_history, topic=topic, limit=limit,
+    )
+    # The global ring carries every tenant's audit payloads. Serve those via
+    # /api/core/audit (tenant-filtered) instead of leaking them here.
+    events = [
+        event for event in events
+        if not str(event.get("topic", "")).startswith("audit.")
+    ]
+    return {"events": events}
 
 
 @router.get("/core/events/metrics")

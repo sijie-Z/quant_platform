@@ -45,6 +45,16 @@ _DIST_DIR = _FRONTEND_DIR / "dist"
 #: the largest) while bounding memory a single client can pin.
 _MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 
+#: Bodies larger than this are authorized *before* buffering so an
+#: unauthenticated client cannot make the server allocate 10 MB per request.
+_EARLY_AUTH_BYTES = 64 * 1024
+
+#: Protected document routes (kept in sync with APITokenMiddleware).
+_PROTECTED_DOCS = frozenset({
+    "/docs", "/redoc", "/docs/oauth2-redirect", "/openapi.json",
+    "/api/docs", "/api/redoc",
+})
+
 #: Expensive compute endpoints get a simple per-client token bucket. The
 #: analytics pool already rejects concurrent saturation with 429; this stops
 #: one client from queueing a rapid-fire series that keeps the pool busy.
@@ -68,6 +78,16 @@ _RATE_LIMITED_PATHS = frozenset({
     "/api/fundamentals/bulk",
     "/api/fundamentals/rank",
     "/api/portfolio/import",
+})
+# These GET endpoints build/reuse the heavy research context; without a
+# bucket they bypass the compute admission control entirely.
+_RATE_LIMITED_GET_PATHS = frozenset({
+    "/api/analysis/ic-decay",
+    "/api/analysis/correlation",
+    "/api/monitor/risk-overview",
+    "/api/monitor/tca-summary",
+    "/api/monitor/factor-status",
+    "/api/monitor/capacity-gauge",
 })
 _RATE_LIMIT_CAPACITY = 20.0        # burst
 _RATE_LIMIT_REFILL_PER_SECOND = 1.0
@@ -168,6 +188,24 @@ def _host_name(value: str) -> str:
         end = value.find("]")
         return value[1:end].lower() if end > 0 else ""
     return (value.rsplit(":", 1)[0] if ":" in value else value).lower()
+
+
+def _host_is_loopback(value: str) -> bool:
+    """Whether a Host header names the local machine.
+
+    DNS rebinding connects to 127.0.0.1 from a page whose Host/Origin is an
+    attacker domain, so the token-less loopback bypass must also require a
+    loopback Host name (or an explicit QUANT_ALLOWED_HOSTS entry).
+    """
+    host = _host_name(value)
+    if host in {"localhost", "127.0.0.1", "::1", "testserver"}:
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _host_is_allowed(value: str) -> bool:
@@ -312,6 +350,43 @@ def _origin_is_allowed(scope) -> bool:
     return origin == (scheme, request_origin[0], request_origin[1])
 
 
+def _requires_auth(scope) -> bool:
+    """Whether the request targets a protected /api or docs route."""
+    path = _normalized_route_path(scope)
+    if path is None:
+        return True
+    if path in _PROTECTED_DOCS:
+        return True
+    return (
+        (path == "/api" or path.startswith("/api/")) and path != "/api/health"
+    )
+
+
+def _quick_authorized(scope) -> bool:
+    """Cheap credential check used before buffering a large request body.
+
+    Mirrors APITokenMiddleware (token compares are timing-safe; token-less
+    mode additionally requires a loopback Host to defeat DNS rebinding).
+    """
+    token = os.environ.get("QUANT_API_TOKEN", "")
+    if token:
+        token_bytes = token.encode("utf-8")
+        auth = (_scope_header(scope, "authorization") or "").encode("utf-8")
+        key = (_scope_header(scope, "x-api-key") or "").encode("utf-8")
+        return secrets.compare_digest(key, token_bytes) or secrets.compare_digest(
+            auth, f"Bearer {token}".encode(),
+        )
+    peer = (scope.get("client") or ("", 0))[0]
+    host = _scope_host(scope)
+    host_ok = _host_is_loopback(host) or (
+        bool(os.environ.get("QUANT_ALLOWED_HOSTS", "").strip())
+        and _host_is_allowed(host)
+    )
+    return (
+        peer in ("127.0.0.1", "::1", "localhost", "testclient") and host_ok
+    )
+
+
 def _normalized_route_path(scope) -> str | None:
     """Normalize ``scope["path"]`` for the authorization decision.
 
@@ -360,7 +435,12 @@ class RequestGuardMiddleware:
         self._buckets: dict[str, list[float]] = {}
 
     def _rate_limited(self, scope, path: str) -> tuple[bool, float]:
-        if scope.get("method") != "POST" or path not in _RATE_LIMITED_PATHS:
+        method = scope.get("method")
+        applies = (
+            (method == "POST" and path in _RATE_LIMITED_PATHS)
+            or (method == "GET" and path in _RATE_LIMITED_GET_PATHS)
+        )
+        if not applies:
             return False, 0.0
         client = scope.get("client")
         key = client[0] if client else "unknown"
@@ -388,7 +468,12 @@ class RequestGuardMiddleware:
             return
 
         host = _scope_host(scope)
-        if host and (not _valid_host_header(host) or not _host_is_allowed(host)):
+        host_allowlist_configured = bool(
+            os.environ.get("QUANT_ALLOWED_HOSTS", "").strip()
+        )
+        if (not host and host_allowlist_configured) or (
+            host and (not _valid_host_header(host) or not _host_is_allowed(host))
+        ):
             if scope_type == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             else:
@@ -447,6 +532,17 @@ class RequestGuardMiddleware:
                     {"detail": f"Request body exceeds {_MAX_REQUEST_BODY_BYTES} bytes"},
                 )
                 return
+            if (
+                declared > _EARLY_AUTH_BYTES
+                and _requires_auth(scope)
+                and not _quick_authorized(scope)
+            ):
+                await _send_json(
+                    send,
+                    401 if os.environ.get("QUANT_API_TOKEN") else 403,
+                    {"detail": "Authentication required"},
+                )
+                return
 
         # Buffer the body up to the cap, then replay it downstream. A lazy
         # receive-wrapper cannot work here: FastAPI converts any exception
@@ -460,6 +556,17 @@ class RequestGuardMiddleware:
                 break
             chunk = message.get("body", b"")
             received += len(chunk)
+            if (
+                received > _EARLY_AUTH_BYTES
+                and _requires_auth(scope)
+                and not _quick_authorized(scope)
+            ):
+                await _send_json(
+                    send,
+                    401 if os.environ.get("QUANT_API_TOKEN") else 403,
+                    {"detail": "Authentication required"},
+                )
+                return
             if received > _MAX_REQUEST_BODY_BYTES:
                 await _send_json(
                     send,
@@ -484,7 +591,21 @@ class RequestGuardMiddleware:
                 }
             return await receive()
 
-        await self.app(scope, replay_receive, send)
+        async def send_with_security_headers(message):
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers") or [])
+                present = {name.lower() for name, _ in headers}
+                for name, value in (
+                    (b"x-content-type-options", b"nosniff"),
+                    (b"x-frame-options", b"DENY"),
+                    (b"referrer-policy", b"same-origin"),
+                ):
+                    if name not in present:
+                        headers.append((name, value))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, replay_receive, send_with_security_headers)
 
 
 class APITokenMiddleware(BaseHTTPMiddleware):
@@ -547,14 +668,22 @@ class APITokenMiddleware(BaseHTTPMiddleware):
                         content={"detail": "Invalid or missing API token"},
                     )
             else:
-                host = request.client.host if request.client else ""
-                if host not in self.LOOPBACK_HOSTS:
+                peer = request.client.host if request.client else ""
+                host_header = _scope_host(request.scope)
+                host_ok = _host_is_loopback(host_header)
+                if (
+                    not host_ok
+                    and os.environ.get("QUANT_ALLOWED_HOSTS", "").strip()
+                ):
+                    host_ok = _host_is_allowed(host_header)
+                if peer not in self.LOOPBACK_HOSTS or not host_ok:
                     return JSONResponse(
                         status_code=403,
                         content={
                             "detail": (
                                 "No QUANT_API_TOKEN configured: all API routes "
-                                "are loopback-only. Set the token to allow "
+                                "are loopback-only (and the Host must be a "
+                                "loopback name). Set the token to allow "
                                 "remote access."
                             )
                         },

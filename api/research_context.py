@@ -308,11 +308,30 @@ def parse_window(
             )
         parsed.append(parsed_date.isoformat())
     start, end = parsed
-    if start is not None and end is not None:
-        if start >= end:
-            raise ValueError("start_date must be earlier than end_date")
-        if (date.fromisoformat(end) - date.fromisoformat(start)).days > _MAX_WINDOW_DAYS:
-            raise ValueError("date span must be at most 10 years")
+    # One-sided overrides are resolved against the config they will be merged
+    # into before the span check: `?end_date=2100-12-31` alone used to pass
+    # validation and then expand the default 2021 start into a 29k-day window.
+    if start is not None or end is not None:
+        effective_start, effective_end = start, end
+        if effective_start is None or effective_end is None:
+            try:
+                base = _load_base_config(_default_config_identity())
+                effective_start = effective_start or str(base.data.start_date)
+                effective_end = effective_end or str(base.data.end_date)
+            except Exception:
+                effective_start, effective_end = start, end
+        if effective_start is not None and effective_end is not None:
+            try:
+                start_day = date.fromisoformat(str(effective_start)[:10])
+                end_day = date.fromisoformat(str(effective_end)[:10])
+            except ValueError:
+                raise ValueError(
+                    "effective data window is not an ISO date pair",
+                ) from None
+            if start_day >= end_day:
+                raise ValueError("start_date must be earlier than end_date")
+            if (end_day - start_day).days > _MAX_WINDOW_DAYS:
+                raise ValueError("date span must be at most 10 years")
     return start, end
 
 
