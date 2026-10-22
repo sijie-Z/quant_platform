@@ -2,7 +2,7 @@
 
 > **一句话**：A股多因子量化研究+交易平台，从数据到回测到执行的完整流水线。面向量化开发面试，展示架构设计、性能优化、真实市场处理、LLM增强选股、ML信号、图网络因子、Barra风险模型、Prometheus监控、机构级风控和执行。
 
-**最终状态（2026-10-22 实测）**：2,989 个测试函数（3,285 条用例；2026-10-21 全量 3282 passed / 3 skipped；基线 8f8caec 为 2709 passed / 3 skipped）。约 233 个非测试 Python 文件 + 234 个测试文件 + 37 个 Vue 组件。约 75,000 行非测试 Python + 约 11,000 行 Vue。6 个 Numba JIT 内核加速。**99 个 HTTP 端点 + 1 个 WebSocket**。**事件驱动核心架构 + 实时风控熔断 + 多因子信号 + WebSocket实时推送 + 实时A股行情 + Level 2盘口 + 实时基本面 + PostgreSQL存储 + Paper Trading(延迟/部分成交/撤单失败/L2回放) + QMT/XTP实盘接口 + 合规导出 + 基金运营(NAV/投资者门户) + 跨资产接口(股票/ETF/期货/期权)**。**企业级就绪度评估：A（生产级研究+交易平台）**——详见[企业级就绪度评估](#企业级就绪度评估)。
+**最终状态（2026-10-22 实测）**：3,014 个测试函数（3,328 条用例；2026-10-21 全量 3325 passed / 3 skipped；基线 8f8caec 为 2709 passed / 3 skipped）。约 233 个非测试 Python 文件 + 236 个测试文件 + 37 个 Vue 组件。约 75,000 行非测试 Python + 约 11,000 行 Vue。6 个 Numba JIT 内核加速。**99 个 HTTP 端点 + 1 个 WebSocket**。**事件驱动核心架构 + 实时风控熔断 + 多因子信号 + WebSocket实时推送 + 实时A股行情 + Level 2盘口 + 实时基本面 + PostgreSQL存储 + Paper Trading(延迟/部分成交/撤单失败/L2回放) + QMT/XTP实盘接口 + 合规导出 + 基金运营(NAV/投资者门户) + 跨资产接口(股票/ETF/期货/期权)**。**企业级就绪度评估：A（生产级研究+交易平台）**——详见[企业级就绪度评估](#企业级就绪度评估)。
 
 ---
 
@@ -277,7 +277,7 @@ quant_platform/
 │   ├── package.json
 │   └── vite.config.js
 │
-├── tests/                      # 234个测试文件, 2,989个测试函数（3,285条用例）
+├── tests/                      # 236个测试文件, 3,014个测试函数（3,328条用例）
 │   ├── conftest.py             # 共享fixtures
 │   ├── test_data/              # 合成数据(9) + pipeline(5) + 质量(7) + 连接池(11) + PostgreSQL(10) + WebSocket(18) + Level2(22) + 基本面(23) = 105
 │   ├── test_factors/           # 技术(6) + 基本面(5) + 处理(5) + 评估(7) + IC监控(12) + 网络(17) + 正交化(18) + 择时(25) = 95
@@ -1091,7 +1091,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 32. **FastAPI + Vue 3 Web 界面** — REST API 99端点 + Bloomberg Terminal风格暗色仪表盘 + 10个视图
 33. **ABC抽象接口** — DataProvider / BaseFactor / PortfolioOptimizer 全部可插拔，注册表模式
 34. **配置驱动** — YAML参数化，零硬编码，类型化dataclass验证
-35. **2,989个测试函数（3,285条用例；3282 passed / 3 skipped）** — 覆盖全模块：数据/因子/Alpha/组合/回测/风险/LLM/报告/工具/核心架构/执行/交易/策略/ML/IC/Barra/指标/并行/Agent/连接池/图因子/PostgreSQL/WebSocket/Level2/基本面/合规导出/基金运营/监控API/跨资产/Paper Broker/XTP Broker/Live Runner/QMT Broker
+35. **3,014个测试函数（3,328条用例；3325 passed / 3 skipped）** — 覆盖全模块：数据/因子/Alpha/组合/回测/风险/LLM/报告/工具/核心架构/执行/交易/策略/ML/IC/Barra/指标/并行/Agent/连接池/图因子/PostgreSQL/WebSocket/Level2/基本面/合规导出/基金运营/监控API/跨资产/Paper Broker/XTP Broker/Live Runner/QMT Broker
 36. **Pipeline 缓存** — 基于 config hash 的自动缓存，支持 `--force` `--no-cache`
 
 ---
@@ -1113,7 +1113,7 @@ t=2025-12: 有过去5年的IC数据 → IC加权（和2021年完全不同的因�
 | **实时风控** | RiskMonitor集成到交易引擎，下单前自动检查，Kill Switch一键熔断，前端实时风险面板 | A |
 | **多因子信号** | Web 引擎与 CLI LiveRunner 共用同一 7 因子等权复合（1/3/6月动量+20/60日波动+RSI+MACD，百分位分数 [0,1]），默认启用21个因子 | B+ |
 | **实时推送** | EventBus→WebSocket桥接，交易事件(order/fill/risk/portfolio)实时推送到前端 | A |
-| **可测试性** | 2,989个测试函数（3,285条用例；3282 passed / 3 skipped），fixture共享，覆盖全模块 | A |
+| **可测试性** | 3,014个测试函数（3,328条用例；3325 passed / 3 skipped），fixture共享，覆盖全模块 | A |
 | **可扩展性** | ABC抽象接口，注册表模式，Strategy模式，插件式因子/优化器/数据源 | A |
 | **配置管理** | YAML驱动，零硬编码，类型化dataclass验证，环境变量覆盖 | A- |
 | **性能优化** | 6个Numba JIT内核，prange并行化，Pipeline缓存，向量化回测 | A- |
