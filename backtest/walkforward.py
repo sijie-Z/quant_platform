@@ -37,6 +37,23 @@ class WalkForwardValidator:
     If `factors` dict is provided, signals are recomputed per fold using only
     train-period data — eliminating look-ahead from IC/ICIR weighting and
     making the OOS evaluation truly representative of live performance.
+
+    Purge / embargo isolation (same terminology as `alpha.ml_signal`):
+
+    - ``purge_gap``: each fold's test window starts ``purge_gap`` trading days
+      after its training window ends. Those days are neither trained nor
+      tested, so labels from the end of the training window cannot spill into
+      the test window. purge_gap：测试窗起点相对训练窗终点向后推迟
+      purge_gap 个交易日，这段空隙既不训练也不测试。
+    - ``embargo``: when training any fold, the ``embargo`` trading days that
+      immediately follow an earlier fold's test window are removed from the
+      training sample (only when that training window covers those days).
+      Freshly tested market conditions must not flow straight back into the
+      next fit. embargo：此前某个 fold 的测试窗结束后的 embargo 个交易日
+      从后续 fold 的训练样本中剔除。
+
+    The rolling/expanding window advancement is unchanged, and the fold count
+    is still capped by ``n_folds``.
     """
 
     def __init__(
@@ -46,6 +63,8 @@ class WalkForwardValidator:
         step_size: int = 126,      # Step forward by test_period
         mode: str = "rolling",     # "rolling" or "expanding"
         n_folds: int | None = None,
+        purge_gap: int = 0,        # trading days between train end and test start
+        embargo: int = 0,          # trading days after a prior test window excluded from training
     ):
         # M22: `start += step_size` never advanced for step_size <= 0, so the
         # fold loop spun forever (or sliced invalid windows). Validate the
@@ -61,6 +80,14 @@ class WalkForwardValidator:
                 raise ValueError(f"{name} must be >= 1, got {value!r}")
         if mode not in ("rolling", "expanding"):
             raise ValueError(f"mode must be 'rolling' or 'expanding', got {mode!r}")
+        # purge_gap / embargo may be 0 but never negative: both are offsets
+        # into the trading-day axis, and a negative gap would silently turn
+        # the test window into an in-sample slice.
+        for name, value in (("purge_gap", purge_gap), ("embargo", embargo)):
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"{name} must be an integer >= 0, got {value!r}")
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value!r}")
         self.train_period = train_period
         self.test_period = test_period
         self.step_size = step_size
@@ -68,6 +95,8 @@ class WalkForwardValidator:
         if n_folds is not None and n_folds < 1:
             raise ValueError(f"n_folds must be >= 1, got {n_folds}")
         self.n_folds = n_folds
+        self.purge_gap = int(purge_gap)
+        self.embargo = int(embargo)
 
     def run(
         self,
@@ -150,46 +179,12 @@ class WalkForwardValidator:
                 f"Not enough data: {n_dates} days < {self.train_period} train + {self.test_period} test"
             )
 
-        folds = []
-        start = 0
-        fold_idx = 0
+        folds = self._generate_folds(dates)
 
-        while True:
-            if self.mode == "expanding":
-                train_start = 0
-            else:
-                train_start = start
-
-            train_end = start + self.train_period
-            test_start = train_end
-            test_end = min(test_start + self.test_period, n_dates)
-
-            if test_start >= n_dates:
-                break
-
-            folds.append({
-                "fold": fold_idx,
-                "train_dates": (dates[train_start], dates[min(train_end - 1, n_dates - 1)]),
-                "test_dates": (dates[test_start], dates[min(test_end - 1, n_dates - 1)]),
-                "train_slice": slice(train_start, train_end),
-                "test_slice": slice(test_start, test_end),
-            })
-
-            fold_idx += 1
-            start += self.step_size
-
-            if test_end >= n_dates:
-                break
-
-        if self.n_folds is not None:
-            # The CLI exposes --folds; previously it only printed the value
-            # while the loop decided the count, so a request for one fold ran
-            # every fold the data allowed.
-            folds = folds[:self.n_folds]
-
-        logger.info("Walk-forward: %d folds (%s mode, train=%d, test=%d, step=%d, recomputed=%s)",
-                     len(folds), self.mode, self.train_period, self.test_period, self.step_size,
-                     signal_recomputed)
+        logger.info("Walk-forward: %d folds (%s mode, train=%d, test=%d, step=%d, "
+                     "purge_gap=%d, embargo=%d, recomputed=%s)",
+                     len(folds), self.mode, self.train_period, self.test_period,
+                     self.step_size, self.purge_gap, self.embargo, signal_recomputed)
 
         oos_returns_list = []
         oos_benchmark_list = []
@@ -203,8 +198,25 @@ class WalkForwardValidator:
 
             # --- Build signal for this fold ---
             if factors is not None:
+                if len(fold_info["train_positions"]) == 0:
+                    # An out-sized embargo can remove every day of a later
+                    # fold's training window. There is nothing to fit on --
+                    # record the fold instead of fabricating a signal.
+                    logger.warning(
+                        "  Fold %d skipped: embargo removed every training day", fi,
+                    )
+                    fold_details.append({
+                        "fold": fi,
+                        "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
+                        "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
+                        "train_days": 0,
+                        "oos_days": 0,
+                        "error": "embargo removed every training day",
+                    })
+                    continue
                 fold_signal = self._compute_signal_in_sample(
                     factors, returns, train_sl, test_sl, alpha_kwargs,
+                    train_positions=fold_info["train_positions"],
                 )
             else:
                 # Backward compatible: use pre-computed signal. The real alpha
@@ -287,6 +299,9 @@ class WalkForwardValidator:
                     m["train_end"] = str(fold_info["train_dates"][1])
                     m["test_start"] = str(fold_info["test_dates"][0])
                     m["test_end"] = str(fold_info["test_dates"][1])
+                    # Trading days actually usable for training: the nominal
+                    # window minus any embargo days removed from it.
+                    m["train_days"] = len(fold_info["train_positions"])
                     m["oos_days"] = len(oos_ret)
                     fold_metrics.append(m)
 
@@ -294,6 +309,7 @@ class WalkForwardValidator:
                     "fold": fi,
                     "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
                     "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
+                    "train_days": len(fold_info["train_positions"]),
                     "oos_days": len(oos_ret),
                     "sharpe": fold_metrics[-1].get("sharpe_ratio", 0) if fold_metrics else 0,
                 })
@@ -308,6 +324,7 @@ class WalkForwardValidator:
                     "fold": fi,
                     "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
                     "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
+                    "train_days": len(fold_info["train_positions"]),
                     "oos_days": 0,
                     "error": str(e)[:100],
                 })
@@ -349,8 +366,92 @@ class WalkForwardValidator:
             "mode": self.mode,
             "train_period": self.train_period,
             "test_period": self.test_period,
+            "purge_gap": self.purge_gap,
+            "embargo": self.embargo,
             "signal_recomputed": signal_recomputed,
         }
+
+    def _generate_folds(self, dates: pd.Index) -> list[dict]:
+        """Cut the timeline into train/test folds.
+
+        Window arithmetic is the historical layout plus the optional purge
+        gap: the test window starts ``purge_gap`` trading days after the
+        training window ends, and the fold count is still capped by
+        ``n_folds``. Each fold also carries ``train_positions`` -- the integer
+        positions actually usable for training after embargo days are removed
+        -- and the removed ranges in ``embargo_ranges``.
+
+        With ``purge_gap=0`` and ``embargo=0`` the boundaries are identical
+        to the pre-purge arithmetic.
+        """
+        n_dates = len(dates)
+        folds = []
+        start = 0
+        fold_idx = 0
+
+        while True:
+            if self.mode == "expanding":
+                train_start = 0
+            else:
+                train_start = start
+
+            train_end = start + self.train_period
+            test_start = train_end + self.purge_gap
+            test_end = min(test_start + self.test_period, n_dates)
+
+            if test_start >= n_dates:
+                break
+
+            folds.append({
+                "fold": fold_idx,
+                "train_dates": (dates[train_start], dates[min(train_end - 1, n_dates - 1)]),
+                "test_dates": (dates[test_start], dates[min(test_end - 1, n_dates - 1)]),
+                "train_slice": slice(train_start, train_end),
+                "test_slice": slice(test_start, test_end),
+            })
+
+            fold_idx += 1
+            start += self.step_size
+
+            if test_end >= n_dates:
+                break
+
+        if self.n_folds is not None:
+            # The CLI exposes --folds; previously it only printed the value
+            # while the loop decided the count, so a request for one fold ran
+            # every fold the data allowed.
+            folds = folds[:self.n_folds]
+
+        self._apply_embargo(folds, n_dates)
+        return folds
+
+    def _apply_embargo(self, folds: list[dict], n_dates: int) -> None:
+        """Remove embargo days from each fold's training positions.
+
+        For a fold at index ``i``, every earlier fold's test window end is
+        followed by ``embargo`` trading days. When the current *training*
+        window covers any of those days, they are withheld from training --
+        the market regime that was just evaluated must not flow straight back
+        into the next fit. Windows that end before the training window starts
+        leave it untouched, so the common rolling layout (step ==
+        test_period) keeps every training day.
+        """
+        for i, fold in enumerate(folds):
+            train_sl = fold["train_slice"]
+            positions = np.arange(train_sl.start, train_sl.stop, dtype=int)
+            removed = np.zeros(len(positions), dtype=bool)
+            embargo_ranges: list[tuple[int, int]] = []
+            if self.embargo > 0:
+                for prev in folds[:i]:
+                    lo = prev["test_slice"].stop
+                    hi = min(lo + self.embargo, n_dates)
+                    lo = max(lo, train_sl.start)
+                    hi = min(hi, train_sl.stop)
+                    if lo < hi:
+                        removed[lo - train_sl.start:hi - train_sl.start] = True
+                        embargo_ranges.append((int(lo), int(hi)))
+            fold["train_positions"] = positions[~removed]
+            fold["embargo_ranges"] = embargo_ranges
 
     def _compute_signal_in_sample(
         self,
@@ -359,11 +460,14 @@ class WalkForwardValidator:
         train_slice: slice,
         test_slice: slice,
         alpha_kwargs: dict,
+        train_positions: np.ndarray | None = None,
     ) -> pd.DataFrame:
         """Recompute signal using only train-period data for IC weights.
 
         Factor values are taken from the test period (those are observable),
-        but IC weights are estimated from train-period data only.
+        but IC weights are estimated from train-period data only. When
+        ``train_positions`` is given, only those positions (the nominal train
+        window minus embargo days) feed the IC estimation.
         """
         from quant_platform.alpha.combination import (
             combine_equal_weight,
@@ -381,8 +485,11 @@ class WalkForwardValidator:
         for name, df in factors.items():
             fold_factors[name] = df.iloc[full_slice]
 
-        # Slice forward_returns to train period only
-        train_returns = forward_returns.iloc[train_slice]
+        # Slice forward_returns to train period only (minus embargo days)
+        if train_positions is None:
+            train_returns = forward_returns.iloc[train_slice]
+        else:
+            train_returns = forward_returns.iloc[train_positions]
 
         if method == "equal_weight":
             return combine_equal_weight(fold_factors)
