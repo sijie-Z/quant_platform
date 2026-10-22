@@ -190,3 +190,17 @@ execution:
     server: "localhost:58610"  # miniQMT TCP address
     mode: "sim"                # sim or live
     data_server: ""            # market data server (defaults to server)
+
+# --- Research ---
+# Final-evaluation holdout window. While configured, these dates are reserved
+# for the final one-shot evaluation and may not participate in any choice:
+#   * `/api/sweep` and `python main.py sweep` refuse to run when the data
+#     window (data.start_date/data.end_date) overlaps the holdout;
+#   * research validation (strategy/research_validation.py) drops holdout rows
+#     before factor screening and walk-forward.
+# Both dates are inclusive and must satisfy start_date < end_date.
+# Empty (the default) means the holdout is disabled and behaviour is unchanged.
+research:
+  holdout:
+    start_date: ""           # ISO date, e.g. "2025-01-01"
+    end_date: ""             # ISO date, e.g. "2025-12-31"
