@@ -50,6 +50,7 @@
 | 向量化回测 | 月频调仓 + 日频持仓漂移，横截面运算向量化（回测按交易日/调仓日推进，非逐股票循环） |
 | A 股成本模型 | 佣金 0.03%（双边，每笔最低佣金）+ 印花税 0.1%（仅卖出；CostModel 另支持 2023-08-28 起法定 0.05% 的按日期税率）+ 过户费 + 滑点 |
 | Walk-Forward | 滚动/扩展窗口 OOS 验证，每个 fold 内用 train-only 数据重算信号；支持 purge/embargo 隔离（训练/测试窗之间留空隙，测试窗后的行情不回流入训练） |
+| 多重检验校正 | `/api/sweep` 与 CLI `sweep` 对 N 次参数试验做 DSR + BH-FDR（best 不显著时给出警告）；Walk-Forward 因子筛选先做 IC t 检验 + BH-FDR |
 | 系统性验证 | Oracle Factor / Known Alpha 诊断工具（`tools/diagnose_ic.py`、`tools/sanity_check.py`）、Rank IC 对手算、MVO/成本模型回归测试（历史 60/60 报告已作废，见「研究验证」） |
 | 风险建模 | VaR/CVaR、蒙特卡洛模拟、Barra 10 因子风险模型、压力测试 |
 
