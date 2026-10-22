@@ -1816,6 +1816,7 @@ def cmd_sweep(args) -> int:
     """Parameter sweep: grid search over key parameters."""
     import itertools
 
+    import numpy as np
     import pandas as pd
 
     config = load_config(args.config)
@@ -1831,11 +1832,16 @@ def cmd_sweep(args) -> int:
     n_stocks_list = [int(n) for n in args.n_stocks.split(",")] if args.n_stocks else [200]
 
     sweep_results = []
+    # Successful configurations keep their daily returns so the grid can be
+    # tested for multiple-testing bias with the shared DSR/BH helper.
+    trial_returns: dict = {}
+    row_config: list[str | None] = []
     total = len(optimizers) * len(frequencies) * len(n_stocks_list)
     count = 0
 
     for opt, freq, n_stocks in itertools.product(optimizers, frequencies, n_stocks_list):
         count += 1
+        config_id = f"{opt}/{freq}/{n_stocks}"
         logger.info("[%d/%d] Sweep: opt=%s freq=%s n=%d", count, total, opt, freq, n_stocks)
 
         config.portfolio.optimizer = opt
@@ -1855,6 +1861,9 @@ def cmd_sweep(args) -> int:
             )
 
             summary = bt_results["summary"]
+            daily_returns = bt_results.get("daily_returns")
+            if daily_returns is not None:
+                trial_returns[config_id] = np.asarray(daily_returns, dtype=float)
             sweep_results.append({
                 "Optimizer": opt,
                 "Frequency": freq,
@@ -1865,12 +1874,26 @@ def cmd_sweep(args) -> int:
                 "Sortino": round(summary.get("sortino_ratio", 0), 2),
                 "Win Rate %": round(summary.get("win_rate", 0) * 100, 1),
             })
+            row_config.append(config_id if config_id in trial_returns else None)
         except Exception as e:
             logger.error("Sweep [%s/%s/%d] failed: %s", opt, freq, n_stocks, e)
             sweep_results.append({
                 "Optimizer": opt, "Frequency": freq, "N Stocks": n_stocks,
                 "Sharpe": "ERR", "Error": str(e)[:60],
             })
+            row_config.append(None)
+
+    validation = None
+    if trial_returns:
+        from quant_platform.research.validation import validate_sweep_trials
+
+        validation = validate_sweep_trials(trial_returns)
+        for idx, config_id in enumerate(row_config):
+            if config_id is None:
+                continue
+            info = validation["trials"][config_id]
+            sweep_results[idx]["DSR p"] = info["dsr_p"]
+            sweep_results[idx]["BH Significant"] = info["bh_significant"]
 
     if sweep_results:
         df = pd.DataFrame(sweep_results)
@@ -1882,6 +1905,47 @@ def cmd_sweep(args) -> int:
         print("=" * 80)
         print(df.to_string(index=False))
         print("=" * 80)
+
+        numeric_rows = [
+            (i, r) for i, r in enumerate(sweep_results)
+            if isinstance(r.get("Sharpe"), (int, float))
+        ]
+        if numeric_rows:
+            best_idx, best_row = max(numeric_rows, key=lambda pair: pair[1]["Sharpe"])
+            best_config = row_config[best_idx]
+            info = (
+                validation["trials"].get(best_config)
+                if validation is not None and best_config is not None else None
+            )
+            if info is not None:
+                significant = bool(info["dsr_significant"] and info["bh_significant"])
+                print(
+                    f"trials={validation['num_trials']} best={best_config} "
+                    f"raw_p={info['raw_p']:.4f} dsr_p={info['dsr_p']:.4f} "
+                    f"significant={significant}"
+                )
+                if not significant:
+                    print(
+                        "WARNING: the selected best does not survive multiple-testing "
+                        "correction (DSR and/or BH-FDR); treat these parameters as "
+                        "unvalidated."
+                    )
+            else:
+                print(
+                    f"trials={validation['num_trials'] if validation else 0} "
+                    f"best={best_config} raw_p=n/a dsr_p=n/a significant=False"
+                )
+                print(
+                    "WARNING: no daily return series was available for the selected "
+                    "best; multiple-testing correction could not be applied."
+                )
+        elif validation is not None:
+            print(
+                f"trials={validation['num_trials']} best=None raw_p=n/a dsr_p=n/a "
+                "significant=False"
+            )
+        else:
+            print("trials=0 best=None raw_p=n/a dsr_p=n/a significant=False")
 
     return 0
 
