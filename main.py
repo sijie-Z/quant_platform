@@ -1863,7 +1863,14 @@ def cmd_sweep(args) -> int:
             summary = bt_results["summary"]
             daily_returns = bt_results.get("daily_returns")
             if daily_returns is not None:
-                trial_returns[config_id] = np.asarray(daily_returns, dtype=float)
+                try:
+                    trial_returns[config_id] = np.asarray(daily_returns, dtype=float)
+                except (TypeError, ValueError) as exc:
+                    # Missing validation input, not a failed backtest.
+                    logger.warning(
+                        "Sweep %s: daily returns not usable for DSR: %s",
+                        config_id, exc,
+                    )
             sweep_results.append({
                 "Optimizer": opt,
                 "Frequency": freq,
