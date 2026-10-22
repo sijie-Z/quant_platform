@@ -210,7 +210,7 @@ quant_platform/
 ├── tools/                  # 研究工具：common_runner / sanity_check / attribution
 │
 ├── docs/                   # 文档：架构 / 里程碑 / 研究报告 / 协议
-├── tests/                  # 单元测试（236 个测试文件，3,333 条用例，覆盖全部模块）
+├── tests/                  # 单元测试（236 个测试文件，3,337 条用例，覆盖全部模块）
 ├── config/                 # YAML 配置（零硬编码）
 └── requirements.txt        # Python 依赖（版本锁定；adata 例外见下文）
 ```
