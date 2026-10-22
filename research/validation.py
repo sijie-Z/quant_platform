@@ -20,6 +20,7 @@ Reference:
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from statistics import NormalDist
 
@@ -379,3 +380,96 @@ def _benjamini_hochberg(p_values: np.ndarray, alpha: float) -> np.ndarray:
     result[sorted_idx] = rejections_sorted
 
     return result
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Sweep-level validation (shared by /api/sweep and `main.py sweep`)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def validate_sweep_trials(
+    results: Mapping[str, np.ndarray],
+    periods_per_year: float = 252.0,
+    significance_level: float = 0.05,
+) -> dict:
+    """Validate a parameter sweep's trials with DSR plus BH-FDR.
+
+    Contract
+    --------
+    * ``results`` maps a configuration id to that configuration's periodic
+      return series. Only configurations that completed successfully should
+      be passed; ``N = len(results)`` is the number of trials.
+    * Every configuration is tested with
+      :meth:`FactorValidator.deflated_sharpe_test` at ``num_trials=N``, so the
+      expected maximum Sharpe is deflated for picking the best of N
+      independent trials (Bailey & López de Prado). The deflated p-value is
+      the probability of observing a Sharpe at least this high by chance
+      after that selection bias; it is reported as ``dsr_p``.
+    * The one-sided *raw* p-values (no deflation) feed a single
+      Benjamini-Hochberg correction at ``significance_level``; the resulting
+      mask is reported per configuration as ``bh_significant``.
+    * A configuration is ``significant`` only when both the DSR deflated
+      p-value and the BH-adjusted raw p-value pass -- the same policy as
+      :meth:`FactorValidator.validate_factor_batch`.
+    * ``best`` is the configuration with the highest observed (annualized)
+      Sharpe. It carries the same significance fields plus ``config`` so a
+      caller can tie the verdict back to the table row that was selected.
+
+    Returns
+    -------
+    dict with:
+      ``num_trials``: N
+      ``trials``: {config: {observed_sharpe, expected_max_sharpe, raw_p,
+      dsr_p, dsr_significant, bh_significant}}
+      ``best``: {config, observed, expected_max, deflated_p, raw_p,
+      significant, dsr_significant, bh_significant} or None when empty.
+
+    Non-finite returns (NaN/inf) are dropped by ``deflated_sharpe_test``; a
+    series with fewer than 20 finite observations can never be significant
+    (p=1 by that method) and is reported that way rather than crashing.
+    """
+    validator = FactorValidator(significance_level=significance_level)
+    names = list(results)
+    num_trials = len(names)
+
+    raw_p_values: list[float] = []
+    trial_results: dict[str, DeflatedSharpeResult] = {}
+    for name in names:
+        series = np.asarray(results[name], dtype=float)
+        trial_results[name] = validator.deflated_sharpe_test(
+            series, num_trials=num_trials, periods_per_year=periods_per_year,
+        )
+        raw_p_values.append(trial_results[name].raw_p_value)
+
+    bh_mask = validator.multiple_testing_correction(raw_p_values, method="bh")
+
+    trials: dict[str, dict] = {}
+    for i, name in enumerate(names):
+        prev = trial_results[name]
+        dsr_sig = bool(prev.deflated_p_value < significance_level)
+        bh_sig = bool(bh_mask[i]) if num_trials else False
+        trials[name] = {
+            "observed_sharpe": prev.observed_sharpe,
+            "expected_max_sharpe": prev.expected_max_sharpe,
+            "raw_p": prev.raw_p_value,
+            "dsr_p": prev.deflated_p_value,
+            "dsr_significant": dsr_sig,
+            "bh_significant": bh_sig,
+        }
+
+    best = None
+    if names:
+        best_name = max(names, key=lambda n: trials[n]["observed_sharpe"])
+        entry = trials[best_name]
+        best = {
+            "config": best_name,
+            "observed": entry["observed_sharpe"],
+            "expected_max": entry["expected_max_sharpe"],
+            "deflated_p": entry["dsr_p"],
+            "raw_p": entry["raw_p"],
+            "significant": bool(entry["dsr_significant"] and entry["bh_significant"]),
+            "dsr_significant": entry["dsr_significant"],
+            "bh_significant": entry["bh_significant"],
+        }
+
+    return {"num_trials": num_trials, "trials": trials, "best": best}

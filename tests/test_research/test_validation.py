@@ -320,3 +320,88 @@ class TestNonFiniteInputsAndAnnualization:
         for bad in (0, -1, float("nan"), float("inf")):
             with pytest.raises(ValueError, match="periods_per_year"):
                 validator.deflated_sharpe_test(np.zeros(100), periods_per_year=bad)
+
+
+class TestValidateSweepTrials:
+    """Sweep-level helper: DSR deflation at N trials + BH on raw p-values."""
+
+    def test_deflated_p_grows_with_num_trials(self):
+        from quant_platform.research.validation import validate_sweep_trials
+
+        rng = np.random.default_rng(7)
+        returns = rng.normal(0.0008, 0.01, size=500)
+
+        single = validate_sweep_trials({"only": returns})
+        many = validate_sweep_trials({f"cfg{i}": returns for i in range(20)})
+
+        assert single["num_trials"] == 1
+        assert many["num_trials"] == 20
+        assert many["trials"]["cfg0"]["dsr_p"] > single["trials"]["only"]["dsr_p"]
+        # The observed Sharpe and the raw p-value do not depend on N; only
+        # the E[max SR] deflation changes.
+        assert many["trials"]["cfg0"]["observed_sharpe"] == pytest.approx(
+            single["trials"]["only"]["observed_sharpe"]
+        )
+        assert many["trials"]["cfg0"]["raw_p"] == pytest.approx(
+            single["trials"]["only"]["raw_p"]
+        )
+
+    def test_bh_mask_on_known_p_values_matches_hand_computation(self):
+        validator = FactorValidator(significance_level=0.05)
+
+        # m=4, thresholds (rank/m)*alpha = .0125/.025/.0375/.05:
+        # .01<=.0125, .02<=.025, .03<=.0375, .2>.05 -> first three rejected.
+        mask = validator.multiple_testing_correction(
+            [0.01, 0.02, 0.03, 0.2], method="bh",
+        )
+        assert mask.tolist() == [True, True, True, False]
+
+        # m=3, thresholds .0167/.0333/.05. The third p-value passes and BH's
+        # step-up rule therefore also rejects the second (0.04 > 0.0333).
+        mask = validator.multiple_testing_correction(
+            [0.01, 0.04, 0.045], method="bh",
+        )
+        assert mask.tolist() == [True, True, True]
+
+    def test_empty_input(self):
+        from quant_platform.research.validation import validate_sweep_trials
+
+        result = validate_sweep_trials({})
+        assert result == {"num_trials": 0, "trials": {}, "best": None}
+
+    def test_best_is_by_observed_sharpe_and_requires_both_corrections(self):
+        from quant_platform.research.validation import validate_sweep_trials
+
+        rng = np.random.default_rng(8)
+        strong = rng.normal(0.002, 0.01, size=500)
+        weak = rng.normal(0.0001, 0.01, size=500)
+
+        result = validate_sweep_trials({"strong": strong, "weak": weak})
+
+        best = result["best"]
+        assert best["config"] == "strong"
+        assert best["observed"] == result["trials"]["strong"]["observed_sharpe"]
+        assert best["significant"] is True
+        assert best["dsr_significant"] is True
+        assert best["bh_significant"] is True
+
+    def test_non_finite_and_too_short_series_never_significant(self):
+        from quant_platform.research.validation import validate_sweep_trials
+
+        rng = np.random.default_rng(9)
+        with_nan = rng.normal(0.0, 0.01, size=100)
+        with_nan[::3] = np.nan
+        with_inf = np.concatenate([with_nan, [np.inf, -np.inf]])
+        too_short = np.array([0.01, -0.02, 0.03, np.nan])
+
+        result = validate_sweep_trials({"nan": with_inf, "short": too_short})
+
+        assert result["num_trials"] == 2
+        for name in ("nan", "short"):
+            assert result["trials"][name]["dsr_significant"] is False
+            assert result["trials"][name]["dsr_p"] > 0.05
+            assert np.isfinite(result["trials"][name]["observed_sharpe"])
+        # A series with fewer than 20 finite observations is the documented
+        # short-circuit: p=1, observed Sharpe reported as 0.
+        assert result["trials"]["short"]["dsr_p"] == 1.0
+        assert result["best"]["significant"] is False
