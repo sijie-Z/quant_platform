@@ -92,7 +92,6 @@ from quant_platform.main import (
     _load_data,
     _run_backtest,
 )
-from quant_platform.research.validation import validate_sweep_trials
 from quant_platform.utils.config import load_config
 from quant_platform.utils.logging import get_logger
 
@@ -2287,6 +2286,8 @@ async def sweep_parameters(req: SweepRequest):
 def _run_sweep(req: SweepRequest) -> SweepResult:
     import itertools
 
+    from quant_platform.research.validation import validate_sweep_trials
+
     config = load_config(None)
     table = []
     # Successful configurations keep their daily returns in memory so the
@@ -2388,10 +2389,11 @@ def _run_sweep(req: SweepRequest) -> SweepResult:
             }
             if not best_dsr["significant"]:
                 selection_note = (
-                    f"Best configuration {best_config} (Sharpe {best['sharpe']}) "
-                    f"does not survive multiple-testing correction: raw_p="
-                    f"{info['raw_p']:.4f}, DSR p={info['dsr_p']:.4f}, "
-                    f"BH-significant={info['bh_significant']}. The selected "
+                    f"Best configuration {best_config} (table Sharpe "
+                    f"{best['sharpe']}) does not survive multiple-testing "
+                    f"correction: raw_p={info['raw_p']:.4f}, DSR p="
+                    f"{info['dsr_p']:.4f}, BH-significant="
+                    f"{info['bh_significant']}. The selected "
                     "parameters are not statistically validated."
                 )
         else:

@@ -188,11 +188,24 @@ def select_walk_forward_factors(
         selection_warning = (
             "no factor survives BH-FDR; falling back to top-|ICIR|"
         )
-        # Same ordering expression as the original selector.
-        ranked = sorted(
-            ic_results.items(), key=lambda x: abs(x[1].get("icir", 0)),
-            reverse=True,
-        )
+        # Fallback keeps the original top-|ICIR| rule, but a factor whose
+        # ICIR is undefined (fewer than MIN_IC_OBSERVATIONS ICs, hence NaN)
+        # cannot be ranked and must not win by sort accident. If no factor
+        # has a finite ICIR at all, preserve the historical ordering so a
+        # short-sample run still walks forward exactly as it used to.
+        finite = [
+            (name, info) for name, info in ic_results.items()
+            if math.isfinite(_finite(info.get("icir", float("nan"))))
+        ]
+        if finite:
+            ranked = sorted(
+                finite, key=lambda item: abs(item[1]["icir"]), reverse=True,
+            )
+        else:
+            ranked = sorted(
+                ic_results.items(), key=lambda x: abs(x[1].get("icir", 0)),
+                reverse=True,
+            )
         selected = [name for name, _ in ranked[:max_factors]]
 
     return {

@@ -423,6 +423,11 @@ def validate_sweep_trials(
       dsr_p, dsr_significant, bh_significant}}
       ``best``: {config, observed, expected_max, deflated_p, raw_p,
       significant, dsr_significant, bh_significant} or None when empty.
+      ``best`` is by ``observed_sharpe``; note that a series too short for
+      the DSR test reports ``observed_sharpe=0.0`` (the method's documented
+      short-circuit), so with only such series the pick is degenerate. The
+      API/CLI select their best row from the backtest table and only use
+      these entries for the verdict, not for selection.
 
     Non-finite returns (NaN/inf) are dropped by ``deflated_sharpe_test``; a
     series with fewer than 20 finite observations can never be significant

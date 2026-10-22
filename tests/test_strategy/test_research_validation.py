@@ -93,6 +93,25 @@ class TestSelectWalkForwardFactors:
         ]
         assert result["selected"] == expected
 
+    def test_fallback_ignores_undefined_icir(self):
+        """A factor with icir=NaN (too few ICs) cannot be ranked and must
+        not win the fallback by sort accident."""
+        factors, returns = _make_case(seed=2, strong=0, noise=3)
+        factors["undefined"] = factors["noise_0"]
+        ic_results = _ic_summaries(
+            {name: panel for name, panel in factors.items() if name != "undefined"},
+            returns,
+        )
+        ic_results["undefined"] = {
+            "mean_ic": float("nan"), "std_ic": float("nan"), "icir": float("nan"),
+        }
+
+        result = select_walk_forward_factors(ic_results, factors, returns)
+
+        assert result["fallback"] is True
+        assert "undefined" not in result["selected"]
+        assert len(result["selected"]) == 2
+
     def test_step_details_carry_factor_selection(self, monkeypatch):
         from quant_platform.backtest.walkforward import WalkForwardValidator
 
@@ -140,6 +159,21 @@ class TestSelectWalkForwardFactors:
         assert detail["fallback"] is True
         assert len(detail["selected"]) == 2
         assert "no factor survives BH-FDR; falling back to top-|ICIR|" in step.warnings
+
+    def test_skipped_step_keeps_factor_selection_details(self):
+        _factors, returns = _make_case(seed=5, strong=0, noise=1)
+
+        validator = ResearchValidator(n_stocks=25)
+        step = validator._step_walk_forward(
+            {}, {}, None, returns, None, {}, None, [], max_folds=1,
+        )
+
+        assert step.status == "skipped"
+        detail = step.details["factor_selection"]
+        assert detail["selected"] == []
+        assert detail["survivors"] == []
+        assert detail["fallback"] is False
+        assert step.details["wf_result"] is None
 
 
 class TestValidationStep:

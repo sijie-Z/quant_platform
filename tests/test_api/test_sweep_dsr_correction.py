@@ -39,7 +39,8 @@ def _oscillating_returns(mean_daily: float, amplitude: float = 0.01, n: int = 50
     return np.tile(block, n // 2)
 
 
-def _install_fakes(monkeypatch, series: np.ndarray, fail_optimizers: tuple[str, ...] = ()) -> None:
+def _install_fakes(monkeypatch, series: np.ndarray, fail_optimizers: tuple[str, ...] = (),
+                   no_returns_optimizers: tuple[str, ...] = ()) -> None:
     config = SimpleNamespace(universe=SimpleNamespace(n_stocks=0))
     monkeypatch.setattr(routes, "load_config", lambda _path=None: config)
     monkeypatch.setattr(
@@ -57,15 +58,21 @@ def _install_fakes(monkeypatch, series: np.ndarray, fail_optimizers: tuple[str, 
         if optimizer_override in fail_optimizers:
             raise RuntimeError("synthetic backtest failure")
         sharpe = float(np.mean(series) / np.std(series, ddof=1) * np.sqrt(252))
+        if optimizer_override in no_returns_optimizers:
+            sharp = 9.9  # attract the "best" pick without a return series
+            daily = None
+        else:
+            sharp = sharpe
+            daily = pd.Series(series)
         return {
             "summary": {
-                "sharpe_ratio": sharpe,
+                "sharpe_ratio": sharp,
                 "annual_return": 0.10,
                 "max_drawdown": -0.20,
                 "sortino_ratio": 1.0,
                 "win_rate": 0.5,
             },
-            "daily_returns": pd.Series(series),
+            "daily_returns": daily,
         }
 
     monkeypatch.setattr(routes, "_run_backtest", fake_backtest)
@@ -98,7 +105,8 @@ def test_sweep_reports_dsr_bh_and_no_note_when_best_passes(client, monkeypatch):
     assert body["best_dsr"]["config"] == "equal_weight/monthly/200"
     assert body["best_dsr"]["significant"] is True
     assert body["best_dsr"]["deflated_p"] < 0.05
-    assert body["best_dsr"]["expected_max"] >= 0.0
+    # N=1 means no E[max SR] deflation: the expected max is exactly zero.
+    assert body["best_dsr"]["expected_max"] == 0.0
     assert body["selection_note"] is None
     # best_params keeps its original max-Sharpe meaning.
     assert body["best_params"]["optimizer"] == "equal_weight"
@@ -129,6 +137,11 @@ def test_more_trials_flip_the_selection_verdict(client, monkeypatch):
     assert grid["best_dsr"]["raw_p"] < 0.05       # undeflated test still passes
     assert grid["best_dsr"]["deflated_p"] > 0.05  # deflation kills it
     assert grid["best_dsr"]["significant"] is False
+    # BH consumes the raw p-values, not the deflated ones: with 30 trials the
+    # largest rank threshold is alpha, so the shared raw p still clears BH.
+    assert grid["best_dsr"]["bh_significant"] is True
+    assert grid["best_dsr"]["dsr_significant"] is False
+    assert grid["best_dsr"]["expected_max"] > 0
     assert grid["selection_note"]
     assert "does not survive multiple-testing correction" in grid["selection_note"]
 
@@ -153,6 +166,34 @@ def test_failed_configs_are_not_counted_as_trials(client, monkeypatch):
     assert "DSR p" not in by_optimizer["mean_variance"]
     assert by_optimizer["equal_weight"]["BH Significant"] is True
     assert body["best_dsr"]["config"] == "equal_weight/monthly/200"
+
+
+def test_successful_config_without_daily_returns_is_kept_but_flagged(client, monkeypatch):
+    """A successful backtest with no usable series must not be dropped or
+    turned into an ERR row; if it is the best row, the note says it could
+    not be validated and it is not counted as a DSR trial."""
+    series = _oscillating_returns(mean_daily=0.002)
+    _install_fakes(monkeypatch, series, no_returns_optimizers=("mean_variance",))
+
+    body = _post_sweep(
+        client, optimizers=["equal_weight", "mean_variance"],
+        frequencies=["monthly"], n_stocks_list=[200],
+    )
+
+    # Only the config with a usable series contributes a trial.
+    assert body["num_trials"] == 1
+    by_optimizer = {row["Optimizer"]: row for row in body["table"]}
+    missing = by_optimizer["mean_variance"]
+    assert missing["Sharpe"] == 9.9          # still a valid table row
+    assert "DSR p" not in missing            # but no invented p-value
+
+    # mean_variance wins on table Sharpe; its verdict is unavailable.
+    assert body["best_params"]["optimizer"] == "mean_variance"
+    assert body["best_dsr"] is None
+    assert body["selection_note"]
+    assert "could not be validated" in body["selection_note"]
+    # The other row still carries its own correction.
+    assert by_optimizer["equal_weight"]["BH Significant"] is True
 
 
 def test_sweep_result_schema_is_backward_compatible():
