@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from quant_platform.backtest.walkforward import WalkForwardValidator
+from quant_platform.factors.evaluation import rank_ic
 
 
 class TestWalkForwardValidator:
@@ -334,3 +335,267 @@ class TestPurgeAndEmbargo:
     def test_non_integer_purge_or_embargo_raises(self, kwargs):
         with pytest.raises(ValueError, match="purge_gap|embargo"):
             WalkForwardValidator(**kwargs)
+
+
+def _regime_panel(n_dates=450, n_assets=15, switch=100, seed=11):
+    """Factor A predicts returns only before ``switch``; factor B after it.
+
+    Everything else is cross-sectional noise, so a training-window selector
+    must flip from A to B as the (expanding) train window grows past the
+    regime boundary.
+    """
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2020-01-01", periods=n_dates)
+    assets = [f"S{i}" for i in range(n_assets)]
+    base = rng.normal(size=(n_dates, n_assets))
+    ret = pd.DataFrame(base * 0.01, index=dates, columns=assets)
+    prices = (1 + ret).cumprod() * 100
+
+    a_vals = rng.normal(size=(n_dates, n_assets))
+    b_vals = rng.normal(size=(n_dates, n_assets))
+    a_vals[:switch] = base[:switch] + rng.normal(scale=0.5, size=(switch, n_assets))
+    b_vals[switch:] = base[switch:] + rng.normal(
+        scale=0.5, size=(n_dates - switch, n_assets),
+    )
+    factors = {
+        "A": pd.DataFrame(a_vals, index=dates, columns=assets),
+        "B": pd.DataFrame(b_vals, index=dates, columns=assets),
+    }
+    signal = pd.DataFrame(0.0, index=dates, columns=assets)
+    return signal, prices, ret, ret.mean(axis=1), pd.Series("Tech", index=assets), factors
+
+
+def _best_icir_selector(fold_info, factors, forward_returns):
+    """Toy selector: the factor with the highest train-window |ICIR|."""
+    positions = fold_info["train_positions"]
+    scores = {}
+    for name, panel in factors.items():
+        ic = rank_ic(panel.iloc[positions], forward_returns.iloc[positions])
+        ic = ic[np.isfinite(np.asarray(ic, dtype=float))]
+        std = float(ic.std()) if len(ic) > 1 else 0.0
+        scores[name] = abs(float(ic.mean()) / std) if std > 0 else 0.0
+    return [max(sorted(scores), key=lambda name: scores[name])]
+
+
+class TestFactorSelectorContract:
+    """R4: per-fold factor selection is confined to the training window."""
+
+    def test_selector_receives_only_train_positions_minus_embargo(self):
+        signal, prices, ret, bench, sector_map, factors = _panel(
+            n_dates=300, n_assets=12, seed=5,
+        )
+        factors = {"f1": factors["f"], "f2": factors["f"].copy()}
+        validator = WalkForwardValidator(
+            train_period=100, test_period=20, step_size=20,
+            mode="expanding", purge_gap=3, embargo=10,
+        )
+        folds = {f["fold"]: f for f in validator._generate_folds(prices.index)}
+        seen = []
+
+        def spy(fold_info, factor_panels, forward_returns):
+            positions = np.array(fold_info["train_positions"])
+            seen.append((fold_info["fold"], positions))
+            # The label panel sliced by these positions must cover exactly
+            # the training rows the selector is allowed to use.
+            window = forward_returns.iloc[positions]
+            assert len(window) == len(positions)
+            # A hostile mutation must not leak into the signal computation:
+            # the engine hands over a copy of fold_info/train_positions.
+            fold_info["train_positions"][:] = -1
+            return ["f1"]
+
+        result = validator.run(
+            signal=signal, prices=prices, returns=ret, benchmark_returns=bench,
+            sector_map=sector_map, factors=factors,
+            alpha_kwargs={"method": "equal_weight"},
+            factor_selector=spy,
+        )
+
+        assert seen, "selector was never called"
+        embargoed_somewhere = False
+        for fold_id, positions in seen:
+            meta = folds[fold_id]
+            test = meta["test_slice"]
+            assert not ((positions >= test.start) & (positions < test.stop)).any(), (
+                f"fold {fold_id}: selector saw test-period positions"
+            )
+            for lo, hi in meta["embargo_ranges"]:
+                embargoed_somewhere = True
+                assert not ((positions >= lo) & (positions < hi)).any(), (
+                    f"fold {fold_id}: embargo range ({lo}, {hi}) reached the selector"
+                )
+            assert set(positions.tolist()) == set(meta["train_positions"].tolist())
+        assert embargoed_somewhere, "test layout must exercise an embargo range"
+
+        # The hostile mutation of the handed-over metadata did not corrupt
+        # the fold bookkeeping.
+        for detail in result["fold_details"]:
+            assert detail["train_days"] == folds[detail["fold"]]["train_days"]
+        assert result["fold_metrics"], "no fold produced OOS metrics"
+
+    def test_selection_flips_with_the_train_window_regime(self):
+        signal, prices, ret, bench, sector_map, factors = _regime_panel()
+        validator = WalkForwardValidator(
+            train_period=100, test_period=20, step_size=20, mode="expanding",
+        )
+
+        calls = {}
+        real = validator._compute_signal_in_sample
+
+        def spy(factors_used, *args, **kwargs):
+            calls[len(calls)] = sorted(factors_used)
+            return real(factors_used, *args, **kwargs)
+
+        validator._compute_signal_in_sample = spy
+
+        result = validator.run(
+            signal=signal, prices=prices, returns=ret, benchmark_returns=bench,
+            sector_map=sector_map, factors=factors,
+            alpha_kwargs={"method": "equal_weight"},
+            factor_selector=_best_icir_selector,
+        )
+
+        selected = {d["fold"]: d["selected_factors"] for d in result["fold_details"]}
+        assert selected, "expected fold details"
+        # Early train window: only A has predictive power; late train window:
+        # B dominates. The selection must differ across folds.
+        assert selected[0] == ["A"]
+        later = [sel for fold, sel in selected.items() if fold > 0]
+        assert ["B"] in later, f"selection never flipped to B: {selected}"
+        assert selected[0] != ["B"]
+
+        # The signal recomputation really consumed the per-fold selection:
+        # calls are in fold order and match selected_factors exactly.
+        order = [d["fold"] for d in result["fold_details"]]
+        used = [calls[i] for i in range(len(order))]
+        assert used == [sorted(selected[fold]) for fold in order]
+
+        # And the fold metrics carry the same selection for audit.
+        for metric in result["fold_metrics"]:
+            assert metric["selected_factors"] == selected[metric["fold"]]
+
+    def test_no_selector_keeps_the_historical_output_exactly(self):
+        """Default ``factor_selector=None`` must behave bit for bit as before:
+        identical OOS series, fold metrics and dict shape (no new keys)."""
+        signal, prices, ret, bench, sector_map, factors = _panel(
+            n_dates=500, n_assets=20, seed=7,
+        )
+        validator = WalkForwardValidator(
+            train_period=200, test_period=50, step_size=50, mode="rolling",
+        )
+        kwargs = dict(
+            signal=signal, prices=prices, returns=ret, benchmark_returns=bench,
+            sector_map=sector_map, factors=factors,
+            alpha_kwargs={"method": "ic_weighted", "lookback": 60},
+        )
+
+        default_run = validator.run(**kwargs)
+        explicit_none = validator.run(**kwargs, factor_selector=None)
+
+        pd.testing.assert_series_equal(
+            default_run["oos_returns"], explicit_none["oos_returns"],
+        )
+        assert default_run["n_folds"] == explicit_none["n_folds"]
+        assert default_run["fold_details"] == explicit_none["fold_details"]
+        assert default_run["fold_metrics"] == explicit_none["fold_metrics"]
+        assert default_run["stability"] == explicit_none["stability"]
+
+        # The historical dict shape is preserved: no selected_factors keys.
+        for detail in default_run["fold_details"]:
+            assert "selected_factors" not in detail
+        for metric in default_run["fold_metrics"]:
+            assert "selected_factors" not in metric
+
+        # Selecting every factor must reproduce the default run exactly --
+        # the selector is a pure filter, not a different code path.
+        all_factors = validator.run(
+            **kwargs, factor_selector=lambda fold, panels, fwd: list(panels),
+        )
+        pd.testing.assert_series_equal(
+            default_run["oos_returns"], all_factors["oos_returns"],
+        )
+        for base_m, sel_m in zip(
+            default_run["fold_metrics"], all_factors["fold_metrics"], strict=True,
+        ):
+            stripped = {k: v for k, v in sel_m.items() if k != "selected_factors"}
+            assert stripped == base_m
+        for detail in all_factors["fold_details"]:
+            assert detail["selected_factors"] == list(factors)
+
+    def test_empty_selection_skips_the_fold_and_records_it(self):
+        signal, prices, ret, bench, sector_map, factors = _panel(
+            n_dates=300, n_assets=12, seed=9,
+        )
+        validator = WalkForwardValidator(
+            train_period=100, test_period=20, step_size=20, mode="rolling",
+        )
+
+        def selector(fold_info, panels, fwd):
+            return [] if fold_info["fold"] == 1 else list(panels)
+
+        result = validator.run(
+            signal=signal, prices=prices, returns=ret, benchmark_returns=bench,
+            sector_map=sector_map, factors=factors,
+            alpha_kwargs={"method": "equal_weight"},
+            factor_selector=selector,
+        )
+
+        details = {d["fold"]: d for d in result["fold_details"]}
+        assert details[1]["selected_factors"] == []
+        assert details[1]["oos_days"] == 0
+        assert "selected no factors" in details[1]["error"]
+        # The skipped fold contributes no OOS metrics and no fabricated OOS
+        # rows; the other folds still complete.
+        assert 1 not in {m["fold"] for m in result["fold_metrics"]}
+        fold_one = validator._generate_folds(prices.index)[1]
+        test_dates = prices.index[fold_one["test_slice"]]
+        assert not test_dates.isin(result["oos_returns"].index).any()
+        assert result["n_folds"] == 10
+
+    def test_selector_exceptions_abort_the_run(self):
+        signal, prices, ret, bench, sector_map, factors = _panel(
+            n_dates=300, n_assets=12, seed=13,
+        )
+        validator = WalkForwardValidator(
+            train_period=100, test_period=20, step_size=20,
+        )
+
+        def broken(fold_info, panels, fwd):
+            raise RuntimeError("selector boom")
+
+        with pytest.raises(RuntimeError, match="selector boom"):
+            validator.run(
+                signal=signal, prices=prices, returns=ret, benchmark_returns=bench,
+                sector_map=sector_map, factors=factors,
+                alpha_kwargs={"method": "equal_weight"},
+                factor_selector=broken,
+            )
+
+    def test_selector_requires_factors(self):
+        signal, prices, ret, bench, sector_map, _ = _panel(
+            n_dates=300, n_assets=12, seed=15,
+        )
+        validator = WalkForwardValidator(
+            train_period=100, test_period=20, step_size=20,
+        )
+        with pytest.raises(ValueError, match="factor_selector requires factors"):
+            validator.run(
+                signal=signal, prices=prices, returns=ret, benchmark_returns=bench,
+                sector_map=sector_map,
+                factor_selector=lambda fold, panels, fwd: [],
+            )
+
+    def test_unknown_selected_factor_raises(self):
+        signal, prices, ret, bench, sector_map, factors = _panel(
+            n_dates=300, n_assets=12, seed=17,
+        )
+        validator = WalkForwardValidator(
+            train_period=100, test_period=20, step_size=20,
+        )
+        with pytest.raises(ValueError, match="unknown factor"):
+            validator.run(
+                signal=signal, prices=prices, returns=ret, benchmark_returns=bench,
+                sector_map=sector_map, factors=factors,
+                alpha_kwargs={"method": "equal_weight"},
+                factor_selector=lambda fold, panels, fwd: ["does_not_exist"],
+            )

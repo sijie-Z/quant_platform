@@ -9,9 +9,15 @@ Two modes:
 
 When `factors` dict is provided, signals are recomputed per fold using
 only train-period data — eliminating look-ahead from IC/ICIR weighting.
+
+An optional ``factor_selector`` can pick the factor subset *inside each fold*
+from that fold's training window only (see :data:`FactorSelector`). The
+default (``None``) keeps the historical behaviour bit for bit.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -21,6 +27,28 @@ from quant_platform.backtest.metrics import all_metrics
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+#: Per-fold factor selector.
+#:
+#: Called once per fold, before that fold's signal is computed, as
+#:
+#: ``selector(fold_info, factors, forward_returns) -> iterable of factor names``
+#:
+#: * ``fold_info``: the fold metadata dict. ``fold_info["train_positions"]``
+#:   holds the integer positions (into the validator's date axis) usable for
+#:   training — the nominal training window minus embargo days. The dict also
+#:   carries ``fold``, ``train_slice``, ``test_slice``, ``train_dates``,
+#:   ``test_dates``, ``train_days`` and ``embargo_ranges``.
+#: * ``factors``: the full ``{name: (date x asset) panel}`` mapping.
+#: * ``forward_returns``: the same forward-return panel the in-sample signal
+#:   computation uses (``t -> t+1`` labels).
+#:
+#: The returned names must be existing keys of ``factors``; only those panels
+#: feed the fold's :meth:`WalkForwardValidator._compute_signal_in_sample`.
+#: Returning an empty iterable skips the fold (recorded in ``fold_details``,
+#: never fabricated). Exceptions raised by the selector abort the run.
+FactorSelector = Callable[[dict, dict[str, pd.DataFrame], pd.DataFrame], Sequence[str]]
+
 
 
 class WalkForwardValidator:
@@ -120,6 +148,7 @@ class WalkForwardValidator:
         risk_free_rate: float | None = None,
         periods_per_year: float | None = None,
         execution_gates: dict | None = None,
+        factor_selector: FactorSelector | None = None,
     ) -> dict:
         """Run walk-forward validation.
 
@@ -130,6 +159,15 @@ class WalkForwardValidator:
                      train-period data. Eliminates look-ahead from IC weighting.
             alpha_kwargs: Dict with 'method', 'lookback', 'min_icir' for signal
                           recomputation. Required when factors is provided.
+            factor_selector: Optional per-fold factor selector (see
+                :data:`FactorSelector`). Called once per fold with that fold's
+                ``train_positions`` (embargo already removed), the full factor
+                panels and the forward-return panel; the returned names are
+                the only factors fed to that fold's signal recomputation. An
+                empty selection skips the fold and records it in
+                ``fold_details``; selector exceptions abort the run. Default
+                ``None`` recomputes every fold from all ``factors`` exactly as
+                before.
             engine_kwargs: Raw BacktestEngine keyword arguments.
             cost_model, constraints, optimizer, benchmark, covariance_method,
             covariance_lookback, covariance_ewma_half_life, execution_timing,
@@ -150,6 +188,11 @@ class WalkForwardValidator:
             - fold_details: train/test date ranges per fold
             - n_folds: number of folds used
             - signal_recomputed: True if signal was recomputed per fold
+
+            When ``factor_selector`` is used, every ``fold_metrics`` /
+            ``fold_details`` entry also carries ``selected_factors`` (the list
+            that fold's signal was computed from). With the default
+            ``factor_selector=None`` these dicts keep their historical shape.
         """
         engine_kwargs = dict(engine_kwargs or {})
         explicit_engine_config = {
@@ -170,6 +213,13 @@ class WalkForwardValidator:
         })
         alpha_kwargs = alpha_kwargs or {}
         signal_recomputed = factors is not None
+        if factor_selector is not None and factors is None:
+            # Nothing to select from a pre-computed signal; a selector here
+            # would be silently ignored, which is worse than a clear error.
+            raise ValueError(
+                "factor_selector requires factors: there is nothing to select "
+                "from a pre-computed signal"
+            )
 
         dates = signal.index
         n_dates = len(dates)
@@ -197,6 +247,7 @@ class WalkForwardValidator:
             test_sl = fold_info["test_slice"]
 
             # --- Build signal for this fold ---
+            selected_factors: list[str] | None = None
             if factors is not None:
                 if fold_info["train_days"] == 0:
                     # An out-sized embargo can remove every day of a later
@@ -205,17 +256,46 @@ class WalkForwardValidator:
                     logger.warning(
                         "  Fold %d skipped: embargo removed every training day", fi,
                     )
-                    fold_details.append({
+                    detail = {
                         "fold": fi,
                         "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
                         "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
                         "train_days": 0,
                         "oos_days": 0,
                         "error": "embargo removed every training day",
-                    })
+                    }
+                    if factor_selector is not None:
+                        detail["selected_factors"] = []
+                    fold_details.append(detail)
                     continue
+                fold_factors = factors
+                if factor_selector is not None:
+                    # Choose this fold's factors from its training window only
+                    # (train_positions already excludes embargo days). The
+                    # selector must never see the test window as training
+                    # input; test-period factor *values* are still observable
+                    # and are used by the signal recomputation itself.
+                    selected_factors, fold_factors = self._select_fold_factors(
+                        factor_selector, fold_info, factors, returns,
+                    )
+                    if not selected_factors:
+                        # Nothing survives this fold's training-window screen.
+                        # Record the fold and move on -- never fabricate OOS.
+                        logger.warning(
+                            "  Fold %d skipped: factor_selector selected no factors", fi,
+                        )
+                        fold_details.append({
+                            "fold": fi,
+                            "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
+                            "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
+                            "train_days": fold_info["train_days"],
+                            "oos_days": 0,
+                            "selected_factors": [],
+                            "error": "factor_selector selected no factors",
+                        })
+                        continue
                 fold_signal = self._compute_signal_in_sample(
-                    factors, returns, train_sl, test_sl, alpha_kwargs,
+                    fold_factors, returns, train_sl, test_sl, alpha_kwargs,
                     train_positions=fold_info["train_positions"],
                 )
             else:
@@ -303,16 +383,21 @@ class WalkForwardValidator:
                     # window minus any embargo days removed from it.
                     m["train_days"] = fold_info["train_days"]
                     m["oos_days"] = len(oos_ret)
+                    if selected_factors is not None:
+                        m["selected_factors"] = list(selected_factors)
                     fold_metrics.append(m)
 
-                fold_details.append({
+                detail = {
                     "fold": fi,
                     "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
                     "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
                     "train_days": fold_info["train_days"],
                     "oos_days": len(oos_ret),
                     "sharpe": fold_metrics[-1].get("sharpe_ratio", 0) if fold_metrics else 0,
-                })
+                }
+                if selected_factors is not None:
+                    detail["selected_factors"] = list(selected_factors)
+                fold_details.append(detail)
 
                 logger.info("  Fold %d: OOS %s -> %s (%d days, Sharpe=%.2f)",
                             fi, fold_info["test_dates"][0], fold_info["test_dates"][1],
@@ -320,14 +405,17 @@ class WalkForwardValidator:
 
             except Exception as e:
                 logger.warning("  Fold %d failed: %s", fi, e)
-                fold_details.append({
+                failure = {
                     "fold": fi,
                     "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
                     "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
                     "train_days": fold_info["train_days"],
                     "oos_days": 0,
                     "error": str(e)[:100],
-                })
+                }
+                if selected_factors is not None:
+                    failure["selected_factors"] = list(selected_factors)
+                fold_details.append(failure)
 
         if not oos_returns_list:
             raise ValueError("All walk-forward folds failed")
@@ -455,6 +543,42 @@ class WalkForwardValidator:
             fold["train_positions"] = positions[~removed]
             fold["train_days"] = len(fold["train_positions"])
             fold["embargo_ranges"] = embargo_ranges
+
+    @staticmethod
+    def _select_fold_factors(
+        selector: FactorSelector,
+        fold_info: dict,
+        factors: dict[str, pd.DataFrame],
+        forward_returns: pd.DataFrame,
+    ) -> tuple[list[str], dict[str, pd.DataFrame]]:
+        """Run one per-fold selection and validate the returned names.
+
+        The selector receives a shallow copy of ``fold_info`` whose
+        ``train_positions`` array is copied, so a selector cannot mutate the
+        metadata the signal computation later relies on. Unknown names and
+        string returns are contract violations and fail loud here rather than
+        silently producing a signal from the wrong panels.
+        """
+        selector_fold_info = dict(fold_info)
+        selector_fold_info["train_positions"] = np.array(
+            fold_info["train_positions"], copy=True,
+        )
+        chosen = selector(selector_fold_info, factors, forward_returns)
+        if isinstance(chosen, (str, bytes)):
+            raise ValueError(
+                "factor_selector must return an iterable of factor names, "
+                f"got the string {chosen!r}"
+            )
+        selected = list(chosen)
+        if not all(name in factors for name in selected):
+            unknown = [name for name in selected if name not in factors]
+            raise ValueError(
+                f"factor_selector returned unknown factor(s) {unknown!r}; "
+                f"available factors: {sorted(factors)}"
+            )
+        # Preserve the selector's order but drop duplicates for clarity.
+        selected = list(dict.fromkeys(selected))
+        return selected, {name: factors[name] for name in selected}
 
     def _compute_signal_in_sample(
         self,
