@@ -1277,6 +1277,7 @@ source = { editable = "." }
 dependencies = [
     { name = "adata" },
     { name = "akshare" },
+    { name = "anyio" },
     { name = "asyncpg" },
     { name = "baostock" },
     { name = "certifi" },
@@ -1312,6 +1313,7 @@ dependencies = [
 requires-dist = [
     { name = "adata", specifier = ">=1.0.0" },
     { name = "akshare", specifier = "==1.18.59" },
+    { name = "anyio", specifier = ">=4.15.1" },
     { name = "asyncpg", specifier = "==0.30.0" },
     { name = "baostock", specifier = "==0.9.1" },
     { name = "certifi", specifier = ">=2026.10.19" },
