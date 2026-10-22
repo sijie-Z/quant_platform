@@ -78,6 +78,9 @@ _RATE_LIMITED_PATHS = frozenset({
     "/api/fundamentals/bulk",
     "/api/fundamentals/rank",
     "/api/portfolio/import",
+    "/api/oms/order",
+    "/api/oms/fill",
+    "/api/trading/order",
 })
 # These GET endpoints build/reuse the heavy research context; without a
 # bucket they bypass the compute admission control entirely.

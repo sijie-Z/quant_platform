@@ -35,6 +35,12 @@ COMMISSION_RATE = 0.0003      # 0.03% per side
 MIN_COMMISSION = 5.0          # Minimum 5 RMB per trade
 STAMP_TAX_RATE = 0.001        # 0.1% sell-side only
 MIN_LOT = 100                 # 1 lot = 100 shares
+#: Bound the in-memory books: a long-running API process accepted orders
+#: forever and the blotter/snapshot lists were never pruned (the audit found
+#: 1,000 unthrottled orders accepted with no growth limit).
+MAX_ORDERS = 10_000
+MAX_SNAPSHOTS = 10_000
+_PRUNE_RATIO = 0.9
 
 #: Bases that describe a return-generating (adjusted) series.  Cash, fills,
 #: commission and position marks are CNY amounts and must use raw prices.
@@ -150,10 +156,37 @@ class OrderManager:
                 notes=notes,
             )
             self.orders[order.order_id] = order
+            self._prune_orders()
         logger.info("Created order %s: %s %s x%d @ %s",
                      order.order_id, side, ticker, quantity,
                      limit_price or "market")
         return order
+
+    def _prune_orders(self) -> None:
+        """Drop the oldest completed orders once the book exceeds the cap.
+
+        Active orders are never evicted (a client must still be able to fill
+        or cancel them). Called under ``self._lock``.
+        """
+        if len(self.blotter) > MAX_ORDERS:
+            self.blotter = self.blotter[-int(MAX_ORDERS * _PRUNE_RATIO):]
+        if len(self.orders) <= MAX_ORDERS:
+            return
+        target = int(MAX_ORDERS * _PRUNE_RATIO)
+        removable = [
+            order_id
+            for order_id, order in self.orders.items()
+            if order.status in (
+                OrderStatus.FILLED,
+                OrderStatus.CANCELLED,
+                OrderStatus.REJECTED,
+                OrderStatus.EXPIRED,
+            )
+        ]
+        for order_id in removable[: max(0, len(self.orders) - target)]:
+            self.orders.pop(order_id, None)
+        if len(self.blotter) > target:
+            self.blotter = self.blotter[-target:]
 
     def submit_order(self, order_id: str) -> Order:
         """Submit order (PENDING -> SUBMITTED)."""
@@ -183,6 +216,7 @@ class OrderManager:
         with self._lock:
             order = self._fill_order(order_id, price, quantity, commission)
             self.price_basis = basis
+            self._prune_orders()
             return order
 
     def _fill_order(

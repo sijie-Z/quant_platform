@@ -143,3 +143,25 @@ class TestSellCashLedger:
         assert om.cash == pytest.approx(998_989.0, rel=0, abs=1e-9)
         assert om.positions["600519"].quantity == 100
         assert om.positions["600519"].available == 100
+
+
+class TestOrderBookIsBounded:
+    def test_completed_orders_are_pruned_but_active_orders_survive(
+        self, monkeypatch,
+    ):
+        """The order book and blotter used to grow for the process lifetime."""
+        from quant_platform.execution import oms as oms_module
+
+        monkeypatch.setattr(oms_module, "MAX_ORDERS", 10)
+        om = OrderManager(initial_cash=1_000_000)
+        for _ in range(30):
+            order = om.create_order("600519", "buy", 100)
+            om.submit_order(order.order_id)
+            om.fill_order(order.order_id, price=10.0)
+
+        assert len(om.orders) <= 10
+        assert len(om.blotter) <= 10
+
+        active = om.create_order("000001", "buy", 100)
+        assert active.order_id in om.orders
+        assert om.orders[active.order_id].status == OrderStatus.PENDING
