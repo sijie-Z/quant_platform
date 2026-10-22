@@ -1018,7 +1018,20 @@ async def websocket_endpoint(ws: WebSocket):
         # routes to loopback; the event stream carries the same information
         # and must not be open to remote clients either.
         host = ws.client.host if ws.client else ""
-        if host not in _LOOPBACK_HOSTS:
+        # A DNS-rebound page connects from 127.0.0.1 but presents its own
+        # Host/Origin; the HTTP guard rejects that, and the event stream must
+        # apply the same rule (it carries order/risk/portfolio events).
+        from quant_platform.app import (
+            _host_is_allowed,
+            _host_is_loopback,
+            _scope_host,
+        )
+
+        host_header = _scope_host(ws.scope)
+        host_ok = _host_is_loopback(host_header)
+        if not host_ok and os.environ.get("QUANT_ALLOWED_HOSTS", "").strip():
+            host_ok = _host_is_allowed(host_header)
+        if host not in _LOOPBACK_HOSTS or not host_ok:
             await ws.close(code=1008)
             return
     global _ws_pending
@@ -2389,6 +2402,14 @@ async def import_holdings(file_content: dict):
             raise HTTPException(
                 413, "Portfolio import is limited to 10,000 rows",
             )
+        # Disjoint per-row keys become distinct pandas columns: 10k rows with
+        # 40k keys built an 8M-cell frame (and far worse at the body cap).
+        allowed_keys = {"code", "hold_vol"}
+        for row in rows:
+            if not isinstance(row, dict) or not set(row) <= allowed_keys:
+                raise HTTPException(
+                    400, "Each row must contain only 'code' and 'hold_vol'",
+                )
 
         # Pandas parsing/cleaning is CPU-bound; keep it off the event loop.
         parsed = await run_in_threadpool(_parse_holdings_rows, rows)
@@ -2613,12 +2634,16 @@ async def create_order(order_req: dict):
         raise HTTPException(422, "ticker is required")
     # Canonical identity: `600519` and `600519.SH` must be one position.
     ticker = normalize_symbol(ticker)
+    if len(ticker) > 32:
+        raise HTTPException(422, "ticker is too long")
     try:
         quantity = int(order_req.get("quantity", 100))
     except (TypeError, ValueError) as exc:
         raise HTTPException(422, "quantity must be an integer") from exc
     if quantity <= 0:
         raise HTTPException(422, "quantity must be positive")
+    if quantity > 100_000_000:
+        raise HTTPException(422, "quantity exceeds the 100,000,000-share cap")
     side = order_req.get("side", "buy")
     if side not in ("buy", "sell"):
         raise HTTPException(422, "side must be 'buy' or 'sell'")
@@ -2633,6 +2658,9 @@ async def create_order(order_req: dict):
         if not np.isfinite(limit_price) or limit_price <= 0:
             raise HTTPException(422, "limit_price must be a finite positive number")
 
+    strategy = str(order_req.get("strategy", "") or "")
+    if len(strategy) > 64:
+        raise HTTPException(422, "strategy is limited to 64 characters")
     try:
         oms = _get_oms()
         order = oms.create_order(
@@ -2641,7 +2669,7 @@ async def create_order(order_req: dict):
             quantity=quantity,
             order_type=order_req.get("order_type") or order_req.get("type", "market"),
             limit_price=limit_price,
-            strategy=order_req.get("strategy", ""),
+            strategy=strategy,
         )
         # Auto-submit for market orders
         if order_req.get("auto_submit", True):
@@ -4127,6 +4155,8 @@ def smart_route_order(req: dict):
     # Canonical CODE.EXCHANGE keeps OMS position identity consistent with the
     # trading runner / live portfolio (D19/D30/D41).
     ticker = normalize_symbol(ticker)
+    if len(ticker) > 32:
+        raise HTTPException(422, "ticker is too long")
     try:
         quantity = int(quantity)
         adv = float(adv)
@@ -4134,6 +4164,8 @@ def smart_route_order(req: dict):
         raise HTTPException(422, "quantity and avg_daily_volume must be numbers") from exc
     if quantity <= 0:
         raise HTTPException(422, "quantity must be positive")
+    if quantity > 100_000_000:
+        raise HTTPException(422, "quantity exceeds the 100,000,000-share cap")
     if adv <= 0:
         raise HTTPException(422, "avg_daily_volume must be positive")
 
@@ -4941,10 +4973,11 @@ async def core_events(topic: str = "", limit: int = 50):
     )
     # The global ring carries every tenant's audit payloads. Serve those via
     # /api/core/audit (tenant-filtered) instead of leaking them here.
-    events = [
-        event for event in events
-        if not str(event.get("topic", "")).startswith("audit.")
-    ]
+    def _is_audit_event(event) -> bool:
+        topic = str(event.get("topic", "")).strip().lower()
+        return topic == "audit" or topic.startswith("audit.")
+
+    events = [event for event in events if not _is_audit_event(event)]
     return {"events": events}
 
 

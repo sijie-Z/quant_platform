@@ -110,6 +110,7 @@ class _FakeWebSocket:
         from types import SimpleNamespace
 
         self.client = SimpleNamespace(host=host)
+        self.scope = {"headers": [(b"host", b"localhost")]}
         self.close_code = None
         self.accepted = False
 

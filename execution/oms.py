@@ -40,6 +40,7 @@ MIN_LOT = 100                 # 1 lot = 100 shares
 #: 1,000 unthrottled orders accepted with no growth limit).
 MAX_ORDERS = 10_000
 MAX_SNAPSHOTS = 10_000
+MAX_FILLS_PER_ORDER = 1_000
 _PRUNE_RATIO = 0.9
 
 #: Bases that describe a return-generating (adjusted) series.  Cash, fills,
@@ -155,8 +156,13 @@ class OrderManager:
                 strategy=strategy,
                 notes=notes,
             )
-            self.orders[order.order_id] = order
             self._prune_orders()
+            if len(self.orders) >= MAX_ORDERS:
+                raise ValueError(
+                    "order book is at its active-order cap; fill or cancel "
+                    "open orders before creating more"
+                )
+            self.orders[order.order_id] = order
         logger.info("Created order %s: %s %s x%d @ %s",
                      order.order_id, side, ticker, quantity,
                      limit_price or "market")
@@ -170,7 +176,7 @@ class OrderManager:
         """
         if len(self.blotter) > MAX_ORDERS:
             self.blotter = self.blotter[-int(MAX_ORDERS * _PRUNE_RATIO):]
-        if len(self.orders) <= MAX_ORDERS:
+        if len(self.orders) < MAX_ORDERS:
             return
         target = int(MAX_ORDERS * _PRUNE_RATIO)
         removable = [
@@ -259,6 +265,10 @@ class OrderManager:
             raise ValueError(f"Invalid fill quantity: {qty!r}")
         if order.remaining_quantity <= 0:
             raise ValueError(f"Order {order_id} has no remaining quantity")
+        if len(order.fills) >= MAX_FILLS_PER_ORDER:
+            raise ValueError(
+                f"Order {order_id} reached the {MAX_FILLS_PER_ORDER}-fill cap"
+            )
         qty = min(qty, order.remaining_quantity)
 
         # Calculate costs

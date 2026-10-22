@@ -171,7 +171,7 @@ class TestLeaks:
         from quant_platform.risk import healthcheck
 
         sink = healthcheck.WebhookAlertSink(
-            "https://user:topsecret@alerts.example/hook?token=abc123",
+            "https://user:topsecret@alerts.example/hook/PATHSECRET?token=abc123",
         )
 
         def _fail(*args, **kwargs):
@@ -182,6 +182,7 @@ class TestLeaks:
             sink.emit({"severity": "warning", "message": "x"})
         assert "topsecret" not in caplog.text
         assert "abc123" not in caplog.text
+        assert "PATHSECRET" not in caplog.text
         assert "alerts.example" in caplog.text
 
 
@@ -242,3 +243,69 @@ def test_redaction_covers_secret_query_parameters():
     })
     assert redacted["webhook"] == REDACTED
     assert redacted["plain_url"] == "https://alerts.example/hook?kind=prod"
+
+
+async def _drive_ws(app, host):
+    scope = {
+        "type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "scheme": "ws", "path": "/api/ws", "raw_path": b"/api/ws",
+        "query_string": b"", "root_path": "",
+        "headers": [
+            (b"host", host.encode()),
+            (b"origin", b"http://" + host.encode()),
+        ],
+        "client": ("127.0.0.1", 4567), "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+    sent = []
+    queue = [{"type": "websocket.connect"}]
+
+    async def receive():
+        if queue:
+            return queue.pop(0)
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    async def send(message):
+        sent.append(message)
+
+    await app(scope, receive, send)
+    return sent
+
+
+class TestWebSocketRebinding:
+    def test_rebound_host_is_closed_in_tokenless_mode(self, app, monkeypatch):
+        """HTTP required a loopback Host; the WS stream must too."""
+        monkeypatch.delenv("QUANT_API_TOKEN", raising=False)
+        monkeypatch.delenv("QUANT_ALLOWED_HOSTS", raising=False)
+        import asyncio
+
+        sent = asyncio.run(_drive_ws(app, "attacker.example:8000"))
+        assert sent and sent[0]["type"] == "websocket.close"
+        assert sent[0]["code"] == 1008
+
+    def test_loopback_host_still_accepts(self, app, monkeypatch):
+        monkeypatch.delenv("QUANT_API_TOKEN", raising=False)
+        import asyncio
+
+        sent = asyncio.run(_drive_ws(app, "localhost:8000"))
+        assert sent and sent[0]["type"] == "websocket.accept"
+
+
+def test_portfolio_import_rejects_extra_columns(app):
+    client = TestClient(app)
+    rows = [{"code": "600519", "hold_vol": 100, f"junk{i}": i} for i in range(5)]
+    response = client.post("/api/portfolio/import", json={"data": rows})
+    assert response.status_code == 400
+    assert "only 'code' and 'hold_vol'" in response.json()["detail"]
+
+
+class TestActiveOrderCap:
+    def test_active_orders_are_rejected_at_the_cap(self, monkeypatch):
+        from quant_platform.execution import oms as oms_module
+
+        monkeypatch.setattr(oms_module, "MAX_ORDERS", 5)
+        om = oms_module.OrderManager(initial_cash=1_000_000)
+        for index in range(5):
+            om.create_order(f"{index:06d}", "buy", 100)
+        with pytest.raises(ValueError, match="active-order cap"):
+            om.create_order("999999", "buy", 100)

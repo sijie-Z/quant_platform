@@ -503,6 +503,7 @@ class RequestGuardMiddleware:
             return
 
         path = _normalized_route_path(scope)
+        is_docs_page = path in _PROTECTED_DOCS
         if path is not None:
             limited, retry_after = self._rate_limited(scope, path)
             if limited:
@@ -608,7 +609,7 @@ class RequestGuardMiddleware:
                     (b"x-frame-options", b"DENY"),
                     (b"referrer-policy", b"same-origin"),
                 ]
-                if b"text/html" in content_type:
+                if b"text/html" in content_type and not is_docs_page:
                     extra.append((
                         b"content-security-policy",
                         b"default-src 'self'; script-src 'self'; "

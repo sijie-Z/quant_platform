@@ -125,10 +125,15 @@ class WebhookAlertSink(AlertSink):
             from urllib.parse import urlsplit
 
             parts = urlsplit(self._url)
+            # Host only: Slack/Discord webhook tokens live in the path, so a
+            # path (or query) in the log would leak the credential.
+            try:
+                port = parts.port
+            except ValueError:
+                port = None
             safe_url = f"{parts.scheme}://{parts.hostname or '?'}"
-            if parts.port:
-                safe_url += f":{parts.port}"
-            safe_url += parts.path or "/"
+            if port:
+                safe_url += f":{port}"
             logger.error("Alert webhook delivery failed (%s): %s", safe_url, exc)
             return
         metrics.counter(
