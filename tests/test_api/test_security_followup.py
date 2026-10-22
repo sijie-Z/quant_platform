@@ -204,3 +204,41 @@ def test_safety_headers_present(app):
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["referrer-policy"] == "same-origin"
+
+
+class TestResourceBounds:
+    def test_store_stats_does_not_leak_an_absolute_path(self, app):
+        client = TestClient(app)
+        payload = client.get("/api/core/store/stats").json()
+        assert "db_path" not in payload
+        assert "/" not in payload.get("db_name", "")
+        assert "\\" not in payload.get("db_name", "")
+
+    def test_portfolio_import_is_row_bounded(self, app):
+        client = TestClient(app)
+        rows = [{"code": f"{index:06d}", "hold_vol": 100} for index in range(10_001)]
+        response = client.post("/api/portfolio/import", json={"data": rows})
+        assert response.status_code == 413
+
+    def test_l2_reads_do_not_lazily_start_the_provider(self, app, monkeypatch):
+        from quant_platform.api import routes
+
+        class _Stopped:
+            is_running = False
+
+        monkeypatch.setattr(routes, "_l2_provider", _Stopped())
+        client = TestClient(app)
+        response = client.get("/api/l2/book/600519")
+        assert response.status_code == 503
+        assert "POST /api/l2/start" in response.json()["detail"]
+
+
+def test_redaction_covers_secret_query_parameters():
+    from quant_platform.utils.version_manager import REDACTED, redact_secrets
+
+    redacted = redact_secrets({
+        "webhook": "https://alerts.example/hook?token=abc123",
+        "plain_url": "https://alerts.example/hook?kind=prod",
+    })
+    assert redacted["webhook"] == REDACTED
+    assert redacted["plain_url"] == "https://alerts.example/hook?kind=prod"

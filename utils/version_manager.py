@@ -81,9 +81,32 @@ def _is_secret_key(key: str) -> bool:
     return lowered == "auth" or lowered.endswith("_auth")
 
 
+_SENSITIVE_QUERY_KEYS = (
+    "token", "key", "secret", "password", "passwd", "signature",
+    "credential", "auth",
+)
+
+
 def _is_credential_url(value: str) -> bool:
-    """Whether a string is a URL of the form ``scheme://user:pass@host``."""
-    return bool(_CREDENTIAL_URL_RE.match(value))
+    """Whether a URL carries credentials or a secret query parameter.
+
+    Covers ``scheme://user:pass@host`` as well as webhook-style URLs such as
+    ``https://alerts.example/hook?token=...`` that leaked verbatim before.
+    """
+    if _CREDENTIAL_URL_RE.match(value):
+        return True
+    if "://" not in value:
+        return False
+    try:
+        from urllib.parse import parse_qsl, urlsplit
+
+        pairs = parse_qsl(urlsplit(value).query, keep_blank_values=True)
+    except ValueError:
+        return False
+    return any(
+        any(pattern in key.lower() for pattern in _SENSITIVE_QUERY_KEYS)
+        for key, _ in pairs
+    )
 
 
 class _FileLock:

@@ -221,6 +221,7 @@ class RunStatusWithPhase(RunStatus):
 _WS_QUEUE_SIZE = 256
 _WS_SEND_TIMEOUT = 5.0
 _WS_MAX_CLIENTS = 100
+_ws_pending = 0  # handshakes between the cap check and `accept()`
 _HIGH_RATE_TOPICS = frozenset({"market.tick"})
 _LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
 
@@ -1020,19 +1021,27 @@ async def websocket_endpoint(ws: WebSocket):
         if host not in _LOOPBACK_HOSTS:
             await ws.close(code=1008)
             return
-    if len(_ws_clients) >= _WS_MAX_CLIENTS:
+    global _ws_pending
+    # Reserve the slot before the first await: checking the set and adding
+    # after `accept()` let concurrent handshakes all pass the 100-client cap
+    # (99 -> 119 observed).
+    if len(_ws_clients) + _ws_pending >= _WS_MAX_CLIENTS:
         await ws.close(code=1013)
         return
-    # Capture the loop here: this is the one place guaranteed to be running on
-    # it before events start flowing. See _on_bus_event.
-    _remember_loop()
-    if bearer:
-        await ws.accept(subprotocol=bearer)
-    else:
-        await ws.accept()
-    client = _WSClient(ws)
-    client.task = asyncio.create_task(_ws_sender_loop(client))
-    _ws_clients.add(client)
+    _ws_pending += 1
+    try:
+        # Capture the loop here: this is the one place guaranteed to be
+        # running on it before events start flowing. See _on_bus_event.
+        _remember_loop()
+        if bearer:
+            await ws.accept(subprotocol=bearer)
+        else:
+            await ws.accept()
+        client = _WSClient(ws)
+        client.task = asyncio.create_task(_ws_sender_loop(client))
+        _ws_clients.add(client)
+    finally:
+        _ws_pending -= 1
     try:
         while True:
             await ws.receive_text()  # keep alive
@@ -2376,6 +2385,10 @@ async def import_holdings(file_content: dict):
         rows = file_content.get("data", [])
         if not rows:
             raise HTTPException(400, "No data provided")
+        if len(rows) > 10_000:
+            raise HTTPException(
+                413, "Portfolio import is limited to 10,000 rows",
+            )
 
         # Pandas parsing/cleaning is CPU-bound; keep it off the event loop.
         parsed = await run_in_threadpool(_parse_holdings_rows, rows)
@@ -5741,9 +5754,9 @@ def l2_order_book(code: str):
     """Get order book for a stock."""
     provider = _get_l2_provider()
     if not provider.is_running:
-        provider.start()
-        import time
-        time.sleep(0.3)
+        raise HTTPException(
+            503, "Level 2 provider is not running; POST /api/l2/start first",
+        )
     book = provider.get_order_book(code)
     if not book:
         raise HTTPException(404, f"No order book for {code}")
@@ -5763,9 +5776,9 @@ def l2_ticks(
     """
     provider = _get_l2_provider()
     if not provider.is_running:
-        provider.start()
-        import time
-        time.sleep(0.3)
+        raise HTTPException(
+            503, "Level 2 provider is not running; POST /api/l2/start first",
+        )
     ticks = provider.get_ticks(code, limit=limit)
     return [TickDataResponse(**t.to_dict()) for t in ticks]
 
@@ -5775,9 +5788,9 @@ def l2_vwap(code: str, n_ticks: int = Query(100, ge=1, le=5000)):
     """Compute VWAP from recent ticks."""
     provider = _get_l2_provider()
     if not provider.is_running:
-        provider.start()
-        import time
-        time.sleep(0.3)
+        raise HTTPException(
+            503, "Level 2 provider is not running; POST /api/l2/start first",
+        )
     ticks = provider.get_ticks(code, limit=n_ticks)
     if not ticks or sum(t.volume for t in ticks) <= 0:
         # Returning vwap=0.0 with n_ticks=100 presented "no data" as a price.
@@ -5794,9 +5807,9 @@ def l2_trade_flow(code: str, n_ticks: int = Query(100, ge=1, le=5000)):
     """Compute buy/sell trade flow imbalance."""
     provider = _get_l2_provider()
     if not provider.is_running:
-        provider.start()
-        import time
-        time.sleep(0.3)
+        raise HTTPException(
+            503, "Level 2 provider is not running; POST /api/l2/start first",
+        )
     flow = provider.compute_trade_flow(code, n_ticks=n_ticks)
     if flow["buy_volume"] + flow["sell_volume"] <= 0:
         raise HTTPException(404, f"No directional tick data for {code}")

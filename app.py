@@ -598,11 +598,28 @@ class RequestGuardMiddleware:
             if message.get("type") == "http.response.start":
                 headers = list(message.get("headers") or [])
                 present = {name.lower() for name, _ in headers}
-                for name, value in (
+                content_type = b""
+                for name, value in headers:
+                    if name.lower() == b"content-type":
+                        content_type = value.lower()
+                        break
+                extra = [
                     (b"x-content-type-options", b"nosniff"),
                     (b"x-frame-options", b"DENY"),
                     (b"referrer-policy", b"same-origin"),
-                ):
+                ]
+                if b"text/html" in content_type:
+                    extra.append((
+                        b"content-security-policy",
+                        b"default-src 'self'; script-src 'self'; "
+                        b"style-src 'self' 'unsafe-inline' "
+                        b"https://fonts.googleapis.com; "
+                        b"font-src 'self' data: https://fonts.gstatic.com; "
+                        b"img-src 'self' data:; connect-src 'self' ws: wss:; "
+                        b"object-src 'none'; base-uri 'self'; "
+                        b"frame-ancestors 'none'",
+                    ))
+                for name, value in extra:
                     if name not in present:
                         headers.append((name, value))
                 message = {**message, "headers": headers}

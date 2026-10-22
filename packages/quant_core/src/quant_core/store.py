@@ -1559,6 +1559,6 @@ class Store:
                 "signals": _count("SELECT COUNT(*) FROM signals" + where),
                 "sessions": _count("SELECT COUNT(*) FROM sessions" + where),
                 "events": _count("SELECT COUNT(*) FROM events" + where),
-                "db_path": self._db_path,
+                "db_name": Path(self._db_path).name,
                 "db_size_bytes": self.size_bytes(),
             }
