@@ -104,6 +104,114 @@ def stability_from_fold_metrics(fold_metrics: list[dict] | None) -> dict:
     }
 
 
+def select_walk_forward_factors(
+    ic_results: dict,
+    processed_factors: dict,
+    returns: pd.DataFrame,
+    *,
+    max_factors: int = 2,
+    significance_level: float = 0.05,
+) -> dict:
+    """Pick walk-forward factors after an IC t-test with BH-FDR control.
+
+    The old selector took the top ``max_factors`` by full-sample ``|ICIR|``
+    with no significance test, so a noise factor could reach the
+    walk-forward stage (and its OOS numbers were then selection-biased).
+
+    Per-factor significance is a two-sided t-test on the IC series,
+    approximated in the normal tail:
+
+        t = mean(IC) / std(IC) * sqrt(n) = ICIR * sqrt(n)
+
+    ``ic_results`` stores only scalar moments (mean/std/ICIR), not the IC
+    series or its length, so the very same Rank IC series is recomputed with
+    :func:`quant_platform.factors.evaluation.rank_ic` to obtain ``n``. This
+    is an approximation: the IC series is treated as iid (no autocorrelation
+    adjustment) and the t distribution is approximated by the normal one
+    (differences are negligible for the hundreds of daily ICs a real panel
+    produces). It is recorded as such in the returned detail.
+
+    Selection: among factors whose raw p-values survive Benjamini-Hochberg
+    at ``significance_level``, take the top ``max_factors`` by ``|ICIR|``.
+    If some survive but fewer than ``max_factors``, take all survivors. If
+    none survive, fall back to the old top-``|ICIR|`` selection and set
+    ``selection_warning`` — the fallback is explicit, never silent.
+
+    Returns a detail dict with ``method``, ``p_values``, ``n_obs``,
+    ``survivors``, ``selected``, ``fallback`` and ``selection_warning``.
+    """
+    from quant_platform.factors.evaluation import rank_ic
+    from quant_platform.research.validation import FactorValidator
+
+    validator = FactorValidator(significance_level=significance_level)
+    names = list(ic_results)
+    p_values: dict[str, float] = {}
+    n_obs: dict[str, int] = {}
+
+    for name in names:
+        factor = processed_factors.get(name)
+        if factor is None:
+            p_values[name] = 1.0
+            n_obs[name] = 0
+            continue
+        ic = rank_ic(factor, returns)
+        ic = ic[np.isfinite(np.asarray(ic, dtype=float))]
+        n = int(len(ic))
+        n_obs[name] = n
+        icir = _finite(ic_results[name].get("icir", float("nan")))
+        if n < 2 or not math.isfinite(icir):
+            p_values[name] = 1.0
+            continue
+        t_stat = icir * math.sqrt(n)
+        # Two-sided normal tail (selection uses |ICIR|, so sign does not
+        # matter). erfc(|t|/sqrt(2)) is P(|Z| >= |t|).
+        p_values[name] = min(1.0, math.erfc(abs(t_stat) / math.sqrt(2.0)))
+
+    if names:
+        mask = validator.multiple_testing_correction(
+            [p_values[n] for n in names], method="bh",
+        )
+        survivors = [n for n, ok in zip(names, mask, strict=True) if bool(ok)]
+    else:
+        survivors = []
+
+    selected = sorted(
+        survivors,
+        key=lambda n: abs(_finite(ic_results[n].get("icir", 0.0))),
+        reverse=True,
+    )[:max_factors]
+
+    fallback = False
+    selection_warning = None
+    if not selected and names:
+        fallback = True
+        selection_warning = (
+            "no factor survives BH-FDR; falling back to top-|ICIR|"
+        )
+        # Same ordering expression as the original selector.
+        ranked = sorted(
+            ic_results.items(), key=lambda x: abs(x[1].get("icir", 0)),
+            reverse=True,
+        )
+        selected = [name for name, _ in ranked[:max_factors]]
+
+    return {
+        "method": "full-sample ICIR two-sided t-test + BH-FDR",
+        "significance_level": significance_level,
+        "p_value_method": (
+            "normal approximation to t = ICIR*sqrt(n_obs); n_obs is the "
+            "length of the recomputed Rank IC series; IC autocorrelation "
+            "is not modelled"
+        ),
+        "p_values": p_values,
+        "n_obs": n_obs,
+        "survivors": survivors,
+        "selected": selected,
+        "fallback": fallback,
+        "selection_warning": selection_warning,
+    }
+
+
 def persist_validation_results(
     ic_results: dict,
     processed_factors: dict,
@@ -684,22 +792,31 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
-            # Pick top 2 factors by ICIR for walk-forward
-            sorted_factors = sorted(
-                ic_results.items(), key=lambda x: abs(x[1].get("icir", 0)), reverse=True
+            # Pick walk-forward factors by ICIR, but only among factors whose
+            # full-sample IC series is significant after a t-test and BH-FDR
+            # control. Selection details are kept for audit.
+            factor_selection = select_walk_forward_factors(
+                ic_results, processed_factors, returns,
             )
-            top_factors = [f[0] for f in sorted_factors[:min(2, len(sorted_factors))]]
+            step.details["factor_selection"] = factor_selection
+            top_factors = factor_selection["selected"]
             if top_factors:
                 step.warnings.append(
                     "walk-forward factors were selected by full-sample ICIR "
                     f"({', '.join(top_factors)}); their OOS metrics are "
                     "selection-biased"
                 )
+            if factor_selection["fallback"]:
+                step.warnings.append(factor_selection["selection_warning"])
 
             if not top_factors:
                 step.status = "skipped"
                 step.runtime_seconds = time.time() - t0
-                step.details = {"wf_result": None, "wf_results": {}}
+                step.details = {
+                    "wf_result": None,
+                    "wf_results": {},
+                    "factor_selection": factor_selection,
+                }
                 return step
 
             from quant_platform.backtest.walkforward import WalkForwardValidator
