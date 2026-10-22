@@ -174,6 +174,29 @@ python main.py web
 
 ---
 
+## 实时数据接入（默认不是实时行情）
+
+**默认 `data.provider: synthetic`**：离线、可复现，用于测试与研究演示，不是实时行情。真实/实时数据有三条路径，按需开启：
+
+| 路径 | 入口 | 说明 |
+|---|---|---|
+| 交易事件流 | `WS /api/ws`（`bearer.<token>` 子协议） | 引擎运行时推送 `order.*`/`trade.*`/`risk.*`/`portfolio.snapshot`，前端交易页实时刷新；无事件时保持长连接 |
+| 实时行情 | `GET /api/market/*`（AKShare 快照）、`GET /api/portfolio/live`（Baostock 报价）、`POST /api/ws-quotes/start` + `GET /api/ws-quotes`（东财/新浪 WebSocket） | 响应携带数据源与 `price_basis`；数据源不可用返回 503/明确原因，**不会伪装成实时** |
+| 真实研究/交易数据 | `data.provider: baostock`（免费无 key）或 `tushare`（`TUSHARE_TOKEN`），生产可用 `postgres` | 首次全量拉取较慢（500 只逐只拉取），之后命中缓存；`python main.py run --incremental` 只追加新交易日并刷新复权因子 |
+
+```yaml
+data:
+  provider: baostock        # synthetic | baostock | tushare | postgres
+  start_date: "2024-01-01"
+  end_date: "2026-10-21"
+```
+
+远程部署需设置 `QUANT_API_TOKEN`（前端 Settings 填同一个值）；UI 与 API 不同源时设置 `QUANT_ALLOWED_ORIGINS`。浏览器用 `localhost` 打开时 WebSocket 会自动改连 `127.0.0.1`（服务端默认只绑 IPv4）。
+
+实测备注（2026-10-22）：本机 Baostock 登录可达，但受限网络下 500 只全量串行拉取会超时；真实行情依赖网络与数据源可用性，取不到时系统明确报错/回退，不伪造实时数据。
+
+---
+
 ## 目录结构
 
 ```
@@ -210,7 +233,7 @@ quant_platform/
 ├── tools/                  # 研究工具：common_runner / sanity_check / attribution
 │
 ├── docs/                   # 文档：架构 / 里程碑 / 研究报告 / 协议
-├── tests/                  # 单元测试（236 个测试文件，3,337 条用例，覆盖全部模块）
+├── tests/                  # 单元测试（236 个测试文件，3,342 条用例，覆盖全部模块）
 ├── config/                 # YAML 配置（零硬编码）
 └── requirements.txt        # Python 依赖（版本锁定；adata 例外见下文）
 ```
