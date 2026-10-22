@@ -198,7 +198,7 @@ class WalkForwardValidator:
 
             # --- Build signal for this fold ---
             if factors is not None:
-                if len(fold_info["train_positions"]) == 0:
+                if fold_info["train_days"] == 0:
                     # An out-sized embargo can remove every day of a later
                     # fold's training window. There is nothing to fit on --
                     # record the fold instead of fabricating a signal.
@@ -301,7 +301,7 @@ class WalkForwardValidator:
                     m["test_end"] = str(fold_info["test_dates"][1])
                     # Trading days actually usable for training: the nominal
                     # window minus any embargo days removed from it.
-                    m["train_days"] = len(fold_info["train_positions"])
+                    m["train_days"] = fold_info["train_days"]
                     m["oos_days"] = len(oos_ret)
                     fold_metrics.append(m)
 
@@ -309,7 +309,7 @@ class WalkForwardValidator:
                     "fold": fi,
                     "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
                     "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
-                    "train_days": len(fold_info["train_positions"]),
+                    "train_days": fold_info["train_days"],
                     "oos_days": len(oos_ret),
                     "sharpe": fold_metrics[-1].get("sharpe_ratio", 0) if fold_metrics else 0,
                 })
@@ -324,7 +324,7 @@ class WalkForwardValidator:
                     "fold": fi,
                     "train": f"{fold_info['train_dates'][0]} -> {fold_info['train_dates'][1]}",
                     "test": f"{fold_info['test_dates'][0]} -> {fold_info['test_dates'][1]}",
-                    "train_days": len(fold_info["train_positions"]),
+                    "train_days": fold_info["train_days"],
                     "oos_days": 0,
                     "error": str(e)[:100],
                 })
@@ -451,6 +451,7 @@ class WalkForwardValidator:
                         removed[lo - train_sl.start:hi - train_sl.start] = True
                         embargo_ranges.append((int(lo), int(hi)))
             fold["train_positions"] = positions[~removed]
+            fold["train_days"] = len(fold["train_positions"])
             fold["embargo_ranges"] = embargo_ranges
 
     def _compute_signal_in_sample(
