@@ -432,9 +432,11 @@ class WalkForwardValidator:
         followed by ``embargo`` trading days. When the current *training*
         window covers any of those days, they are withheld from training --
         the market regime that was just evaluated must not flow straight back
-        into the next fit. Windows that end before the training window starts
-        leave it untouched, so the common rolling layout (step ==
-        test_period) keeps every training day.
+        into the next fit. Windows ending at or after the training window end
+        leave it untouched; in the common rolling layout (step ==
+        test_period) the immediately preceding test window ends exactly at
+        the current train end, so only older test windows contribute embargo
+        days there.
         """
         for i, fold in enumerate(folds):
             train_sl = fold["train_slice"]
