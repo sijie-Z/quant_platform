@@ -398,6 +398,12 @@ class CompareResult(BaseModel):
 class SweepResult(BaseModel):
     table: list[dict[str, Any]]
     best_params: dict[str, Any] | None = None
+    # Multiple-testing correction for the trial grid (DSR + BH-FDR). All
+    # optional so the response stays backward compatible for callers that
+    # only read ``table``/``best_params``.
+    num_trials: int | None = None
+    best_dsr: dict[str, Any] | None = None
+    selection_note: str | None = None
 
 
 class ConfigInfo(BaseModel):

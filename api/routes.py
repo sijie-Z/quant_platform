@@ -92,6 +92,7 @@ from quant_platform.main import (
     _load_data,
     _run_backtest,
 )
+from quant_platform.research.validation import validate_sweep_trials
 from quant_platform.utils.config import load_config
 from quant_platform.utils.logging import get_logger
 
@@ -2288,10 +2289,16 @@ def _run_sweep(req: SweepRequest) -> SweepResult:
 
     config = load_config(None)
     table = []
+    # Successful configurations keep their daily returns in memory so the
+    # grid's multiple-testing bias can be measured (DSR). ``row_config`` is
+    # parallel to ``table`` and maps a row back to its trial id.
+    trial_returns: dict[str, np.ndarray] = {}
+    row_config: list[str | None] = []
 
     for opt, freq, n_stocks in itertools.product(
         req.optimizers, req.frequencies, req.n_stocks_list
     ):
+        config_id = f"{opt}/{freq}/{n_stocks}"
         try:
             config.universe.n_stocks = n_stocks
             prices, returns, benchmark, metadata, financials, turnover = _load_data(config, use_tushare=False)
@@ -2305,6 +2312,9 @@ def _run_sweep(req: SweepRequest) -> SweepResult:
                 gates=_execution_gates(metadata),
             )
             s = bt_results["summary"]
+            daily_returns = bt_results.get("daily_returns")
+            if daily_returns is not None:
+                trial_returns[config_id] = np.asarray(daily_returns, dtype=float)
             table.append({
                 "Optimizer": opt,
                 "Frequency": freq,
@@ -2315,24 +2325,80 @@ def _run_sweep(req: SweepRequest) -> SweepResult:
                 "Sortino": round(s.get("sortino_ratio", 0), 2),
                 "Win Rate %": round(s.get("win_rate", 0) * 100, 1),
             })
+            row_config.append(config_id if config_id in trial_returns else None)
         except Exception as e:
             table.append({
                 "Optimizer": opt, "Frequency": freq, "N Stocks": n_stocks,
                 "Sharpe": "ERR", "Error": str(e)[:60],
             })
+            row_config.append(None)
+
+    validation = validate_sweep_trials(trial_returns) if trial_returns else None
+    if validation is not None:
+        for idx, config_id in enumerate(row_config):
+            if config_id is None:
+                continue
+            info = validation["trials"][config_id]
+            table[idx]["DSR p"] = info["dsr_p"]
+            table[idx]["BH Significant"] = info["bh_significant"]
 
     best = None
-    valid = [r for r in table if isinstance(r.get("Sharpe"), (int, float))]
+    best_idx = None
+    valid = [
+        (i, r) for i, r in enumerate(table)
+        if isinstance(r.get("Sharpe"), (int, float))
+    ]
     if valid:
-        best = max(valid, key=lambda r: r["Sharpe"])
+        best_idx, best_row = max(valid, key=lambda pair: pair[1]["Sharpe"])
         best = {
-            "optimizer": best["Optimizer"],
-            "frequency": best["Frequency"],
-            "n_stocks": best["N Stocks"],
-            "sharpe": best["Sharpe"],
+            "optimizer": best_row["Optimizer"],
+            "frequency": best_row["Frequency"],
+            "n_stocks": best_row["N Stocks"],
+            "sharpe": best_row["Sharpe"],
         }
 
-    return SweepResult(table=table, best_params=best)
+    # best_params above keeps its original meaning: the highest (rounded)
+    # Sharpe row. `best_dsr` only reports whether that same row survives the
+    # correction -- the selection itself is not silently changed.
+    best_dsr = None
+    selection_note = None
+    if best is not None:
+        best_config = row_config[best_idx]
+        if validation is not None and best_config in validation["trials"]:
+            info = validation["trials"][best_config]
+            best_dsr = {
+                "config": best_config,
+                "observed": info["observed_sharpe"],
+                "expected_max": info["expected_max_sharpe"],
+                "deflated_p": info["dsr_p"],
+                "raw_p": info["raw_p"],
+                "significant": bool(
+                    info["dsr_significant"] and info["bh_significant"]
+                ),
+                "dsr_significant": info["dsr_significant"],
+                "bh_significant": info["bh_significant"],
+            }
+            if not best_dsr["significant"]:
+                selection_note = (
+                    f"Best configuration {best_config} (Sharpe {best['sharpe']}) "
+                    f"does not survive multiple-testing correction: raw_p="
+                    f"{info['raw_p']:.4f}, DSR p={info['dsr_p']:.4f}, "
+                    f"BH-significant={info['bh_significant']}. The selected "
+                    "parameters are not statistically validated."
+                )
+        else:
+            selection_note = (
+                "Best configuration could not be validated: no daily return "
+                "series was available for multiple-testing correction."
+            )
+
+    return SweepResult(
+        table=table,
+        best_params=best,
+        num_trials=validation["num_trials"] if validation is not None else None,
+        best_dsr=best_dsr,
+        selection_note=selection_note,
+    )
 
 
 # ---------------------------------------------------------------------------
