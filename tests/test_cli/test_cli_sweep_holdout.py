@@ -79,6 +79,32 @@ def test_cmd_sweep_reports_invalid_holdout_config(monkeypatch, capsys):
     assert "strictly before" in captured.err
 
 
+def test_cmd_sweep_reports_loader_validation_error(monkeypatch, capsys):
+    """A real ``load_config()`` raises ``ConfigValidationError`` (a
+    ``ValueError``) for a bad holdout window in the YAML; the CLI must print
+    a clean error and exit non-zero before loading any data."""
+    def broken_loader(_path=None):
+        raise ValueError(
+            "config.research.holdout.start_date must be strictly before "
+            "end_date, got 2024-12-31 >= 2024-01-01",
+        )
+
+    monkeypatch.setattr(main, "load_config", broken_loader)
+    calls: list[str] = []
+    monkeypatch.setattr(main, "_load_data", lambda *a, **k: calls.append("load"))
+    monkeypatch.setattr(
+        main, "_run_backtest", lambda *a, **k: calls.append("backtest"),
+    )
+
+    rc = main.cmd_sweep(_args())
+
+    captured = capsys.readouterr()
+    assert rc != 0
+    assert "holdout" in captured.err
+    assert "strictly before" in captured.err
+    assert calls == []
+
+
 def test_cmd_sweep_runs_when_window_is_disjoint(monkeypatch, capsys):
     config = load_config(raw=_raw_config(
         "2024-07-01", "2024-12-31",

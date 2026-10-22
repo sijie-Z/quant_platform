@@ -166,6 +166,36 @@ class TestMasking:
             (pd.Timestamp("2024-04-01"), "A"),
         ]
 
+    def test_mask_frame_drop_forward_labels_drops_the_boundary_row(self):
+        """returns[t] labels t -> t+1, so the last pre-holdout row carries a
+        holdout-day return; the research mask must drop it as well."""
+        spec = HoldoutSpec(date(2024, 3, 1), date(2024, 3, 31))
+        index = pd.to_datetime([
+            "2024-02-28", "2024-02-29", "2024-03-01", "2024-04-01",
+        ])
+        frame = pd.DataFrame({"A": range(4)}, index=index)
+
+        default = spec.mask_frame(frame)
+        strict = spec.mask_frame(frame, drop_forward_labels=True)
+
+        assert list(default.index) == [
+            pd.Timestamp("2024-02-28"), pd.Timestamp("2024-02-29"),
+            pd.Timestamp("2024-04-01"),
+        ]
+        # 2024-02-29's forward label is 2024-03-01, a holdout day.
+        assert list(strict.index) == [
+            pd.Timestamp("2024-02-28"), pd.Timestamp("2024-04-01"),
+        ]
+
+    def test_mask_frame_drop_forward_labels_without_a_prior_row(self):
+        spec = HoldoutSpec(date(2024, 3, 1), date(2024, 3, 31))
+        index = pd.to_datetime(["2024-03-01", "2024-04-01"])
+        frame = pd.DataFrame({"A": [1, 2]}, index=index)
+
+        masked = spec.mask_frame(frame, drop_forward_labels=True)
+
+        assert list(masked.index) == [pd.Timestamp("2024-04-01")]
+
 
 class TestConfigWiring:
     def test_default_config_has_a_disabled_holdout(self):
@@ -194,6 +224,19 @@ class TestConfigWiring:
     def test_invalid_yaml_holdout_raises_value_error(self, start, end):
         with pytest.raises(ValueError):
             load_config(raw=_raw_config(start, end))
+
+    def test_validate_false_skips_holdout_validation_but_spec_still_fails(self):
+        """The config system's documented contract: validate=False builds
+        synthetic/partial configs without range/enum checks (the generic
+        schema round-trip test relies on it). The holdout is still validated
+        fail-loud wherever it is consumed, i.e. by HoldoutSpec.from_settings."""
+        raw = _raw_config("2024-12-31", "2024-01-01")  # start > end
+
+        config = load_config(raw=raw, validate=False)  # must not raise
+
+        assert config.research.holdout.start_date == "2024-12-31"
+        with pytest.raises(ValueError, match="strictly before"):
+            HoldoutSpec.from_settings(config)
 
 
 class TestSweepGuard:

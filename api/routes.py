@@ -2284,10 +2284,12 @@ async def sweep_parameters(req: SweepRequest):
     # Holdout discipline: a sweep selects/tunes parameters, so its data window
     # must not touch the final-evaluation holdout. Refuse before any analytics
     # work is scheduled. An empty holdout keeps the old behaviour unchanged.
-    config = load_config(None)
     try:
+        config = load_config(None)
         holdout_violation = sweep_guard_message(config)
     except ValueError as exc:
+        # ConfigValidationError subclasses ValueError: a bad holdout window in
+        # the YAML must reach the client as a readable 422, not a 500.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if holdout_violation is not None:
         raise HTTPException(status_code=422, detail=holdout_violation)

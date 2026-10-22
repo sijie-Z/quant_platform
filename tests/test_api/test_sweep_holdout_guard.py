@@ -165,3 +165,25 @@ def test_enabled_holdout_without_data_window_is_422(
     assert resp.status_code == 422
     assert "data window" in resp.json()["detail"]
     assert analytics_spy == []
+
+
+def test_config_loader_validation_error_is_a_422(
+    client, monkeypatch, analytics_spy,
+):
+    """The real ``load_config()`` raises ``ConfigValidationError`` (a
+    ``ValueError``) for a bad holdout window in the YAML. The endpoint must
+    surface that as a readable 422, not a 500, and still never schedule the
+    analytics work."""
+    def broken_loader(_path=None):
+        raise ValueError(
+            "config.research.holdout.start_date must be strictly before "
+            "end_date, got 2024-12-31 >= 2024-01-01",
+        )
+
+    monkeypatch.setattr(routes, "load_config", broken_loader)
+
+    resp = client.post("/api/sweep", json=_request())
+
+    assert resp.status_code == 422
+    assert "strictly before" in resp.json()["detail"]
+    assert analytics_spy == []

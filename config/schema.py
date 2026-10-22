@@ -124,40 +124,19 @@ class HoldoutConfig:
     """Final-evaluation holdout window (ISO dates; empty = disabled).
 
     The window is inclusive on both ends. Both dates must be set together and
-    ``start_date < end_date``; anything else is rejected here (during config
-    parsing) rather than silently disabling the holdout. Validation lives in
-    this dataclass so it runs wherever the schema is constructed, without
-    touching the generic loader.
+    ``start_date < end_date``. Validation lives in ``validate_config()``
+    (``utils/config.py``), not here: the config system's documented contract
+    is that ``load_config(validate=False)`` skips validation for synthetic /
+    partial configs (see ``utils/config.py``'s module docstring), and a
+    dataclass constructor cannot honour that flag. The constructor only
+    normalises ``None``/whitespace so empty means disabled.
     """
     start_date: str = ""
     end_date: str = ""
 
     def __post_init__(self) -> None:
-        from datetime import date
-
         self.start_date = "" if self.start_date is None else str(self.start_date).strip()
         self.end_date = "" if self.end_date is None else str(self.end_date).strip()
-        if not self.start_date and not self.end_date:
-            return
-        if not self.start_date or not self.end_date:
-            raise ValueError(
-                "config.research.holdout requires both start_date and end_date "
-                "(or neither); got "
-                f"start_date={self.start_date!r}, end_date={self.end_date!r}",
-            )
-        try:
-            start = date.fromisoformat(self.start_date)
-            end = date.fromisoformat(self.end_date)
-        except ValueError:
-            raise ValueError(
-                "config.research.holdout dates must be ISO dates "
-                f"(YYYY-MM-DD), got {self.start_date!r}/{self.end_date!r}",
-            ) from None
-        if start >= end:
-            raise ValueError(
-                "config.research.holdout.start_date must be strictly before "
-                f"end_date, got {start} >= {end}",
-            )
 
 
 @dataclass

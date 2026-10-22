@@ -209,13 +209,16 @@ class TestMaskResearchInputs:
             financials=financials, turnover=turnover,
         )
 
-        keep = list(dates[:3]) + list(dates[6:])
+        keep = list(dates[:2]) + list(dates[6:])
+        # dates[2] (the last row before the holdout) is dropped too: its
+        # forward t -> t+1 return label is the first holdout day's return.
         assert list(masked["prices"].index) == keep
         assert list(masked["returns"].index) == keep
         assert list(masked["benchmark"].index) == keep
         assert list(masked["turnover"].index) == keep
         assert keep == sorted(keep)  # original order preserved
-        # (date, asset) MultiIndex: 3 holdout days x 2 assets dropped.
+        # (date, asset) MultiIndex: 3 holdout days x 2 assets dropped (plus the
+        # boundary date for the forward-label guard).
         assert masked["financials"].index.get_level_values("date").unique().tolist() == keep
         assert info == {
             "spec": {"start_date": str(dates[3].date()),
@@ -223,10 +226,29 @@ class TestMaskResearchInputs:
             "excluded_days": 3,
         }
 
+    def test_forward_label_boundary_row_is_dropped(self):
+        """Returns[t] labels t -> t+1: the pre-holdout row leaks a holdout
+        return and must be dropped; frames stay aligned and ordered."""
+        dates = pd.bdate_range("2024-01-01", periods=6)
+        returns = pd.DataFrame({"A": np.arange(6, dtype=float)}, index=dates)
+        prices = returns.copy()
+        spec = HoldoutSpec(dates[3].date(), dates[4].date())
+
+        masked, info = mask_research_inputs(
+            spec, prices=prices, returns=returns, benchmark=None,
+            financials=None, turnover=None,
+        )
+
+        # Holdout rows 3-4 and the boundary row 2 are gone; 0-1 and 5 remain.
+        assert list(masked["returns"].index) == [dates[0], dates[1], dates[5]]
+        assert list(masked["prices"].index) == list(masked["returns"].index)
+        assert info["excluded_days"] == 2
+
     def test_none_inputs_pass_through(self):
         dates = pd.bdate_range("2024-01-01", periods=4)
         returns = pd.DataFrame({"A": [0.1, 0.2, 0.3, 0.4]}, index=dates)
-        spec = HoldoutSpec(dates[1].date(), dates[2].date())
+        # Window starts on the first row: no boundary row before it.
+        spec = HoldoutSpec(dates[0].date(), dates[1].date())
 
         masked, info = mask_research_inputs(
             spec, prices=None, returns=returns, benchmark=None,
@@ -305,10 +327,25 @@ class TestHoldoutResearchIsolation:
         }
         assert _selected(report) == ["clean", "holdout_alpha"]
 
+    def test_holdout_in_the_middle_warns_about_remaining_rows(self, monkeypatch):
+        # A non-tail holdout is allowed but documented as a risk: rows after
+        # the window can still span its (removed) price path in long-lookback
+        # factors, so the report says so instead of hiding it.
+        dates = pd.bdate_range("2020-01-02", periods=700)
+        spec = HoldoutSpec(dates[400].date(), dates[459].date())
+        report, _seen = _run_validator(monkeypatch, holdout=spec)
+
+        load_step = _step(report, "load_data")
+        assert any(
+            "holdout_not_at_tail" in warning for warning in load_step.warnings
+        )
+        assert report.holdout["excluded_days"] == 60
+
     def test_insufficient_samples_after_exclusion_skip_walk_forward(
         self, monkeypatch,
     ):
-        # 620 days - 60 holdout days = 560 < 504 train + 126 test.
+        # 620 days - 60 holdout days - 1 boundary (forward-label) day = 559
+        # remaining, below 504 train + 126 test.
         spec = _holdout_spec(n_dates=620, holdout_days=60)
         report, _seen = _run_validator(
             monkeypatch, holdout=spec, n_dates=620, holdout_days=60,
@@ -319,7 +356,10 @@ class TestHoldoutResearchIsolation:
         assert wf_step.details["wf_result"] is None
         assert wf_step.details["wf_results"] == {}
         assert wf_step.details["holdout_skip"]["excluded_days"] == 60
-        assert wf_step.details["holdout_skip"]["remaining_days"] == 560
+        assert wf_step.details["holdout_skip"]["remaining_days"] == 559
+        # The selection detail is still present, like the other skipped path.
+        assert "factor_selection" in wf_step.details
+        assert wf_step.details["factor_selection"]["selected"] == ["clean"]
         warning = " ".join(wf_step.warnings)
         assert "holdout excluded 60 trading days" in warning
         assert "required for walk-forward" in warning

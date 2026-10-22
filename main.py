@@ -1821,12 +1821,13 @@ def cmd_sweep(args) -> int:
 
     from quant_platform.research.holdout import sweep_guard_message
 
-    config = load_config(args.config)
-
     # Holdout discipline: a sweep selects/tunes parameters, so its data window
     # must not touch the final-evaluation holdout. Refuse before running any
-    # backtest; an empty holdout keeps the old behaviour unchanged.
+    # backtest; an empty holdout keeps the old behaviour unchanged. The config
+    # load is inside the guard so an invalid holdout window is reported as a
+    # clean error (ConfigValidationError is a ValueError), not a traceback.
     try:
+        config = load_config(args.config)
         holdout_violation = sweep_guard_message(config)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)

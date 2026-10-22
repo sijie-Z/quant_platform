@@ -192,18 +192,57 @@ class HoldoutSpec:
         """Drop holdout rows from an index, preserving the remaining order."""
         return index[~self._row_mask(index)]
 
+    def _drop_mask_with_forward_label(
+        self, index: pd.Index, level: str | None = None,
+    ) -> np.ndarray:
+        """Rows to drop when returns are labelled ``t -> t+1``.
+
+        Besides the holdout rows themselves, the last non-holdout row *before*
+        the window carries the first holdout day's return as its label, so it
+        would leak one holdout observation into IC/selection. Dropping that
+        boundary row removes every forward label tied to the holdout. The
+        holdout is a contiguous window, so at most one row per window is
+        affected.
+        """
+        dates = pd.to_datetime(
+            index.get_level_values(level or index.names[0])
+            if isinstance(index, pd.MultiIndex) else index
+        )
+        start = pd.Timestamp(self.start_date)
+        end = pd.Timestamp(self.end_date)
+        inside = np.asarray((dates >= start) & (dates <= end), dtype=bool)
+        if not inside.any():
+            return inside
+        before = dates[dates < start]
+        if len(before) == 0:
+            return inside
+        boundary = before.max()
+        return inside | np.asarray(dates == boundary)
+
     def mask_frame(
         self, frame: pd.DataFrame | pd.Series | None, level: str | None = None,
+        *, drop_forward_labels: bool = False,
     ) -> pd.DataFrame | pd.Series | None:
         """Drop holdout rows from a date-indexed frame/series.
 
         ``level`` selects the date level for a MultiIndex (e.g. financials are
         indexed by ``(date, asset)``).  ``None`` passes through.
+
+        ``drop_forward_labels=True`` also drops the last row *before* the
+        window: the pipeline labels ``returns[t]`` with the ``t -> t+1``
+        return, so that row's label is a holdout-day return. The research
+        path uses this mode for every input, keeping all frames aligned while
+        ensuring no holdout return reaches IC or selection.
         """
         if frame is None:
             return None
-        mask = self._row_mask(frame.index, level=level)
-        return frame.loc[~mask]
+        if drop_forward_labels:
+            drop = self._drop_mask_with_forward_label(
+                frame.index, level=level,
+            )
+        else:
+            drop = self._row_mask(frame.index, level=level)
+        return frame.loc[~drop]
 
 
 def sweep_guard_message(config: Any) -> str | None:
@@ -242,9 +281,14 @@ def load_configured_holdout(config: Any = None) -> HoldoutSpec | None:
     The YAML config is the authoritative source.  ``config`` may be passed in
     (e.g. an already-loaded ``Config``); otherwise the default config chain
     (``QUANT_CONFIG`` / ``config/default.yaml``) is loaded.
+
+    The fallback load uses ``validate=False`` on purpose: a research sprint
+    must not be blocked by an unrelated range/enum error elsewhere in the
+    config file, while the holdout section itself is validated right here by
+    :meth:`HoldoutSpec.from_settings` (still fail-loud for a bad window).
     """
     if config is None:
         from quant_platform.utils.config import load_config
 
-        config = load_config()
+        config = load_config(validate=False)
     return HoldoutSpec.from_settings(config)

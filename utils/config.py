@@ -589,6 +589,19 @@ def validate_config(config: Config) -> Config:
         f"got {execution.qmt.connect_timeout!r}",
     )
 
+    # Research holdout window (optional final-evaluation reservation).
+    # R3: validated here rather than in HoldoutConfig.__post_init__ because
+    # this module's contract is that ``validate=False`` skips validation for
+    # synthetic/partial configs; a dataclass constructor cannot honour that
+    # flag. HoldoutSpec.from_settings() re-validates at every consumption
+    # point (sweep guards, research validation), so runtime stays fail-loud.
+    from quant_platform.research.holdout import HoldoutSpec
+
+    try:
+        HoldoutSpec.from_settings(config)
+    except ValueError as exc:
+        raise ConfigValidationError(str(exc)) from exc
+
     return config
 
 

@@ -57,16 +57,27 @@ def mask_research_inputs(
     ``(date, asset)`` MultiIndex panel, hence the ``level="date"`` mask;
     ``None`` inputs pass through.
 
+    Every input is masked with ``drop_forward_labels=True``: returns are
+    labelled ``t -> t+1``, so the last row before the window carries the first
+    holdout day's return and is dropped as well (one row per window). That
+    also keeps all frames on the same index.
+
     Returns ``(masked_inputs, holdout_info)`` where ``holdout_info`` is the
-    ``{"spec": {...}, "excluded_days": N}`` record written into the report.
+    ``{"spec": {...}, "excluded_days": N}`` record written into the report
+    (``excluded_days`` counts holdout rows, not the extra boundary row).
     """
     excluded = int(spec.excluded_days(returns.index)) if returns is not None else 0
     masked = {
-        "prices": spec.mask_frame(prices),
-        "returns": spec.mask_frame(returns),
-        "benchmark": spec.mask_frame(benchmark),
-        "financials": spec.mask_frame(financials, level="date"),
-        "turnover": spec.mask_frame(turnover),
+        "prices": spec.mask_frame(
+            prices, drop_forward_labels=True),
+        "returns": spec.mask_frame(
+            returns, drop_forward_labels=True),
+        "benchmark": spec.mask_frame(
+            benchmark, drop_forward_labels=True),
+        "financials": spec.mask_frame(
+            financials, level="date", drop_forward_labels=True),
+        "turnover": spec.mask_frame(
+            turnover, drop_forward_labels=True),
     }
     info = {"spec": spec.to_dict(), "excluded_days": excluded}
     return masked, info
@@ -558,8 +569,10 @@ class ResearchValidator:
         self.factor_store_path = factor_store_path
         #: Final-evaluation window. ``_HOLDOUT_UNSET`` (the default) means
         #: "resolve from the platform configuration" so the CLI research path
-        #: is protected without extra wiring; an explicit ``None`` disables
-        #: the holdout regardless of config; a spec applies it directly.
+        #: is protected without extra wiring. The explicit parameter is a
+        #: test-only override (it lets a test pin either state); production
+        #: callers must leave it unset and must never pass ``None`` to bypass
+        #: a configured holdout.
         self._holdout_explicit = holdout is not _HOLDOUT_UNSET
         self.holdout: HoldoutSpec | None = (
             None if holdout is _HOLDOUT_UNSET else holdout  # type: ignore[assignment]
@@ -659,6 +672,21 @@ class ResearchValidator:
                 f"({holdout_info['spec']['start_date']}.."
                 f"{holdout_info['spec']['end_date']})"
             )
+            # A holdout in the middle of the sample leaves rows after it. Their
+            # dates are kept, but a long-lookback factor can still span the
+            # (removed) holdout price path. The documented usage is a final
+            # evaluation window at the tail; say so instead of hiding it.
+            if (
+                returns is not None
+                and len(returns) > 0
+                and pd.Timestamp(returns.index.max())
+                > pd.Timestamp(holdout_spec.end_date)
+            ):
+                step1.warnings.append(
+                    "holdout_not_at_tail: rows after the holdout are kept; "
+                    "long-lookback factors on those rows can still span the "
+                    "holdout price path even though its dates were removed"
+                )
         report.holdout = holdout_info
 
         # Step 2: Register and get factors
@@ -706,10 +734,8 @@ class ResearchValidator:
                 processed_factors, returns,
             )
             step3.details["ic_results"] = ic_results
+            step3.details["holdout_ic_recomputed"] = True
             step3.warnings.extend(ic_warnings)
-            step3.warnings.append(
-                "ic_moments_recomputed_after_holdout_exclusion"
-            )
 
         # Step 4: Run walk-forward on each factor (up to max_folds)
         step4 = self._step_walk_forward(
@@ -962,9 +988,20 @@ class ResearchValidator:
         )
         t0 = time.time()
         try:
+            # Pick walk-forward factors by ICIR, but only among factors whose
+            # full-sample IC series is significant after a t-test and BH-FDR
+            # control. Selection details are kept for audit.
+            factor_selection = select_walk_forward_factors(
+                ic_results, processed_factors, returns,
+            )
+            step.details["factor_selection"] = factor_selection
+            top_factors = factor_selection["selected"]
+
             # If the holdout left fewer days than a single walk-forward window
             # needs, say so and skip: never fabricate OOS metrics, and never
-            # report a "completed" walk-forward that measured nothing.
+            # report a "completed" walk-forward that measured nothing. The
+            # selection detail above stays in the report for consistency with
+            # the other skipped path.
             required_days = _WF_TRAIN_PERIOD + _WF_TEST_PERIOD
             if (
                 holdout_excluded_days > 0
@@ -979,26 +1016,16 @@ class ResearchValidator:
                     f"({_WF_TRAIN_PERIOD} train + {_WF_TEST_PERIOD} test). "
                     "No walk-forward was run."
                 )
-                step.details = {
-                    "wf_result": None,
-                    "wf_results": {},
-                    "holdout_skip": {
-                        "excluded_days": int(holdout_excluded_days),
-                        "remaining_days": int(len(returns)),
-                        "required_days": required_days,
-                    },
+                step.details["wf_result"] = None
+                step.details["wf_results"] = {}
+                step.details["holdout_skip"] = {
+                    "excluded_days": int(holdout_excluded_days),
+                    "remaining_days": int(len(returns)),
+                    "required_days": required_days,
                 }
                 step.runtime_seconds = time.time() - t0
                 return step
 
-            # Pick walk-forward factors by ICIR, but only among factors whose
-            # full-sample IC series is significant after a t-test and BH-FDR
-            # control. Selection details are kept for audit.
-            factor_selection = select_walk_forward_factors(
-                ic_results, processed_factors, returns,
-            )
-            step.details["factor_selection"] = factor_selection
-            top_factors = factor_selection["selected"]
             if top_factors:
                 step.warnings.append(
                     "walk-forward factors were selected by full-sample ICIR "
