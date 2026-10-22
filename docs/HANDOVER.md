@@ -438,10 +438,10 @@ Vue 组件 37 个。计数会随代码变化，以 `main.py --help`、`pytest --
 | 安全加固（P1/P2） | sweep/parallel-sweep/研究窗口全部有界（组合 ≤200、n_stocks 50–1000、日期 2000–2100/≤10 年、workers≤4）；`/api/core/store/*` 与审计按租户过滤（`X-Tenant-Id`/`tenant_id`，跨租户需 loopback+显式 `all_tenants`），`delete_position` 必须有租户；HTML 报告转义+CSP、保留归档 CSV 公式注入中和、配置版本后缀密钥脱敏、WS 查询 token 移除、指标标签基数有界、QMT 密码禁止请求体、Tushare 客户端强制 HTTPS；`python-multipart`/`lightgbm` 升级到修复版本 |
 | 公司行动 | provider 契约 `get_corporate_actions`（送转/派息，规范化/组合事件拆分）、pipeline 访问器、Synthetic/Tushare/Baostock 数据源；paper broker/ExecutionEngine/LiveEngine/LiveRunner/dual-track PaperBroker 按除权日幂等应用（拆股数量/成本、现金分红入账、T+1、持久化 `(asset, ex_date)` 标记），真实券商不本地应用；Web 引擎/CLI trade/daemon 全部接线，报告 `corporate_actions_applied` |
 | 安全复核修复 | 单边日期参数先与配置合并再做 10 年跨度检查（`end_date=2100-12-31` 曾展开为 29,218 天），GET 研究端点纳入令牌桶；无 token 的 loopback 旁路增加 Host 必须为 loopback 名称（防 DNS rebinding），配置 `QUANT_ALLOWED_HOSTS` 时拒绝缺失 Host；大请求体在缓冲前先鉴权（>64KB 未认证直接 401/403）；`/api/core/events` 不再泄露其他租户的 `audit.*` 事件；Prometheus `method` 标签白名单（未知→OTHER）；QMT `server` 禁止请求体指定（仅 `QMT_SERVER`）；webhook 失败日志脱敏 URL；配置脱敏覆盖列表值；响应加 nosniff/DENY/referrer 安全头 |
-| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **3,325 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
+| 验证 | 新增 53 条价格基测试（`test_price_basis*`、`test_symbol_normalization`）；全量 **3,330 passed / 3 skipped / 0 failed**；ruff 全绿；CI 另修两处环境差异（fresh-boot 首条告警被 `monotonic` 节流吞掉、无 pyarrow 时缓存回退 CSV） |
 
-**当前计数（2026-10-21 实测）**：3,014 个测试函数、3,328 条用例
-（3,325 passed / 3 skipped）、236 个测试文件、约 233 个非测试 Python 文件、
+**当前计数（2026-10-21 实测）**：3,019 个测试函数、3,333 条用例
+（3,330 passed / 3 skipped）、236 个测试文件、约 233 个非测试 Python 文件、
 99 HTTP + 1 WebSocket、21 个 CLI 命令、37 个 Vue 组件。
 
 **仍未处理（诚实清单）**：多租户隔离（#75）；
