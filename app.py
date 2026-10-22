@@ -350,7 +350,17 @@ def _origin_is_allowed(scope) -> bool:
     request_origin = _split_host_port(host, _DEFAULT_PORTS[scheme])
     if request_origin is None:
         return False
-    return origin == (scheme, request_origin[0], request_origin[1])
+    if origin == (scheme, request_origin[0], request_origin[1]):
+        return True
+    # localhost and 127.0.0.1 (or ::1) are the same machine: a page opened at
+    # http://localhost may legitimately connect its WebSocket to 127.0.0.1
+    # because the server binds IPv4 only. Both ends must still be loopback.
+    return (
+        origin[0] == scheme
+        and origin[2] == request_origin[1]
+        and _host_is_loopback(origin[1])
+        and _host_is_loopback(request_origin[0])
+    )
 
 
 def _requires_auth(scope) -> bool:
@@ -443,6 +453,21 @@ class RequestGuardMiddleware:
             (method == "POST" and path in _RATE_LIMITED_PATHS)
             or (method == "GET" and path in _RATE_LIMITED_GET_PATHS)
         )
+        if applies and method == "GET":
+            # The local dashboard loads several research panels per view and
+            # a couple of reloads could exhaust a 20-token bucket. Loopback
+            # clients with a loopback Host are the trusted local UI (remote
+            # clients and DNS-rebound hosts are not exempt).
+            peer = (scope.get("client") or ("", 0))[0]
+            host = _scope_host(scope)
+            if peer in ("127.0.0.1", "::1", "localhost", "testclient") and (
+                _host_is_loopback(host)
+                or (
+                    os.environ.get("QUANT_ALLOWED_HOSTS", "").strip()
+                    and _host_is_allowed(host)
+                )
+            ):
+                return False, 0.0
         if not applies:
             return False, 0.0
         client = scope.get("client")

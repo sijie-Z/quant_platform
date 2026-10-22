@@ -245,14 +245,14 @@ def test_redaction_covers_secret_query_parameters():
     assert redacted["plain_url"] == "https://alerts.example/hook?kind=prod"
 
 
-async def _drive_ws(app, host):
+async def _drive_ws(app, host, origin=None):
     scope = {
         "type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1",
         "scheme": "ws", "path": "/api/ws", "raw_path": b"/api/ws",
         "query_string": b"", "root_path": "",
         "headers": [
             (b"host", host.encode()),
-            (b"origin", b"http://" + host.encode()),
+            (b"origin", b"http://" + (origin or host).encode()),
         ],
         "client": ("127.0.0.1", 4567), "server": ("testserver", 80),
         "subprotocols": [],
@@ -290,6 +290,16 @@ class TestWebSocketRebinding:
         sent = asyncio.run(_drive_ws(app, "localhost:8000"))
         assert sent and sent[0]["type"] == "websocket.accept"
 
+    def test_localhost_origin_may_target_ipv4_loopback(self, app, monkeypatch):
+        """The UI opened at localhost must be able to use ws://127.0.0.1."""
+        monkeypatch.delenv("QUANT_API_TOKEN", raising=False)
+        import asyncio
+
+        sent = asyncio.run(_drive_ws(
+            app, "127.0.0.1:8000", origin="localhost:8000",
+        ))
+        assert sent and sent[0]["type"] == "websocket.accept"
+
 
 def test_portfolio_import_rejects_extra_columns(app):
     client = TestClient(app)
@@ -309,3 +319,31 @@ class TestActiveOrderCap:
             om.create_order(f"{index:06d}", "buy", 100)
         with pytest.raises(ValueError, match="active-order cap"):
             om.create_order("999999", "buy", 100)
+
+
+class TestGetRateLimitExemption:
+    def test_loopback_ui_is_not_bucket_limited_for_get(self, monkeypatch):
+        from quant_platform.app import RequestGuardMiddleware
+
+        guard = RequestGuardMiddleware(app=None)
+        scope = _raw_scope(
+            path="/api/analysis/ic-decay", client=("127.0.0.1", 4444),
+        )
+        for _ in range(40):
+            limited, _retry = guard._rate_limited(
+                scope, "/api/analysis/ic-decay",
+            )
+            assert limited is False
+
+    def test_remote_get_is_still_bucket_limited(self):
+        from quant_platform.app import RequestGuardMiddleware
+
+        guard = RequestGuardMiddleware(app=None)
+        scope = _raw_scope(
+            path="/api/analysis/ic-decay", client=("203.0.113.9", 4444),
+        )
+        results = [
+            guard._rate_limited(scope, "/api/analysis/ic-decay")[0]
+            for _ in range(25)
+        ]
+        assert results[-1] is True

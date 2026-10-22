@@ -27,6 +27,7 @@ Cost control:
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -458,6 +459,40 @@ def _resolve_and_load(config: Any, memo_key: str) -> ResearchContext:
     return _load_and_cache(config, resolution, key)
 
 
+#: One in-flight build per key. A dashboard that opens correlation and
+#: ic-decay (or a reload while the first build runs) must not spend both
+#: analytics slots on the same context: followers await the leader's future
+#: without occupying a worker.
+_inflight_lock = threading.Lock()
+_inflight: dict[str, asyncio.Future] = {}
+
+
+async def _single_flight(key: str, factory):
+    loop = asyncio.get_running_loop()
+    with _inflight_lock:
+        future = _inflight.get(key)
+        leader = future is None
+        if leader:
+            future = loop.create_future()
+            _inflight[key] = future
+    if not leader:
+        return await asyncio.shield(future)
+    try:
+        result = await factory()
+    except BaseException as exc:
+        if not future.done():
+            future.set_exception(exc)
+        raise
+    else:
+        if not future.done():
+            future.set_result(result)
+        return result
+    finally:
+        with _inflight_lock:
+            if _inflight.get(key) is future:
+                _inflight.pop(key, None)
+
+
 async def get_research_context(
     *,
     start_date: str | None = None,
@@ -488,13 +523,17 @@ async def get_research_context(
         # the memoized provider on a worker.
         from quant_platform.api import routes as routes_module
 
-        return await routes_module._run_analytics(
-            _load_and_cache, cfg, memo["resolution"], context_key,
+        return await _single_flight(
+            f"ctx:{context_key}",
+            lambda: routes_module._run_analytics(
+                _load_and_cache, cfg, memo["resolution"], context_key,
+            ),
         )
 
     # Imported lazily: routes imports this module at startup.
     from quant_platform.api import routes as routes_module
 
-    return await routes_module._run_analytics(
-        _resolve_and_load, cfg, memo_key,
+    return await _single_flight(
+        f"memo:{memo_key}",
+        lambda: routes_module._run_analytics(_resolve_and_load, cfg, memo_key),
     )

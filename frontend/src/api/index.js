@@ -85,12 +85,45 @@ export function getWsUrl() {
     }
   }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}${base.replace(/\/+$/, '')}/ws`
+  // A server bound to 127.0.0.1 does not accept the browser's IPv6-first
+  // `localhost` resolution for WebSockets (HTTP falls back, WS does not), so
+  // the shipped local UI would loop on reconnect. Prefer the IPv4 loopback
+  // host when the page itself was opened via localhost.
+  const host = location.hostname === 'localhost'
+    ? `127.0.0.1${location.port ? `:${location.port}` : ''}`
+    : location.host
+  return `${proto}//${host}${base.replace(/\/+$/, '')}/ws`
 }
 
 const api = axios.create({
   baseURL: getApiBase(),
   timeout: 300000, // 5 min for long pipeline runs
+})
+
+// The analysis/monitor GETs build a heavy research context on first use; if
+// the two analytics workers are busy the backend answers 429 + Retry-After.
+// Retry those safe reads twice instead of leaving a panel blank until reload.
+api.interceptors.response.use(undefined, async (error) => {
+  const cfg = error && error.config
+  const status = error && error.response && error.response.status
+  const method = String((cfg && cfg.method) || 'get').toLowerCase()
+  if (status === 429 && cfg && method === 'get') {
+    cfg.__rateRetries = (cfg.__rateRetries || 0) + 1
+    if (cfg.__rateRetries <= 4) {
+      const retryAfter = Number(
+        (error.response.headers && error.response.headers['retry-after']) || 5,
+      )
+      // A first context build can hold an analytics slot for ~a minute;
+      // back off exponentially instead of burning every retry in 15 s.
+      const waitMs = Math.min(
+        20000,
+        Math.max(1000, retryAfter * 1000 * (2 ** (cfg.__rateRetries - 1))),
+      )
+      await new Promise((resolve) => setTimeout(resolve, waitMs))
+      return api.request(cfg)
+    }
+  }
+  return Promise.reject(error)
 })
 
 // Optional bearer token, mirroring the backend's QUANT_API_TOKEN mode.
