@@ -42,6 +42,38 @@ def test_run_backtest_forwards_portfolio_config(monkeypatch):
     assert captured["covariance_ewma_half_life"] == 21
 
 
+def test_run_backtest_forwards_both_execution_masks(monkeypatch):
+    """R6b: main must hand ``tradable_mask`` and ``universe_mask`` to the
+    engine unchanged (buys check both, sells check tradability only)."""
+    import quant_platform.backtest.engine as engine_mod
+
+    config = load_config(str(DEFAULT_CONFIG))
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, **kwargs):
+            captured.update(kwargs)
+            return {"summary": {}, "daily_returns": None, "weights_history": {}}
+
+    monkeypatch.setattr(engine_mod, "BacktestEngine", FakeEngine)
+
+    dates = pd.bdate_range("2024-01-02", periods=3)
+    tradable = pd.DataFrame(True, index=dates, columns=["A", "B"])
+    universe = pd.DataFrame(True, index=dates, columns=["A", "B"])
+    universe.loc[dates[-1], "B"] = False
+
+    _run_backtest(
+        config, None, None, None, None, None, None,
+        gates={"tradable_mask": tradable, "universe_mask": universe},
+    )
+
+    assert captured["tradable_mask"] is tradable
+    assert captured["universe_mask"] is universe
+
+
 def test_engine_forwards_ewma_half_life_to_covariance(monkeypatch):
     import quant_platform.backtest.engine as engine_mod
     from quant_platform.backtest.engine import BacktestEngine
