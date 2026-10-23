@@ -4,10 +4,12 @@ import numpy as np
 import pandas as pd
 import pytest
 from quant_platform.portfolio.constraints import PortfolioConstraints
+from quant_platform.portfolio.covariance import estimate_covariance
 from quant_platform.portfolio.optimizers import (
     EqualWeightOptimizer,
     MeanVarianceOptimizer,
     RiskParityOptimizer,
+    _ensure_psd,
 )
 
 
@@ -752,3 +754,200 @@ def test_infeasible_capacity_falls_back_with_a_warning(caplog):
         for record in caplog.records
     )
     assert weights.sum() > 0.0  # a portfolio is still returned
+
+
+# ---------------------------------------------------------------------------
+# R15: numerical stability for (near-)singular covariances
+# ---------------------------------------------------------------------------
+
+# Weights produced by the pre-R15 MeanVarianceOptimizer (HEAD c00a056) on
+# ``_r15_well_conditioned_case``. The relative ridge and the PSD-certification
+# change are numerical hardening, not a strategy change: these decisions must
+# be reproduced within 1e-6.
+_R15_WELL_CONDITIONED_BASELINE_NO_PREV = {
+    'S00': 0.0090858940, 'S01': 0.0000000006, 'S02': 0.0000000000,
+    'S03': 0.0259619017, 'S04': 0.0292168874, 'S05': 0.0479369843,
+    'S06': 0.0176481637, 'S07': 0.0457303015, 'S08': 0.0054938823,
+    'S09': 0.0107563108, 'S10': 0.0000000000, 'S11': 0.0031595525,
+    'S12': 0.0119331185, 'S13': 0.0313959755, 'S14': 0.0732134799,
+    'S15': 0.0000000000, 'S16': 0.0263243915, 'S17': 0.0191505376,
+    'S18': 0.0091740539, 'S19': 0.0000000000, 'S20': 0.0085706322,
+    'S21': 0.0497255791, 'S22': 0.0394152634, 'S23': 0.0541271115,
+    'S24': 0.0000000002, 'S25': 0.0259640201, 'S26': 0.0142178181,
+    'S27': 0.0000000000, 'S28': 0.0124382658, 'S29': 0.0207591049,
+    'S30': 0.0000000000, 'S31': 0.0142488758, 'S32': 0.0253156602,
+    'S33': 0.0168671777, 'S34': 0.0219836047, 'S35': 0.0000000000,
+    'S36': 0.0000000002, 'S37': 0.0000000000, 'S38': 0.0552044151,
+    'S39': 0.0423313502, 'S40': 0.0105493774, 'S41': 0.0299690040,
+    'S42': 0.0071752869, 'S43': 0.0000000000, 'S44': 0.0230492698,
+    'S45': 0.0354185312, 'S46': 0.0228161150, 'S47': 0.0300284561,
+    'S48': 0.0101607971, 'S49': 0.0634828478,
+}
+_R15_WELL_CONDITIONED_BASELINE_WITH_PREV = {
+    'S00': 0.0000000000, 'S01': 0.0739112152, 'S02': 0.0000000000,
+    'S03': 0.0000000000, 'S04': 0.0448605928, 'S05': 0.0800000000,
+    'S06': 0.0000000000, 'S07': 0.0225011258, 'S08': 0.0000000001,
+    'S09': 0.0800000000, 'S10': 0.0000000000, 'S11': 0.0000000000,
+    'S12': 0.0000000000, 'S13': 0.0220460576, 'S14': 0.0596881660,
+    'S15': 0.0800000000, 'S16': 0.0357316952, 'S17': 0.0800000000,
+    'S18': 0.0000000000, 'S19': 0.0005839465, 'S20': 0.0120058791,
+    'S21': 0.0800000000, 'S22': 0.0216979232, 'S23': 0.0070835720,
+    'S24': 0.0000000000, 'S25': 0.0360012885, 'S26': 0.0100591701,
+    'S27': 0.0017068224, 'S28': 0.0387438218, 'S29': 0.0044206908,
+    'S30': 0.0000000000, 'S31': 0.0000000000, 'S32': 0.0000000000,
+    'S33': 0.0748570562, 'S34': 0.0192694567, 'S35': 0.0000000000,
+    'S36': 0.0021331058, 'S37': 0.0263711358, 'S38': 0.0800000000,
+    'S39': 0.0000000000, 'S40': 0.0000000000, 'S41': 0.0030428819,
+    'S42': 0.0000000000, 'S43': 0.0000000001, 'S44': 0.0000000000,
+    'S45': 0.0000000000, 'S46': 0.0000000000, 'S47': 0.0000000000,
+    'S48': 0.0000000000, 'S49': 0.0032843964,
+}
+
+
+def _r15_well_conditioned_case():
+    """Same fixture as the R15 pre-change comparison run."""
+    rng = np.random.default_rng(42)
+    n = 50
+    assets = [f"S{i:02d}" for i in range(n)]
+    signal = pd.Series(rng.normal(size=n), index=assets)
+    signal = signal - signal.min() + 0.1
+    a = rng.normal(size=(n, n))
+    cov = pd.DataFrame(a @ a.T + np.eye(n) * 0.01, index=assets, columns=assets)
+    sectors = pd.Series([f"SEC{i % 5}" for i in range(n)], index=assets)
+    prev = pd.Series(0.0, index=assets)
+    prev.loc[signal.nsmallest(10).index] = 0.10
+    constraints = PortfolioConstraints(
+        max_weight=0.08, max_sector_exposure=0.30, max_turnover=0.30,
+        transaction_cost_bps=20.0, turnover_penalty=0.5, risk_aversion=1.0,
+    )
+    return signal, cov, sectors, prev, constraints
+
+
+def _r15_t_less_than_n_case(n_assets=101, n_observations=60):
+    """A deterministic T<N Ledoit-Wolf covariance that used to break MVO.
+
+    Five systematic factors plus idiosyncratic noise gives the same shape as
+    the real-data reproduction (T=60 sessions, N=101 names, LW shrinkage):
+    the matrix is full-rank but its eigendecomposition reconstruction made
+    cvxpy's PSD certification raise ARPACKNoConvergence, so CLARABEL and SCS
+    both failed while the problem was being built and every rebalance fell
+    back to equal weight.
+    """
+    rng = np.random.default_rng(0)
+    factors = rng.normal(0.0, 0.01, size=(n_observations, 5))
+    loadings = rng.normal(0.0, 0.8, size=(5, n_assets))
+    returns = factors @ loadings + rng.normal(
+        0.0, 0.01, size=(n_observations, n_assets),
+    )
+    dates = pd.bdate_range("2020-01-01", periods=n_observations)
+    assets = [f"S{i:03d}" for i in range(n_assets)]
+    cov = estimate_covariance(
+        pd.DataFrame(returns, index=dates, columns=assets),
+        method="ledoit_wolf", lookback=n_observations,
+    )
+    signal = pd.Series(rng.normal(size=n_assets), index=assets)
+    signal = signal - signal.min() + 0.1
+    prev = pd.Series(1.0 / n_assets, index=assets)
+    return signal, cov, prev
+
+
+def _r15_optimizer():
+    return MeanVarianceOptimizer(PortfolioConstraints(
+        max_weight=0.08, max_turnover=0.30,
+        transaction_cost_bps=20.0, turnover_penalty=0.5, risk_aversion=1.0,
+    ))
+
+
+def test_ensure_psd_rank_deficient_gets_a_relative_ridge(caplog):
+    """a: rank-10, n=50 -> symmetric, PSD, and a 1e-8 * trace/n diagonal ridge.
+
+    The last row/column of the fixture is exactly zero, so its repaired
+    diagonal equals the ridge itself: the ridge is really there and not
+    swamped by the reconstructed variances.
+    """
+    rng = np.random.default_rng(0)
+    n, rank = 50, 10
+    b = rng.normal(size=(n, rank))
+    b[-1] = 0.0
+    cov = b @ b.T
+    assert np.linalg.matrix_rank(cov) == rank
+
+    with caplog.at_level("INFO"):
+        repaired = _ensure_psd(cov)
+
+    assert np.array_equal(repaired, repaired.T), "repaired matrix is not symmetric"
+    assert np.isfinite(repaired).all()
+    assert np.linalg.eigvalsh(repaired).min() >= 0.0
+    ridge = 1e-8 * float(np.trace(cov)) / n
+    assert repaired[-1, -1] == pytest.approx(ridge, rel=1e-12)
+    # The material repair is reported, never silent.
+    assert any(
+        "near-singular" in record.getMessage() for record in caplog.records
+    ), "the singular covariance repair was not logged"
+
+
+def test_ensure_psd_cleans_non_finite_entries_instead_of_faking_identity(caplog):
+    """Non-finite input is cleaned per the covariance contract (not silently
+    replaced by eye(n)*0.9 + 0.1/n, which invented a risk model)."""
+    cov = np.array([[1.0, np.nan], [np.inf, 4.0]])
+    with caplog.at_level("WARNING"):
+        repaired = _ensure_psd(cov)
+
+    assert np.isfinite(repaired).all()
+    assert np.array_equal(repaired, repaired.T)
+    assert repaired[0, 0] == pytest.approx(1.0)
+    assert repaired[1, 1] == pytest.approx(4.0)
+    assert any(
+        "non-finite" in record.getMessage() for record in caplog.records
+    ), "the non-finite cleanup was not logged"
+
+
+def test_ensure_psd_rejects_structural_garbage():
+    with pytest.raises(ValueError):
+        _ensure_psd(np.zeros((3, 2)))
+    with pytest.raises(ValueError):
+        _ensure_psd(np.zeros(0))
+
+
+def test_t_less_than_n_ledoit_wolf_solves_without_equal_weight_fallback(caplog):
+    """b: T=60/N=101 LW covariance + cost constraints must optimize.
+
+    The pre-R15 implementation ended every such rebalance in the equal-weight
+    fallback with `MVO solver failed (CLARABEL=error, SCS=error)`.
+    """
+    signal, cov, prev = _r15_t_less_than_n_case()
+    optimizer = _r15_optimizer()
+
+    with caplog.at_level("WARNING"):
+        weights = optimizer.optimize(signal, cov, prev_weights=prev)
+
+    assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
+    assert not any(
+        "Optimizer fallback" in record.getMessage() for record in caplog.records
+    ), "the T<N rebalance still fell back to equal weight"
+    assert float(weights.sum()) == pytest.approx(1.0, abs=1e-6)
+    assert np.isfinite(weights.to_numpy()).all()
+    assert (weights > 0).sum() > 10
+
+
+def test_well_conditioned_weights_are_unchanged_by_the_ridge():
+    """c: numerical hardening must not move a healthy decision (atol 1e-6)."""
+    signal, cov, sectors, prev, constraints = _r15_well_conditioned_case()
+
+    no_prev = MeanVarianceOptimizer(constraints).optimize(
+        signal, cov, sector_map=sectors,
+    )
+    with_prev = MeanVarianceOptimizer(constraints).optimize(
+        signal, cov, prev_weights=prev, sector_map=sectors,
+    )
+
+    expected_no_prev = pd.Series(_R15_WELL_CONDITIONED_BASELINE_NO_PREV)
+    expected_with_prev = pd.Series(_R15_WELL_CONDITIONED_BASELINE_WITH_PREV)
+    np.testing.assert_allclose(
+        no_prev.reindex(expected_no_prev.index).to_numpy(),
+        expected_no_prev.to_numpy(), atol=1e-6, rtol=0,
+    )
+    np.testing.assert_allclose(
+        with_prev.reindex(expected_with_prev.index).to_numpy(),
+        expected_with_prev.to_numpy(), atol=1e-6, rtol=0,
+    )
