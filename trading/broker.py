@@ -1210,6 +1210,12 @@ class QMTBroker(BrokerInterface):
         #: Serializes resync so concurrent get_orders calls cannot both
         #: append the same unknown broker order (check-then-act on _orders).
         self._resync_lock = threading.Lock()
+        #: Serializes lazy reconnects: two threads polling a dead link must
+        #: not each create a trader session. Safe as a plain Lock because
+        #: _ensure_connected checks `_connected` before acquiring, and
+        #: connect() sets `_connected = True` before it calls back into
+        #: get_account() -> _ensure_connected (which then returns early).
+        self._reconnect_lock = threading.Lock()
 
         # Resolve password: explicit arg > env var
         if not self._password:
@@ -1349,6 +1355,13 @@ class QMTBroker(BrokerInterface):
         if self._connected:
             return
 
+        with self._reconnect_lock:
+            if self._connected:
+                return
+            self._reconnect_locked()
+
+    def _reconnect_locked(self) -> None:
+        """Body of ``_ensure_connected``; caller holds ``_reconnect_lock``."""
         logger.warning(
             "QMT link is down — attempting lazy reconnect (up to %d attempts)",
             self._max_reconnect_attempts,
