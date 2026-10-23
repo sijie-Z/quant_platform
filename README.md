@@ -66,6 +66,7 @@
 | 实时风控 | 仓位/行业/日亏损/回撤限额 + 5 级风险等级 + Kill Switch 熔断 |
 | 执行算法 | TWAP / VWAP / Iceberg + SmartRouter 智能路由 + TCA 成本分析 |
 | 运行内核 | EventBus（异步/背压/死信队列）+ StateMachine + 审计日志 + 调度器 |
+| 每日对账 | 每个交易日 EOD 自动账实对账（Store 账本 vs 券商柜台），按 `QUANT_RECON_*` 容差判定 passed/failed/unknown 并持久化结果 |
 
 ### 🖥️ Web 平台
 
