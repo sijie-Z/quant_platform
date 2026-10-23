@@ -466,9 +466,10 @@ def validate_config(config: Config) -> Config:
         f"got {costs.commission!r}",
     )
     _require(
-        0.0 <= float(costs.stamp_tax) <= 0.01,
-        "config.costs.stamp_tax must be in [0, 0.01] (0-1%), "
-        f"got {costs.stamp_tax!r}",
+        costs.stamp_tax is None or 0.0 <= float(costs.stamp_tax) <= 0.01,
+        "config.costs.stamp_tax must be null (follow the statutory schedule: "
+        "0.1% before 2023-08-28, 0.05% from that date) or in [0, 0.01] "
+        f"(0-1%), got {costs.stamp_tax!r}",
     )
     _require(
         0.0 <= float(costs.slippage) <= 0.1,

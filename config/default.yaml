@@ -105,17 +105,20 @@ backtest:
 # --- Costs ---
 costs:
   commission: 0.0003       # 0.03% per trade
-  stamp_tax: 0.001          # 0.1% on sell only (A-share)
-  slippage: 0.001           # 0.1% slippage (baseline bps)
+  # Stamp tax (sell side only). null = statutory schedule by trade date:
+  # 0.1% before 2023-08-28, 0.05% from that date. An explicit value is a flat
+  # override of the schedule (e.g. 0.001 pins 0.1% for every date).
+  stamp_tax: null
+  slippage: 0.001           # 0.1% fixed slippage; impact-model baseline
   # fixed, proportional, or impact.
   #
-  # This said "impact" while nothing supplied the per-asset daily_volume and
-  # volatility the impact model requires -- CostModel fell through to fixed
-  # slippage on every rebalance, so the config described a model that was not
-  # running. Set to what actually runs. Switching to "impact" needs
-  # BacktestEngine.compute_costs() callers to pass both series; CostModel now
-  # logs a warning once if a non-fixed model cannot engage.
-  slippage_model: "fixed"
+  # "impact" is the default now that the pipeline actually supplies the
+  # inputs it needs: `_load_data` attaches share volume, `_run_backtest`
+  # hands the engine volume + the unadjusted close, and the engine converts
+  # shares to CNY before calling the cost model. Without those inputs the
+  # cost model warns once and falls back to fixed slippage, so the config
+  # can never silently describe a model that is not running.
+  slippage_model: "impact"
   impact_model: "composite" # composite, almgren_chriss, square_root
 
 # --- Risk ---

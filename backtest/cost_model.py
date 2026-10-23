@@ -423,14 +423,30 @@ class CostModel:
         return pd.Series(rate, index=index) if index is not None else rate
 
     def _init_impact_calculator(self):
-        """Lazy-init the market impact calculator."""
+        """Lazy-init the market impact calculator for the configured model.
+
+        ``impact_model`` selects the scalar-path model: ``composite`` (the
+        default ensemble), ``almgren_chriss`` or ``square_root``. The
+        vectorised path documents its own rule (pure square-root) in
+        ``_compute_impact_cost``.
+        """
         try:
             from quant_core.market_impact import (
+                AlmgrenChrissModel,
                 CompositeImpactModel,
                 ExecutionCostCalculator,
+                SquareRootModel,
             )
+            model_classes = {
+                "composite": CompositeImpactModel,
+                "almgren_chriss": AlmgrenChrissModel,
+                "square_root": SquareRootModel,
+            }
+            impact_model = model_classes.get(
+                self._impact_model_name, CompositeImpactModel,
+            )()
             self._impact_calculator = ExecutionCostCalculator(
-                impact_model=CompositeImpactModel(),
+                impact_model=impact_model,
                 commission_rate=self.commission,
                 stamp_tax_rate=self.stamp_tax,
             )

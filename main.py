@@ -888,6 +888,20 @@ def _load_data(
             metadata.attrs["raw_prices"] = {
                 "close": raw_close, "price_basis": "raw",
             }
+        # R9: share volume (provider unit) for the cost model. The engine
+        # converts it to CNY with the raw close above; without both panels it
+        # warns and the cost model falls back to fixed slippage -- a missing
+        # panel is never replaced with a fabricated one.
+        try:
+            daily_volume = pipeline.get_volume()
+        except Exception as exc:  # defensive: cost inputs must not kill the run
+            logger.warning(
+                "Trading volume unavailable (%s); volume-dependent slippage "
+                "models will fall back to fixed slippage", exc,
+            )
+        else:
+            if daily_volume is not None:
+                metadata.attrs["daily_volume"] = daily_volume
     data_date = ""
     payload_assets: list[str] = []
     if factor_prices is not None and len(factor_prices.index) > 0:
@@ -1126,8 +1140,40 @@ def _execution_gates(metadata):
     return attrs.get("execution_gates") if attrs else None
 
 
+def _market_panels(metadata):
+    """R9: market panels the cost model needs, read from ``metadata.attrs``.
+
+    ``_load_data`` attaches ``daily_volume`` (share volume, the provider
+    boundary unit) and ``raw_prices`` (unadjusted CNY close). The engine
+    converts shares to CNY with the raw close for both the R8 capacity cap
+    and the cost model's volume-dependent slippage, so the two can never
+    disagree about the price basis. Missing panels are returned as ``None``
+    -- the engine then warns and the cost model falls back to fixed
+    slippage instead of inventing a volume.
+    """
+    attrs = getattr(metadata, "attrs", None) or {}
+    raw_entry = attrs.get("raw_prices")
+    raw_close = raw_entry.get("close") if isinstance(raw_entry, dict) else None
+    return {"daily_volume": attrs.get("daily_volume"), "raw_prices": raw_close}
+
+
+def _engine_inputs(metadata):
+    """Engine keyword arguments carried on ``metadata.attrs``.
+
+    The R6b execution-day gates plus the R9 market panels, merged into one
+    dict for entry points that hand engine kwargs through a single mapping
+    (walk-forward folds). A key is only added when its panel exists.
+    """
+    inputs = dict(_execution_gates(metadata) or {})
+    for key, value in _market_panels(metadata).items():
+        if value is not None:
+            inputs[key] = value
+    return inputs
+
+
 def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financials,
-                  optimizer_override=None, frequency_override=None, gates=None):
+                  optimizer_override=None, frequency_override=None, gates=None,
+                  metadata=None):
     """Set up and run backtest engine. Returns results dict.
 
     ``gates`` is the pipeline's execution-day tradability set
@@ -1136,6 +1182,13 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
     engine fills at any next-bar close, including limit-up opens and
     suspension days. ``universe_mask`` gates buys only (index membership);
     sells remain gated by ``tradable_mask`` so an index exit can be closed.
+
+    ``metadata`` is the frame returned by ``_load_data``. When given, the
+    share-volume and raw-close panels it carries are forwarded to
+    ``engine.run`` (R9): the engine converts volume to CNY with the raw close
+    and the configured impact slippage model engages. Callers that cannot
+    supply it keep the old behaviour (engine warning + fixed-slippage
+    fallback), never a guessed volume.
     """
     from quant_platform.backtest.cost_model import CostModel
     from quant_platform.backtest.engine import BacktestEngine
@@ -1158,6 +1211,7 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
         stamp_tax=config.costs.stamp_tax,
         slippage=config.costs.slippage,
         slippage_model=config.costs.slippage_model,
+        impact_model=config.costs.impact_model,
     )
 
     engine = BacktestEngine(
@@ -1172,11 +1226,17 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
         covariance_ewma_half_life=config.portfolio.covariance.ewma_half_life,
     )
 
+    engine_inputs = dict(gates or {})
+    if metadata is not None:
+        for key, value in _market_panels(metadata).items():
+            if value is not None:
+                engine_inputs.setdefault(key, value)
+
     return engine.run(
         signal=signal, prices=prices, returns=returns,
         benchmark_returns=benchmark, sector_map=sector_map,
         financials=financials,
-        **(gates or {}),
+        **engine_inputs,
     )
 
 
@@ -1629,7 +1689,8 @@ def cmd_run(args) -> int:
     with pipeline_stage("backtest"):
         results = _run_backtest(config, signal, prices, returns, benchmark,
                                 sector_map, fin_unstacked,
-                                gates=_execution_gates(metadata))
+                                gates=_execution_gates(metadata),
+                                metadata=metadata)
 
     # ------------------------------------------------------------------
     # 6. Report
@@ -1818,7 +1879,7 @@ def cmd_compare(args) -> int:
             bt_results = _run_backtest(
                 config, signal, prices, returns, benchmark,
                 sector_map, fin_unstacked, optimizer_override=opt,
-                gates=_execution_gates(metadata),
+                gates=_execution_gates(metadata), metadata=metadata,
             )
             summary = bt_results["summary"]
             results_table.append({
@@ -1908,7 +1969,7 @@ def cmd_sweep(args) -> int:
                 config, signal, prices, returns, benchmark,
                 sector_map, fin_unstacked,
                 optimizer_override=opt, frequency_override=freq,
-                gates=_execution_gates(metadata),
+                gates=_execution_gates(metadata), metadata=metadata,
             )
 
             summary = bt_results["summary"]
@@ -2788,7 +2849,7 @@ def cmd_profile(args) -> int:
     # Stage 4: Backtest
     t0 = time.perf_counter()
     _run_backtest(config, signal, prices, returns, benchmark, sector_map, fin_unstacked,
-                  gates=_execution_gates(metadata))
+                  gates=_execution_gates(metadata), metadata=metadata)
     timings["4_backtest"] = time.perf_counter() - t0
 
     total = time.perf_counter() - total_start
@@ -3242,7 +3303,7 @@ def cmd_gate(args) -> int:
         bt_results = _run_backtest(
             config, signal, prices, returns, benchmark,
             sector_map, fin_unstacked,
-            gates=_execution_gates(metadata),
+            gates=_execution_gates(metadata), metadata=metadata,
         )
         backtest_summary = bt_results.get("summary")
     except Exception as exc:
@@ -3377,7 +3438,8 @@ def cmd_strategy(args) -> int:
         signal = _generate_signal(config, processed_factors, returns, prices=prices)
         bt_result = _run_backtest(config, signal, prices, returns, benchmark,
                                    sector_map, financials,
-                                   gates=_execution_gates(metadata))
+                                   gates=_execution_gates(metadata),
+                                   metadata=metadata)
 
         # Generate report
         from pathlib import Path
@@ -3494,6 +3556,7 @@ def cmd_walkforward(args) -> int:
         stamp_tax=config.costs.stamp_tax,
         slippage=config.costs.slippage,
         slippage_model=config.costs.slippage_model,
+        impact_model=config.costs.impact_model,
     )
     constraints = PortfolioConstraints(
         long_only=config.portfolio.constraints.long_only,
@@ -3527,7 +3590,7 @@ def cmd_walkforward(args) -> int:
         covariance_method=config.portfolio.covariance.method,
         covariance_lookback=config.portfolio.covariance.lookback,
         covariance_ewma_half_life=config.portfolio.covariance.ewma_half_life,
-        execution_gates=_execution_gates(metadata),
+        execution_gates=_engine_inputs(metadata),
     )
 
     # Print results

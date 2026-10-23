@@ -150,3 +150,60 @@ def test_engine_forwards_ewma_half_life_to_covariance(monkeypatch):
 
     assert captured["method"] == "ewma"
     assert captured["ewma_half_life"] == 17
+
+
+def _failing_engine(monkeypatch):
+    import quant_platform.backtest.engine as engine_mod
+
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, **kwargs):
+            captured.update(kwargs)
+            return {"summary": {}, "daily_returns": None, "weights_history": {}}
+
+    monkeypatch.setattr(engine_mod, "BacktestEngine", FakeEngine)
+    return captured
+
+
+def test_run_backtest_forwards_volume_and_raw_close_from_metadata(monkeypatch):
+    """R9: the volume (shares) and raw close mounted by `_load_data` must reach
+    the engine, which converts shares to CNY; the CostModel also gets the
+    configured impact model."""
+    config = load_config(str(DEFAULT_CONFIG))
+    captured = _failing_engine(monkeypatch)
+
+    dates = pd.bdate_range("2024-01-02", periods=3)
+    volume = pd.DataFrame(10_000.0, index=dates, columns=["A", "B"])
+    raw_close = pd.DataFrame(12.5, index=dates, columns=["A", "B"])
+    metadata = pd.DataFrame({"note": ["provenance"]})
+    metadata.attrs["daily_volume"] = volume
+    metadata.attrs["raw_prices"] = {"close": raw_close, "price_basis": "raw"}
+
+    _run_backtest(
+        config, None, None, None, None, None, None, metadata=metadata,
+    )
+
+    assert captured["daily_volume"] is volume
+    assert captured["raw_prices"] is raw_close
+    assert captured["cost_model"]._impact_model_name == config.costs.impact_model
+    # The shipped default really is the impact model.
+    assert config.costs.slippage_model == "impact"
+
+
+def test_run_backtest_without_market_panels_fabricates_nothing(monkeypatch):
+    """Missing panels must stay missing: the engine then warns and the cost
+    model falls back to fixed slippage."""
+    config = load_config(str(DEFAULT_CONFIG))
+    captured = _failing_engine(monkeypatch)
+
+    metadata = pd.DataFrame({"note": ["no volume"]})
+    _run_backtest(
+        config, None, None, None, None, None, None, metadata=metadata,
+    )
+
+    assert "daily_volume" not in captured
+    assert "raw_prices" not in captured

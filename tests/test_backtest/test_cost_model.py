@@ -353,6 +353,32 @@ class TestTransferFee:
 class TestStampTaxSchedule:
     """B11: 0.1% before 2023-08-28 and 0.05% from that date, sell side only."""
 
+    def test_stamp_rate_is_0_1_percent_in_2022_and_0_05_percent_in_2024(self):
+        """R9: the schedule is selected per trade date, not pinned at load."""
+        model = CostModel(
+            commission=0.0, slippage=0.0, transfer_fee=0.0,  # stamp_tax=None
+        )
+
+        assert model._stamp_rate("2022-06-01") == pytest.approx(0.001)
+        assert model._stamp_rate("2023-08-27") == pytest.approx(0.001)
+        assert model._stamp_rate("2023-08-28") == pytest.approx(0.0005)
+        assert model._stamp_rate("2024-06-03") == pytest.approx(0.0005)
+
+        notional = 1_000_000.0
+        assert model.compute_costs(
+            notional, sell_turnover=notional, date="2022-06-01",
+        ) == pytest.approx(1_000.0)   # 0.1%
+        assert model.compute_costs(
+            notional, sell_turnover=notional, date="2024-06-03",
+        ) == pytest.approx(500.0)     # 0.05%
+
+    def test_explicit_override_applies_at_every_date(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0002, slippage=0.0, transfer_fee=0.0,
+        )
+        assert model._stamp_rate("2022-06-01") == pytest.approx(0.0002)
+        assert model._stamp_rate("2024-06-03") == pytest.approx(0.0002)
+
     def test_statutory_rate_cut_takes_effect_on_2023_08_28(self):
         model = CostModel(
             commission=0.0, slippage=0.0, transfer_fee=0.0,  # stamp_tax=None
@@ -422,3 +448,93 @@ class TestCostsAreChargedExactlyOnce:
         assert buy == pytest.approx(notional * common)
         assert sell == pytest.approx(notional * (common + 0.0005))
         assert swap == pytest.approx(buy + sell)
+
+
+class TestImpactCostScalesWithParticipation:
+    """R9: with volume (CNY) and volatility supplied, impact slippage grows
+    with the participation rate and is always a cost (positive), never
+    income."""
+
+    @staticmethod
+    def _model():
+        return CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, transfer_fee=0.0,
+            slippage_model="impact", min_commission=0.0,
+        )
+
+    def test_vector_cost_rises_with_participation(self):
+        model = self._model()
+        notional = 1_000_000.0
+        transfers = 0.0  # transfer_fee=0
+        assert transfers == 0.0
+
+        costs = [
+            model.compute_costs(
+                pd.Series([notional], index=["A"]),
+                daily_volume=pd.Series([volume], index=["A"]),
+                volatility=pd.Series([0.02], index=["A"]),
+            ).iloc[0]
+            for volume in (1_000_000_000.0, 10_000_000.0, 1_000_000.0)
+        ]
+
+        assert all(cost > 0 for cost in costs), costs
+        assert costs[0] < costs[1] < costs[2], costs
+        # The rate uses sqrt(participation) * volatility: pin the top case.
+        assert costs[2] == pytest.approx(notional * 0.02 * np.sqrt(1.0))
+
+    def test_scalar_cost_rises_with_participation(self):
+        model = self._model()
+        notional = 1_000_000.0
+        costs = [
+            model.compute_costs(
+                notional, daily_volume=volume, volatility=0.02,
+            )
+            for volume in (1_000_000_000.0, 10_000_000.0, 1_000_000.0)
+        ]
+        assert all(cost > 0 for cost in costs), costs
+        assert costs[0] < costs[1] < costs[2], costs
+
+    def test_missing_volume_falls_back_to_the_fixed_rate_and_warns(self, caplog):
+        common = dict(
+            commission=0.0, stamp_tax=0.0, slippage=0.0007, transfer_fee=0.0,
+            min_commission=0.0,
+        )
+        impact = CostModel(slippage_model="impact", **common)
+        fixed = CostModel(slippage_model="fixed", **common)
+
+        with caplog.at_level(logging.WARNING):
+            impact_cost = impact.compute_costs(
+                1_000_000.0, daily_volume=None, volatility=0.02,
+            )
+
+        assert impact_cost == pytest.approx(fixed.compute_costs(1_000_000.0))
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "Falling back to fixed" in m and "daily_volume" in m
+            for m in messages
+        ), messages
+
+
+class TestImpactModelSelection:
+    """R9: ``impact_model`` selects the scalar-path calculator instead of
+    always instantiating the composite ensemble."""
+
+    def test_square_root_selection(self):
+        pytest.importorskip("quant_core")
+        model = CostModel(
+            slippage_model="impact", impact_model="square_root",
+            commission=0.0, stamp_tax=0.0, slippage=0.0, transfer_fee=0.0,
+        )
+        model._init_impact_calculator()
+        assert type(model._impact_calculator.impact_model).__name__ == (
+            "SquareRootModel"
+        )
+
+    def test_composite_is_the_default_selection(self):
+        pytest.importorskip("quant_core")
+        model = CostModel(slippage_model="impact")
+        model._init_impact_calculator()
+        assert type(model._impact_calculator.impact_model).__name__ == (
+            "CompositeImpactModel"
+        )
+

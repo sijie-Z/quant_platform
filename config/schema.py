@@ -96,7 +96,10 @@ class BacktestConfig:
 @dataclass
 class CostsConfig:
     commission: float = 0.0003
-    stamp_tax: float = 0.001
+    # None = follow the statutory sell-side schedule by trade date (0.1%
+    # before 2023-08-28, 0.05% from that date); an explicit value is a flat
+    # override. Flat 0.1% on a post-cut backtest overstated sell costs.
+    stamp_tax: float | None = None
     slippage: float = 0.001
     slippage_model: str = "impact"  # fixed, proportional, impact
     impact_model: str = "composite"  # composite, almgren_chriss, square_root

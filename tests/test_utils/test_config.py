@@ -19,6 +19,14 @@ class TestConfigLoading:
         assert config.backtest.initial_capital == 10_000_000
         assert config.portfolio.optimizer == "mean_variance"
 
+    def test_default_cost_model_follows_the_statutory_schedule(self):
+        """R9: stamp tax defaults to None (date schedule) and slippage to the
+        impact model; an explicit value stays a flat override."""
+        config = load_config()
+        assert config.costs.stamp_tax is None
+        assert config.costs.slippage_model == "impact"
+        assert config.costs.impact_model == "composite"
+
     def test_load_custom_config(self):
         """Custom YAML config should be loadable."""
         import yaml
@@ -234,6 +242,15 @@ class TestConfigValidation:
             "backtest": {"rebalance_frequency": "weekly"},
         })
         assert cfg.universe.n_stocks == 100
+
+    def test_stamp_tax_null_and_explicit_override_are_both_valid(self):
+        """R9: null selects the statutory schedule; an explicit rate in
+        [0, 0.01] is a flat override."""
+        assert load_config(raw={"costs": {"stamp_tax": None}}).costs.stamp_tax is None
+        assert load_config(
+            raw={"costs": {"stamp_tax": 0.001}},
+        ).costs.stamp_tax == pytest.approx(0.001)
+
 
 
 class TestEnvironmentOverrides:

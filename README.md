@@ -49,7 +49,7 @@
 | 能力 | 说明 |
 |------|------|
 | 向量化回测 | 月频调仓 + 日频持仓漂移，横截面运算向量化（回测按交易日/调仓日推进，非逐股票循环） |
-| A 股成本模型 | 佣金 0.03%（双边，每笔最低佣金）+ 印花税 0.1%（仅卖出；CostModel 另支持 2023-08-28 起法定 0.05% 的按日期税率）+ 过户费 + 滑点 |
+| A 股成本模型 | 佣金 0.03%（双边，每笔最低佣金）+ 印花税按日期（2023-08-28 前 0.1%、之后 0.05%，仅卖出）+ 过户费 + 冲击成本滑点（默认 impact 模型；缺量价数据时告警并回退固定滑点） |
 | Walk-Forward | 滚动/扩展窗口 OOS 验证，每个 fold 内用 train-only 数据重算信号，因子按 fold 训练窗逐窗选择（IC t 检验 + BH-FDR）；支持 purge/embargo 隔离（训练/测试窗之间留空隙，测试窗后的行情不回流入训练） |
 | 多重检验校正 | `/api/sweep` 与 CLI `sweep` 对 N 次参数试验做 DSR + BH-FDR（best 不显著时给出警告）；Walk-Forward 因子筛选先做 IC t 检验 + BH-FDR |
 | 研究 holdout | `research.holdout.start_date/end_date` 预留最终评估窗口（闭区间，空 = 关闭）。数据窗口与 holdout 重叠时 `/api/sweep` 返回 422、CLI `sweep` 非零退出且不先跑；研究验证在因子筛选与 Walk-Forward 前剔除 holdout 交易日及紧邻的前向标签行（重算 IC 矩），报告记录 `holdout: {spec, excluded_days}`；剩余样本不足时显式 skipped |

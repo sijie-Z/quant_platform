@@ -688,7 +688,8 @@ class TestCapacityWiring:
         return prices, returns, signal, volume
 
     @staticmethod
-    def _run(constraints, daily_volume, inputs=None, raw_prices=None):
+    def _run(constraints, daily_volume, inputs=None, raw_prices=None,
+             cost_model=None):
         prices, returns, signal, _volume = inputs or TestCapacityWiring._inputs()
 
         class RecordingOptimizer:
@@ -708,6 +709,7 @@ class TestCapacityWiring:
             initial_capital=10_000_000,
             rebalance_frequency="monthly",
             constraints=constraints,
+            cost_model=cost_model,
         )
         recorder = RecordingOptimizer()
         engine._get_optimizer = lambda: recorder
@@ -844,6 +846,64 @@ class TestCapacityWiring:
         assert engine.daily_returns.loc[dates[1]] == pytest.approx(
             -expected_cost
         )
+
+
+    def test_capacity_and_slippage_share_the_same_raw_close_basis(self):
+        """R9: the R8 capacity cap and the R9 impact slippage must turn the
+        share volume into CNY with the *same* raw close (``volume * raw``),
+        so the two constraints can never disagree about the price basis."""
+        constraints = PortfolioConstraints(
+            max_participation=0.10, max_turnover=1.0,
+        )
+        inputs = self._inputs()
+        adjusted, volume = inputs[0], inputs[3]
+        raw = self._raw_prices(adjusted)
+
+        class RecordingCostModel(CostModel):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.volume_by_date = {}
+
+            def compute_costs(self, turnover, **kwargs):
+                volume_row = kwargs.get("daily_volume")
+                if volume_row is not None:
+                    self.volume_by_date[kwargs.get("date")] = volume_row
+                return super().compute_costs(turnover, **kwargs)
+
+        cost_model = RecordingCostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, transfer_fee=0.0,
+            slippage_model="impact", min_commission=0.0,
+        )
+        engine, recorder, _, _ = self._run(
+            constraints, daily_volume=volume, inputs=inputs,
+            raw_prices=raw, cost_model=cost_model,
+        )
+
+        expected_cny = volume * raw
+        assert cost_model.volume_by_date, "the cost model never saw a volume"
+        for date, row in cost_model.volume_by_date.items():
+            pd.testing.assert_series_equal(
+                row.sort_index(),
+                expected_cny.loc[date].sort_index(),
+                check_names=False,
+            )
+
+        # The capacity ADV (rolling 20 sessions) used the same CNY basis.
+        expected_adv = expected_cny.rolling(20, min_periods=5).mean()
+        rdates = list(engine.optimizer_outcomes)
+        assert recorder.calls
+        for rdate, call in zip(rdates, recorder.calls, strict=True):
+            adv = call["adv"]
+            if adv is None:
+                continue
+            pd.testing.assert_series_equal(
+                adv.sort_index(),
+                expected_adv.loc[rdate].reindex(adv.index).sort_index(),
+                check_names=False, rtol=1e-12, atol=1e-9,
+            )
+
+        # Impact slippage is booked as a positive cost, never as income.
+        assert engine.total_cost_drag > 0
 
 
     def test_share_volume_without_raw_prices_falls_back_to_fixed_slippage(self, caplog):
