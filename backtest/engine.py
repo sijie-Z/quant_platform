@@ -22,11 +22,13 @@ the panels.
 Execution-day tradability
 -------------------------
 ``run`` accepts the pipeline's per-date ``tradable_mask`` (suspension / ST /
-listing / delisting), plus ``limit_up`` and ``limit_down`` panels. Buys are
-blocked on limit-up and non-tradable days, sells on limit-down and
-non-tradable days. Blocked trades are carried to the next tradable day; no
-cost or turnover is booked for them. Without the panels the engine behaves
-exactly as before.
+listing / delisting), an optional ``universe_mask`` (index membership), plus
+``limit_up`` and ``limit_down`` panels. Buys are blocked on non-tradable
+days, on non-member days and at limit-up; sells are blocked on non-tradable
+days and at limit-down but *not* on non-membership -- a name that leaves the
+index must remain sellable. Blocked trades are carried to the next tradable
+day; no cost or turnover is booked for them. Without the panels the engine
+behaves exactly as before.
 """
 
 from __future__ import annotations
@@ -207,6 +209,7 @@ class BacktestEngine:
         sector_map: pd.Series,
         financials: pd.DataFrame | None = None,
         tradable_mask: pd.DataFrame | None = None,
+        universe_mask: pd.DataFrame | None = None,
         limit_up: pd.DataFrame | None = None,
         limit_down: pd.DataFrame | None = None,
         daily_volume: pd.DataFrame | None = None,
@@ -229,6 +232,11 @@ class BacktestEngine:
             tradable_mask: (date x asset) True where a new position is
                 allowed. False on suspension / ST / listing / delisting days.
                 Missing entries default to tradable.
+            universe_mask: (date x asset) True where the asset is an index
+                constituent. Gates buys only; sells are not restricted by
+                membership so an index exit can still be liquidated. Missing
+                entries default to member (True). ``None`` is equivalent to
+                an all-True panel.
             limit_up: (date x asset) True where the asset closed limit-up.
                 Buys are blocked there.
             limit_down: (date x asset) True where the asset closed
@@ -396,6 +404,7 @@ class BacktestEngine:
         self._simulate_pnl(
             returns,
             tradable_mask=tradable_mask,
+            universe_mask=universe_mask,
             limit_up=limit_up,
             limit_down=limit_down,
             daily_volume=daily_volume,
@@ -589,6 +598,7 @@ class BacktestEngine:
         self,
         returns: pd.DataFrame,
         tradable_mask: pd.DataFrame | None = None,
+        universe_mask: pd.DataFrame | None = None,
         limit_up: pd.DataFrame | None = None,
         limit_down: pd.DataFrame | None = None,
         daily_volume: pd.DataFrame | None = None,
@@ -601,30 +611,40 @@ class BacktestEngine:
         computed against the held weights, and the cost is charged for that
         day -- so `turnover_history` is indexed by execution date too.
 
-        When ``tradable_mask`` / ``limit_up`` / ``limit_down`` are supplied
-        (B1), each asset's trade is checked on the *execution* date, not the
-        signal date: buys are blocked where the asset is not tradable or
-        closed limit-up, sells where it is not tradable or closed limit-down.
-        Blocked deltas are retried on following days until they fill or a
-        newer rebalance supersedes them; no cost or turnover is booked for a
-        blocked trade.
+        When ``tradable_mask`` / ``universe_mask`` / ``limit_up`` /
+        ``limit_down`` are supplied (B1, R6b), each asset's trade is checked
+        on the *execution* date, not the signal date: buys are blocked where
+        the asset is not tradable, not an index member, or closed limit-up;
+        sells are blocked where it is not tradable or closed limit-down --
+        deliberately *not* by ``universe_mask``, so leaving the index never
+        traps a held position. Blocked deltas are retried on following days
+        until they fill or a newer rebalance supersedes them; no cost or
+        turnover is booked for a blocked trade.
         """
         all_dates = returns.index.sort_values()
         columns = returns.columns
         schedule = self._execution_schedule(returns)
 
         gates_enabled = any(
-            panel is not None for panel in (tradable_mask, limit_up, limit_down)
+            panel is not None
+            for panel in (tradable_mask, universe_mask, limit_up, limit_down)
         )
         mask_panel = self._align_gate(tradable_mask, all_dates, columns, True)
+        universe_panel = self._align_gate(
+            universe_mask, all_dates, columns, True,
+        )
         up_panel = self._align_gate(limit_up, all_dates, columns, False)
         down_panel = self._align_gate(limit_down, all_dates, columns, False)
         if gates_enabled:
-            # Supplying one gate panel must not dereference the two the caller
-            # omitted (the gate check indexes all three). The neutral values
-            # are "tradable" and "not at the limit".
+            # Supplying one gate panel must not dereference the others the
+            # caller omitted (the gate check indexes all of them). The
+            # neutral values are "tradable"/"member" and "not at the limit".
             if mask_panel is None:
                 mask_panel = pd.DataFrame(True, index=all_dates, columns=columns)
+            if universe_panel is None:
+                universe_panel = pd.DataFrame(
+                    True, index=all_dates, columns=columns,
+                )
             if up_panel is None:
                 up_panel = pd.DataFrame(False, index=all_dates, columns=columns)
             if down_panel is None:
@@ -690,11 +710,15 @@ class BacktestEngine:
                     buys = delta.index[delta > 0]
                     sells = delta.index[delta < 0]
                     if len(buys):
+                        # Buys require both tradability and index membership.
                         allowed.loc[buys] = (
                             mask_panel.loc[date].reindex(buys)
+                            & universe_panel.loc[date].reindex(buys)
                             & ~up_panel.loc[date].reindex(buys)
                         )
                     if len(sells):
+                        # Sells check tradability and limit-down only: an
+                        # index exit must not prevent closing the position.
                         allowed.loc[sells] = (
                             mask_panel.loc[date].reindex(sells)
                             & ~down_panel.loc[date].reindex(sells)

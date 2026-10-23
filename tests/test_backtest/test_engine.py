@@ -532,6 +532,133 @@ class TestExecutionDayTradability:
         assert float(held.isna().sum()) == 0.0
 
 
+class TestUniverseBuyGate:
+    """R6b: index membership gates buys only.
+
+    A non-member buy is blocked (and retried); an index *exit* must never
+    block the sale of a position already held. Suspension still blocks both
+    sides through ``tradable_mask``. Omitting ``universe_mask`` is
+    bit-identical to an all-True panel.
+    """
+
+    @staticmethod
+    def _engine() -> BacktestEngine:
+        return BacktestEngine(
+            initial_capital=1_000_000,
+            rebalance_frequency="monthly",
+            optimizer="equal_weight",
+            constraints=PortfolioConstraints(max_turnover=1.0),
+            cost_model=CostModel(
+                commission=0, stamp_tax=0, slippage=0,
+                min_commission=0, transfer_fee=0,
+            ),
+        )
+
+    @staticmethod
+    def _flat_returns(n=5):
+        dates = pd.bdate_range("2024-01-01", periods=n)
+        return pd.DataFrame(0.0, index=dates, columns=["A", "B"]), dates
+
+    def test_non_member_buy_is_blocked_and_retried(self):
+        returns, dates = self._flat_returns()
+        engine = self._engine()
+        engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
+        universe = pd.DataFrame(True, index=dates, columns=["A", "B"])
+        universe.loc[dates[1], "A"] = False  # not a constituent on day 1
+
+        engine._simulate_pnl(returns, universe_mask=universe)
+
+        # The buy is rejected on dates[1] and fills on dates[2] once the
+        # name is a member again.
+        assert list(engine.turnover_history.index) == [dates[2]]
+        assert engine.turnover_history.iloc[0] == pytest.approx(0.5)
+
+    def test_member_buy_is_allowed(self):
+        returns, dates = self._flat_returns()
+        engine = self._engine()
+        engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
+        universe = pd.DataFrame(True, index=dates, columns=["A", "B"])
+
+        engine._simulate_pnl(returns, universe_mask=universe)
+
+        assert list(engine.turnover_history.index) == [dates[1]]
+
+    def test_index_exit_does_not_block_the_sell(self):
+        """The core R6b regression: leaving the index must not trap a name."""
+        returns, dates = self._flat_returns(n=6)
+        engine = self._engine()
+        engine.weights_history = {
+            dates[0]: pd.Series({"A": 1.0, "B": 0.0}),  # bought at dates[1]
+            dates[2]: pd.Series({"A": 0.0, "B": 0.0}),  # sold at dates[3]
+        }
+        universe = pd.DataFrame(True, index=dates, columns=["A", "B"])
+        universe.loc[dates[2]:, "A"] = False  # A exits the index on day 2
+
+        engine._simulate_pnl(returns, universe_mask=universe)
+
+        # Buy filled while still a member; the exit did not stop the sell.
+        assert dates[1] in engine.turnover_history.index
+        assert dates[3] in engine.turnover_history.index
+        assert engine.weights_history[dates[2]]["A"] == pytest.approx(0.0)
+
+    def test_suspension_blocks_both_sides_even_for_members(self):
+        returns, dates = self._flat_returns(n=6)
+        universe = pd.DataFrame(True, index=dates, columns=["A", "B"])
+
+        # Buy side: A is suspended on the execution day -> deferred.
+        buy_engine = self._engine()
+        buy_engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
+        tradable_buy = pd.DataFrame(True, index=dates, columns=["A", "B"])
+        tradable_buy.loc[dates[1], "A"] = False
+        buy_engine._simulate_pnl(
+            returns, tradable_mask=tradable_buy, universe_mask=universe,
+        )
+        assert list(buy_engine.turnover_history.index) == [dates[2]]
+
+        # Sell side: A is suspended when the liquidation would execute.
+        sell_engine = self._engine()
+        sell_engine.weights_history = {
+            dates[0]: pd.Series({"A": 1.0, "B": 0.0}),
+            dates[2]: pd.Series({"A": 0.0, "B": 0.0}),
+        }
+        tradable_sell = pd.DataFrame(True, index=dates, columns=["A", "B"])
+        tradable_sell.loc[dates[3], "A"] = False
+        sell_engine._simulate_pnl(
+            returns, tradable_mask=tradable_sell, universe_mask=universe,
+        )
+        assert dates[3] not in sell_engine.turnover_history.index
+        assert dates[4] in sell_engine.turnover_history.index
+
+    def test_omitting_universe_mask_matches_all_true_panel(self):
+        returns, dates = self._flat_returns(n=6)
+
+        def run(**extra):
+            engine = self._engine()
+            engine.weights_history = {
+                dates[0]: pd.Series({"A": 1.0, "B": 0.0}),
+                dates[2]: pd.Series({"A": 0.5, "B": 0.5}),
+            }
+            tradable = pd.DataFrame(True, index=dates, columns=["A", "B"])
+            tradable.loc[dates[3], "B"] = False
+            engine._simulate_pnl(returns, tradable_mask=tradable, **extra)
+            return engine
+
+        without = run()
+        with_all_true = run(
+            universe_mask=pd.DataFrame(True, index=dates, columns=["A", "B"]),
+        )
+
+        pd.testing.assert_series_equal(
+            without.daily_returns, with_all_true.daily_returns,
+        )
+        pd.testing.assert_series_equal(
+            without.turnover_history, with_all_true.turnover_history,
+        )
+        pd.testing.assert_series_equal(
+            without.portfolio_values, with_all_true.portfolio_values,
+        )
+
+
 class TestWeeklyIsoYearBoundary:
     """B2: weekly rebalances group by ISO year + ISO week, chronologically."""
 
