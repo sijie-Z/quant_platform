@@ -109,7 +109,7 @@ costs:
   # 0.1% before 2023-08-28, 0.05% from that date. An explicit value is a flat
   # override of the schedule (e.g. 0.001 pins 0.1% for every date).
   stamp_tax: null
-  slippage: 0.001           # 0.1% fixed slippage; impact-model baseline
+  slippage: 0.001           # 0.1% fixed slippage; fallback rate for impact
   # fixed, proportional, or impact.
   #
   # "impact" is the default now that the pipeline actually supplies the

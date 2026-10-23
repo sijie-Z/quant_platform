@@ -207,3 +207,53 @@ def test_run_backtest_without_market_panels_fabricates_nothing(monkeypatch):
 
     assert "daily_volume" not in captured
     assert "raw_prices" not in captured
+
+
+def test_execution_gates_adapter_carries_the_r9_market_panels():
+    """api/routes.py and backtest/distributed.py import `_execution_gates`
+    from main (they are outside this change's write set). The adapter must
+    therefore hand them the volume and raw close too, so their backtests run
+    the configured impact model instead of falling back to fixed."""
+    from quant_platform.main import _execution_gates
+
+    dates = pd.bdate_range("2024-01-02", periods=3)
+    volume = pd.DataFrame(10_000.0, index=dates, columns=["A", "B"])
+    raw_close = pd.DataFrame(12.5, index=dates, columns=["A", "B"])
+    tradable = pd.DataFrame(True, index=dates, columns=["A", "B"])
+
+    metadata = pd.DataFrame({"note": ["provenance"]})
+    metadata.attrs["execution_gates"] = {"tradable_mask": tradable}
+    metadata.attrs["daily_volume"] = volume
+    metadata.attrs["raw_prices"] = {"close": raw_close, "price_basis": "raw"}
+
+    inputs = _execution_gates(metadata)
+
+    assert inputs["tradable_mask"] is tradable
+    assert inputs["daily_volume"] is volume
+    assert inputs["raw_prices"] is raw_close
+
+
+def test_api_style_call_forwards_the_market_panels(monkeypatch):
+    """The API's `_run_backtest(..., gates=_execution_gates(metadata))` call
+    shape (no `metadata=` keyword) must still reach the engine with both
+    panels."""
+    from quant_platform.main import _execution_gates
+
+    config = load_config(str(DEFAULT_CONFIG))
+    captured = _failing_engine(monkeypatch)
+
+    dates = pd.bdate_range("2024-01-02", periods=3)
+    volume = pd.DataFrame(10_000.0, index=dates, columns=["A", "B"])
+    raw_close = pd.DataFrame(12.5, index=dates, columns=["A", "B"])
+    metadata = pd.DataFrame({"note": ["provenance"]})
+    metadata.attrs["execution_gates"] = {}
+    metadata.attrs["daily_volume"] = volume
+    metadata.attrs["raw_prices"] = {"close": raw_close, "price_basis": "raw"}
+
+    _run_backtest(
+        config, None, None, None, None, None, None,
+        gates=_execution_gates(metadata),
+    )
+
+    assert captured["daily_volume"] is volume
+    assert captured["raw_prices"] is raw_close

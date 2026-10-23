@@ -1127,17 +1127,28 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
 
 
 def _execution_gates(metadata):
-    """Execution-day tradability panels attached by `_load_data`, if any.
+    """Engine kwargs carried on ``metadata.attrs`` (R6b gates + R9 panels).
 
     The dict carries ``tradable_mask`` / ``universe_mask`` / ``limit_up`` /
     ``limit_down`` (R6b split index membership out of tradability).  The
     engine restricts buys to ``tradable_mask & universe_mask`` and sells to
     ``tradable_mask`` only, so an index exit blocks new positions without
-    trapping a held one.  Returns ``None`` when no gates were attached (the
-    engine then treats every day as tradeable).
+    trapping a held one.
+
+    R9 extends the same mapping with the market panels ``_load_data``
+    attaches (``daily_volume`` share volume and ``raw_prices`` unadjusted
+    close) because ``BacktestEngine.run`` takes both as keyword arguments and
+    every backtest entry point -- ``api/routes.py``, ``backtest/walkforward``
+    and ``backtest/distributed`` included -- funnels engine kwargs through
+    this helper (its historical name; the pipeline's own
+    ``get_execution_gates()`` is unchanged). One adapter means no entry point
+    can run the configured impact model without its inputs.
+
+    Returns ``None`` when neither gates nor panels were attached (the engine
+    then treats every day as tradeable and the cost model warns and falls
+    back to fixed slippage).
     """
-    attrs = getattr(metadata, "attrs", None)
-    return attrs.get("execution_gates") if attrs else None
+    return _engine_inputs(metadata) or None
 
 
 def _market_panels(metadata):
@@ -1162,9 +1173,11 @@ def _engine_inputs(metadata):
 
     The R6b execution-day gates plus the R9 market panels, merged into one
     dict for entry points that hand engine kwargs through a single mapping
-    (walk-forward folds). A key is only added when its panel exists.
+    (walk-forward folds, the parallel sweep worker). A key is only added
+    when its panel exists.
     """
-    inputs = dict(_execution_gates(metadata) or {})
+    attrs = getattr(metadata, "attrs", None) or {}
+    inputs = dict(attrs.get("execution_gates") or {})
     for key, value in _market_panels(metadata).items():
         if value is not None:
             inputs[key] = value
@@ -3590,7 +3603,7 @@ def cmd_walkforward(args) -> int:
         covariance_method=config.portfolio.covariance.method,
         covariance_lookback=config.portfolio.covariance.lookback,
         covariance_ewma_half_life=config.portfolio.covariance.ewma_half_life,
-        execution_gates=_engine_inputs(metadata),
+        execution_gates=_execution_gates(metadata),
     )
 
     # Print results
