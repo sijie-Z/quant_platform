@@ -1387,7 +1387,7 @@ class TushareProvider(DataProvider):
             return _empty_namechange(), failed
         try:
             raw = self._combine_namechange_frames(frames, codes)
-        except ValueError as exc:
+        except Exception as exc:  # noqa: BLE001 - a broken feed is not fatal
             logger.warning(
                 "namechange response is unusable (%s); marking ST history "
                 "unavailable", exc,
@@ -1512,7 +1512,7 @@ class TushareProvider(DataProvider):
                         self._st_namechange = self._combine_namechange_frames(
                             [self._st_namechange, fresh], codes,
                         )
-                    except ValueError as exc:
+                    except Exception as exc:  # noqa: BLE001 - never fatal
                         logger.warning(
                             "namechange window rows could not be merged (%s); "
                             "keeping the cached ST feed", exc,
