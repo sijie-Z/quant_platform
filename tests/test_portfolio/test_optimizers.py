@@ -938,13 +938,26 @@ def test_ensure_psd_warns_on_materially_invalid_covariances(caplog):
     ), "an invalid covariance was repaired without a warning"
 
 
-def test_risk_parity_t_less_than_n_solves_without_fallback():
-    """The RiskParity quad form takes the same psd_wrap path.
+def test_risk_parity_wraps_its_t_less_than_n_covariance(monkeypatch):
+    """The RiskParity quad form must take the psd_wrap path.
 
     T=12 observations for its 26-name candidate set (sample covariance,
-    rank <= 11) used to be the kind of problem that could not certify PSD.
+    rank <= 11) is the T<N shape that could not certify PSD. The spy pins the
+    wiring: removing that wrapper makes the test fail even though this
+    particular solve would still converge.
     """
-    rng = np.random.default_rng(3)
+    import cvxpy as cp
+
+    wrapped: list[np.ndarray] = []
+    real_psd_wrap = cp.psd_wrap
+
+    def spy(matrix):
+        wrapped.append(np.array(matrix, copy=True))
+        return real_psd_wrap(matrix)
+
+    monkeypatch.setattr(cp, "psd_wrap", spy)
+
+    rng = np.random.default_rng(1)
     t, n = 12, 60
     dates = pd.bdate_range("2021-01-04", periods=t)
     assets = [f"R{i:02d}" for i in range(n)]
@@ -960,6 +973,9 @@ def test_risk_parity_t_less_than_n_solves_without_fallback():
     weights = optimizer.optimize(signal, cov)
 
     assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
+    assert wrapped, "RiskParity did not wrap its covariance with cp.psd_wrap"
+    # The wrapped matrix is the PSD-repaired covariance, not raw input.
+    assert np.linalg.eigvalsh(wrapped[0]).min() >= -1e-12
     assert float(weights.sum()) == pytest.approx(1.0, abs=1e-6)
     assert np.isfinite(weights.to_numpy()).all()
 
