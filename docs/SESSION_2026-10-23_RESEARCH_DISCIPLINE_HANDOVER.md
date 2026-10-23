@@ -32,6 +32,18 @@
 | R11 | Scheduler EOD 每日账实对账 + `reconciliation_results` 表 + 事件 | `2942352..50f3f50` | 90 passed |
 | R12 | 独立账本：启动基线 + 成交流水推导 expected（消除同源自比较）；无基线=unknown | `f80be55..5e78128` | 144 passed |
 | R13 | 实盘异步成交回写 Store（`_sync_broker_fills`，累计量幂等，order.synced） | `a39c15f..4a8a639` | 101 passed |
+| R14 | Tushare ST 历史（namechange → episode 表）；缓存 schema 8 | `3ed18d1..c00a056` | 72 passed |
+| R15 | 优化器数值稳定性：`cp.psd_wrap` 修 cvxpy ARPACK 认证失败；PSD 加脊与告警 | `d50342e..9e11329` | 129 passed |
+
+### 真实数据研究（2026-10-24）
+
+本机网络不可用（Baostock 登录超时），改用本机既有真实日线缓存（101 只 × 2018–2025）跑完整研究闭环，详见 `docs/research/REAL_DATA_EVIDENCE_2026-10-24.md`。核心结果（净成本、12 折 OOS、逐 fold 选因子）：
+
+- 等权因子组合 Sharpe −0.506（方向用反）；IC 加权 +0.211；
+- **低换手单因子（5% 单票上限）：Sharpe 0.669、年化 13.8%、最大回撤 −17.7%**；同池等权基准 0.222 / 4.5% / −25.7%；
+- `turnover_20d` 年度 IC 六年全为负（均值 −0.047，ICIR −0.225），低风险异象稳定；
+- 成本敏感性：impact vs fixed 几乎一致；R15 修复后优化器回退 0 次；
+- 诚实限制：DSR p≈0.33 不显著、股票池可能有幸存者偏差、无财务/ST、未做 paper——定位为“有希望的候选”，不是已证实 alpha。
 
 ### 关键数字与结论
 
