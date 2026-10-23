@@ -585,3 +585,103 @@ class TestEodReconciliationMarker:
         assert reopened.has_eod_reconciliation("2026-10-20") is True
         assert len(reopened.get_orders()) == 1, "existing rows are untouched"
 
+
+class TestDailyReconciliationResults:
+    """R11: the books-vs-broker outcome is persisted, one row per date."""
+
+    @staticmethod
+    def _result(**overrides):
+        result = {
+            "date": "2026-10-20",
+            "timestamp": "2026-10-20T15:05:00",
+            "status": "failed",
+            "n_positions": 2,
+            "n_mismatched": 1,
+            "cash_diff": -125.5,
+            "total_mismatch_value": 500.0,
+            "details": [
+                {"asset": "600519", "expected_shares": 100,
+                 "actual_shares": 90, "diff": 10, "is_matched": False},
+            ],
+            "tolerances": {"shares": 0, "cash": 1000.0,
+                           "cash_bps": 0, "materiality": 0},
+        }
+        result.update(overrides)
+        return result
+
+    def test_round_trip(self, store):
+        store.save_reconciliation_result(self._result())
+
+        row = store.get_reconciliation_result("2026-10-20")
+
+        assert row["status"] == "failed"
+        assert row["n_positions"] == 2
+        assert row["n_mismatched"] == 1
+        assert row["cash_diff"] == pytest.approx(-125.5)
+        assert row["total_mismatch_value"] == pytest.approx(500.0)
+        assert row["details"][0]["asset"] == "600519"
+        assert row["details"][0]["diff"] == 10
+        assert row["tolerances"]["cash"] == pytest.approx(1000.0)
+
+    def test_one_row_per_date(self, store):
+        store.save_reconciliation_result(self._result())
+        store.save_reconciliation_result(self._result(status="passed"))
+
+        import sqlite3
+        conn = sqlite3.connect(store._db_path)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM reconciliation_results").fetchone()[0]
+        finally:
+            conn.close()
+        assert count == 1
+        assert store.get_reconciliation_result("2026-10-20")["status"] == "passed"
+
+    def test_unknown_keeps_nulls_instead_of_zero(self, store):
+        """An unknown comparison must not persist as a zero diff."""
+        store.save_reconciliation_result(self._result(
+            status="unknown", cash_diff=None,
+            total_mismatch_value=None, details=[],
+        ))
+
+        row = store.get_reconciliation_result("2026-10-20")
+        assert row["status"] == "unknown"
+        assert row["cash_diff"] is None
+        assert row["total_mismatch_value"] is None
+
+    def test_an_unknown_status_is_rejected(self, store):
+        with pytest.raises(ValueError, match="status"):
+            store.save_reconciliation_result(self._result(status="maybe"))
+
+    def test_last_reconciliation_is_the_newest_date(self, store):
+        assert store.get_last_reconciliation() is None
+
+        store.save_reconciliation_result(self._result(date="2026-10-19"))
+        store.save_reconciliation_result(self._result(date="2026-10-20"))
+
+        assert store.get_last_reconciliation()["date"] == "2026-10-20"
+        assert store.get_reconciliation_result("2026-10-18") is None
+
+    def test_an_existing_database_gains_the_table(self, tmp_path):
+        import sqlite3
+
+        db = str(tmp_path / "legacy_r11.db")
+        first = Store(db)
+        first.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0})
+        first.close()
+
+        # Simulate a database created before reconciliation_results existed.
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE reconciliation_results")
+        conn.commit()
+        conn.close()
+
+        reopened = Store(db)
+        assert reopened.get_last_reconciliation() is None
+        reopened.save_reconciliation_result(self._result())
+
+        assert reopened.get_reconciliation_result(
+            "2026-10-20")["status"] == "failed"
+        assert len(reopened.get_orders()) == 1, "existing rows are untouched"
+

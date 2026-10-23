@@ -10,6 +10,7 @@ Tables:
     events      — event log for audit trail
     config      — strategy configuration snapshots
     eod_reconciliation — once-per-day marker for the end-of-day run
+    reconciliation_results — per-day books-vs-broker reconciliation outcome
 
 Usage:
     store = Store('data/trading.db')
@@ -395,6 +396,24 @@ class Store:
                 CREATE TABLE IF NOT EXISTS eod_reconciliation (
                     date TEXT PRIMARY KEY,
                     timestamp TEXT
+                );
+
+                -- Daily books-vs-broker reconciliation outcome (R11).
+                -- One row per exchange date; `cash_diff`/`total_mismatch_value`
+                -- stay NULL when the comparison could not run (status
+                -- 'unknown'), so "unknown" is never stored as a zero diff.
+                -- CREATE TABLE IF NOT EXISTS is also the migration for
+                -- databases written before this table existed.
+                CREATE TABLE IF NOT EXISTS reconciliation_results (
+                    date TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    n_positions INTEGER DEFAULT 0,
+                    n_mismatched INTEGER DEFAULT 0,
+                    cash_diff REAL,
+                    total_mismatch_value REAL,
+                    details TEXT DEFAULT '[]',
+                    tolerances TEXT DEFAULT '{}'
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);
@@ -1071,6 +1090,78 @@ class Store:
                 "SELECT MAX(timestamp) AS last_ts FROM pnl_history"
             ).fetchone()
         return str(row["last_ts"] or "") if row else ""
+
+    # ── Daily reconciliation results (R11) ──
+
+    #: Allowed ``reconciliation_results.status`` values.
+    RECONCILIATION_STATUSES = ("passed", "failed", "unknown")
+
+    def save_reconciliation_result(self, result: dict) -> None:
+        """Persist one day's books-vs-broker reconciliation outcome.
+
+        Keyed by exchange date so a repeated EOD trigger can never append a
+        second row; ``INSERT OR REPLACE`` keeps the table at one row per day
+        even when two processes race the write. ``details`` and
+        ``tolerances`` are stored as JSON text.
+        """
+        status = result.get("status")
+        if status not in self.RECONCILIATION_STATUSES:
+            raise ValueError(
+                f"reconciliation status must be one of "
+                f"{self.RECONCILIATION_STATUSES}, got {status!r}"
+            )
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO reconciliation_results "
+                "(date, timestamp, status, n_positions, n_mismatched, "
+                " cash_diff, total_mismatch_value, details, tolerances) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    result["date"],
+                    result.get("timestamp") or exchange_now_iso(),
+                    status,
+                    int(result.get("n_positions") or 0),
+                    int(result.get("n_mismatched") or 0),
+                    result.get("cash_diff"),
+                    result.get("total_mismatch_value"),
+                    json.dumps(result.get("details") or []),
+                    json.dumps(result.get("tolerances") or {}),
+                ),
+            )
+
+    @staticmethod
+    def _reconciliation_row(row: sqlite3.Row) -> dict:
+        """Row -> dict, decoding the two JSON columns.
+
+        Unreadable JSON degrades to the empty container instead of failing
+        the read: the status/counts are still valid audit data.
+        """
+        result = dict(row)
+        for column, empty in (("details", []), ("tolerances", {})):
+            raw = result.get(column)
+            if isinstance(raw, str):
+                try:
+                    result[column] = json.loads(raw)
+                except json.JSONDecodeError:
+                    result[column] = empty
+        return result
+
+    def get_reconciliation_result(self, date: str) -> dict | None:
+        """The reconciliation result recorded for `date` (YYYY-MM-DD), or None."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM reconciliation_results WHERE date = ?", (date,)
+            ).fetchone()
+        return self._reconciliation_row(row) if row is not None else None
+
+    def get_last_reconciliation(self) -> dict | None:
+        """The most recent reconciliation result, or None when there is none."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM reconciliation_results ORDER BY date DESC LIMIT 1"
+            ).fetchone()
+        return self._reconciliation_row(row) if row is not None else None
+
 
     # ── Signals ──
 
