@@ -37,6 +37,7 @@ import logging
 import pandas as pd
 import pytest
 import quant_platform.data.providers.tushare_loader as mod
+from quant_platform.data.providers.base import read_cache_manifest
 from quant_platform.data.providers.tushare_loader import TushareProvider
 
 DATES = ["20240102", "20240103", "20240104"]
@@ -519,6 +520,133 @@ def test_partial_reload_repeats_the_failure_warning(tmp_path, caplog):
                for message in messages)
 
 
+# ----------------------------------------------------------------------
+# Incremental window refresh (R14 review round 2): malformed replies must
+# never truncate an open ST episode; failures stay visible in the manifest.
+# ----------------------------------------------------------------------
+
+class WindowAPI:
+    """namechange stub returning one fixed reply for the window call."""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    def namechange(self, ts_code=None, start_date=None, end_date=None, fields=None):
+        self.calls += 1
+        return self.result
+
+
+def open_st_feed() -> pd.DataFrame:
+    return pd.DataFrame([{
+        "ts_code": "600001.SH", "name": "ST AAA", "start_date": "20230101",
+        "end_date": None, "ann_date": "20221220", "change_reason": "ST",
+    }], columns=mod._ST_NAMECHANGE_COLUMNS)
+
+
+def refresh_window(prov, result, monkeypatch=None):
+    if monkeypatch is not None:
+        monkeypatch.setattr(mod, "_NAMECHANGE_ROW_CAP", 2)
+    api = WindowAPI(result)
+    prov._st_namechange = open_st_feed()
+    prov._st_fetch_status = "ok"
+    prov._prices = price_panel()
+    prov._refresh_st_after_update(
+        api, SAMPLE_END, SAMPLE_END, ["600001.SH"],
+    )
+    return prov.get_st_timeseries()
+
+
+def test_window_reply_without_name_does_not_truncate_open_st(tmp_path, caplog):
+    result = pd.DataFrame([
+        {"ts_code": "600001.SH", "start_date": "20240105",
+         "ann_date": "20240104"},
+    ])
+    prov = provider(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        episodes = refresh_window(prov, result)
+
+    assert prov._st_last_window_refresh == "failed"
+    assert len(episodes) == 1
+    # The malformed row must not act as a non-ST rename boundary.
+    assert episodes.iloc[0]["end_date"] == SAMPLE_END
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("missing required column" in message for message in messages)
+
+
+def test_window_reply_that_is_not_a_dataframe_is_a_visible_failure(tmp_path, caplog):
+    prov = provider(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        episodes = refresh_window(prov, {"not": "a frame"})
+
+    assert prov._st_last_window_refresh == "failed"
+    assert episodes.iloc[0]["end_date"] == SAMPLE_END
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("instead of a DataFrame" in message for message in messages)
+
+
+def test_window_row_cap_marks_the_refresh_incomplete(tmp_path, caplog, monkeypatch):
+    result = pd.DataFrame([
+        {"ts_code": "600002.SZ", "name": "ST BBB", "start_date": "20240102",
+         "end_date": "20240103", "ann_date": "20240101"},
+        {"ts_code": "600002.SZ", "name": "ST CCC", "start_date": "20240102",
+         "end_date": "20240103", "ann_date": "20240101"},
+    ])
+    prov = provider(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        refresh_window(prov, result, monkeypatch)
+
+    assert prov._st_last_window_refresh == "failed"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("may be truncated" in message for message in messages)
+
+
+def test_window_closed_row_correction_wins_over_the_cached_row(tmp_path):
+    cached = pd.DataFrame([{
+        "ts_code": "600001.SH", "name": "ST AAA", "start_date": "20230110",
+        "end_date": "20230630", "ann_date": "20230107", "change_reason": "ST",
+    }], columns=mod._ST_NAMECHANGE_COLUMNS)
+    corrected = pd.DataFrame([{
+        "ts_code": "600001.SH", "name": "ST AAA", "start_date": "20230110",
+        "end_date": "20240110", "ann_date": "20230107", "change_reason": "ST",
+    }], columns=mod._ST_NAMECHANGE_COLUMNS)
+    prov = provider(tmp_path)
+    prov._st_namechange = cached
+    prov._st_fetch_status = "ok"
+    prov._prices = price_panel()
+
+    prov._refresh_st_after_update(
+        WindowAPI(corrected), SAMPLE_END, SAMPLE_END, ["600001.SH"],
+    )
+
+    assert prov._st_last_window_refresh == "ok"
+    assert prov.get_st_timeseries().iloc[0]["end_date"] == pd.Timestamp(
+        "2024-01-10"
+    )
+
+
+def test_failed_window_refresh_is_persisted_and_warned_on_reload(tmp_path, caplog):
+    api = FakeTushareSTAPI({
+        "600001.SH": [
+            row("600001.SH", "ST AAA", "20230101", None, "20221220"),
+        ],
+    })
+    prov = provider(tmp_path)
+    seed_full_provider(prov, api)
+    prov._st_last_window_refresh = "failed"
+    cache_file = prov._cache_file()
+    prov._save_to_cache(cache_file)
+
+    assert read_cache_manifest(cache_file)["st_window_refresh"] == "failed"
+
+    reloaded = provider(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        reloaded._load_from_cache(cache_file)
+    assert reloaded._st_last_window_refresh == "failed"
+    messages = [record.getMessage().lower() for record in caplog.records]
+    assert any("window refresh failed" in message for message in messages)
+
+
 def test_cache_identity_tracks_the_st_feed_state(tmp_path):
     """A degraded data panel must not share a pipeline cache key with a
     healthy one, and a deleted cache gets a fresh identity token."""
@@ -533,17 +661,28 @@ def test_cache_identity_tracks_the_st_feed_state(tmp_path):
 
     seed_full_provider(prov, api)
     prov._save_to_cache(prov._cache_file())
-    assert provider(tmp_path).cache_identity()["st_fetch_status"] == "ok"
+    healthy = provider(tmp_path).cache_identity()["st_fetch_status"]
+    assert healthy.startswith("ok|available=True|episodes=1")
 
     degraded_dir = tmp_path / "degraded"
     degraded_dir.mkdir()
     degraded = provider(degraded_dir)
     seed_full_provider(degraded, FakeTushareSTAPI(fail_all_namechange=True))
     degraded._save_to_cache(degraded._cache_file())
-    assert (
-        provider(degraded_dir).cache_identity()["st_fetch_status"]
-        == "unavailable"
-    )
+    unavailable = provider(degraded_dir).cache_identity()["st_fetch_status"]
+    assert unavailable.startswith("unavailable")
+
+    # An endpoint that answers "ok" with zero rows is NOT the same state as
+    # one that produced episodes: an ST-off panel cached from the former must
+    # not be reused after the latter appears.
+    empty_dir = tmp_path / "empty_ok"
+    empty_dir.mkdir()
+    empty = provider(empty_dir)
+    seed_full_provider(empty, FakeTushareSTAPI())
+    empty._save_to_cache(empty._cache_file())
+    empty_identity = provider(empty_dir).cache_identity()["st_fetch_status"]
+    assert empty_identity.startswith("ok|available=False|episodes=0")
+    assert empty_identity != healthy
 
     degraded_cache = degraded._cache_file()
     degraded_cache.unlink()

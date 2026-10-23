@@ -200,7 +200,12 @@ class RangeTushareAPI:
         ])
 
     def namechange(self, ts_code=None, start_date=None, end_date=None, fields=None):
-        """Per-code history, or a market-wide window keyed on either date."""
+        """Per-code history, or a market-wide window filtered on ann_date.
+
+        Tushare's ``start_date``/``end_date`` inputs filter the *announcement*
+        date, so the fake matches ann_date only (a rename announced before the
+        window whose effective date falls inside it is NOT returned).
+        """
         self.namechange_calls.append((ts_code, start_date, end_date))
         if ts_code:
             return pd.DataFrame(self.st_rows.get(ts_code, []))
@@ -209,15 +214,13 @@ class RangeTushareAPI:
         rows = []
         for code_rows in self.st_rows.values():
             for item in code_rows:
-                stamps = [
-                    pd.Timestamp(value)
-                    for value in (item.get("start_date"), item.get("ann_date"))
-                    if value
-                ]
-                if any(
+                announced = item.get("ann_date")
+                if not announced:
+                    continue
+                stamp = pd.Timestamp(announced)
+                if (
                     (start is None or stamp >= start)
                     and (end is None or stamp <= end)
-                    for stamp in stamps
                 ):
                     rows.append(item)
         return pd.DataFrame(rows)
