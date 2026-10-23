@@ -493,6 +493,8 @@ def test_capacity_caps_weights_when_adv_is_small():
     assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
     assert weights.sum() == pytest.approx(1.0, abs=1e-6)
     assert weights.loc[names[:10]].max() <= cap + 1e-6
+    # The cap is actually binding: at least one top-signal name sits at it.
+    assert weights.loc[names[:10]].max() == pytest.approx(cap, abs=1e-6)
     # The uncapped names absorbed the difference (the problem is feasible).
     assert weights.loc[names[20:]].sum() > 0.0
 
