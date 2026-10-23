@@ -445,6 +445,8 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
                 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
                 CREATE INDEX IF NOT EXISTS idx_trades_order ON trades(order_id);
+                CREATE INDEX IF NOT EXISTS idx_orders_broker_id
+                    ON orders(broker_order_id);
                 CREATE INDEX IF NOT EXISTS idx_pnl_ts ON pnl_history(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_signals_code ON signals(code);
                 CREATE INDEX IF NOT EXISTS idx_events_topic ON events(topic);
@@ -923,6 +925,47 @@ class Store:
         if tenant_id:
             query += " AND tenant_id = ?"
             params.append(tenant_id)
+        with self._conn() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
+    def get_trade_quantity_for_broker_order(
+        self, broker_order_id: str, *, tenant_id: str = "",
+        code: str = "", side: str = "", since: str = "",
+    ) -> int:
+        """Sum persisted trade quantity booked under a broker wire order id.
+
+        QMT rebuilds orders it did not watch being submitted -- a previous
+        process's order after a restart, e.g. -- with a fresh local
+        ``order_id``; the broker's wire id is the only stable key. The match
+        is scoped by ``code``/``side`` and by ``since`` (an ISO date compared
+        with the order row's ``created_at``) because broker numeric ids are
+        reused across days: a global id match could swallow a genuine new
+        fill. ``since`` uses the host-local clock, the same clock the broker
+        adapters stamp ``created_at`` with.
+
+        Reads ``idx_orders_broker_id`` (created with the schema).
+        """
+        if not broker_order_id:
+            return 0
+        query = (
+            "SELECT COALESCE(SUM(t.quantity), 0) FROM trades t "
+            "JOIN orders o ON t.order_id = o.order_id "
+            "WHERE o.broker_order_id = ?"
+        )
+        params: list = [broker_order_id]
+        if tenant_id:
+            query += " AND t.tenant_id = ?"
+            params.append(tenant_id)
+        if code:
+            query += " AND o.code = ?"
+            params.append(code)
+        if side:
+            query += " AND o.side = ?"
+            params.append(side)
+        if since:
+            query += " AND o.created_at >= ?"
+            params.append(since)
         with self._conn() as conn:
             row = conn.execute(query, params).fetchone()
         return int(row[0] or 0) if row is not None else 0

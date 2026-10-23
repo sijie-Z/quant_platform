@@ -250,12 +250,13 @@ class LiveTradingEngine:
         self._session_id = ""
         # Serialises the daemon loop against manual run-once triggers.
         self._cycle_lock = threading.Lock()
-        # R13: order ids whose broker execution is being persisted by the
-        # synchronous path right now (`manual_order` runs outside the cycle
-        # lock). The fill sync skips them until `{order_id}:fill` is written,
-        # otherwise a concurrent sync could book the same execution as a
-        # delta under `{order_id}:sync:N`.
-        self._fills_in_flight: set[str] = set()
+        # R13: a manual order whose broker execution is being persisted by
+        # the synchronous path right now (`manual_order` runs outside the
+        # cycle lock). While non-zero the fill sync stands down: a broker may
+        # replace the tracked order with a recovered instance under a new
+        # local id inside `place_order`, so no id-based skip can see the
+        # whole window.
+        self._fills_in_flight = 0
         self._fills_in_flight_lock = threading.Lock()
         # R13 startup-sync outcome: `confirmed` means the broker order book
         # was actually readable; `blocked` means a filled order could not be
@@ -967,18 +968,10 @@ class LiveTradingEngine:
         # R13: keep the order marked in flight until its synchronous fill is
         # persisted; the cycle's fill sync runs in another thread and must not
         # book the same execution as a delta in the meantime.
-        tracked_ids = [order.order_id]
         with self._fills_in_flight_lock:
-            self._fills_in_flight.add(order.order_id)
+            self._fills_in_flight += 1
         try:
             result = self._broker.place_order(order)
-            result_id = str(getattr(result, "order_id", "") or "")
-            if result_id and result_id not in tracked_ids:
-                # A concurrent resync may have replaced the tracked order
-                # with a recovered instance carrying a different local id.
-                tracked_ids.append(result_id)
-                with self._fills_in_flight_lock:
-                    self._fills_in_flight.add(result_id)
             # A manual fill is a real broker execution: persist order+trade
             # and count only actual fills. The old code logged MANUAL_ORDER
             # (no trade row) and incremented `_trade_count` even for
@@ -1005,8 +998,7 @@ class LiveTradingEngine:
                 )
         finally:
             with self._fills_in_flight_lock:
-                for tracked_id in tracked_ids:
-                    self._fills_in_flight.discard(tracked_id)
+                self._fills_in_flight -= 1
         # Off-cycle fills must still reach the persisted snapshot. A filled
         # sell may legitimately leave the broker flat while the store still
         # has the (about to be pruned) row.
@@ -1035,6 +1027,13 @@ class LiveTradingEngine:
                     self._cycle_log.append(cycle)
                     if len(self._cycle_log) > 100:
                         self._cycle_log = self._cycle_log[-50:]
+                else:
+                    # R13: actual fills (closing auction, late callbacks) can
+                    # land after the last cycle; the loop keeps idling after
+                    # the close, so book them here instead of waiting for
+                    # stop() -- otherwise the day's EOD could run with a
+                    # stale ledger.
+                    self._sync_broker_fills()
             except Exception as e:
                 logger.error("Cycle error: %s", e, exc_info=True)
                 try:
@@ -1449,6 +1448,28 @@ class LiveTradingEngine:
         """
         self._fill_sync_confirmed = False
         self._fill_sync_blocked = False
+        with self._fills_in_flight_lock:
+            manual_fill_in_flight = self._fills_in_flight > 0
+        if manual_fill_in_flight:
+            logger.debug(
+                "Broker fill sync deferred: a manual fill is being persisted",
+            )
+            return 0
+
+        # QMT's get_orders() degrades to its in-memory cache -- an empty list
+        # on a fresh process -- when the broker query fails. Ask the adapter's
+        # raw resync path for the real outcome when it exposes one; adapters
+        # without it (paper/test) are trusted through get_orders().
+        resync_probe = getattr(self._broker, "_resync_from_broker", None)
+        probe_ok = True
+        if callable(resync_probe):
+            try:
+                probe_ok = bool(resync_probe())
+            except Exception as exc:
+                logger.warning(
+                    "Broker fill sync: order-book resync probe failed: %s", exc,
+                )
+                probe_ok = False
         try:
             orders = self._broker.get_orders()
         except Exception as exc:
@@ -1459,14 +1480,19 @@ class LiveTradingEngine:
             return 0
         try:
             order_list = list(orders)
-        except TypeError:
+        except Exception as exc:
             logger.warning(
-                "Broker fill sync skipped: get_orders returned %s",
-                type(orders).__name__,
+                "Broker fill sync skipped: get_orders returned %s (%s)",
+                type(orders).__name__, exc,
             )
             return 0
 
-        self._fill_sync_confirmed = True
+        self._fill_sync_confirmed = probe_ok
+        if not probe_ok:
+            logger.warning(
+                "Broker fill sync: the broker order query failed; treating "
+                "the snapshot as unconfirmed",
+            )
         written = 0
         for order in order_list:
             try:
@@ -1478,6 +1504,8 @@ class LiveTradingEngine:
                     "Broker fill sync skipped order %r: %s",
                     getattr(order, "order_id", ""), exc,
                 )
+                # A retried success after the baseline would double count.
+                self._fill_sync_blocked = True
         return written
 
     def _sync_one_broker_order(self, order, executed_at: str | None = None) -> int:
@@ -1489,6 +1517,9 @@ class LiveTradingEngine:
                 "Broker fill sync: unreadable filled_quantity on order %r",
                 getattr(order, "order_id", ""),
             )
+            # An unknown fill may be retried (or corrected) later; at startup
+            # that means the baseline must be withheld.
+            self._fill_sync_blocked = True
             return 0
         if filled <= 0:
             return 0
@@ -1500,17 +1531,7 @@ class LiveTradingEngine:
                 "Broker fill sync: order without order_id/code skipped (%r)",
                 getattr(order, "order_id", ""),
             )
-            return 0
-
-        with self._fills_in_flight_lock:
-            in_flight = order_id in self._fills_in_flight
-        if in_flight:
-            # `manual_order` has handed this order to the broker but has not
-            # written `{order_id}:fill` yet; the delta would double book it.
-            logger.debug(
-                "Broker fill sync: %s is being persisted synchronously; "
-                "deferred to the next sync", order_id,
-            )
+            self._fill_sync_blocked = True
             return 0
 
         booked = self._booked_quantity_for_order(order, order_id)
@@ -1531,6 +1552,7 @@ class LiveTradingEngine:
                 "Broker fill sync: order %s has unsupported side %r; skipped",
                 order_id, side_value,
             )
+            self._fill_sync_blocked = True
             return 0
         status = getattr(order, "status", "")
         status_value = str(getattr(status, "value", status) or "")
@@ -1614,14 +1636,13 @@ class LiveTradingEngine:
             # The store may have committed the write and then raised (e.g. a
             # commit error): re-read before declaring drift. A present trade
             # means the fill is booked, and the retry's duplicate-key failure
-            # was the wrong signal.
+            # was the wrong signal. Re-read through the cross-restart-aware
+            # helper: the previous partial may sit under an older local id.
             try:
-                present = self._store.get_trade_quantity_for_order(
-                    order_id, self._tenant_id,
-                )
+                present = self._booked_quantity_for_order(order, order_id)
             except Exception:
-                present = 0
-            if int(present or 0) < filled:
+                present = None
+            if present is None or int(present) < filled:
                 logger.critical(
                     "Synced fill %s (%d shares) could not be persisted; the "
                     "ledger will drift from the broker", order_id, delta,
@@ -1698,33 +1719,27 @@ class LiveTradingEngine:
         broker_order_id = str(getattr(order, "broker_order_id", "") or "")
         if not broker_order_id:
             return booked
+        code = str(getattr(order, "code", "") or "")
+        side = getattr(order, "side", "")
+        side_value = str(getattr(side, "value", side) or "")
         try:
-            rows = self._store.get_orders(
-                tenant_id=self._tenant_id, limit=1000,
+            # A broker's numeric wire ids are reused across days; scope the
+            # match to the same asset/side and to order rows created on the
+            # host-local trading day (QMT reports the current exchange day's
+            # book, and order rows are stamped on the host clock).
+            booked += self._store.get_trade_quantity_for_broker_order(
+                broker_order_id,
+                tenant_id=self._tenant_id,
+                code=code,
+                side=side_value,
+                since=datetime.now().date().isoformat(),
             )
         except Exception as exc:
             logger.warning(
-                "Broker fill sync: broker-id dedupe query failed for %s: %s",
-                order_id, exc,
+                "Broker fill sync: broker-id dedupe query failed for %s "
+                "(broker order %s): %s", order_id, broker_order_id, exc,
             )
             return None
-        for row in rows:
-            if str(row.get("broker_order_id") or "") != broker_order_id:
-                continue
-            other_id = str(row.get("order_id") or "")
-            if not other_id or other_id == order_id:
-                continue
-            try:
-                booked += self._store.get_trade_quantity_for_order(
-                    other_id, self._tenant_id,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Broker fill sync: persisted quantity query failed for "
-                    "%s (broker order %s): %s",
-                    other_id, broker_order_id, exc,
-                )
-                return None
         return booked
 
     def _unbooked_broker_fill_deltas(self) -> dict[str, int] | None:

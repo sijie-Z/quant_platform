@@ -145,6 +145,68 @@ class TestTradeQuantityForOrder:
         assert "idx_trades_order" in names
 
 
+class TestTradeQuantityForBrokerOrder:
+    """R13: QMT regenerates the local order_id after a restart; the broker's
+    wire id is the only stable key, scoped by day/asset/side."""
+
+    def _book(self, store, order_id, broker_id, qty, *, code="600519",
+              side="buy", created_at="2026-10-23T09:30:00",
+              tenant="default"):
+        store.save_order({
+            "order_id": order_id, "tenant_id": tenant, "code": code,
+            "side": side, "quantity": qty, "price": 10.0,
+            "filled_quantity": qty, "status": "filled",
+            "broker_order_id": broker_id, "created_at": created_at,
+        })
+        store.save_trade({
+            "trade_id": f"{order_id}:t", "tenant_id": tenant,
+            "order_id": order_id, "code": code, "side": side,
+            "quantity": qty, "price": 10.0,
+        })
+
+    def test_sums_across_regenerated_local_ids(self, store):
+        self._book(store, "old-local", "9001", 40)
+        self._book(store, "new-local", "9001", 60)
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", code="600519", side="buy", since="2026-10-23",
+        ) == 100
+
+    def test_scope_prevents_cross_day_and_cross_asset_matches(self, store):
+        self._book(store, "old-day", "9001", 100,
+                   created_at="2026-10-22T09:30:00")
+        self._book(store, "other-code", "9001", 100, code="000001")
+        self._book(store, "other-side", "9001", 100, side="sell")
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", code="600519", side="buy", since="2026-10-23",
+        ) == 0
+
+    def test_tenant_filter_scopes_the_sum(self, store):
+        self._book(store, "a", "9001", 40, tenant="default")
+        self._book(store, "b", "9001", 60, tenant="other")
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", tenant_id="default", code="600519", side="buy",
+            since="2026-10-23",
+        ) == 40
+
+    def test_unknown_and_empty_broker_id_are_zero(self, store):
+        assert store.get_trade_quantity_for_broker_order("missing") == 0
+        assert store.get_trade_quantity_for_broker_order("") == 0
+
+    def test_broker_id_lookup_is_indexed(self, store):
+        import sqlite3
+
+        conn = sqlite3.connect(store._db_path)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'orders'"
+            ).fetchall()
+        finally:
+            conn.close()
+        names = {name for (name,) in rows}
+        assert "idx_orders_broker_id" in names
+
+
 class TestStorePnL:
     def test_save_and_get_pnl(self, store):
         store.save_pnl_snapshot({

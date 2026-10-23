@@ -344,6 +344,52 @@ def test_cross_restart_recovered_order_is_not_rebooked(tmp_path):
     assert store.get_trade_quantity_for_order("new-local") == 0
 
 
+def test_broker_id_dedupe_does_not_swallow_a_new_days_fill(tmp_path):
+    """N1: broker wire ids are reused across days; a same-id row from an
+    earlier day (or another asset/side) must not explain today's fill."""
+    store = Store(str(tmp_path / "engine.db"))
+    store.save_order_with_trade(
+        {
+            "order_id": "yesterday", "code": "600519", "side": "buy",
+            "quantity": 100, "price": 10.0, "status": "filled",
+            "filled_quantity": 100, "filled_price": 10.5,
+            "broker_order_id": "9001",
+            "created_at": "2000-01-01T09:30:00",
+        },
+        {
+            "trade_id": "yesterday:fill", "order_id": "yesterday",
+            "code": "600519", "side": "buy", "quantity": 100, "price": 10.5,
+        },
+    )
+    store.save_order_with_trade(
+        {
+            "order_id": "other-code", "code": "000001", "side": "buy",
+            "quantity": 100, "price": 10.0, "status": "filled",
+            "filled_quantity": 100, "filled_price": 10.5,
+            "broker_order_id": "9001",
+        },
+        {
+            "trade_id": "other-code:fill", "order_id": "other-code",
+            "code": "000001", "side": "buy", "quantity": 100, "price": 10.5,
+        },
+    )
+    recovered = _order(
+        order_id="today", code="600519", filled_quantity=100,
+        filled_price=10.5, status=OrderStatus.FILLED,
+        broker_order_id="9001",
+    )
+    engine = LiveTradingEngine(
+        broker=FakeBroker([recovered]), store=store,
+        bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+
+    assert engine._sync_broker_fills() == 1, (
+        "an old-day or other-asset row with the same wire id must not "
+        "swallow today's fill"
+    )
+    assert store.get_trade_quantity_for_order("today") == 100
+
+
 def test_start_withholds_the_baseline_when_the_order_book_is_unreadable(
     tmp_path, monkeypatch,
 ):
@@ -364,6 +410,52 @@ def test_start_withholds_the_baseline_when_the_order_book_is_unreadable(
         engine.stop()
 
 
+class _UnreadableResyncBroker(FakeBroker):
+    """Mimics QMT after a failed order query: ``get_orders()`` serves its
+    in-memory cache (empty on a fresh process), so only the resync knows."""
+
+    def _resync_from_broker(self):
+        return False
+
+
+def test_start_withholds_the_baseline_when_the_resync_query_fails(
+    tmp_path, monkeypatch,
+):
+    engine = LiveTradingEngine(
+        broker=_UnreadableResyncBroker(),
+        store=Store(str(tmp_path / "engine.db")),
+        bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+    _freeze_pre_market(engine, monkeypatch)
+
+    engine.start()
+    try:
+        assert engine._running
+        assert engine._store.get_latest_ledger_baseline() is None, (
+            "an empty cached book from a failed resync must not count as "
+            "confirmed"
+        )
+    finally:
+        engine.stop()
+
+
+class _ExplodingBookBroker(FakeBroker):
+    def get_orders(self, status=None):
+        def gen():
+            raise RuntimeError("iterator blew up")
+            yield  # pragma: no cover
+
+        return gen()
+
+
+def test_get_orders_iteration_failure_is_contained(tmp_path, caplog):
+    """N6: non-TypeError iterator errors must not escape the sync."""
+    engine = _engine(tmp_path, _ExplodingBookBroker())
+    with caplog.at_level(logging.WARNING):
+        assert engine._sync_broker_fills() == 0
+    assert "get_orders returned" in caplog.text
+
+
 def test_start_syncs_fills_before_stamping_the_ledger_baseline(
     tmp_path, monkeypatch,
 ):
@@ -376,11 +468,13 @@ def test_start_syncs_fills_before_stamping_the_ledger_baseline(
 
     def sync(executed_at=None):
         # The real sync confirms the (readable) order book; the fake must
-        # too, otherwise start() withholds the baseline by design.
+        # too, otherwise start() withholds the baseline by design. The loop
+        # may sync again after start(); only the first call is inspected.
         engine._fill_sync_confirmed = True
         engine._fill_sync_blocked = False
-        calls.append("sync")
-        stamps["sync"] = executed_at
+        if not calls:
+            calls.append("sync")
+            stamps["sync"] = executed_at
         return 0
 
     def baseline(not_before=None):
@@ -564,7 +658,44 @@ def test_manual_order_fill_in_flight_is_not_double_booked(tmp_path):
     trades = engine._store.get_trades()
     assert [t["trade_id"] for t in trades] == [f"{result['order_id']}:fill"]
     assert engine._store.get_trade_quantity_for_order(result["order_id"]) == 100
-    assert engine._fills_in_flight == set(), "the in-flight marker must be cleared"
+    assert engine._fills_in_flight == 0, "the in-flight marker must be cleared"
+
+
+class _RecoveredDuringPlaceBroker(FakeBroker):
+    """M5/N3: place_order swaps in a recovered order with a different local id
+    *inside* the call; an id-based skip cannot see that window."""
+
+    def __init__(self):
+        super().__init__()
+        self.engine: LiveTradingEngine | None = None
+
+    def place_order(self, order):
+        result = BrokerOrder(
+            order_id="recovered-id", code=order.code, side=order.side,
+            quantity=order.quantity, price=order.price,
+            filled_quantity=order.quantity, filled_price=order.price,
+            status=OrderStatus.FILLED, broker_order_id="9002",
+        )
+        self.orders = [result]
+        self.engine._sync_broker_fills()
+        return result
+
+
+def test_manual_order_recovered_id_window_is_covered(tmp_path):
+    broker = _RecoveredDuringPlaceBroker()
+    engine = LiveTradingEngine(
+        broker=broker, store=Store(str(tmp_path / "engine.db")),
+        bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+    broker.engine = engine
+
+    result = engine.manual_order("600519", "buy", 100, 10.0)
+
+    assert result["order_id"] == "recovered-id"
+    trades = engine._store.get_trades()
+    assert [t["trade_id"] for t in trades] == ["recovered-id:fill"]
+    assert engine._store.get_trade_quantity_for_order("recovered-id") == 100
+    assert engine._fills_in_flight == 0
 
 
 def test_synced_fill_emits_order_synced_never_order_filled(tmp_path):
