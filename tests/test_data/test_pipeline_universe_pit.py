@@ -127,6 +127,7 @@ class _MembershipProvider(_BaseFixtureProvider):
         drop_mask_columns: list[str] | None = None,
         mask_exception: Exception | None = None,
         index_code: str | None = "000300.SH",
+        snapshot_offsets: list[int] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -134,6 +135,7 @@ class _MembershipProvider(_BaseFixtureProvider):
         self.index_code = index_code
         self._drop_mask_columns = list(drop_mask_columns or [])
         self._mask_exception = mask_exception
+        self._snapshot_offsets = snapshot_offsets
 
     def get_index_membership_mask(
         self, start_date: str, end_date: str,
@@ -145,6 +147,10 @@ class _MembershipProvider(_BaseFixtureProvider):
         bare = [asset.split(".")[0] for asset in ASSETS]
         mask = pd.DataFrame(True, index=DATES, columns=bare)
         mask.iloc[:INCLUSION_DAY, 1] = False  # 000002 joins at INCLUSION_DAY
+        if self._snapshot_offsets is not None:
+            # Model the real provider: index_weight history is snapshot-dated,
+            # not daily.
+            mask = mask.iloc[self._snapshot_offsets]
         if self._drop_mask_columns:
             mask = mask.drop(columns=self._drop_mask_columns)
         return mask.loc[pd.Timestamp(start_date):pd.Timestamp(end_date)]
@@ -200,6 +206,33 @@ class TestMembershipMaskApplied:
         assert pipeline.universe_mask is not None
         assert "000001.SZ" in pipeline.universe_mask.columns
         assert pipeline.universe_mask["000001.SZ"].all()
+
+
+class TestSnapshotDatedMask:
+    """Tushare index_weight is monthly: the returned mask is snapshot-dated.
+
+    A snapshot's membership holds until the next snapshot; dates before the
+    first snapshot are unknown and must be False (never assumed members).
+    """
+
+    def test_snapshot_membership_holds_until_next_snapshot(self):
+        provider = _MembershipProvider(
+            history_available=True, snapshot_offsets=[10, 30, 60, 80],
+        )
+        pipeline = _run(provider)
+        mask = pipeline.tradable_mask
+
+        # Before the first snapshot nothing is known: not members.
+        assert not mask["000001.SZ"].iloc[:10].any()
+        assert not mask["000002.SZ"].iloc[:10].any()
+        # Snapshot at day 10 includes A; membership persists between
+        # snapshots (day 15 is not a snapshot date).
+        assert mask["000001.SZ"].iloc[10:].all()
+        assert pipeline.universe_mask.loc[DATES[15], "000001.SZ"]
+        assert not mask["000002.SZ"].iloc[10:60].any()
+        # Snapshot at day 60 includes B; it stays a member to the end.
+        assert mask["000002.SZ"].iloc[60:].all()
+        assert pipeline.universe_mask.loc[DATES[65], "000002.SZ"]
 
 
 class TestSingleSnapshotRefused:

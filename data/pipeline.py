@@ -1070,15 +1070,18 @@ class DataPipeline:
         sample -- the same look-ahead this gate exists to remove -- so it is
         refused with a warning and tradability is left unchanged.
 
-        The mask is aligned to the panel by date (dates the provider did not
-        return are treated as "not a member") and by asset (only the column
-        intersection is applied; assets with no mask column keep their
-        previous eligibility instead of being silently excluded).  A mask
-        fetch that raises aborts the run: silently treating a broken mask as
-        all-True or all-False would silently change the universe.
+        The mask is aligned to the panel by date (snapshot-dated panels -- the
+        real provider's ``index_weight`` history is monthly -- stay in force
+        until the next snapshot; dates before the first snapshot are not
+        members) and by asset (only the column intersection is applied;
+        assets with no mask column keep their previous eligibility instead of
+        being silently excluded).  A mask fetch that raises aborts the run:
+        silently treating a broken mask as all-True or all-False would
+        silently change the universe.
 
         Provider contract: ``get_index_membership_mask(start, end)`` returns
-        a boolean date x asset frame covering the sample.
+        a boolean date x asset frame; it may be snapshot-dated, and a
+        snapshot's membership holds until the next snapshot.
         """
         provider = self.provider
         hook = getattr(provider, "get_index_membership_mask", None)
@@ -1150,8 +1153,12 @@ class DataPipeline:
             mask = mask.groupby(level=0).any()
         if mask.columns.has_duplicates:
             mask = mask.T.groupby(level=0).any().T
-        mask = mask.reindex(index=dates, fill_value=False)
-        mask = mask.fillna(False).astype(bool)
+        # Snapshot panels (Tushare index_weight is monthly) describe
+        # membership until the next snapshot, so days between snapshots
+        # inherit the previous row.  Days before the first snapshot are
+        # unknown and stay False.
+        mask = mask.reindex(index=dates)
+        mask = mask.ffill().fillna(False).astype(bool)
 
         common = tradable.columns.intersection(mask.columns)
         missing = tradable.columns.difference(mask.columns)
