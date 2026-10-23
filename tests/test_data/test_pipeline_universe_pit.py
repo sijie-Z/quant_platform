@@ -443,7 +443,7 @@ class TestColumnMismatch:
         assert pipeline.universe_pit["applied"] is True
         _assert_tradable_is_membership_free(pipeline)
         assert any(
-            "do not match the tradable panel" in record.getMessage()
+            "do not match the price panel" in record.getMessage()
             for record in caplog.records
         )
 

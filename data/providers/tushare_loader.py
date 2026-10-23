@@ -517,9 +517,11 @@ class TushareProvider(DataProvider):
         """Per-date (date x asset) index-membership mask.
 
         Membership snapshots are kept as ``(trade_date, ts_code)`` history and
-        forward-filled between snapshot dates: a constituent stays a member
-        until the next snapshot says otherwise.  Dates before the first
-        snapshot are False (unknown, never assumed to be members).
+        returned snapshot-dated: each row describes membership until the next
+        snapshot, and the consumer reindexes the panel onto its price grid and
+        forward-fills.  A constituent stays a member until the next snapshot
+        says otherwise; dates before the first snapshot are False (unknown,
+        never assumed to be members).
 
         Every snapshot row lists both current members (True) and non-members
         (False), so a plain forward fill propagates an explicit *exit* as

@@ -1151,7 +1151,7 @@ class DataPipeline:
         if raw.empty:
             logger.warning(
                 "%s: get_index_membership_mask returned an empty frame; "
-                "leaving tradability unchanged",
+                "every asset stays buyable (universe unchanged)",
                 provider_label(owner),
             )
             self.universe_pit = {**provenance, "reason": "empty_membership_mask"}
@@ -1175,8 +1175,8 @@ class DataPipeline:
         # flag on reload); applying it would blank every earlier day.  The
         # check is deliberately conservative: a legitimate short sample that
         # only contains one snapshot is refused too (the gate is skipped and
-        # data is left unchanged) because the two cases are indistinguishable
-        # from the mask alone.
+        # every asset stays buyable) because the two cases are
+        # indistinguishable from the mask alone.
         snapshot_count = len(mask.index.intersection(dates))
         if snapshot_count < 2:
             logger.warning(
@@ -1202,15 +1202,15 @@ class DataPipeline:
         extra = mask.columns.difference(assets)
         if len(missing) or len(extra):
             logger.warning(
-                "%s: index-membership mask columns do not match the tradable "
+                "%s: index-membership mask columns do not match the price "
                 "panel (%d asset(s) without a mask column, %d mask column(s) "
                 "matching no asset); applying the %d-column intersection and "
-                "leaving unmatched assets unchanged",
+                "keeping unmatched assets buyable",
                 provider_label(owner), len(missing), len(extra), len(common),
             )
         if len(common) == 0:
             logger.warning(
-                "%s: index-membership mask shares no asset with the tradable "
+                "%s: index-membership mask shares no asset with the price "
                 "panel; every asset stays buyable",
                 provider_label(owner),
             )
