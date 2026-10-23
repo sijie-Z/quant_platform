@@ -821,6 +821,9 @@ class TestLedgerBaselines:
         with pytest.raises(ValueError, match="created_at"):
             store.save_ledger_baseline(self._baseline(created_at=""))
 
+        with pytest.raises(ValueError, match="created_at"):
+            store.save_ledger_baseline(self._baseline(created_at="   "))
+
     def test_positions_may_be_json_text(self, store):
         store.save_ledger_baseline(
             self._baseline(positions_json='{"600519": 100}'),

@@ -1222,7 +1222,7 @@ class Store:
         never updated -- a restart appends a new row and readers take the
         newest id, so the derivation never applies old fills twice.
         """
-        created_at = str(baseline.get("created_at") or "")
+        created_at = str(baseline.get("created_at") or "").strip()
         if not created_at:
             raise ValueError(
                 "ledger baseline created_at is required: the ledger's "
