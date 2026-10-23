@@ -285,6 +285,26 @@ class TestMembershipMaskApplied:
         assert "000001.SZ" in pipeline.universe_mask.columns
         assert pipeline.universe_mask["000001.SZ"].all()
 
+    def test_tradable_mask_matches_no_hook_baseline_bit_for_bit(self):
+        """R6b: applying membership must not move `tradable_mask` at all."""
+        suspended = ("000003.SZ", 10, 15)
+        baseline = _run(_BaseFixtureProvider(suspended_window=suspended))
+        applied = _run(
+            _MembershipProvider(
+                history_available=True, suspended_window=suspended,
+            )
+        )
+        pd.testing.assert_frame_equal(
+            applied.tradable_mask, baseline.tradable_mask,
+        )
+        # The suspension is the only difference from all-True, and the
+        # membership narrowing is visible in the separate mask.
+        assert not applied.tradable_mask.loc[
+            DATES[10]:DATES[15], "000003.SZ"
+        ].any()
+        assert not applied.universe_mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        assert applied.universe_mask["000001.SZ"].all()
+
 
 class TestMembershipExit:
     """R6b: an index exit must end buy eligibility but not sellability."""
