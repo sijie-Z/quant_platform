@@ -511,10 +511,25 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
         weights = weights.reindex(signal.index, fill_value=0.0)
 
         # The target-level turnover cap is a hard constraint, so it is applied
-        # last (the solver's version is approximate).
-        return _limit_turnover(
+        # last (the solver's version is approximate). With a capacity cap the
+        # blend toward a previous book that itself exceeded the new cap could
+        # otherwise push a weight back above it, so clip defensively.
+        weights = _limit_turnover(
             weights, prev_weights, self.constraints.max_turnover, signal.index,
         )
+        if capacity_caps is not None:
+            cap_series = pd.Series(
+                capacity_caps, index=assets,
+            ).reindex(weights.index)
+            above = weights > cap_series + 1e-9
+            if bool(above.any()):
+                logger.warning(
+                    "MVO: the post-turnover blend exceeded the ADV capacity "
+                    "cap for %d asset(s); clipping to the cap (the sum may "
+                    "fall marginally below 1)", int(above.sum()),
+                )
+                weights = weights.where(~above, cap_series)
+        return weights
 
 
 class RiskParityOptimizer(PortfolioOptimizer):
