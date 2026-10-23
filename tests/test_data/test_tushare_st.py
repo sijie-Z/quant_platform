@@ -32,6 +32,7 @@ No network access: the Tushare API is replaced with a fake.
 
 from __future__ import annotations
 
+import json
 import logging
 
 import pandas as pd
@@ -404,6 +405,24 @@ def test_duplicate_namechange_rows_prefer_the_recorded_end(
     assert episode["end_date"] != SAMPLE_END
 
 
+def test_timestamp_start_duplicates_prefer_the_closed_row(tmp_path):
+    """Equivalent start spellings (Timestamp vs string) must dedupe too."""
+    api = FakeTushareSTAPI({
+        "600001.SH": [
+            row("600001.SH", "ST AAA", "20230110", None, "20230107"),
+            row("600001.SH", "ST AAA", "20230110", "20230227", "20230107"),
+        ],
+    })
+    api.namechange_rows["600001.SH"][0]["start_date"] = pd.Timestamp("2023-01-10")
+    api.namechange_rows["600001.SH"][1]["start_date"] = pd.Timestamp("2023-01-10")
+    prov = provider(tmp_path)
+    prov._prices = price_panel()
+
+    episode = prov._fetch_st_episodes(api, ["600001.SH"]).iloc[0]
+
+    assert episode["end_date"] == pd.Timestamp("2023-02-27")
+
+
 def test_large_universe_logs_estimate_but_fetches_every_symbol(tmp_path, caplog):
     api = FakeTushareSTAPI()
     prov = provider(tmp_path)
@@ -647,6 +666,125 @@ def test_failed_window_refresh_is_persisted_and_warned_on_reload(tmp_path, caplo
     assert any("window refresh failed" in message for message in messages)
 
 
+class RecordingWindow:
+    """namechange stub: records window args, returns a result or raises."""
+
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def namechange(self, ts_code=None, start_date=None, end_date=None, fields=None):
+        self.calls.append((ts_code, start_date, end_date))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def test_failed_window_coverage_is_sticky_until_a_successful_retry(tmp_path):
+    """A failed window may let the price marker advance past ST coverage;
+    the next window must start from the last *successful* coverage (N14)."""
+    prov = provider(tmp_path)
+    prov._st_namechange = open_st_feed()
+    prov._st_fetch_status = "ok"
+    prov._prices = price_panel()
+    prov._st_covered_until = SAMPLE_END
+
+    failing = RecordingWindow(error=RuntimeError("window down"))
+    prov._refresh_st_after_update(
+        failing, pd.Timestamp("2024-03-01"), pd.Timestamp("2024-03-01"),
+        ["600001.SH"],
+    )
+    assert prov._st_last_window_refresh == "failed"
+    assert prov._st_covered_until == SAMPLE_END  # coverage did not advance
+
+    recovered_row = pd.DataFrame([{
+        "ts_code": "600002.SZ", "name": "*ST NEW", "start_date": "20240120",
+        "end_date": None, "ann_date": "20240115", "change_reason": "ST",
+    }], columns=mod._ST_NAMECHANGE_COLUMNS)
+    recovering = RecordingWindow(result=recovered_row)
+    prov._refresh_st_after_update(
+        recovering, pd.Timestamp("2024-03-15"), pd.Timestamp("2024-03-15"),
+        ["600001.SH", "600002.SZ"],
+    )
+
+    # The retry re-covers the failed interval (starts at coverage-30d).
+    assert recovering.calls[0][1] <= "20240115"
+    assert prov._st_last_window_refresh == "ok"
+    assert prov._st_covered_until == pd.Timestamp("2024-03-15")
+    assert set(prov.get_st_timeseries()["asset"]) == {"600001.SH", "600002.SZ"}
+
+
+def test_window_reply_with_all_blank_names_is_a_failure(tmp_path):
+    result = pd.DataFrame([{
+        "ts_code": "600001.SH", "name": "", "start_date": "20240105",
+        "end_date": None, "ann_date": "20240104",
+    }])
+    prov = provider(tmp_path)
+    episodes = refresh_window(prov, result)
+
+    assert prov._st_last_window_refresh == "failed"
+    assert episodes.iloc[0]["end_date"] == SAMPLE_END
+
+
+def test_full_fetch_resets_window_markers(tmp_path):
+    api = FakeTushareSTAPI()
+    prov = provider(tmp_path)
+    prov._ts_api = api
+    prov._st_last_window_refresh = "failed"
+    prov._st_covered_until = pd.Timestamp("2023-01-01")
+
+    prov._load_or_fetch_all()
+
+    assert prov._st_last_window_refresh == "not_attempted"
+    assert prov._st_covered_until == SAMPLE_END
+    manifest = read_cache_manifest(prov._cache_file())
+    assert manifest["st_window_refresh"] == "not_attempted"
+    assert manifest["st_covered_until"] == SAMPLE_END.strftime("%Y-%m-%d")
+
+
+def test_legacy_v5_manifest_is_retired(tmp_path):
+    api = FakeTushareSTAPI({
+        "600001.SH": [
+            row("600001.SH", "ST AAA", "20220425", "20230510", "20220420"),
+        ],
+    })
+    prov = provider(tmp_path)
+    seed_full_provider(prov, api)
+    cache_file = prov._cache_file()
+    prov._save_to_cache(cache_file)
+    assert provider(tmp_path)._cache_manifest_valid(cache_file) is True
+
+    manifest_path = cache_file.with_name(f"{cache_file.name}.manifest.json")
+    payload = read_cache_manifest(cache_file)
+    payload["cache_version"] = "v5"  # pre-R14-round-3 semantics
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert provider(tmp_path)._cache_manifest_valid(cache_file) is False
+
+
+def test_cache_identity_distinguishes_feed_content(tmp_path):
+    """Same status/count but different ST intervals must not share a key."""
+    def identity_for(name, end):
+        directory = tmp_path / name
+        directory.mkdir()
+        api = FakeTushareSTAPI({
+            "600001.SH": [
+                row("600001.SH", "ST AAA", "20220425", end, "20220420"),
+            ],
+        })
+        prov = provider(directory)
+        seed_full_provider(prov, api)
+        prov._save_to_cache(prov._cache_file())
+        return provider(directory).cache_identity()["st_fetch_status"]
+
+    first = identity_for("first", "20230510")
+    second = identity_for("second", "20230610")
+
+    assert first.startswith("ok|available=True|episodes=1")
+    assert first != second
+
+
 def test_cache_identity_tracks_the_st_feed_state(tmp_path):
     """A degraded data panel must not share a pipeline cache key with a
     healthy one, and a deleted cache gets a fresh identity token."""
@@ -725,4 +863,4 @@ def test_cache_and_schema_versions_are_bumped():
     from quant_platform.utils.cache import DATA_SCHEMA_VERSION
 
     assert DATA_SCHEMA_VERSION == 8
-    assert mod._PROVIDER_CACHE_VERSION == "v5"
+    assert mod._PROVIDER_CACHE_VERSION == "v6"

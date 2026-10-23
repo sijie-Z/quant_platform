@@ -25,6 +25,7 @@ Requires: TUSHARE_TOKEN env var or config value (free registration at tushare.pr
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 import uuid
@@ -76,7 +77,11 @@ CACHE_DIR.mkdir(exist_ok=True)
 # would silently disable ST screening on real data, so they must never be
 # replayed. The sidecar manifest records ``st_fetch_status`` so a cache built
 # while the endpoint was unavailable is not mistaken for "no ST names".
-_PROVIDER_CACHE_VERSION = "v5"
+# v6: the manifest also records ST availability/episode count, the incremental
+# window coverage boundary/failure marker and a raw-feed fingerprint. v5
+# manifests lack these fields, so an empty and a populated v5 feed would share
+# one pipeline cache identity; they must be retired (R14 review N12/N14).
+_PROVIDER_CACHE_VERSION = "v6"
 #: Basis of the stored ``close`` column (raw traded price).
 _PRICE_ADJUSTMENT = "raw"
 #: Basis of ``close / adj_factor`` (the return-generating series).
@@ -201,6 +206,11 @@ class TushareProvider(DataProvider):
         #: ``ok`` / ``failed`` / ``not_attempted`` (persisted in the manifest
         #: so a failed refresh stays visible to later runs).
         self._st_last_window_refresh = "not_attempted"
+        #: Last date for which the namechange feed is known to cover all
+        #: announcements. Advanced only by a full fetch or a successful,
+        #: untruncated incremental window; a failed window leaves it in place
+        #: so the next window starts before the failed interval (sticky gap).
+        self._st_covered_until: pd.Timestamp | None = None
         #: Symbols whose namechange call failed after all attempts (reporting
         #: surface; also recorded in the cache manifest).
         self.st_failed_symbols: list[str] = []
@@ -722,6 +732,14 @@ class TushareProvider(DataProvider):
             ),
             "st_failed_symbols": sorted(self.st_failed_symbols),
             "st_window_refresh": self._st_last_window_refresh,
+            "st_covered_until": (
+                self._st_covered_until.strftime("%Y-%m-%d")
+                if isinstance(self._st_covered_until, pd.Timestamp)
+                else None
+            ),
+            "st_feed_fingerprint": self._namechange_fingerprint(
+                self._st_namechange
+            ),
         }
         if extra:
             payload.update(extra)
@@ -780,9 +798,11 @@ class TushareProvider(DataProvider):
         available = manifest.get("st_available", "unknown")
         episodes = manifest.get("st_episode_count", "unknown")
         window = manifest.get("st_window_refresh", "unknown")
+        feed = manifest.get("st_feed_fingerprint", "unknown")
         suffix = "|window_failed=1" if window == "failed" else ""
         return (
-            f"{status}|available={available}|episodes={episodes}{suffix}"
+            f"{status}|available={available}|episodes={episodes}"
+            f"|feed={feed}{suffix}"
         )
 
     def cache_universe(
@@ -996,6 +1016,14 @@ class TushareProvider(DataProvider):
             self._st_last_window_refresh = str(
                 manifest.get("st_window_refresh", "not_attempted")
             )
+            covered_raw = manifest.get("st_covered_until")
+            covered = (
+                pd.to_datetime(covered_raw, errors="coerce")
+                if covered_raw else pd.NaT
+            )
+            self._st_covered_until = (
+                covered.normalize() if pd.notna(covered) else None
+            )
             self.st_failed_symbols = [
                 str(code) for code in manifest.get("st_failed_symbols", [])
             ]
@@ -1162,6 +1190,11 @@ class TushareProvider(DataProvider):
         # 6. Get ST history (namechange; one call per symbol, best effort)
         logger.info("  Fetching ST name-change history...")
         episodes = self._fetch_st_episodes(api, all_codes)
+        # A full fetch rebuilds the feed from scratch: any incremental-window
+        # failure marker is cleared and coverage is complete through the
+        # panel's last day (R14 review N13).
+        self._st_last_window_refresh = "not_attempted"
+        self._st_covered_until = panel_last_date(self._prices)
         logger.info("  ST episodes: %d", len(episodes))
 
     def _fetch_constituents(self, api) -> pd.DataFrame:
@@ -1453,6 +1486,14 @@ class TushareProvider(DataProvider):
                 "failure", label, missing,
             )
             return False
+        names = frame["name"].astype("string").fillna("").str.strip()
+        starts = frame["start_date"].astype("string").fillna("").str.strip()
+        if not bool((names != "").any()) or not bool((starts != "").any()):
+            logger.warning(
+                "%s carries no usable name/start_date values; treating it as "
+                "a failure", label,
+            )
+            return False
         return True
 
     @staticmethod
@@ -1469,11 +1510,10 @@ class TushareProvider(DataProvider):
         frame = raw.copy()
         frame["_code_key"] = frame["ts_code"].astype("string").fillna("").str.strip()
         frame["_name_key"] = frame["name"].astype("string").fillna("").str.strip()
-        parsed_start = pd.to_datetime(
-            frame["start_date"].astype("string"), format="%Y%m%d",
-            errors="coerce",
+        parsed_start = frame["start_date"].map(
+            TushareProvider._parse_namechange_date
         )
-        start_key = parsed_start.dt.strftime("%Y%m%d")
+        start_key = pd.to_datetime(parsed_start).dt.strftime("%Y%m%d")
         frame["_start_key"] = start_key.fillna(
             pd.Series(
                 [f"unparsed:{i}" for i in range(len(frame))],
@@ -1501,6 +1541,32 @@ class TushareProvider(DataProvider):
         if pd.isna(value):
             return False
         return str(value).strip() not in ("", "None", "nan", "NaT")
+
+    @staticmethod
+    def _parse_namechange_date(value) -> pd.Timestamp:
+        """Parse one raw namechange date cell (``YYYYMMDD`` or Timestamp)."""
+        if isinstance(value, pd.Timestamp):
+            return value.normalize()
+        if pd.isna(value):
+            return pd.NaT
+        text = str(value).strip()
+        if text in ("", "None", "nan", "NaT"):
+            return pd.NaT
+        return pd.to_datetime(text, format="%Y%m%d", errors="coerce")
+
+    @staticmethod
+    def _namechange_fingerprint(frame: pd.DataFrame | None) -> str:
+        """Stable short hash of the raw ST feed (part of the cache identity)."""
+        if frame is None:
+            return "none"
+        if len(frame) == 0:
+            return "empty"
+        columns = [c for c in _ST_NAMECHANGE_COLUMNS if c in frame.columns]
+        values = frame.loc[:, columns].astype("string").fillna("")
+        values = values.sort_values(columns, kind="stable")
+        digest = hashlib.sha1()
+        digest.update(values.to_csv(index=False).encode("utf-8"))
+        return digest.hexdigest()[:12]
 
     def _combine_namechange_frames(
         self, frames: list[pd.DataFrame], codes: list[str],
@@ -1547,6 +1613,11 @@ class TushareProvider(DataProvider):
         A window-only response is never allowed to stand in for a missing
         full feed (it would silently lose every older episode), so recovery
         from an unavailable feed still requires a full refresh.
+
+        Coverage is sticky: the start of the next window is the last date a
+        *successful, untruncated* window (or a full fetch) covered, so a
+        failed window spanning more than the 30-day margin is re-queried
+        instead of being silently skipped (R14 review N14).
         """
         if self._st_namechange is None:
             if self._st_fetch_status == "unavailable":
@@ -1564,10 +1635,19 @@ class TushareProvider(DataProvider):
             )
         self._st_last_window_refresh = "not_attempted"
         if api is not None:
+            # Start from the last *successful* coverage boundary, not the
+            # price marker: a failed window may leave the price marker ahead
+            # of the ST coverage, and that gap must be re-covered (N14).
+            base = (
+                self._st_covered_until
+                if self._st_covered_until is not None
+                else pd.Timestamp(marker).normalize()
+            )
             window_start = max(
-                pd.Timestamp(marker).normalize() - pd.Timedelta(days=30),
+                base - pd.Timedelta(days=30),
                 pd.Timestamp(self.start_date).normalize(),
             )
+            failed = False
             try:
                 fresh = self._call_with_retries(
                     "namechange window",
@@ -1577,23 +1657,23 @@ class TushareProvider(DataProvider):
                     fields=_NAMECHANGE_FIELDS,
                 )
             except Exception as exc:  # noqa: BLE001 - ST feed is best effort
-                self._st_last_window_refresh = "failed"
+                failed = True
                 logger.warning(
                     "Incremental ST name-change refresh failed (%s); keeping "
                     "the cached feed (name changes after it was built stay "
-                    "invisible until a full refresh)", exc,
+                    "invisible until a successful window or a full refresh)",
+                    exc,
                 )
             else:
-                usable = self._namechange_frame_is_usable(
+                if not self._namechange_frame_is_usable(
                     fresh, "namechange window",
-                )
-                if not usable:
-                    self._st_last_window_refresh = "failed"
+                ):
+                    failed = True
                 else:
                     if len(fresh) >= _NAMECHANGE_ROW_CAP:
                         # A full response at the per-call ceiling may be
                         # truncated; keep the rows but never call it complete.
-                        self._st_last_window_refresh = "failed"
+                        failed = True
                         logger.warning(
                             "namechange window returned %d rows (per-call "
                             "ceiling %d); the response may be truncated. "
@@ -1601,8 +1681,6 @@ class TushareProvider(DataProvider):
                             "refresh is advised.",
                             len(fresh), _NAMECHANGE_ROW_CAP,
                         )
-                    else:
-                        self._st_last_window_refresh = "ok"
                     if len(fresh):
                         try:
                             # Fresh rows first: among equally-closed
@@ -1611,11 +1689,26 @@ class TushareProvider(DataProvider):
                                 [fresh, self._st_namechange], codes,
                             )
                         except Exception as exc:  # noqa: BLE001 - never fatal
-                            self._st_last_window_refresh = "failed"
+                            failed = True
                             logger.warning(
                                 "namechange window rows could not be merged "
                                 "(%s); keeping the cached ST feed", exc,
                             )
+            if failed:
+                self._st_last_window_refresh = "failed"
+                # Never advance coverage past a failed window. With no prior
+                # boundary, pin it to this window's start so the next attempt
+                # re-covers the whole failed interval.
+                if self._st_covered_until is None:
+                    self._st_covered_until = window_start
+            else:
+                self._st_last_window_refresh = "ok"
+                new_coverage = pd.Timestamp(requested_end).normalize()
+                if (
+                    self._st_covered_until is None
+                    or new_coverage > self._st_covered_until
+                ):
+                    self._st_covered_until = new_coverage
         derived = self._safe_derive_st_episodes(self._st_namechange)
         self._st_timeseries = (
             derived if derived is not None else _empty_st_timeseries()
@@ -1704,16 +1797,16 @@ class TushareProvider(DataProvider):
                 for code in raw["ts_code"]
             ],
             "name": raw["name"].astype("string").fillna("").str.strip(),
-            "start": pd.to_datetime(
-                raw["start_date"], format="%Y%m%d", errors="coerce",
+            "start": raw["start_date"].map(
+                TushareProvider._parse_namechange_date
             ),
             "end": (
-                pd.to_datetime(raw["end_date"], format="%Y%m%d", errors="coerce")
+                raw["end_date"].map(TushareProvider._parse_namechange_date)
                 if "end_date" in raw.columns
                 else pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
             ),
             "ann": (
-                pd.to_datetime(raw["ann_date"], format="%Y%m%d", errors="coerce")
+                raw["ann_date"].map(TushareProvider._parse_namechange_date)
                 if "ann_date" in raw.columns
                 else pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
             ),
