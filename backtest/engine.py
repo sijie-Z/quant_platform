@@ -213,6 +213,7 @@ class BacktestEngine:
         limit_up: pd.DataFrame | None = None,
         limit_down: pd.DataFrame | None = None,
         daily_volume: pd.DataFrame | None = None,
+        raw_prices: pd.DataFrame | None = None,
         volatility: pd.DataFrame | None = None,
         risk_free_rate: float | None = None,
         periods_per_year: float | None = None,
@@ -242,10 +243,18 @@ class BacktestEngine:
             limit_down: (date x asset) True where the asset closed
                 limit-down. Sells are blocked there.
             daily_volume: (date x asset) traded **volume in shares** (the
-                provider boundary unit). Used for the R8 capacity cap as
-                ``adv = (volume * close).rolling(20, min_periods=5).mean()``
-                (CNY), and converted to CNY before being handed to the
-                cost model's proportional/impact slippage models.
+                provider boundary unit). Converted to CNY with ``raw_prices``
+                (unadjusted traded close) for the R8 capacity cap
+                ``adv = (volume * raw_close).rolling(20, min_periods=5).mean()``
+                and for the cost model's proportional/impact slippage models.
+                ``prices`` is the adjusted research panel and must NOT be
+                used as a CNY price; without ``raw_prices`` the capacity cap
+                is disabled and the volume is passed to the cost model
+                unchanged (both paths log a warning).
+            raw_prices: (date x asset) **unadjusted** close prices (CNY),
+                e.g. ``DataPipeline.get_raw_close()``. Required to turn share
+                volume into a CNY traded value. Only used when
+                ``daily_volume`` is supplied.
             volatility: (date x asset) daily volatility estimate for the
                 impact model. When omitted and an impact/proportional model
                 is configured, a 20-day rolling std of ``returns`` shifted by
@@ -318,10 +327,12 @@ class BacktestEngine:
             )
 
         # R8 capacity: ADV in CNY is the 20-session mean of volume (shares)
-        # x close, using the same adjusted price panel as the rest of the
-        # engine (consistent with backtest/capacity.py and the monitor's
-        # capacity gauge). Only computed when the participation cap is
-        # configured; the default path never touches this.
+        # x **raw** close. ``prices`` is the adjusted research panel and is
+        # not a CNY price (data/pipeline.get_factor_prices docstring), so a
+        # share volume cannot be turned into a traded value without
+        # ``raw_prices``; the cap is refused rather than computed on the
+        # wrong price basis. Only evaluated when the cap is configured; the
+        # default path never touches this.
         capacity_adv_panel = None
         capacity_adv_warned = False
         if self.constraints.max_participation > 0:
@@ -333,12 +344,26 @@ class BacktestEngine:
                     self.constraints.max_participation,
                 )
                 capacity_adv_warned = True
+            elif raw_prices is None:
+                logger.warning(
+                    "max_participation=%.3f is configured but run() received "
+                    "no raw_prices; ``prices`` is the adjusted research "
+                    "panel, not a CNY price, so share volume cannot be "
+                    "converted to a CNY traded value. The capacity "
+                    "constraint is disabled for this backtest (pass "
+                    "raw_prices, e.g. pipeline.get_raw_close()).",
+                    self.constraints.max_participation,
+                )
+                capacity_adv_warned = True
             else:
                 volume_shares = daily_volume.reindex(
                     index=prices.index, columns=prices.columns,
                 )
+                raw_close = raw_prices.reindex(
+                    index=prices.index, columns=prices.columns,
+                )
                 capacity_adv_panel = (
-                    volume_shares * prices
+                    volume_shares * raw_close
                 ).rolling(20, min_periods=5).mean()
 
         for i, rdate in enumerate(rebalance_dates):
@@ -473,7 +498,7 @@ class BacktestEngine:
             limit_down=limit_down,
             daily_volume=daily_volume,
             volatility=volatility,
-            prices=prices,
+            raw_prices=raw_prices,
         )
 
         # M13: only rebalances that actually reached an execution day belong
@@ -668,15 +693,17 @@ class BacktestEngine:
         limit_down: pd.DataFrame | None = None,
         daily_volume: pd.DataFrame | None = None,
         volatility: pd.DataFrame | None = None,
-        prices: pd.DataFrame | None = None,
+        raw_prices: pd.DataFrame | None = None,
     ) -> None:
         """Simulate daily P&L with costs and an execution-day tradability gate.
 
         ``daily_volume`` is a share-volume panel (provider unit). When
-        ``prices`` is supplied it is converted to CNY (volume x close) before
-        being handed to the cost model, whose ``daily_volume`` argument is
-        documented in CNY. Callers that omit ``prices`` keep the legacy
-        pass-through (used by unit tests that only exercise the gate logic).
+        ``raw_prices`` (unadjusted CNY close) is supplied it is converted to
+        CNY (volume x raw close) before being handed to the cost model, whose
+        ``daily_volume`` argument is documented in CNY. Without
+        ``raw_prices`` the panel is passed through unchanged (legacy units)
+        and a warning is logged -- the adjusted research prices must not be
+        mistaken for CNY prices.
 
         Between executions, weights drift with price movements. On an
         execution date, the new weights take effect at that close, turnover is
@@ -725,9 +752,16 @@ class BacktestEngine:
         # Only needed to turn share volume into CNY for the cost model; skip
         # the full-panel copy on the default (no-volume) path.
         price_panel = (
-            self._align_float(prices, all_dates, columns)
-            if daily_volume is not None else None
+            self._align_float(raw_prices, all_dates, columns)
+            if daily_volume is not None and raw_prices is not None
+            else None
         )
+        if daily_volume is not None and raw_prices is None:
+            logger.warning(
+                "daily_volume is a share panel but raw_prices was not "
+                "supplied; passing it to the cost model unchanged (legacy "
+                "units). Pass raw_prices (unadjusted CNY close) to convert."
+            )
 
         vol_panel = self._align_float(volatility, all_dates, columns)
         if (

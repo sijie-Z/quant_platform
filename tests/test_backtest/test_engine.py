@@ -686,7 +686,7 @@ class TestCapacityWiring:
         return prices, returns, signal, volume
 
     @staticmethod
-    def _run(constraints, daily_volume, inputs=None):
+    def _run(constraints, daily_volume, inputs=None, raw_prices=None):
         prices, returns, signal, _volume = inputs or TestCapacityWiring._inputs()
 
         class RecordingOptimizer:
@@ -712,20 +712,34 @@ class TestCapacityWiring:
         engine.run(
             signal=signal, prices=prices, returns=returns,
             benchmark_returns=None, sector_map=None,
-            daily_volume=daily_volume,
+            daily_volume=daily_volume, raw_prices=raw_prices,
         )
         return engine, recorder, prices, _volume
 
-    def test_adv_is_volume_times_close_rolling_20(self):
+    @staticmethod
+    def _raw_prices(prices):
+        """Unadjusted CNY prices distinct from the adjusted research panel."""
+        factors = pd.Series(
+            np.linspace(1.0, 2.0, prices.shape[1]), index=prices.columns,
+        )
+        return prices.div(factors, axis=1)
+
+    def test_adv_is_volume_times_raw_close_rolling_20(self):
+        """B1: the CNY ADV must use the unadjusted close, never the adjusted
+        research panel (which would overstate traded value by the adjustment
+        factor)."""
         constraints = PortfolioConstraints(
             max_participation=0.10, max_turnover=1.0,
         )
         inputs = self._inputs()
-        prices, volume = inputs[0], inputs[3]
+        adjusted, volume = inputs[0], inputs[3]
+        raw = self._raw_prices(adjusted)
         engine, recorder, _, _ = self._run(
-            constraints, daily_volume=volume, inputs=inputs,
+            constraints, daily_volume=volume, inputs=inputs, raw_prices=raw,
         )
-        expected = (volume * prices).rolling(20, min_periods=5).mean()
+
+        expected = (volume * raw).rolling(20, min_periods=5).mean()
+        wrong_basis = (volume * adjusted).rolling(20, min_periods=5).mean()
         rdates = list(engine.optimizer_outcomes)
         assert rdates, "the engine never called the optimizer"
         assert len(recorder.calls) == len(rdates)
@@ -739,10 +753,36 @@ class TestCapacityWiring:
                 adv.sort_index(), expected_row.sort_index(),
                 rtol=1e-12, atol=1e-9,
             )
-            # The CNY ADV must not be the raw share count.
+            # Not the share count, and not the adjusted-price notional.
             assert not np.allclose(
                 adv.to_numpy(), volume.loc[rdate].reindex(adv.index).to_numpy(),
             )
+            wrong_row = wrong_basis.loc[rdate].reindex(adv.index)
+            assert not np.allclose(
+                adv.to_numpy(), wrong_row.to_numpy(),
+            ), "ADV used the adjusted price panel instead of raw CNY prices"
+
+    def test_capacity_without_raw_prices_warns_and_passes_none(self, caplog):
+        """Fail closed: an adjusted price panel is not a CNY price, so the
+        capacity cap is disabled (with a warning) rather than computed on a
+        wrong basis."""
+        constraints = PortfolioConstraints(
+            max_participation=0.10, max_turnover=1.0,
+        )
+        inputs = self._inputs()
+        with caplog.at_level("WARNING"):
+            engine, recorder, _, _ = self._run(
+                constraints, daily_volume=inputs[3], inputs=inputs,
+                raw_prices=None,
+            )
+        assert any(
+            "no raw_prices" in record.getMessage()
+            for record in caplog.records
+        )
+        assert recorder.calls
+        for call in recorder.calls:
+            assert call["adv"] is None
+            assert call["aum"] == pytest.approx(engine.initial_capital)
 
     def test_capacity_off_by_default_passes_none(self):
         inputs = self._inputs()
@@ -775,12 +815,12 @@ class TestCapacityWiring:
 
     def test_share_volume_is_converted_to_cny_for_the_cost_model(self):
         """R8 redefined run(daily_volume=...) as a share panel. The cost
-        model still expects CNY, so the engine must multiply by close before
-        handing the row over (the old pass-through would overstate the
-        participation rate by 1/price)."""
+        model still expects CNY, so the engine must multiply by the *raw*
+        close before handing the row over (the old pass-through would
+        overstate the participation rate by 1/price)."""
         dates = pd.date_range("2024-01-01", periods=5, freq="D")
         returns = pd.DataFrame(0.0, index=dates, columns=["A", "B"])
-        prices = pd.DataFrame(10.0, index=dates, columns=["A", "B"])
+        raw_prices = pd.DataFrame(10.0, index=dates, columns=["A", "B"])
         volume = pd.DataFrame(1_000_000.0, index=dates, columns=["A", "B"])
 
         engine = BacktestEngine(
@@ -794,7 +834,7 @@ class TestCapacityWiring:
             constraints=PortfolioConstraints(max_turnover=1.0),
         )
         engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
-        engine._simulate_pnl(returns, daily_volume=volume, prices=prices)
+        engine._simulate_pnl(returns, daily_volume=volume, raw_prices=raw_prices)
 
         # Buy 1,000,000 CNY of A against 10,000,000 CNY daily traded value:
         # 10% participation -> slippage 0.001 * sqrt(0.10).
