@@ -200,10 +200,11 @@ class DataPipeline:
         }
 
         # (date x asset) constituent mask actually applied, aligned to the
-        # price dates and to the columns of `tradable_mask`.  None when no
-        # mask was applied (no hook, single-snapshot fallback, mismatch).
-        # Exposed for downstream cross-section consumers; this pipeline does
-        # not consume it itself.
+        # price dates.  Columns are the intersection of the provider mask and
+        # the tradable panel; unmatched assets are not represented.  None
+        # when no mask was applied (no hook, single-snapshot fallback,
+        # mismatch).  Exposed for downstream cross-section consumers; this
+        # pipeline does not consume it itself.
         self.universe_mask: pd.DataFrame | None = None
 
         # (date x asset) suspension flags derived inside `_clean_prices` from
@@ -1068,7 +1069,12 @@ class DataPipeline:
         exposes ``get_index_membership_mask`` but whose data is a single
         end-date snapshot would replay the final constituents over the whole
         sample -- the same look-ahead this gate exists to remove -- so it is
-        refused with a warning and tradability is left unchanged.
+        refused with a warning and tradability is left unchanged.  The same
+        refusal applies when the returned mask itself has fewer than two
+        distinct snapshot dates: a lone snapshot cannot prove per-date
+        history, however the provider's availability flag was set (a
+        provider cache can round-trip a fallback snapshot into a
+        "history" table).
 
         The mask is aligned to the panel by date (snapshot-dated panels -- the
         real provider's ``index_weight`` history is monthly -- stay in force
@@ -1083,9 +1089,8 @@ class DataPipeline:
         a boolean date x asset frame; it may be snapshot-dated, and a
         snapshot's membership holds until the next snapshot.
         """
-        provider = self.provider
-        hook = getattr(provider, "get_index_membership_mask", None)
-        if not callable(hook):
+        owner = self._provider_membership_owner()
+        if owner is None:
             self.universe_pit = {
                 "applied": False,
                 "source": None,
@@ -1094,18 +1099,19 @@ class DataPipeline:
             self.universe_mask = None
             return tradable
 
+        hook = owner.get_index_membership_mask
         provenance: dict = {"applied": False, "source": "get_index_membership_mask"}
-        index_code = getattr(provider, "index_code", None)
+        index_code = getattr(owner, "index_code", None)
         if index_code:
             provenance["index_code"] = str(index_code)
 
-        if getattr(provider, "universe_history_available", False) is not True:
+        if getattr(owner, "universe_history_available", False) is not True:
             logger.warning(
                 "%s: get_index_membership_mask is exposed but "
                 "universe_history_available is not True (single end-date "
                 "snapshot fallback). Refusing to apply it: replaying the "
                 "final constituents over the whole sample is look-ahead.",
-                provider_label(provider),
+                provider_label(owner),
             )
             self.universe_pit = {
                 **provenance,
@@ -1120,23 +1126,23 @@ class DataPipeline:
             logger.error(
                 "%s: index-membership mask fetch failed; aborting instead of "
                 "silently keeping an unmasked tradability panel",
-                provider_label(provider),
+                provider_label(owner),
             )
             raise DataQualityError(
-                f"{provider_label(provider)}: get_index_membership_mask failed "
+                f"{provider_label(owner)}: get_index_membership_mask failed "
                 f"({exc}); refusing to fall back to an unmasked universe"
             ) from exc
 
         if not isinstance(raw, pd.DataFrame):
             raise DataContractError(
-                f"{provider_label(provider)}: get_index_membership_mask must "
+                f"{provider_label(owner)}: get_index_membership_mask must "
                 f"return a pandas DataFrame, got {type(raw).__name__}"
             )
         if raw.empty:
             logger.warning(
                 "%s: get_index_membership_mask returned an empty frame; "
                 "leaving tradability unchanged",
-                provider_label(provider),
+                provider_label(owner),
             )
             self.universe_pit = {**provenance, "reason": "empty_membership_mask"}
             self.universe_mask = None
@@ -1153,6 +1159,25 @@ class DataPipeline:
             mask = mask.groupby(level=0).any()
         if mask.columns.has_duplicates:
             mask = mask.T.groupby(level=0).any().T
+        # A table with a single distinct snapshot date cannot prove per-date
+        # history, no matter what the provider's flag says.  This is the
+        # documented single-end-date fallback shape (a provider cache can
+        # round-trip it into a "history" table and flip the flag on reload);
+        # applying it would blank every earlier day.
+        snapshot_count = len(mask.index)
+        if snapshot_count < 2:
+            logger.warning(
+                "%s: index-membership mask has only %d distinct snapshot "
+                "date(s); refusing to apply a single end-date snapshot as "
+                "per-date history",
+                provider_label(owner), snapshot_count,
+            )
+            self.universe_pit = {
+                **provenance,
+                "reason": "single_snapshot_constituent_history",
+            }
+            self.universe_mask = None
+            return tradable
         # Snapshot panels (Tushare index_weight is monthly) describe
         # membership until the next snapshot, so days between snapshots
         # inherit the previous row.  Days before the first snapshot are
@@ -1169,13 +1194,13 @@ class DataPipeline:
                 "panel (%d asset(s) without a mask column, %d mask column(s) "
                 "matching no asset); applying the %d-column intersection and "
                 "leaving unmatched assets unchanged",
-                provider_label(provider), len(missing), len(extra), len(common),
+                provider_label(owner), len(missing), len(extra), len(common),
             )
         if len(common) == 0:
             logger.warning(
                 "%s: index-membership mask shares no asset with the tradable "
                 "panel; leaving tradability unchanged",
-                provider_label(provider),
+                provider_label(owner),
             )
             self.universe_pit = {
                 **provenance,
@@ -1195,13 +1220,39 @@ class DataPipeline:
         }
         logger.info(
             "%s: applied per-date index-membership mask to %d asset(s) over "
-            "%d date(s); %d asset-day(s) lost eligibility",
-            provider_label(provider), len(common), len(dates),
+            "%d date(s) from %d snapshot(s); %d asset-day(s) lost eligibility",
+            provider_label(owner), len(common), len(dates), snapshot_count,
             int(
                 (tradable.loc[:, common] & ~aligned).to_numpy().sum()
             ),
         )
         return applied
+
+    def _provider_membership_owner(self):
+        """Provider in the wrapper chain that owns index-membership data.
+
+        ``ValidatedProvider`` implements only the ``DataProvider`` ABC and
+        forwards selected declarations (price basis, corporate actions) but
+        not the optional membership hook.  The primary source defines the
+        panel's semantics, so the membership mask is read from whichever
+        provider in the chain actually exposes
+        ``get_index_membership_mask`` -- mirroring `_provider_basis_attr`.
+        Returns ``None`` when no provider in the chain has the hook.
+        """
+        provider = self.provider
+        seen: set[int] = set()
+        while provider is not None and id(provider) not in seen:
+            seen.add(id(provider))
+            if callable(getattr(provider, "get_index_membership_mask", None)):
+                return provider
+            providers = getattr(provider, "providers", None)
+            if not isinstance(providers, dict) or not providers:
+                return None
+            primary = providers.get(getattr(provider, "primary", None))
+            provider = primary if primary is not None else next(
+                iter(providers.values())
+            )
+        return None
 
     def get_valid_assets(self) -> pd.Index:
         """Assets eligible on at least one date of the sample."""

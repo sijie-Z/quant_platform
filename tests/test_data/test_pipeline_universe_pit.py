@@ -26,7 +26,7 @@ import pandas as pd
 import pytest
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.base import DataProvider
-from quant_platform.data.schema import DataQualityError
+from quant_platform.data.schema import DataContractError, DataQualityError
 
 N_DATES = 90
 DATES = pd.bdate_range("2024-01-02", periods=N_DATES, name="date")
@@ -67,7 +67,7 @@ class _BaseFixtureProvider(DataProvider):
             index=pd.Index(ASSETS, name="asset"),
         )
 
-    def get_prices(self, start_date, end_date) -> pd.DataFrame:
+    def get_prices(self, start_date, end_date, fields=None) -> pd.DataFrame:
         index = pd.MultiIndex.from_product(
             [DATES, ASSETS], names=["date", "asset"]
         )
@@ -128,6 +128,9 @@ class _MembershipProvider(_BaseFixtureProvider):
         mask_exception: Exception | None = None,
         index_code: str | None = "000300.SH",
         snapshot_offsets: list[int] | None = None,
+        empty_mask: bool = False,
+        bad_mask_type: bool = False,
+        extra_mask_columns: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -136,23 +139,43 @@ class _MembershipProvider(_BaseFixtureProvider):
         self._drop_mask_columns = list(drop_mask_columns or [])
         self._mask_exception = mask_exception
         self._snapshot_offsets = snapshot_offsets
+        self._empty_mask = empty_mask
+        self._bad_mask_type = bad_mask_type
+        self._extra_mask_columns = extra_mask_columns
 
     def get_index_membership_mask(
         self, start_date: str, end_date: str,
     ) -> pd.DataFrame:
         if self._mask_exception is not None:
             raise self._mask_exception
+        if self._bad_mask_type:
+            return [1, 2, 3]  # type: ignore[return-value]
+        if self._empty_mask:
+            return pd.DataFrame()
         # Bare codes on purpose: the pipeline must normalize mask labels just
         # like every other provider panel.
         bare = [asset.split(".")[0] for asset in ASSETS]
         mask = pd.DataFrame(True, index=DATES, columns=bare)
         mask.iloc[:INCLUSION_DAY, 1] = False  # 000002 joins at INCLUSION_DAY
+        if self._extra_mask_columns:
+            mask["000099"] = True
         if self._snapshot_offsets is not None:
             # Model the real provider: index_weight history is snapshot-dated,
             # not daily.
             mask = mask.iloc[self._snapshot_offsets]
         if self._drop_mask_columns:
             mask = mask.drop(columns=self._drop_mask_columns)
+        return mask.loc[pd.Timestamp(start_date):pd.Timestamp(end_date)]
+
+
+class _HookWithoutFlagProvider(_BaseFixtureProvider):
+    """Provider exposing the hook but no ``universe_history_available``."""
+
+    def get_index_membership_mask(
+        self, start_date: str, end_date: str,
+    ) -> pd.DataFrame:
+        bare = [asset.split(".")[0] for asset in ASSETS]
+        mask = pd.DataFrame(True, index=DATES, columns=bare)
         return mask.loc[pd.Timestamp(start_date):pd.Timestamp(end_date)]
 
 
@@ -317,6 +340,97 @@ class TestColumnMismatch:
             "do not match the tradable panel" in record.getMessage()
             for record in caplog.records
         )
+
+
+class TestSingleSnapshotMaskShape:
+    """A flag of True cannot turn one snapshot date into per-date history.
+
+    A provider cache may round-trip a single end-date fallback snapshot into
+    a "constituents" table and recompute ``universe_history_available`` from
+    its length on reload.  Applying that mask would blank every earlier day,
+    so the pipeline refuses on the mask's own shape too.
+    """
+
+    def test_flag_true_but_one_snapshot_date_is_refused(self, caplog):
+        provider = _MembershipProvider(
+            history_available=True, snapshot_offsets=[N_DATES - 1],
+        )
+        with caplog.at_level(logging.WARNING):
+            pipeline = _run(provider)
+
+        assert pipeline.tradable_mask.all().all()
+        assert pipeline.universe_mask is None
+        assert pipeline.universe_pit["applied"] is False
+        assert (
+            pipeline.universe_pit["reason"]
+            == "single_snapshot_constituent_history"
+        )
+        assert any(
+            "distinct snapshot" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_missing_availability_attribute_is_refused(self):
+        pipeline = _run(_HookWithoutFlagProvider())
+        assert pipeline.tradable_mask.all().all()
+        assert pipeline.universe_pit["applied"] is False
+        assert (
+            pipeline.universe_pit["reason"]
+            == "single_snapshot_constituent_history"
+        )
+
+
+class TestMaskShapeEdges:
+    def test_empty_mask_leaves_tradability_unchanged(self):
+        provider = _MembershipProvider(history_available=True, empty_mask=True)
+        pipeline = _run(provider)
+        assert pipeline.tradable_mask.all().all()
+        assert pipeline.universe_mask is None
+        assert pipeline.universe_pit["applied"] is False
+        assert pipeline.universe_pit["reason"] == "empty_membership_mask"
+
+    def test_non_dataframe_mask_is_a_contract_error(self):
+        provider = _MembershipProvider(history_available=True, bad_mask_type=True)
+        with pytest.raises(DataContractError, match="DataFrame"):
+            _run(provider)
+
+    def test_extra_mask_column_is_ignored_with_warning(self, caplog):
+        provider = _MembershipProvider(
+            history_available=True, extra_mask_columns=True,
+        )
+        with caplog.at_level(logging.WARNING):
+            pipeline = _run(provider)
+
+        assert pipeline.universe_pit["applied"] is True
+        assert pipeline.universe_mask is not None
+        assert "000099.SZ" not in pipeline.universe_mask.columns
+        assert not pipeline.tradable_mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        assert any(
+            "matching no asset" in record.getMessage()
+            for record in caplog.records
+        )
+
+
+class TestValidatedWrapper:
+    def test_membership_hook_is_read_through_the_wrapper(self):
+        from quant_platform.data.providers.validated_provider import (
+            ValidatedProvider,
+        )
+
+        primary = _MembershipProvider(history_available=True)
+        wrapped = ValidatedProvider({"primary": primary}, primary="primary")
+        # The wrapper does not implement (or forward) the optional hook...
+        assert not hasattr(wrapped, "get_index_membership_mask")
+
+        pipeline = _run(wrapped)
+        # ...but the pipeline must still find the primary's membership data.
+        assert pipeline.universe_pit["applied"] is True
+        assert (
+            pipeline.universe_pit["reason"]
+            == "per_date_constituent_history"
+        )
+        assert not pipeline.tradable_mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        assert pipeline.tradable_mask["000002.SZ"].iloc[INCLUSION_DAY:].all()
 
 
 class TestMaskFailureIsFatal:
