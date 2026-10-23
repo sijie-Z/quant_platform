@@ -100,7 +100,12 @@ STALE_TMP_SECONDS = 3600.0
 #    and providers derive ST episodes from it; provider caches written under
 #    6 have no ST evidence and would silently disable ST screening on real
 #    data, so they must not be replayed either.
-DATA_SCHEMA_VERSION = 7
+# 8: R14 adds the Tushare ST episode feed: the provider cache now carries the
+#    raw `namechange` rows and the pipeline applies a real Tushare ST mask
+#    derived from announcement dates. Panels cached under 7 were produced
+#    without that mask (Tushare ST screening silently unavailable), so a
+#    factor/signal/data stage replayed from them would not match a fresh run.
+DATA_SCHEMA_VERSION = 8
 
 # Bump when the key recipe itself changes, so entries written by an older
 # recipe cannot collide with new ones.

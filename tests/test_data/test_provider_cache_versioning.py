@@ -84,7 +84,10 @@ class TestTushareCacheVersioning:
         assert manifest is not None
         assert manifest["schema_version"] == DATA_SCHEMA_VERSION
         assert manifest["adjustment"] == "raw"
-        assert manifest["cache_version"] == "v4"
+        assert manifest["cache_version"] == "v5"
+        # The fake has no namechange endpoint: the manifest must record the
+        # degraded ST feed instead of letting an empty table look complete.
+        assert manifest["st_fetch_status"] == "unavailable"
 
         reloaded = tushare_provider(tmp_path)
         reloaded._ts_api = _ExplodingTushareAPI()

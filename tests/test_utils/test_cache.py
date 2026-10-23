@@ -209,8 +209,9 @@ class TestCacheRetention:
             assert list(cache.cache_dir.glob("*.meta.json")) == []
 
 
-class TestSchemaVersionBumpR7a:
-    def test_data_schema_version_is_seven(self):
-        """R6c changed the excluded_mask semantics and R7a adds the Baostock
-        ST cache fields; entries written under 6 must be invalidated."""
-        assert DATA_SCHEMA_VERSION == 7
+class TestSchemaVersionBumpR14:
+    def test_data_schema_version_is_eight(self):
+        """R14 adds the Tushare ST episode feed (`namechange`); panels cached
+        under 7 were produced without the Tushare ST mask and must be
+        invalidated (R7a's Baostock bump moved 6 -> 7)."""
+        assert DATA_SCHEMA_VERSION == 8

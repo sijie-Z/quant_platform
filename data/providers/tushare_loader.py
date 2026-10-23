@@ -12,6 +12,9 @@ Connects to Tushare Pro API to fetch actual CSI 300 constituent data with:
 - Real suspension (停牌) handling
 - Delisting tracking (survivorship-bias aware: metadata includes
   ``list_status`` D/P names and per-date index membership is retained)
+- Point-in-time ST history derived from the ``namechange`` endpoint: one
+  API call per constituent, raw rows cached in HDF5, episodes exposed on the
+  shared ``asset/trigger_date/announce_date/end_date/is_st`` contract
 - Bounded retries with exponential backoff; a failed batch raises
   :class:`DataFetchIncompleteError` instead of silently shrinking the universe
 - Unit normalisation at the provider boundary: volume in shares, amount in
@@ -68,7 +71,12 @@ CACHE_DIR.mkdir(exist_ok=True)
 # in what the HDF5 file means) refetches instead of replaying stale data (D13).
 # v4: price semantics changed from pre-multiplied hfq levels (adj_factor=1) to
 # raw OHLCV plus a divisor; v3 files must never be replayed.
-_PROVIDER_CACHE_VERSION = "v4"
+# v5: the cache persists the raw ``namechange`` ST feed (``/st_namechange``)
+# so derived ST episodes survive reloads; v4 files carry no ST evidence and
+# would silently disable ST screening on real data, so they must never be
+# replayed. The sidecar manifest records ``st_fetch_status`` so a cache built
+# while the endpoint was unavailable is not mistaken for "no ST names".
+_PROVIDER_CACHE_VERSION = "v5"
 #: Basis of the stored ``close`` column (raw traded price).
 _PRICE_ADJUSTMENT = "raw"
 #: Basis of ``close / adj_factor`` (the return-generating series).
@@ -80,6 +88,35 @@ _ADJUSTED_PRICE_BASIS = "hfq"
 _LOTS_TO_SHARES = 100.0
 _THOUSAND_CNY_TO_CNY = 1_000.0
 _TEN_THOUSAND_CNY_TO_CNY = 10_000.0
+
+#: ``namechange`` fields requested for every constituent. ``end_date`` is
+#: empty for a name that is still in force, hence the sample-end fill below.
+_NAMECHANGE_FIELDS = "ts_code,name,start_date,end_date,ann_date,change_reason"
+#: One initial attempt plus two retries per symbol (taskbook R14 §2.1).
+_ST_FETCH_ATTEMPTS = 3
+#: Above this universe size the per-symbol fetch is still executed, but the
+#: estimated wall-clock cost is logged instead of being silently skipped.
+_ST_FETCH_WARN_THRESHOLD = 500
+#: Rough per-call latency used only for that estimate.
+_ST_FETCH_SECONDS_PER_CALL = 0.35
+#: Episode table contract, identical to Synthetic/Baostock (R7a).
+_ST_EPISODE_COLUMNS = [
+    "asset", "trigger_date", "announce_date", "end_date", "is_st",
+]
+#: Raw ``namechange`` frame written to the cache; kept as returned so the
+#: cache is evidence, not a derived view.
+_ST_NAMECHANGE_COLUMNS = [
+    "ts_code", "name", "start_date", "end_date", "ann_date", "change_reason",
+]
+
+
+def _empty_st_timeseries() -> pd.DataFrame:
+    """The documented empty ST-episode frame (never ``None``)."""
+    return pd.DataFrame(columns=_ST_EPISODE_COLUMNS)
+
+
+def _empty_namechange() -> pd.DataFrame:
+    return pd.DataFrame(columns=_ST_NAMECHANGE_COLUMNS)
 
 
 class TushareProvider(DataProvider):
@@ -93,10 +130,13 @@ class TushareProvider(DataProvider):
     Data is cached to HDF5 files after first fetch. Subsequent runs
     reload from cache in ~1 second vs ~30 seconds for API fetch.
 
-    ``st_available`` is False: Tushare's stock list only carries the current
-    name, not an ST history, so this provider does not fabricate an
-    all-False ``is_st`` column.  Callers must treat ST screening as
-    unavailable (fail closed or label the result).
+    ST history is derived from Tushare's ``namechange`` endpoint (one call
+    per constituent, raw rows cached under ``/st_namechange``) and exposed on
+    the shared episode contract by :meth:`get_st_timeseries`.  An empty
+    episode table with ``st_available = False`` means *no usable ST evidence*
+    -- either no ST names appeared in the fetched history, or the endpoint
+    was unavailable -- so callers must treat ST screening as unavailable
+    rather than as "every stock is non-ST" (fail closed).
     """
 
     price_adjustment = _PRICE_ADJUSTMENT
@@ -141,8 +181,20 @@ class TushareProvider(DataProvider):
         self._corporate_actions_range: tuple[pd.Timestamp, pd.Timestamp] | None = None
         self.corporate_actions_available = False
 
-        # No point-in-time ST history is available from this source.
+        # Point-in-time ST history from ``namechange`` (R14).  ``st_available``
+        # is True exactly when the derived episode table is non-empty.
         self.st_available = False
+        #: Raw namechange rows (``None`` = the endpoint never produced a
+        #: usable response; an empty frame means it responded with no rows).
+        self._st_namechange: pd.DataFrame | None = None
+        #: Derived episode table (``None`` = not resolved yet).
+        self._st_timeseries: pd.DataFrame | None = None
+        #: ``ok`` / ``partial`` / ``unavailable`` -- persisted in the cache
+        #: manifest so an unavailable endpoint is never replayed as "no ST".
+        self._st_fetch_status = "unavailable"
+        #: Symbols whose namechange call failed after all attempts (reporting
+        #: surface; also recorded in the cache manifest).
+        self.st_failed_symbols: list[str] = []
         # Where get_benchmark() data came from: "index_daily" or
         # "equal_weight_fallback". Recorded in the cache manifest and pipeline
         # provenance so a degraded benchmark is not mistaken for CSI 300.
@@ -277,8 +329,22 @@ class TushareProvider(DataProvider):
         ]
 
     def get_metadata(self) -> pd.DataFrame:
+        """Stock metadata; ``attrs["st_available"]`` mirrors the ST feed.
+
+        The static frame carries no ``is_st`` column (a whole-sample boolean
+        would silently disable per-date screening).  ST information lives in
+        :meth:`get_st_timeseries`; ``attrs["st_available"]`` is True exactly
+        when that episode table is non-empty, so it can never disagree with
+        what the pipeline will consume.
+        """
         if self._metadata is None:
             self._load_or_fetch_all()
+        if self._st_timeseries is None:
+            # Defensive: a metadata frame injected directly (tests) without a
+            # resolved feed must not inherit a stale True.
+            self._st_timeseries = _empty_st_timeseries()
+            self.st_available = False
+        self._metadata.attrs["st_available"] = bool(self.st_available)
         return self._metadata
 
     def data_status(self) -> dict:
@@ -303,14 +369,37 @@ class TushareProvider(DataProvider):
         return status
 
     def get_st_timeseries(self) -> pd.DataFrame:
-        """Explicitly expose that no ST history is available.
+        """ST episodes derived from Tushare's ``namechange`` history.
 
-        Returning an empty frame (instead of inventing an all-False column)
-        lets the pipeline fail closed or label ST screening as unavailable.
+        Derivation rules (point-in-time, conservative; see
+        :meth:`_derive_st_episodes` for the implementation):
+
+        * a ``namechange`` row whose new ``name`` contains ``ST`` (case
+          insensitive, so ``*ST`` matches) describes an ST interval running
+          from its ``start_date`` to its ``end_date``;
+        * ``trigger_date`` is that interval's ``start_date``;
+        * ``announce_date`` is ``ann_date`` when present and parseable,
+          otherwise ``start_date`` -- nothing earlier is inferred, and using
+          the effective date as the fallback can only *delay* exclusion, never
+          pull knowledge forward;
+        * ``end_date`` is the recorded ``end_date``; when it is empty the
+          interval is capped at the next recorded name change minus one day,
+          or, for a name still in force, at the last day of the price sample
+          (same rule as the Baostock R7a feed);
+        * adjacent/overlapping ST intervals of one asset are merged (earliest
+          announce/trigger, latest end); non-ST renames are ignored;
+        * ``is_st`` is True.
+
+        Returns the empty contract frame when the endpoint was unavailable or
+        returned nothing usable: no ST evidence is fabricated, and
+        ``st_available`` is False so the pipeline fails closed instead of
+        treating every stock as non-ST.
         """
-        return pd.DataFrame(
-            columns=["asset", "trigger_date", "announce_date", "end_date", "is_st"]
-        )
+        if self._st_timeseries is None:
+            self._load_or_fetch_all()
+        if self._st_timeseries is None:
+            return _empty_st_timeseries()
+        return self._st_timeseries.copy()
 
     # ------------------------------------------------------------------
     # Corporate actions (best effort)
@@ -605,6 +694,10 @@ class TushareProvider(DataProvider):
             "benchmark_source": self.benchmark_source,
             "adjusted_price_basis": _ADJUSTED_PRICE_BASIS,
             "adj_factor_role": "divisor",
+            # Evidence of whether the cached panel carries ST history: an
+            # ``unavailable`` feed is never replayed as "no ST names" (R14).
+            "st_fetch_status": self._st_fetch_status,
+            "st_failed_symbols": sorted(self.st_failed_symbols),
         }
         if extra:
             payload.update(extra)
@@ -838,8 +931,44 @@ class TushareProvider(DataProvider):
                 )
                 self.universe_history_available = False
 
-        logger.info("Loaded from cache: %d assets, %d price rows",
-                     len(self._metadata), len(self._prices))
+            # ST feed (R14): derive the episode table from the cached raw
+            # namechange rows.  A missing key means the endpoint was
+            # unavailable when this cache was written (the status is in the
+            # manifest) -- it is deliberately NOT treated as "no ST names".
+            self._st_fetch_status = str(
+                manifest.get("st_fetch_status", "unavailable")
+            )
+            self.st_failed_symbols = [
+                str(code) for code in manifest.get("st_failed_symbols", [])
+            ]
+            if "/st_namechange" in keys:
+                self._st_namechange = store["st_namechange"]
+                derived = self._safe_derive_st_episodes(self._st_namechange)
+                self._st_timeseries = (
+                    derived if derived is not None else _empty_st_timeseries()
+                )
+            else:
+                self._st_namechange = None
+                self._st_timeseries = _empty_st_timeseries()
+            self.st_available = not self._st_timeseries.empty
+
+        if self._st_fetch_status == "unavailable":
+            logger.warning(
+                "Cached Tushare panel carries no usable ST history "
+                "(namechange unavailable when it was fetched); st_available="
+                "False -- ST screening fails closed, this does NOT mean every "
+                "stock is non-ST. Delete/refresh the cache to retry."
+            )
+        elif self.st_available:
+            logger.info(
+                "ST history: %d episode(s) derived from cached namechange",
+                len(self._st_timeseries),
+            )
+        else:
+            logger.info(
+                "ST history: namechange responded but produced no ST "
+                "episodes in the fetched history"
+            )
 
     def _save_to_cache(self, cache_file: Path, extra: dict | None = None) -> None:
         """Persist all data to HDF5 atomically (temp file + ``os.replace``).
@@ -862,6 +991,11 @@ class TushareProvider(DataProvider):
                 store["metadata"] = self._metadata
                 if self._constituent_history is not None:
                     store["constituents"] = self._constituent_history
+                # Only a fetched feed is evidence.  ``None`` (endpoint
+                # unavailable) deliberately leaves the key out so a reload
+                # cannot replay an empty table as a complete answer.
+                if self._st_namechange is not None:
+                    store["st_namechange"] = self._st_namechange
             with provider_cache_lock(cache_file.parent) as locked:
                 if not locked:
                     raise TimeoutError(
@@ -927,6 +1061,11 @@ class TushareProvider(DataProvider):
         logger.info("  Fetching CSI 300 index data...")
         self._benchmark = self._fetch_index_daily(api)
         logger.info("  Benchmark: %d rows", len(self._benchmark))
+
+        # 6. Get ST history (namechange; one call per symbol, best effort)
+        logger.info("  Fetching ST name-change history...")
+        episodes = self._fetch_st_episodes(api, all_codes)
+        logger.info("  ST episodes: %d", len(episodes))
 
     def _fetch_constituents(self, api) -> pd.DataFrame:
         """Fetch CSI 300 constituent changes over time.
@@ -1009,9 +1148,12 @@ class TushareProvider(DataProvider):
 
         ``list_status`` L (listed), P (paused) and D (delisted) are all
         fetched so historical cross-sections do not silently lose delisted
-        constituents.  ``is_st`` is deliberately **not** fabricated: Tushare
-        only carries the current name, so an all-False flag would pretend ST
-        screening works.  ``st_available`` stays False.
+        constituents.  ``is_st`` is deliberately **not** fabricated here: this
+        frame is a static snapshot, and ST information is exposed point in
+        time through :meth:`get_st_timeseries` (derived from ``namechange``,
+        R14).  ``attrs["st_available"]`` on the frame is a conservative False
+        at this stage; :meth:`get_metadata` overwrites it with the resolved
+        truth once the episode table exists.
         """
         frames = []
         for status in ("L", "P", "D"):
@@ -1071,6 +1213,312 @@ class TushareProvider(DataProvider):
         }, index=pd.Index(codes, name="asset"))
         result.attrs["st_available"] = False
         return result
+
+    # ------------------------------------------------------------------
+    # ST history (namechange -> episode table)
+    # ------------------------------------------------------------------
+
+    def _fetch_st_episodes(self, api, codes: list[str]) -> pd.DataFrame:
+        """Fetch the name-change feed and derive the ST episode table.
+
+        Best effort by design: the ST feed must never abort a research run.
+        Every symbol is attempted with :data:`_ST_FETCH_ATTEMPTS` tries; a
+        failure is logged and recorded in :attr:`st_failed_symbols` while the
+        remaining symbols continue.  When *no* symbol produced a usable
+        response the status is ``unavailable``: the episode table is empty,
+        ``st_available`` is False, and the cache stores no
+        ``/st_namechange`` key -- an unavailable endpoint is never replayed
+        as "no ST names".
+
+        Episode derivation rules live on :meth:`_derive_st_episodes`.
+        """
+        raw, failed = self._fetch_namechange_raw(api, codes)
+        self._st_namechange = raw
+        self.st_failed_symbols = failed
+        episodes = self._safe_derive_st_episodes(raw)
+        if episodes is None:
+            episodes = _empty_st_timeseries()
+            if self._st_fetch_status == "ok":
+                self._st_fetch_status = "partial"
+        self._st_timeseries = episodes
+        self.st_available = not episodes.empty
+        if self._st_fetch_status == "unavailable":
+            logger.warning(
+                "Tushare ST history unavailable (namechange produced no usable "
+                "response); st_available=False -- ST screening fails closed for "
+                "this run. This is NOT evidence that every stock is non-ST."
+            )
+        elif episodes.empty:
+            logger.info(
+                "Tushare ST history: namechange responded but no ST episodes "
+                "appeared in the fetched history"
+            )
+        else:
+            logger.info("Tushare ST history: %d episode(s)", len(episodes))
+        if failed:
+            logger.warning(
+                "Tushare ST history: %d of %d symbol(s) failed after retries "
+                "(e.g. %s); their ST status is unknown, not non-ST",
+                len(failed), len(codes), sorted(failed)[:10],
+            )
+        return episodes
+
+    def _fetch_namechange_raw(
+        self, api, codes: list[str],
+    ) -> tuple[pd.DataFrame | None, list[str]]:
+        """Per-symbol ``namechange`` fetch with bounded retries.
+
+        Returns ``(raw_rows, failed_codes)``.  ``raw_rows is None`` means no
+        symbol produced a usable response (endpoint unavailable or permission
+        denied); an empty frame means the endpoint answered but had no rows.
+        """
+        if api is None:
+            self._st_fetch_status = "unavailable"
+            return None, []
+        if len(codes) > _ST_FETCH_WARN_THRESHOLD:
+            logger.warning(
+                "ST namechange: universe has %d symbols; one API call per "
+                "symbol (~%.1f min at %.2f s/call). Fetching every symbol "
+                "(silent skipping is not allowed).",
+                len(codes),
+                len(codes) * _ST_FETCH_SECONDS_PER_CALL / 60.0,
+                _ST_FETCH_SECONDS_PER_CALL,
+            )
+        frames: list[pd.DataFrame] = []
+        failed: list[str] = []
+        for code in codes:
+            try:
+                df = self._fetch_namechange_for_code(api, code)
+            except Exception as exc:  # noqa: BLE001 - per-symbol best effort
+                failed.append(str(code))
+                logger.warning(
+                    "namechange failed for %s after %d attempts (%s); "
+                    "continuing with the remaining symbols",
+                    code, _ST_FETCH_ATTEMPTS, exc,
+                )
+                continue
+            if df is not None and len(df):
+                frames.append(df)
+
+        if not codes:
+            self._st_fetch_status = "ok"
+            return _empty_namechange(), failed
+        if failed and len(failed) == len(codes):
+            self._st_fetch_status = "unavailable"
+            return None, failed
+        self._st_fetch_status = "partial" if failed else "ok"
+        if not frames:
+            return _empty_namechange(), failed
+        try:
+            raw = pd.concat(frames, ignore_index=True)
+        except Exception as exc:  # noqa: BLE001 - a broken feed is not fatal
+            logger.warning(
+                "namechange response could not be assembled (%s); marking "
+                "ST history unavailable", exc,
+            )
+            self._st_fetch_status = "unavailable"
+            return None, failed
+        required = {"ts_code", "name", "start_date"}
+        if not required.issubset(raw.columns):
+            logger.warning(
+                "namechange response is missing required column(s) %s; "
+                "ST history is unusable and will be marked unavailable",
+                sorted(required - set(raw.columns)),
+            )
+            self._st_fetch_status = "unavailable"
+            return None, failed
+        for column in _ST_NAMECHANGE_COLUMNS:
+            if column not in raw.columns:
+                raw[column] = pd.NA
+        raw = raw.loc[:, _ST_NAMECHANGE_COLUMNS]
+        return raw, failed
+
+    def _fetch_namechange_for_code(self, api, code: str) -> pd.DataFrame:
+        """One symbol's ``namechange`` call: initial attempt + two retries."""
+        last_exc: Exception | None = None
+        for attempt in range(_ST_FETCH_ATTEMPTS):
+            try:
+                return api.namechange(ts_code=code, fields=_NAMECHANGE_FIELDS)
+            except Exception as exc:  # noqa: BLE001 - API errors are provider-specific
+                last_exc = exc
+                if attempt + 1 < _ST_FETCH_ATTEMPTS:
+                    delay = self.retry_backoff * (2 ** attempt)
+                    logger.warning(
+                        "namechange[%s] failed (attempt %d/%d): %s; "
+                        "retrying in %.1fs",
+                        code, attempt + 1, _ST_FETCH_ATTEMPTS, exc, delay,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
+        raise RuntimeError(
+            f"namechange[{code}] failed after {_ST_FETCH_ATTEMPTS} "
+            f"attempts: {last_exc}"
+        ) from last_exc
+
+    def _safe_derive_st_episodes(
+        self, raw: pd.DataFrame | None,
+    ) -> pd.DataFrame | None:
+        """Derive episodes without letting a malformed feed abort a run.
+
+        Returns ``None`` when derivation itself failed (a code/data-shape
+        problem, not "no ST names"); callers report no usable ST history.
+        """
+        try:
+            return self._derive_st_episodes(raw)
+        except Exception as exc:  # noqa: BLE001 - ST feed must never abort a run
+            logger.warning(
+                "ST episode derivation failed (%s); reporting no usable ST "
+                "history for this call (st_available=False)", exc,
+            )
+            return None
+
+    def _derive_st_episodes(self, raw: pd.DataFrame | None) -> pd.DataFrame:
+        """Derive conservative ST episodes from raw ``namechange`` rows.
+
+        Rules (also documented on :meth:`get_st_timeseries`):
+
+        * a row whose new ``name`` contains ``ST`` (case insensitive, so
+          ``*ST`` matches) marks its ``start_date``..``end_date`` interval as
+          ST; non-ST renames are ignored;
+        * ``trigger_date`` is ``start_date``; ``announce_date`` is ``ann_date``
+          when present and parseable, else ``start_date`` (the fallback can
+          only delay exclusion, never anticipate it);
+        * a missing ``end_date`` is capped at the day before the next recorded
+          name change of that asset -- any later rename proves the ST name
+          ended -- or, when the ST name is still in force, at the price
+          sample's last day (same rule as the Baostock R7a feed);
+        * adjacent (next start no later than the day after the current end)
+          or overlapping ST intervals of one asset are merged, keeping the
+          earliest announce/trigger and the latest end.
+        """
+        if raw is None or len(raw) == 0:
+            return _empty_st_timeseries()
+        required = {"ts_code", "name", "start_date"}
+        if not required.issubset(raw.columns):
+            logger.warning(
+                "namechange feed is missing %s; cannot derive ST episodes",
+                sorted(required - set(raw.columns)),
+            )
+            return _empty_st_timeseries()
+
+        sample_end = panel_last_date(self._prices)
+        if sample_end is None:
+            sample_end = pd.Timestamp(self.end_date).normalize()
+
+        frame = pd.DataFrame({
+            "asset": [
+                normalize_symbol(code) if pd.notna(code) else ""
+                for code in raw["ts_code"]
+            ],
+            "name": raw["name"].astype("string").fillna("").str.strip(),
+            "start": pd.to_datetime(
+                raw["start_date"], format="%Y%m%d", errors="coerce",
+            ),
+            "end": (
+                pd.to_datetime(raw["end_date"], format="%Y%m%d", errors="coerce")
+                if "end_date" in raw.columns
+                else pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
+            ),
+            "ann": (
+                pd.to_datetime(raw["ann_date"], format="%Y%m%d", errors="coerce")
+                if "ann_date" in raw.columns
+                else pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
+            ),
+        })
+        frame = frame.loc[frame["asset"] != ""]
+        frame["is_st"] = frame["name"].str.contains(
+            "st", case=False, regex=False, na=False,
+        )
+        unparseable = int(frame["start"].isna().sum())
+        if unparseable:
+            logger.warning(
+                "namechange: %d row(s) with an unparseable start_date "
+                "were dropped (no episode is invented)",
+                unparseable,
+            )
+        frame = frame.dropna(subset=["start"])
+        if frame.empty:
+            return _empty_st_timeseries()
+
+        frame = frame.sort_values(
+            ["asset", "start"], kind="stable",
+        ).reset_index(drop=True)
+        records: list[dict] = []
+        for asset, group in frame.groupby("asset", sort=True):
+            group = group.reset_index(drop=True)
+            # Every parsed rename -- ST or not -- bounds an open-ended ST
+            # interval: any later name change proves the ST name has ended.
+            starts = group["start"]
+            for idx, row in group.iterrows():
+                if not bool(row["is_st"]):
+                    continue
+                start = row["start"]
+                end = row["end"]
+                if pd.isna(end):
+                    later = starts.iloc[idx + 1:].dropna()
+                    if len(later):
+                        end = later.iloc[0] - pd.Timedelta(days=1)
+                    else:
+                        # Still ST at the end of the fetched history: the
+                        # episode is open only up to the price sample's end.
+                        end = sample_end
+                if end < start:
+                    end = start
+                announce = row["ann"] if pd.notna(row["ann"]) else start
+                records.append({
+                    "asset": asset,
+                    "trigger_date": start,
+                    "announce_date": announce,
+                    "end_date": end,
+                    "is_st": True,
+                })
+        if not records:
+            return _empty_st_timeseries()
+        episodes = pd.DataFrame.from_records(records, columns=_ST_EPISODE_COLUMNS)
+        episodes = self._merge_st_episodes(episodes)
+        return episodes.sort_values(
+            ["asset", "trigger_date"], kind="stable",
+        ).reset_index(drop=True)[_ST_EPISODE_COLUMNS]
+
+    @staticmethod
+    def _merge_st_episodes(episodes: pd.DataFrame) -> pd.DataFrame:
+        """Merge adjacent/overlapping ST intervals of the same asset.
+
+        The merged row keeps the earliest announcement (most conservative
+        exclusion start), the earliest trigger and the latest end.
+        """
+        merged: list[dict] = []
+        for asset, group in episodes.groupby("asset", sort=True):
+            group = group.sort_values("trigger_date", kind="stable")
+            current: dict | None = None
+            for row in group.itertuples(index=False):
+                candidate = {
+                    "asset": asset,
+                    "trigger_date": row.trigger_date,
+                    "announce_date": row.announce_date,
+                    "end_date": row.end_date,
+                    "is_st": True,
+                }
+                if current is None:
+                    current = candidate
+                    continue
+                if candidate["trigger_date"] <= (
+                    current["end_date"] + pd.Timedelta(days=1)
+                ):
+                    current["end_date"] = max(
+                        current["end_date"], candidate["end_date"],
+                    )
+                    current["announce_date"] = min(
+                        current["announce_date"], candidate["announce_date"],
+                    )
+                else:
+                    merged.append(current)
+                    current = candidate
+            if current is not None:
+                merged.append(current)
+        if not merged:
+            return _empty_st_timeseries()
+        return pd.DataFrame.from_records(merged, columns=_ST_EPISODE_COLUMNS)
 
     def _map_sector(self, industry: str) -> str:
         """Map Tushare industry names to our standard sectors."""
