@@ -900,6 +900,33 @@ class Store:
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
 
+    def get_trade_quantity_for_order(
+        self, order_id: str, tenant_id: str = "",
+    ) -> int:
+        """Sum the trade quantity already persisted for one order (R13).
+
+        The live engine's broker-fill sync compares this against the broker's
+        cumulative ``filled_quantity`` to book only the *delta*: replaying the
+        same broker snapshot must not double-count a fill. An empty
+        ``tenant_id`` sums every tenant (matching ``get_trades``); pass the
+        engine's tenant to scope the ledger to one account.
+
+        ``order_id`` is covered by ``idx_trades_order`` (created with the
+        initial schema), so this is an indexed lookup.
+        """
+        if not order_id:
+            return 0
+        query = (
+            "SELECT COALESCE(SUM(quantity), 0) FROM trades WHERE order_id = ?"
+        )
+        params: list = [order_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        with self._conn() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
     def get_trades_for_export(
         self, tenant_id: str = "", start_date: str = "", end_date: str = "",
     ) -> list[dict]:

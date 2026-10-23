@@ -90,6 +90,51 @@ class TestStoreTrades:
         assert len(store.get_trades(code="A")) == 1
 
 
+class TestTradeQuantityForOrder:
+    """R13: the live engine books broker fills as a delta, so it needs the
+    persisted quantity of one order, summed across partial prints."""
+
+    def test_sums_multiple_trades_of_one_order(self, store):
+        store.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 10, "status": "filled"})
+        for trade_id, qty in (("t1", 40), ("t2", 60)):
+            store.save_trade({
+                "trade_id": trade_id, "order_id": "o1", "code": "600519",
+                "side": "buy", "quantity": qty, "price": 10,
+            })
+        assert store.get_trade_quantity_for_order("o1") == 100
+
+    def test_unknown_order_is_zero(self, store):
+        assert store.get_trade_quantity_for_order("missing") == 0
+        assert store.get_trade_quantity_for_order("") == 0
+
+    def test_tenant_filter_scopes_the_sum(self, store):
+        for tenant, qty in (("default", 40), ("other", 60)):
+            store.save_trade({
+                "trade_id": f"{tenant}-t", "tenant_id": tenant,
+                "order_id": "o1", "code": "600519", "side": "buy",
+                "quantity": qty, "price": 10,
+            })
+        assert store.get_trade_quantity_for_order("o1") == 100
+        assert store.get_trade_quantity_for_order("o1", "default") == 40
+        assert store.get_trade_quantity_for_order("o1", "other") == 60
+        assert store.get_trade_quantity_for_order("o1", "missing") == 0
+
+    def test_order_id_lookup_is_indexed(self, store):
+        import sqlite3
+
+        conn = sqlite3.connect(store._db_path)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'trades'"
+            ).fetchall()
+        finally:
+            conn.close()
+        names = {name for (name,) in rows}
+        assert "idx_trades_order" in names
+
+
 class TestStorePnL:
     def test_save_and_get_pnl(self, store):
         store.save_pnl_snapshot({
