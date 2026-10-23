@@ -227,7 +227,21 @@ def qmt_trade_to_dict(qmt_trade: Any) -> dict:
     mocks and for the legacy async-response shape.
     """
     if isinstance(qmt_trade, dict):
-        return qmt_trade
+        # Normalize raw XtTrade-style keys onto the internal names the
+        # reconciliation path reads, without mutating or dropping any of the
+        # caller's keys (plain internal dicts pass through unchanged).
+        normalized = dict(qmt_trade)
+        aliases = (
+            ("traded_volume", "quantity"),
+            ("traded_price", "price"),
+            ("traded_id", "trade_id"),
+            ("traded_amount", "amount"),
+            ("stock_code", "code"),
+        )
+        for source, target in aliases:
+            if target not in normalized and source in normalized:
+                normalized[target] = normalized[source]
+        return normalized
 
     result: dict[str, Any] = {}
     for attr, key in (
@@ -262,7 +276,13 @@ def qmt_order_to_dict(qmt_order: Any) -> dict:
     is the raw xtconstant status code (map with ``qmt_status_to_internal``).
     """
     if isinstance(qmt_order, dict):
-        return qmt_order
+        # Same normalization as qmt_trade_to_dict: a dict shaped like an
+        # XtOrder carries stock_code, while the reconciliation code reads
+        # code. Keep every original key.
+        normalized = dict(qmt_order)
+        if "code" not in normalized and "stock_code" in normalized:
+            normalized["code"] = normalized["stock_code"]
+        return normalized
 
     result: dict[str, Any] = {}
     for attr, key in (

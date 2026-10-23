@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -664,6 +665,21 @@ class TestQmtUtilsReconciliationMappings:
         assert d["quantity"] == 40
         assert d["amount"] == 420.0
 
+    def test_qmt_order_to_dict_normalizes_raw_dict_keys(self):
+        d = qmt_order_to_dict({
+            "order_id": "1", "stock_code": "600519.SH",
+            "order_volume": 100, "order_status": 50,
+        })
+        assert d["code"] == "600519.SH"
+        assert d["stock_code"] == "600519.SH"  # original key preserved
+
+    def test_qmt_trade_to_dict_normalizes_raw_dict_keys(self):
+        d = qmt_trade_to_dict({
+            "order_id": "1", "traded_volume": 60, "traded_price": 10.1,
+        })
+        assert d["quantity"] == 60
+        assert d["price"] == 10.1
+
 
 class TestLazyReconnect:
     def test_query_after_disconnect_reconnects(self):
@@ -917,3 +933,131 @@ class TestGetOrdersTTL:
         clock["now"] += 2.1
         broker.get_orders()
         assert broker._trader.query_stock_orders.call_count == 2
+
+
+class TestReconnectReentrancy:
+    def test_callback_racing_connect_does_not_deadlock(self):
+        """on_disconnected landing inside connect()'s snapshot window must not
+        re-enter (and deadlock on) the non-reentrant reconnect lock."""
+        broker = QMTBroker(account="sim001", sleep_fn=lambda _delay: None)
+        broker._HAS_XTQUANT = True
+        broker._trader = MagicMock()
+        broker._account = MagicMock()
+        inner_errors = []
+
+        def fake_connect(blocking=True):
+            broker._connected = True
+            broker._connected = False  # on_disconnected fires in this window
+            try:
+                broker.get_account()   # connect()'s post-connect snapshot path
+            except QMTBroker.BrokerConnectionError as exc:
+                inner_errors.append(str(exc))
+            return True
+
+        broker.connect = fake_connect
+        outcome = {}
+
+        def run():
+            try:
+                broker.place_order(Order(
+                    code="600519", side=OrderSide.BUY,
+                    order_type=OrderType.LIMIT, quantity=100, price=10.0,
+                ))
+            except Exception as exc:  # the fail-closed outcome under test
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive(), "lazy reconnect deadlocked on its own lock"
+        assert isinstance(outcome.get("error"), QMTBroker.BrokerConnectionError)
+        assert inner_errors, "inner get_account never reached the re-entry guard"
+
+
+class TestConcurrentResyncVsPlaceOrder:
+    def test_place_order_does_not_duplicate_resync_recovered_order(self):
+        """A resync that recovers the broker order between order_stock() and
+        the local append must leave exactly one tracked entry."""
+        broker = _connected_broker()
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("777", status=50),
+        ]
+
+        def order_stock(**_kwargs):
+            # Simulate the concurrent resync winning the race.
+            broker._resync_from_broker()
+            return 777
+
+        broker._trader.order_stock.side_effect = order_stock
+        order = Order(
+            code="600519", side=OrderSide.BUY,
+            order_type=OrderType.LIMIT, quantity=100, price=10.0,
+        )
+
+        result = broker.place_order(order)
+
+        entries = [o for o in broker._orders if o.broker_order_id == "777"]
+        assert len(entries) == 1
+        assert result is entries[0]
+
+
+class TestResyncMonotonicStatus:
+    def test_stale_unreported_snapshot_does_not_demote_submitted(self):
+        broker = _connected_broker(resync_ttl=0.0)
+        known = Order(
+            code="600519", side=OrderSide.BUY,
+            order_type=OrderType.LIMIT, quantity=100, price=10.0,
+        )
+        known.broker_order_id = "9001"
+        known.status = OrderStatus.SUBMITTED
+        broker._orders = [known]
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("9001", status=48),  # UNREPORTED, stale
+        ]
+
+        broker.get_orders()
+
+        assert known.status == OrderStatus.SUBMITTED
+
+
+class TestReconnectEdgeCases:
+    def test_resync_attempt_after_reconnect_is_not_repeated_in_same_call(self):
+        broker = _connected_broker()
+        broker._connected = False
+        broker._trader.query_stock_orders.side_effect = RuntimeError("boom")
+
+        def fake_connect(blocking=True):
+            broker._connected = True
+            return True
+
+        broker.connect = fake_connect
+        broker.get_orders()
+
+        # One attempt inside the reconnect path, none again via the TTL gate.
+        assert broker._trader.query_stock_orders.call_count == 1
+
+
+class TestConnectHousekeeping:
+    def test_connect_stops_previous_trader(self, mock_xtquant):
+        broker = QMTBroker(account="sim001")
+        old_trader = MagicMock()
+        broker._trader = old_trader
+        with patch.object(broker, "_HAS_XTQUANT", True):
+            new_trader = MagicMock()
+            new_trader.connect.return_value = -1
+            broker._XtQuantTrader = MagicMock(return_value=new_trader)
+            broker._StockAccount = MagicMock()
+            assert broker.connect(blocking=False) is False
+        old_trader.stop.assert_called_once()
+
+    def test_connect_invalidates_resync_ttl(self, mock_xtquant):
+        broker = QMTBroker(account="sim001")
+        broker._last_resync_at = 123.0
+        with patch.object(broker, "_HAS_XTQUANT", True):
+            trader = MagicMock()
+            trader.connect.return_value = 0
+            broker._XtQuantTrader = MagicMock(return_value=trader)
+            broker._StockAccount = MagicMock()
+            broker._update_account_snapshot = MagicMock()
+            assert broker.connect(blocking=False) is True
+        assert broker._last_resync_at is None

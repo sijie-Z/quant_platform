@@ -1115,12 +1115,13 @@ class QMTBroker(BrokerInterface):
       between retries). If every attempt fails, ``BrokerConnectionError`` is
       raised — order submission fails closed and ``order_stock`` is never
       called while the broker is unreachable.
-    - Broker reconciliation: after a successful (re)connect, and at most once
-      per ``resync_ttl`` seconds on ``get_orders``, the broker's
-      ``query_stock_orders`` / ``query_stock_trades`` are merged into the
-      local order book (idempotent, keyed by broker order id). Read paths
-      fail loud when the broker cannot be reached, and degrade to the
-      in-memory book (with a warning) when only the resync query fails.
+    - Broker reconciliation: after a successful lazy reconnect, and on
+      ``get_orders`` at most once per ``resync_ttl`` seconds (an explicit
+      ``connect()`` invalidates the TTL), the broker's ``query_stock_orders``
+      / ``query_stock_trades`` are merged into the local order book
+      (idempotent, keyed by broker order id). Read paths fail loud when the
+      broker cannot be reached, and degrade to the in-memory book (with a
+      warning) when only the resync query fails.
 
     Architecture::
 
@@ -1211,11 +1212,15 @@ class QMTBroker(BrokerInterface):
         #: append the same unknown broker order (check-then-act on _orders).
         self._resync_lock = threading.Lock()
         #: Serializes lazy reconnects: two threads polling a dead link must
-        #: not each create a trader session. Safe as a plain Lock because
-        #: _ensure_connected checks `_connected` before acquiring, and
-        #: connect() sets `_connected = True` before it calls back into
-        #: get_account() -> _ensure_connected (which then returns early).
+        #: not each create a trader session.
         self._reconnect_lock = threading.Lock()
+        #: Thread-local re-entrancy guard. connect() calls
+        #: _update_account_snapshot() -> get_account() -> _ensure_connected(),
+        #: and an on_disconnected callback racing that window flips
+        #: `_connected` back to False before the inner check. A plain Lock
+        #: would then deadlock on the thread that already owns it; the inner
+        #: call raises instead and lets the outer attempt retry.
+        self._reconnect_state = threading.local()
 
         # Resolve password: explicit arg > env var
         if not self._password:
@@ -1252,6 +1257,14 @@ class QMTBroker(BrokerInterface):
             return False
 
         try:
+            # A retry (or manual reconnect) must not leak the previous trader
+            # session into miniQMT: stop it before opening a new one.
+            if self._trader is not None:
+                try:
+                    self._trader.stop()
+                except Exception:
+                    pass
+                self._trader = None
             self._session_id = int(datetime.now().timestamp() % 2147483647)
             self._trader = self._XtQuantTrader(self._server, self._session_id)
             self._account = self._StockAccount(self._account_id, "STOCK")
@@ -1303,6 +1316,10 @@ class QMTBroker(BrokerInterface):
 
             if result == 0:
                 self._connected = True
+                # A fresh session invalidates the resync TTL: the next
+                # get_orders must reconcile against this connection (also
+                # covers explicit connect() calls made outside the lazy path).
+                self._last_resync_at = None
                 # Subscribe to account updates
                 try:
                     self._trader.subscribe(self._account)
@@ -1355,10 +1372,23 @@ class QMTBroker(BrokerInterface):
         if self._connected:
             return
 
+        if getattr(self._reconnect_state, "active", False):
+            # Re-entered from connect()'s own callback chain (post-connect
+            # account snapshot) after on_disconnected flipped the flag.
+            # Blocking on the reconnect lock this thread already owns would
+            # deadlock; report failure and let the outer attempt retry.
+            raise self.BrokerConnectionError(
+                "QMT reconnect re-entered from its own connect() callback chain"
+            )
+
         with self._reconnect_lock:
             if self._connected:
                 return
-            self._reconnect_locked()
+            self._reconnect_state.active = True
+            try:
+                self._reconnect_locked()
+            finally:
+                self._reconnect_state.active = False
 
     def _reconnect_locked(self) -> None:
         """Body of ``_ensure_connected``; caller holds ``_reconnect_lock``."""
@@ -1385,9 +1415,12 @@ class QMTBroker(BrokerInterface):
                 connected = False
             if connected and self._connected:
                 logger.info("QMT reconnected after %d attempt(s)", attempt + 1)
+                # Reserve the TTL slot before reconciling: if the resync
+                # query fails here, get_orders must not immediately retry the
+                # same broken endpoint on entry (one attempt per TTL).
+                self._last_resync_at = self._clock_fn()
                 try:
-                    if self._resync_from_broker():
-                        self._last_resync_at = self._clock_fn()
+                    self._resync_from_broker()
                 except Exception as e:
                     logger.warning("QMT post-reconnect resync failed: %s", e)
                 return
@@ -1439,8 +1472,10 @@ class QMTBroker(BrokerInterface):
         an order's status. When the trade endpoint or its fields are
         unavailable a warning is logged and the order-query values stand.
 
-        Any query failure leaves the in-memory book untouched. Returns True
-        only when the order query itself succeeded.
+        Any order-query failure leaves the in-memory book untouched. A
+        trade-query failure only skips the cross-check; the order merge from
+        the same call is kept. Returns True only when the order query itself
+        succeeded.
         """
         from quant_platform.trading.qmt_utils import qmt_order_to_dict
 
@@ -1508,8 +1543,16 @@ class QMTBroker(BrokerInterface):
             if str(order.broker_order_id) != broker_id:
                 continue
             if order.status not in self._TERMINAL_STATUSES:
-                if not (order.status == OrderStatus.PARTIAL
-                        and status in (OrderStatus.PENDING, OrderStatus.SUBMITTED)):
+                if order.status == OrderStatus.PARTIAL and status in (
+                        OrderStatus.PENDING, OrderStatus.SUBMITTED):
+                    pass  # never demote a partially filled order
+                elif (order.status == OrderStatus.SUBMITTED
+                        and status == OrderStatus.PENDING):
+                    # Stale pre-report snapshot (UNREPORTED/WAIT_REPORTING)
+                    # from a query that raced the callback; demoting would
+                    # make cancel_order refuse a live order.
+                    pass
+                else:
                     order.status = status
             if traded > int(order.filled_quantity or 0):
                 order.filled_quantity = (
@@ -1688,7 +1731,8 @@ class QMTBroker(BrokerInterface):
                 order.status = OrderStatus.REJECTED
                 order.error_msg = f"QMT order_stock rejected (broker_id={broker_id!r})"
                 order.updated_at = datetime.now().isoformat()
-                self._orders.append(order)
+                with self._resync_lock:
+                    self._orders.append(order)
                 logger.error("QMT order_stock rejected: %s %s %d@%.2f (broker_id=%r)",
                              order.side.value, order.code, order.quantity,
                              order.price, broker_id)
@@ -1697,7 +1741,26 @@ class QMTBroker(BrokerInterface):
             order.broker_order_id = str(broker_id)
             order.status = OrderStatus.SUBMITTED
             order.updated_at = datetime.now().isoformat()
-            self._orders.append(order)
+            with self._resync_lock:
+                # A concurrent resync can recover this broker order between
+                # order_stock() returning and this append (query_stock_orders
+                # already lists it). Appending would create two entries for
+                # one broker id, and callbacks/resync only update the first,
+                # leaving the caller's order permanently stale. Keep the
+                # single tracked entry and return it instead.
+                tracked = next(
+                    (o for o in self._orders
+                     if str(o.broker_order_id) == order.broker_order_id),
+                    None,
+                )
+                if tracked is not None and tracked is not order:
+                    logger.info(
+                        "QMT order %s already recovered by a concurrent "
+                        "resync; not duplicating", broker_id,
+                    )
+                    order = tracked
+                else:
+                    self._orders.append(order)
 
             logger.info("QMT order: %s %s %d@%.2f (qmt_id=%s)",
                       order.side.value, order.code, order.quantity,
