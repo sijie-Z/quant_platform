@@ -103,7 +103,10 @@ class CostModel:
             slippage_model: 'fixed' for constant bps, 'proportional' for
                            size-dependent impact, 'impact' for full market impact model.
             asset_universe: AssetUniverse for per-instrument cost overrides.
-            impact_model: Which impact model to use when slippage_model='impact'.
+            impact_model: Which impact model to use when slippage_model='impact'
+                on the scalar single-order path. The vectorised path applies
+                the square-root rule documented in ``_compute_impact_cost``
+                regardless of this setting.
             min_commission: Commission floor in CNY per order. Applied on the
                 per-asset notional only when ``compute_costs`` is told the
                 portfolio value (i.e. the values passed are CNY notionals).
