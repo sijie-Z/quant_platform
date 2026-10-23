@@ -14,6 +14,7 @@ Integrates with EventBus and StateMachine.
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 import uuid
@@ -25,6 +26,11 @@ from quant_platform.core.events import EventBus, get_event_bus
 from quant_platform.core.exchange_calendar import is_trading_day
 from quant_platform.core.state_machine import PortfolioState, PortfolioStateMachine
 from quant_platform.core.store import RetentionPolicy, Store
+from quant_platform.operations.reconciliation import (
+    positions_from_broker,
+    positions_from_store,
+    reconcile,
+)
 from quant_platform.utils.logging import get_logger
 from quant_platform.utils.metrics import get_metrics
 
@@ -50,6 +56,42 @@ MAX_EOD_CATCHUP_DAYS = 10
 #: sink deduplicates for five minutes as well; this only keeps the EventBus
 #: history from filling with one event per tick.
 ALERT_THROTTLE_SECONDS = 300.0
+
+#: R11: tolerances for the daily books-vs-broker reconciliation, as
+#: ``(environment variable, default)``. The defaults mirror ``reconcile()``.
+RECON_TOLERANCE_ENV = {
+    "shares": ("QUANT_RECON_SHARES_TOLERANCE", 0.0),
+    "cash": ("QUANT_RECON_CASH_TOLERANCE", 1000.0),
+    "cash_bps": ("QUANT_RECON_CASH_TOLERANCE_BPS", 0.0),
+    "materiality": ("QUANT_RECON_MATERIALITY", 0.0),
+}
+
+
+def _reconciliation_tolerances_from_env() -> dict:
+    """Read the ``QUANT_RECON_*`` tolerances; invalid values raise ValueError.
+
+    An unset or empty variable takes the default. Anything that is not a
+    finite, non-negative number is rejected (fail loud): a typo must not
+    silently widen or narrow the daily reconciliation.
+    """
+    values: dict[str, float] = {}
+    for key, (env, default) in RECON_TOLERANCE_ENV.items():
+        raw = os.environ.get(env)
+        if raw is None or not raw.strip():
+            values[key] = default
+            continue
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{env} must be a number, got {raw!r}"
+            ) from exc
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"{env} must be a finite non-negative number, got {raw!r}"
+            )
+        values[key] = value
+    return values
 
 
 @dataclass
@@ -128,6 +170,11 @@ class TradingScheduler:
             else RetentionPolicy.from_env()
         )
         self._retention_archive_dir = retention_archive_dir
+
+        # R11: tolerances for the daily books-vs-broker reconciliation.
+        # Parsed at construction so a typo in QUANT_RECON_* fails the
+        # scheduler loudly instead of silently reconciling with defaults.
+        self._recon_tolerances = _reconciliation_tolerances_from_env()
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -565,16 +612,26 @@ class TradingScheduler:
         the live engine (S2). The old hard-coded 1,000,000 fabricated a
         snapshot for any book with no prior P&L; when neither source is
         available the day is skipped, alerted and counted instead.
+
+        R11: once the snapshot is durable, the Store position ledger and the
+        snapshot's cash (expected) are reconciled against the broker's
+        positions and account cash (actual). The outcome is persisted to
+        ``reconciliation_results`` and added to the ``eod.reconciliation``
+        event. A repeated trigger never writes a second result; a day whose
+        marker exists but whose result is missing (an upgraded database) has
+        only the result backfilled — never a second snapshot.
         """
         target = date_str or self._now().strftime("%Y-%m-%d")
         try:
-            if self._store.has_eod_reconciliation(target):
-                if not catch_up:
-                    logger.info("EOD reconciliation already done for %s; skipping", target)
-                return False
+            marked = self._store.has_eod_reconciliation(target)
         except Exception as exc:
             logger.error("EOD marker read failed for %s: %s", target, exc)
             return False
+
+        if marked:
+            if not catch_up:
+                logger.info("EOD reconciliation already done for %s; skipping", target)
+            return self._backfill_missing_reconciliation(target)
 
         # S2/S3: a missed *past* day has no observation we can honestly
         # reconstruct. Writing today's equity under a historical date would
@@ -629,18 +686,20 @@ class TradingScheduler:
             )
             return False
 
-        self._bus.publish("eod.reconciliation", {
-            "date": target,
-            "positions": len(positions),
-            "market_value": market_value,
-            "total_equity": equity,
-            "equity_source": source,
-            "catch_up": catch_up,
-        }, source="scheduler")
+        # R11: reconcile the persisted book against the broker counter-book
+        # (persisted to reconciliation_results), then publish one enriched
+        # eod.reconciliation event. The snapshot stays durable even when the
+        # reconciliation cannot run.
+        recon = self._run_eod_reconciliation(target, snapshot=snapshot)
+        self._publish_eod_reconciliation(
+            target, len(positions), market_value, equity, source, catch_up,
+            recon,
+        )
 
         logger.info(
-            "EOD reconciliation %s: %d positions, equity=%.2f (source=%s)",
-            target, len(positions), equity, source,
+            "EOD reconciliation %s: %d positions, equity=%.2f (source=%s), "
+            "books-vs-broker=%s",
+            target, len(positions), equity, source, recon["status"],
         )
 
         if target == self._now().strftime("%Y-%m-%d"):
@@ -706,8 +765,294 @@ class TradingScheduler:
             "equity_source": "backfill-marker-only" if not rows else "existing-snapshot",
             "catch_up": True,
             "marker_only": not rows,
+            # R11: keep the topic's payload shape uniform. A historical day
+            # is never compared against today's broker book (that would
+            # fabricate an observation), so its reconciliation is unknown.
+            "status": "unknown",
+            "passes": False,
+            "n_mismatched": 0,
+            "cash_diff": None,
+            "total_mismatch_value": None,
+            "reason": "historical day: no broker/book observation to reconcile",
         }, source="scheduler")
         return True
+
+    # ── Daily books-vs-broker reconciliation (R11) ──
+
+    def _backfill_missing_reconciliation(self, target: str) -> bool:
+        """Write today's missing reconciliation result without a snapshot.
+
+        An upgraded database can already hold the day's EOD marker (and its
+        P&L snapshot) from before the daily books-vs-broker step existed.
+        Only *today's* observation is backfilled: a historical day's counter-
+        book no longer exists, and reconciling it against today's broker
+        would fabricate an observation — the same failure class as S2.
+        Never returns True: this call writes no snapshot and no marker.
+        """
+        if target != self._now().strftime("%Y-%m-%d"):
+            return False
+        try:
+            existing = self._store.get_reconciliation_result(target)
+        except Exception as exc:
+            logger.error(
+                "EOD reconciliation result read failed for %s: %s", target, exc,
+            )
+            return False
+        if existing is not None:
+            return False
+
+        snapshot = self._latest_pnl_snapshot(target)
+        result = self._run_eod_reconciliation(target, snapshot=snapshot)
+        positions = int(snapshot.get("n_positions") or 0) if snapshot else 0
+        market_value = float(snapshot.get("market_value") or 0.0) if snapshot else 0.0
+        equity = snapshot.get("total_equity") if snapshot else None
+        self._publish_eod_reconciliation(
+            target, positions, market_value, equity,
+            "existing-snapshot" if snapshot else "marker-only",
+            catch_up=False, result=result, backfill=True,
+        )
+        logger.warning(
+            "EOD reconciliation %s: backfilled the missing books-vs-broker "
+            "result (%s) from the existing snapshot; no new snapshot written",
+            target, result["status"],
+        )
+        return False
+
+    def _run_eod_reconciliation(
+        self, target: str, snapshot: dict | None = None,
+    ) -> dict:
+        """Compute and persist the day's books-vs-broker outcome (R11).
+
+        Never raises: the EOD snapshot is already durable, and a broken
+        reconciliation must neither undo it nor stop the event. A failure
+        to compute is recorded as ``unknown`` (fail loud: never a pass).
+        """
+        try:
+            result = self._compute_reconciliation(target, snapshot)
+        except Exception as exc:
+            logger.critical(
+                "EOD books-vs-broker reconciliation failed for %s: %s",
+                target, exc, exc_info=True,
+            )
+            result = self._unknown_reconciliation(
+                target, f"reconciliation failed: {exc}",
+            )
+        try:
+            self._store.save_reconciliation_result(result)
+        except Exception as exc:
+            # Keep the computed outcome in the event/log; the next EOD tick
+            # sees the missing row and backfills it.
+            logger.critical(
+                "EOD reconciliation result write failed for %s: %s",
+                result.get("date"), exc,
+            )
+        return result
+
+    def _compute_reconciliation(
+        self, target: str, snapshot: dict | None,
+    ) -> dict:
+        """expected = Store ledger, actual = broker counter-book.
+
+        Positions: expected from ``Store.get_positions(tenant)``, actual from
+        ``broker.get_positions()``. Cash: expected from the day's P&L
+        snapshot, actual from ``broker.get_account()['cash']``. Tolerances
+        come from the ``QUANT_RECON_*`` values parsed at construction.
+        """
+        timestamp = self._naive_local(self._now())
+        tolerances = dict(self._recon_tolerances)
+        if snapshot is None:
+            snapshot = self._latest_pnl_snapshot(target)
+        if snapshot is None:
+            return self._unknown_reconciliation(
+                target, "no EOD P&L snapshot for the date", timestamp,
+            )
+        expected_cash = snapshot.get("cash")
+        if not self._is_number(expected_cash):
+            return self._unknown_reconciliation(
+                target, "EOD P&L snapshot has no usable cash", timestamp,
+            )
+
+        broker = self._broker
+        if broker is None:
+            return self._unknown_reconciliation(
+                target, "no broker attached; counter-book unknown", timestamp,
+            )
+        try:
+            broker_positions = broker.get_positions()
+        except Exception as exc:
+            logger.error(
+                "EOD reconciliation broker position query failed: %s", exc,
+            )
+            return self._unknown_reconciliation(
+                target, f"broker position query failed: {exc}", timestamp,
+            )
+        if broker_positions is None:
+            # The broker contract: None means the query failed. Treating it
+            # as a flat account would "pass" a book we never observed.
+            return self._unknown_reconciliation(
+                target, "broker positions unknown (None)", timestamp,
+            )
+        try:
+            account = broker.get_account() or {}
+        except Exception as exc:
+            logger.error(
+                "EOD reconciliation broker account query failed: %s", exc,
+            )
+            return self._unknown_reconciliation(
+                target, f"broker account query failed: {exc}", timestamp,
+            )
+        if not isinstance(account, dict):
+            return self._unknown_reconciliation(
+                target, "broker account payload is not a dict", timestamp,
+            )
+        if account.get("connected") is False:
+            # A disconnected QMT/XTP adapter serves placeholder balances;
+            # the snapshot path already refuses them (S2).
+            return self._unknown_reconciliation(
+                target, "broker reports disconnected", timestamp,
+            )
+        actual_cash = account.get("cash")
+        if not self._is_number(actual_cash):
+            return self._unknown_reconciliation(
+                target, "broker account has no usable cash", timestamp,
+            )
+
+        try:
+            store_rows = list(self._store.get_positions(self._tenant_id) or [])
+        except Exception as exc:
+            # An unreadable expected book is unknown, not empty: reconciling
+            # against {} would report every actual position as a breach.
+            logger.error(
+                "EOD reconciliation store position query failed: %s", exc,
+            )
+            return self._unknown_reconciliation(
+                target, f"store position query failed: {exc}", timestamp,
+            )
+
+        report = reconcile(
+            positions_from_store(store_rows),
+            positions_from_broker(list(broker_positions)),
+            float(expected_cash),
+            float(actual_cash),
+            tolerance=tolerances["shares"],
+            cash_tolerance=tolerances["cash"],
+            cash_tolerance_bps=tolerances["cash_bps"],
+            mismatch_materiality=tolerances["materiality"],
+        )
+        status = "passed" if report.passes else "failed"
+        if status == "failed":
+            self._log_reconciliation_failure(
+                report, tolerances, float(expected_cash), float(actual_cash),
+            )
+        return {
+            "date": target,
+            "timestamp": timestamp,
+            "status": status,
+            "n_positions": report.total_positions,
+            "n_mismatched": report.mismatched,
+            "cash_diff": report.cash_diff,
+            "total_mismatch_value": report.total_mismatch_value,
+            "details": [
+                {
+                    "asset": row.asset,
+                    "expected_shares": row.expected_shares,
+                    "actual_shares": row.actual_shares,
+                    "expected_price": row.expected_price,
+                    "actual_price": row.actual_price,
+                    "diff": row.diff,
+                    "tolerance": row.tolerance,
+                    "is_matched": row.is_matched,
+                }
+                for row in report.details
+            ],
+            "tolerances": tolerances,
+        }
+
+    @staticmethod
+    def _log_reconciliation_failure(
+        report, tolerances: dict,
+        expected_cash: float, actual_cash: float,
+    ) -> None:
+        """Log the first few breaching positions and any cash breach."""
+        for row in [row for row in report.details if not row.is_matched][:5]:
+            logger.error(
+                "EOD reconciliation mismatch %s: expected=%s actual=%s diff=%s",
+                row.asset, row.expected_shares, row.actual_shares, row.diff,
+            )
+        cash_limit = tolerances["cash"] + (
+            tolerances["cash_bps"] / 10_000.0
+            * max(abs(expected_cash), abs(actual_cash))
+        )
+        if abs(report.cash_diff) > cash_limit:
+            logger.error(
+                "EOD reconciliation cash mismatch: expected=%.2f actual=%.2f "
+                "diff=%.2f limit=%.2f",
+                expected_cash, actual_cash, report.cash_diff, cash_limit,
+            )
+
+    def _unknown_reconciliation(
+        self, target: str, reason: str, timestamp: str | None = None,
+    ) -> dict:
+        """A comparison that could not run: never a pass, never a zero diff."""
+        return {
+            "date": target,
+            "timestamp": timestamp or self._naive_local(self._now()),
+            "status": "unknown",
+            "n_positions": 0,
+            "n_mismatched": 0,
+            "cash_diff": None,
+            "total_mismatch_value": None,
+            "details": [],
+            "tolerances": dict(self._recon_tolerances),
+            "reason": reason,
+        }
+
+    def _latest_pnl_snapshot(self, target: str) -> dict | None:
+        """Newest P&L snapshot for `target`, or None.
+
+        The EOD snapshot is written under the store's default tenant (the
+        snapshot dict carries no tenant_id), so this read is deliberately
+        unscoped — the same basis ``save_pnl_and_mark_eod`` writes with.
+        """
+        try:
+            rows = self._store.get_pnl_history(
+                start_date=target, end_date=target,
+            )
+        except Exception as exc:
+            logger.error("EOD P&L snapshot read failed for %s: %s", target, exc)
+            return None
+        return rows[-1] if rows else None
+
+    def _publish_eod_reconciliation(
+        self, target: str, positions: int, market_value: float,
+        equity: float | None, source: str, catch_up: bool, result: dict,
+        backfill: bool = False,
+    ) -> None:
+        """Publish the enriched ``eod.reconciliation`` event (R11).
+
+        The legacy keys are kept verbatim; the reconciliation outcome is
+        added as ``status``/``passes``/``n_mismatched``/``cash_diff``/
+        ``total_mismatch_value``.
+        """
+        payload = {
+            "date": target,
+            "positions": positions,
+            "market_value": market_value,
+            "total_equity": equity,
+            "equity_source": source,
+            "catch_up": catch_up,
+            "status": result["status"],
+            # An unknown comparison is not a pass (fail loud).
+            "passes": result["status"] == "passed",
+            "n_mismatched": result.get("n_mismatched", 0),
+            "cash_diff": result.get("cash_diff"),
+            "total_mismatch_value": result.get("total_mismatch_value"),
+        }
+        if result.get("reason"):
+            payload["reason"] = result["reason"]
+        if backfill:
+            payload["backfill"] = True
+        self._bus.publish("eod.reconciliation", payload, source="scheduler")
 
     def _resolve_eod_values(
         self,
