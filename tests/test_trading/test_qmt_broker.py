@@ -1,7 +1,9 @@
 """Tests for QMTBroker — xtquant/miniQMT integration."""
 
+import logging
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,6 +20,9 @@ from quant_platform.trading.qmt_utils import (
     classify_exchange,
     describe_qmt_error,
     from_qmt_code,
+    from_qmt_order_type,
+    from_qmt_price_type,
+    qmt_order_to_dict,
     qmt_position_to_dict,
     qmt_status_to_internal,
     qmt_trade_to_dict,
@@ -262,13 +267,19 @@ class TestQMTBrokerOrders:
         assert result.broker_order_id == "12345"
         broker._trader.order_stock.assert_called_once()
 
-    def test_place_order_while_disconnected(self):
+    def test_place_order_while_disconnected_fails_closed(self):
+        """No lazy reconnect possible -> raise; order_stock is never called."""
         broker = self.broker
         broker._connected = False
+        broker._sleep_fn = lambda _delay: None
+        broker.connect = MagicMock(return_value=False)
         order = Order(code="000001", side=OrderSide.BUY, quantity=100, price=15.0)
-        result = broker.place_order(order)
-        assert result.status == OrderStatus.REJECTED
-        assert "not connected" in result.error_msg.lower()
+
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            broker.place_order(order)
+
+        assert broker.connect.call_count == 3
+        broker._trader.order_stock.assert_not_called()
 
     @pytest.mark.parametrize("reject_value", [0, -1, None])
     def test_order_stock_failure_is_rejected(self, reject_value):
@@ -325,11 +336,13 @@ class TestQMTBrokerOrders:
         result = broker.cancel_order("nonexistent")
         assert result is False
 
-    def test_cancel_order_disconnected(self):
+    def test_cancel_order_disconnected_raises(self):
         broker = self.broker
         broker._connected = False
-        result = broker.cancel_order("any")
-        assert result is False
+        broker._sleep_fn = lambda _delay: None
+        broker.connect = MagicMock(return_value=False)
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            broker.cancel_order("any")
 
 
 class TestQMTBrokerQueries:
@@ -356,12 +369,14 @@ class TestQMTBrokerQueries:
         assert acct["cash"] == 3_000_000
         assert acct["total_equity"] == 5_500_000
 
-    def test_get_account_disconnected(self):
+    def test_get_account_disconnected_raises(self):
+        """Read paths fail loud when the broker cannot be reached (R10)."""
         broker = self.broker
         broker._connected = False
-        acct = broker.get_account()
-        assert acct["broker"] == "qmt"
-        assert acct["connected"] is False
+        broker._sleep_fn = lambda _delay: None
+        broker.connect = MagicMock(return_value=False)
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            broker.get_account()
 
     def test_get_positions_empty(self):
         broker = self.broker
@@ -568,3 +583,337 @@ class TestStaleCallbacksCannotDowngrade:
 
         assert order.status == OrderStatus.PARTIAL
         assert order.filled_quantity == 40
+
+
+# ── R10: lazy reconnect, broker resync, get_orders TTL ──
+
+
+def _xt_order(
+    order_id,
+    *,
+    code="600519.SH",
+    side=23,
+    price_type=11,
+    volume=100,
+    price=10.0,
+    traded_volume=0,
+    traded_price=0.0,
+    status=50,
+    status_msg="",
+    order_time=0,
+):
+    """Shape of an xtquant ``XtOrder`` for reconciliation tests."""
+    return SimpleNamespace(
+        order_id=order_id,
+        stock_code=code,
+        order_type=side,
+        price_type=price_type,
+        order_volume=volume,
+        price=price,
+        traded_volume=traded_volume,
+        traded_price=traded_price,
+        order_status=status,
+        status_msg=status_msg,
+        order_time=order_time,
+    )
+
+
+def _connected_broker(**kwargs):
+    """A QMTBroker that believes it is connected, with an empty mock book."""
+    broker = QMTBroker(account="sim001", sleep_fn=lambda _delay: None, **kwargs)
+    broker._HAS_XTQUANT = True
+    broker._connected = True
+    broker._trader = MagicMock()
+    broker._trader.query_stock_orders.return_value = []
+    broker._trader.query_stock_trades.return_value = []
+    broker._account = MagicMock()
+    return broker
+
+
+class TestQmtUtilsReconciliationMappings:
+    def test_from_qmt_order_type(self):
+        assert from_qmt_order_type(23) == OrderSide.BUY
+        assert from_qmt_order_type(24) == OrderSide.SELL
+        assert from_qmt_order_type(None) == OrderSide.BUY
+
+    def test_from_qmt_price_type(self):
+        assert from_qmt_price_type(5) == OrderType.MARKET
+        assert from_qmt_price_type(11) == OrderType.LIMIT
+        assert from_qmt_price_type(None) == OrderType.LIMIT
+
+    def test_qmt_order_to_dict_reads_xtorder_fields(self):
+        d = qmt_order_to_dict(_xt_order("123", traded_volume=40, traded_price=10.2))
+        assert d["order_id"] == "123"
+        assert d["code"] == "600519.SH"
+        assert d["order_volume"] == 100
+        assert d["traded_volume"] == 40
+        assert d["traded_price"] == 10.2
+        assert d["order_status"] == 50
+
+    def test_qmt_trade_to_dict_reads_xttrade_fields(self):
+        raw = SimpleNamespace(
+            order_id="123", traded_id="T1", stock_code="600519.SH",
+            traded_price=10.5, traded_volume=40, traded_amount=420.0,
+            trade_time="093000",
+        )
+        d = qmt_trade_to_dict(raw)
+        assert d["order_id"] == "123"
+        assert d["trade_id"] == "T1"
+        assert d["code"] == "600519.SH"
+        assert d["price"] == 10.5
+        assert d["quantity"] == 40
+        assert d["amount"] == 420.0
+
+
+class TestLazyReconnect:
+    def test_query_after_disconnect_reconnects(self):
+        """on_disconnected only flips state; the next query reconnects."""
+        broker = _connected_broker()
+        broker._trader.query_stock_positions.return_value = []
+        calls = {"n": 0}
+
+        def fake_connect(blocking=True):
+            calls["n"] += 1
+            broker._connected = True
+            return True
+
+        broker.connect = fake_connect
+        assert broker.connect() is True          # initial explicit connect
+        broker._connected = False                # on_disconnected callback
+        positions = broker.get_positions()
+
+        assert positions == []
+        assert broker._connected is True
+        assert calls["n"] == 2                   # lazy reconnect called again
+
+    def test_reconnect_failure_blocks_submission(self):
+        """Fail closed: 3 attempts, exponential backoff, no order_stock call."""
+        sleeps = []
+        broker = QMTBroker(
+            account="sim001",
+            max_reconnect_attempts=3,
+            reconnect_backoff=1.0,
+            sleep_fn=sleeps.append,
+        )
+        broker._HAS_XTQUANT = True
+        broker._connected = False
+        broker._trader = MagicMock()
+        broker.connect = MagicMock(return_value=False)
+
+        order = Order(code="600519", side=OrderSide.BUY, quantity=100, price=10.0)
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            broker.place_order(order)
+
+        assert broker.connect.call_count == 3
+        assert sleeps == [1.0, 2.0]              # waits before retries 2 and 3
+        broker._trader.order_stock.assert_not_called()
+
+    @pytest.mark.parametrize("method", ["get_positions", "get_orders", "get_account"])
+    def test_read_paths_fail_loud_when_reconnect_fails(self, method):
+        broker = QMTBroker(account="sim001", sleep_fn=lambda _delay: None)
+        broker._HAS_XTQUANT = True
+        broker._connected = False
+        broker._trader = MagicMock()
+        broker.connect = MagicMock(return_value=False)
+
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            getattr(broker, method)()
+
+    def test_reconnected_broker_resyncs_immediately(self):
+        broker = _connected_broker()
+        broker._connected = False
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("9001", status=50),
+        ]
+
+        def fake_connect(blocking=True):
+            broker._connected = True
+            return True
+
+        broker.connect = fake_connect
+        orders = broker.get_orders()
+
+        assert [o.broker_order_id for o in orders] == ["9001"]
+        assert broker._trader.query_stock_orders.call_count == 1
+        assert broker._last_resync_at is not None
+
+
+class TestBrokerResync:
+    def _broker_with_known_order(self, **kwargs):
+        broker = _connected_broker(**kwargs)
+        known = Order(
+            code="600519", side=OrderSide.BUY,
+            order_type=OrderType.LIMIT, quantity=100, price=10.0,
+        )
+        known.broker_order_id = "9001"
+        known.status = OrderStatus.SUBMITTED
+        broker._orders = [known]
+        return broker, known
+
+    def test_resync_updates_known_and_recovers_unknown(self):
+        broker, known = self._broker_with_known_order(resync_ttl=0.0)
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("9001", status=56, traded_volume=100, traded_price=10.5),
+            _xt_order(
+                "9002", code="000001.SZ", side=24, volume=200,
+                price=15.0, status=50,
+            ),
+        ]
+
+        orders = broker.get_orders()
+
+        # Known order: status/fill updated from the broker snapshot.
+        assert known.status == OrderStatus.FILLED
+        assert known.filled_quantity == 100
+        assert known.filled_price == 10.5
+
+        # Unknown order (submitted before restart): recovered, mapped fields.
+        recovered = [o for o in orders if o.broker_order_id == "9002"]
+        assert len(recovered) == 1
+        r = recovered[0]
+        assert r.code == "000001"
+        assert r.side == OrderSide.SELL
+        assert r.order_type == OrderType.LIMIT
+        assert r.quantity == 200
+        assert r.price == 15.0
+        assert r.status == OrderStatus.SUBMITTED
+        assert r.error_msg == ""
+
+    def test_resync_is_idempotent(self):
+        broker, _ = self._broker_with_known_order(resync_ttl=0.0)
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("9002", code="000001.SZ", status=50),
+        ]
+
+        broker.get_orders()
+        broker.get_orders()
+        broker.get_orders()
+
+        assert len([o for o in broker._orders if o.broker_order_id == "9002"]) == 1
+
+    def test_resync_does_not_downgrade_terminal_orders(self):
+        broker, known = self._broker_with_known_order(resync_ttl=0.0)
+        known.status = OrderStatus.FILLED
+        known.filled_quantity = 100
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("9001", status=50, traded_volume=0),
+        ]
+
+        broker.get_orders()
+
+        assert known.status == OrderStatus.FILLED
+        assert known.filled_quantity == 100
+
+    def test_trades_cross_check_stale_filled_volume(self):
+        broker, known = self._broker_with_known_order(resync_ttl=0.0)
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("9001", status=50, traded_volume=0),
+        ]
+        broker._trader.query_stock_trades.return_value = [
+            SimpleNamespace(order_id="9001", traded_volume=60, traded_price=10.1),
+        ]
+
+        broker.get_orders()
+
+        assert known.filled_quantity == 60
+        # Trades never change lifecycle status (order snapshot is the truth).
+        assert known.status == OrderStatus.SUBMITTED
+
+    def test_trade_cross_check_never_exceeds_quantity(self):
+        broker, known = self._broker_with_known_order(resync_ttl=0.0)
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("9001", status=50, traded_volume=0),
+        ]
+        broker._trader.query_stock_trades.return_value = [
+            SimpleNamespace(order_id="9001", traded_volume=80),
+            SimpleNamespace(order_id="9001", traded_volume=80),
+        ]
+
+        broker.get_orders()
+
+        assert known.filled_quantity == 100
+
+    def test_trade_query_failure_warns_but_keeps_order_data(self, caplog):
+        broker, known = self._broker_with_known_order(resync_ttl=0.0)
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("9001", status=55, traded_volume=40, traded_price=10.2),
+        ]
+        broker._trader.query_stock_trades.side_effect = RuntimeError("no trades")
+
+        with caplog.at_level(logging.WARNING):
+            broker.get_orders()
+
+        assert known.status == OrderStatus.PARTIAL
+        assert known.filled_quantity == 40
+        assert any(
+            "query_stock_trades failed" in r.getMessage() for r in caplog.records
+        )
+
+
+class TestResyncFailurePolicy:
+    def test_get_orders_degrades_to_memory_on_resync_failure(self, caplog):
+        broker = _connected_broker()
+        existing = Order(code="600519", side=OrderSide.BUY, quantity=100, price=10.0)
+        broker._orders = [existing]
+        broker._trader.query_stock_orders.side_effect = RuntimeError("boom")
+
+        with caplog.at_level(logging.WARNING):
+            orders = broker.get_orders()
+
+        assert orders == [existing]
+        assert any(
+            "query_stock_orders failed" in r.getMessage() for r in caplog.records
+        )
+
+    def test_submit_proceeds_when_only_resync_fails(self):
+        """Reconnect OK + resync broken -> order is still sent (gateway up)."""
+        broker = QMTBroker(account="sim001", sleep_fn=lambda _delay: None)
+        broker._HAS_XTQUANT = True
+        broker._connected = False
+        broker._trader = MagicMock()
+        broker._trader.order_stock.return_value = 777
+        broker._trader.query_stock_orders.side_effect = RuntimeError("query broken")
+        broker._account = MagicMock()
+
+        def fake_connect(blocking=True):
+            broker._connected = True
+            return True
+
+        broker.connect = fake_connect
+        order = Order(code="600519", side=OrderSide.BUY, quantity=100, price=10.0)
+
+        result = broker.place_order(order)
+
+        assert result.status == OrderStatus.SUBMITTED
+        assert result.broker_order_id == "777"
+        broker._trader.order_stock.assert_called_once()
+
+
+class TestGetOrdersTTL:
+    def test_two_queries_within_ttl_hit_broker_once(self):
+        clock = {"now": 1000.0}
+        broker = _connected_broker(resync_ttl=2.0, clock_fn=lambda: clock["now"])
+
+        broker.get_orders()
+        assert broker._trader.query_stock_orders.call_count == 1
+
+        clock["now"] += 1.9
+        broker.get_orders()
+        assert broker._trader.query_stock_orders.call_count == 1
+
+        clock["now"] += 0.2
+        broker.get_orders()
+        assert broker._trader.query_stock_orders.call_count == 2
+
+    def test_failed_resync_is_rate_limited_by_ttl(self):
+        clock = {"now": 1000.0}
+        broker = _connected_broker(resync_ttl=2.0, clock_fn=lambda: clock["now"])
+        broker._trader.query_stock_orders.side_effect = RuntimeError("boom")
+
+        broker.get_orders()
+        broker.get_orders()
+        assert broker._trader.query_stock_orders.call_count == 1
+
+        clock["now"] += 2.1
+        broker.get_orders()
+        assert broker._trader.query_stock_orders.call_count == 2

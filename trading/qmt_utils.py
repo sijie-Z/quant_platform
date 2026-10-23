@@ -104,6 +104,34 @@ def to_qmt_order_type(side: OrderSide) -> int:
     return 23 if side == OrderSide.BUY else 24
 
 
+def from_qmt_order_type(qmt_order_type: Any) -> OrderSide:
+    """Map an xtconstant order type (``XtOrder.order_type``) back to OrderSide.
+
+    23 = STOCK_BUY, 24 = STOCK_SELL. Unknown/missing values default to BUY,
+    matching the historical direction assumption used when such an order
+    could only be read back from the broker (there was no direction before).
+    """
+    try:
+        value = int(qmt_order_type)
+    except (TypeError, ValueError):
+        return OrderSide.BUY
+    return OrderSide.SELL if value == 24 else OrderSide.BUY
+
+
+def from_qmt_price_type(qmt_price_type: Any) -> OrderType:
+    """Map an xtconstant price type (``XtOrder.price_type``) back to OrderType.
+
+    5 = LATEST_PRICE (market), 11 = FIX_PRICE (limit). Anything else is
+    treated as a limit order because that is the only safe interpretation of
+    an explicit ``price`` field.
+    """
+    try:
+        value = int(qmt_price_type)
+    except (TypeError, ValueError):
+        return OrderType.LIMIT
+    return OrderType.MARKET if value == 5 else OrderType.LIMIT
+
+
 # ── Status mapping ──
 
 
@@ -193,17 +221,67 @@ class QMTExecution:
 def qmt_trade_to_dict(qmt_trade: Any) -> dict:
     """Convert a QMT trade object to a plain dict.
 
-    Handles both xtquant objects and mock dicts during testing.
+    Handles both xtquant objects and mock dicts during testing. Real XtTrade
+    reports carry the ``traded_*`` names (``traded_id`` / ``traded_price`` /
+    ``traded_volume`` / ``traded_amount``); the plain aliases are kept for
+    mocks and for the legacy async-response shape.
     """
     if isinstance(qmt_trade, dict):
         return qmt_trade
 
     result: dict[str, Any] = {}
-    for attr in ("order_id", "trade_id", "stock_code", "price",
-                 "volume", "trade_amount", "order_type", "trade_time"):
+    for attr, key in (
+        # xtquant XtTrade fields.
+        ("traded_id", "trade_id"),
+        ("traded_price", "price"),
+        ("traded_volume", "quantity"),
+        ("traded_amount", "amount"),
+        ("order_sysid", "order_sysid"),
+        # Legacy/mock field names (applied after, so they win when present).
+        ("order_id", "order_id"),
+        ("trade_id", "trade_id"),
+        ("stock_code", "code"),
+        ("price", "price"),
+        ("volume", "quantity"),
+        ("trade_amount", "amount"),
+        ("order_type", "order_type"),
+        ("trade_time", "trade_time"),
+    ):
         val = getattr(qmt_trade, attr, None)
         if val is not None:
-            key = attr.replace("stock_code", "code").replace("volume", "quantity")
+            result[key] = val
+    return result
+
+
+def qmt_order_to_dict(qmt_order: Any) -> dict:
+    """Convert a QMT order object (``XtOrder``) to a plain dict.
+
+    Handles both xtquant objects and mock dicts. Only the fields the
+    reconciliation path needs are extracted; ``order_id`` is the broker order
+    id returned by ``order_stock``/``query_stock_orders`` and ``order_status``
+    is the raw xtconstant status code (map with ``qmt_status_to_internal``).
+    """
+    if isinstance(qmt_order, dict):
+        return qmt_order
+
+    result: dict[str, Any] = {}
+    for attr, key in (
+        ("order_id", "order_id"),
+        ("order_sysid", "order_sysid"),
+        ("stock_code", "code"),
+        ("order_type", "order_type"),
+        ("order_volume", "order_volume"),
+        ("price_type", "price_type"),
+        ("price", "price"),
+        ("traded_volume", "traded_volume"),
+        ("traded_price", "traded_price"),
+        ("order_status", "order_status"),
+        ("status_msg", "status_msg"),
+        ("order_time", "order_time"),
+        ("strategy_name", "strategy_name"),
+    ):
+        val = getattr(qmt_order, attr, None)
+        if val is not None:
             result[key] = val
     return result
 

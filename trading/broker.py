@@ -1109,8 +1109,18 @@ class QMTBroker(BrokerInterface):
     - Full callback chain: on_fill / on_cancel / on_error / on_disconnected
     - EventBus integration: every fill publishes ``qmt.fill`` and ``order.filled``
     - Password from env ``QMT_PASSWORD`` — never in config files
-    - Graceful degradation: unavailable orders/positions return empty lists
-    - Automatic reconnection on disconnect (with backoff)
+    - Lazy reconnection: ``on_disconnected`` only flips state and logs; the
+      next order/query call reconnects with exponential backoff
+      (``max_reconnect_attempts`` connect attempts, waiting 1s, 2s, 4s, ...
+      between retries). If every attempt fails, ``BrokerConnectionError`` is
+      raised — order submission fails closed and ``order_stock`` is never
+      called while the broker is unreachable.
+    - Broker reconciliation: after a successful (re)connect, and at most once
+      per ``resync_ttl`` seconds on ``get_orders``, the broker's
+      ``query_stock_orders`` / ``query_stock_trades`` are merged into the
+      local order book (idempotent, keyed by broker order id). Read paths
+      fail loud when the broker cannot be reached, and degrade to the
+      in-memory book (with a warning) when only the resync query fails.
 
     Architecture::
 
@@ -1119,10 +1129,19 @@ class QMTBroker(BrokerInterface):
                          ├── _xt_trader (order_stock / cancel / query)
                          ├── xtdata.get_full_tick (fresh quotes for live runs)
                          ├── Callback → update Order objects → EventBus
+                         ├── _ensure_connected → lazy reconnect + resync
                          └── connect() == False → hard failure (no simulated fallback)
 
     Supported brokers: 国金证券, 华鑫证券, 国盛证券, 东方财富 etc.
     """
+
+    class BrokerConnectionError(RuntimeError):
+        """QMT is unreachable after all lazy-reconnect attempts failed.
+
+        Raised from ``place_order`` / ``cancel_order`` / the query entry
+        points. Order submission fails closed: no ``order_stock`` call is
+        made when this error is raised.
+        """
 
     def __init__(
         self,
@@ -1132,6 +1151,11 @@ class QMTBroker(BrokerInterface):
         mode: str = "sim",
         data_server: str = "",
         initial_cash: float = 10_000_000,
+        max_reconnect_attempts: int = 3,
+        reconnect_backoff: float = 1.0,
+        resync_ttl: float = 2.0,
+        sleep_fn: Any = None,
+        clock_fn: Any = None,
     ):
         """Initialize QMT broker.
 
@@ -1143,6 +1167,17 @@ class QMTBroker(BrokerInterface):
             data_server: Market data server (host:port). Defaults to same as server.
             initial_cash: Notional initial capital (fallback when QMT account
                           query fails; the broker reports QMT's real balance).
+            max_reconnect_attempts: Connect attempts per lazy reconnect
+                          (>= 1). Waits double between retries.
+            reconnect_backoff: Base backoff in seconds; the wait before retry
+                          *k* is ``reconnect_backoff * 2 ** (k - 1)``
+                          (1s, 2s, 4s, ... by default).
+            resync_ttl: Minimum seconds between broker order/trade re-queries
+                          from ``get_orders`` (avoids one broker round-trip
+                          per poll).
+            sleep_fn: Injectable sleep callable (tests pass a no-op so retry
+                          backoff does not really wait).
+            clock_fn: Injectable monotonic clock for the TTL (tests control it).
         """
         self._account_id = account
         self._server = server
@@ -1150,6 +1185,15 @@ class QMTBroker(BrokerInterface):
         self._mode = mode
         self._data_server = data_server or server
         self._initial_cash = initial_cash
+        self._max_reconnect_attempts = max(1, int(max_reconnect_attempts))
+        self._reconnect_backoff = max(0.0, float(reconnect_backoff))
+        self._resync_ttl = max(0.0, float(resync_ttl))
+        if sleep_fn is None or clock_fn is None:
+            import time as _time
+            sleep_fn = sleep_fn or _time.sleep
+            clock_fn = clock_fn or _time.monotonic
+        self._sleep_fn = sleep_fn
+        self._clock_fn = clock_fn
 
         self._trader: Any = None
         self._account: Any = None
@@ -1161,6 +1205,11 @@ class QMTBroker(BrokerInterface):
         self._cash: float = initial_cash
         self._frozen_cash: float = 0.0
         self._market_value: float = 0.0
+        #: Monotonic time of the last successful broker order/trade resync.
+        self._last_resync_at: float | None = None
+        #: Serializes resync so concurrent get_orders calls cannot both
+        #: append the same unknown broker order (check-then-act on _orders).
+        self._resync_lock = threading.Lock()
 
         # Resolve password: explicit arg > env var
         if not self._password:
@@ -1278,6 +1327,293 @@ class QMTBroker(BrokerInterface):
             logger.error("QMT disconnect error: %s", e)
             return False
 
+    # ── Lazy reconnect & broker reconciliation ──
+
+    def _ensure_connected(self) -> None:
+        """Reconnect on demand, or raise ``BrokerConnectionError``.
+
+        ``on_disconnected`` only flips ``_connected`` and logs; every order
+        and query entry point calls this first. A healthy link returns
+        immediately. Otherwise it makes at most ``max_reconnect_attempts``
+        calls to ``connect(blocking=True)``, waiting
+        ``reconnect_backoff * 2 ** (k - 1)`` seconds before retry *k*
+        (1s, 2s, 4s, ... by default). The waits go through the injected
+        ``sleep_fn`` so tests never actually wait.
+
+        After a successful reconnect the broker book is reconciled via
+        ``_resync_from_broker`` (a failed resync only warns — the connection
+        to the order gateway is what matters for the next operation). When
+        every attempt fails this raises ``BrokerConnectionError``; callers
+        must not place, cancel or report state as if the broker answered.
+        """
+        if self._connected:
+            return
+
+        logger.warning(
+            "QMT link is down — attempting lazy reconnect (up to %d attempts)",
+            self._max_reconnect_attempts,
+        )
+        last_error: Exception | None = None
+        for attempt in range(self._max_reconnect_attempts):
+            if attempt > 0:
+                delay = self._reconnect_backoff * (2 ** (attempt - 1))
+                if delay > 0:
+                    logger.warning(
+                        "QMT reconnect backoff %.2fs before attempt %d/%d",
+                        delay, attempt + 1, self._max_reconnect_attempts,
+                    )
+                    self._sleep_fn(delay)
+            try:
+                # connect() catches its own errors, but a mock/subclass may
+                # raise; either way the attempt failed.
+                connected = bool(self.connect(blocking=True))
+            except Exception as e:
+                last_error = e
+                connected = False
+            if connected and self._connected:
+                logger.info("QMT reconnected after %d attempt(s)", attempt + 1)
+                try:
+                    if self._resync_from_broker():
+                        self._last_resync_at = self._clock_fn()
+                except Exception as e:
+                    logger.warning("QMT post-reconnect resync failed: %s", e)
+                return
+
+        raise self.BrokerConnectionError(
+            "QMT reconnect failed after "
+            f"{self._max_reconnect_attempts} attempt(s); refusing to trade"
+            + (f" (last error: {last_error})" if last_error is not None else "")
+        )
+
+    @staticmethod
+    def _as_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _as_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _created_at_from_broker(raw_time: Any) -> str | None:
+        """Normalize a broker ``order_time`` (epoch seconds or string)."""
+        if isinstance(raw_time, (int, float)) and raw_time > 0:
+            try:
+                return datetime.fromtimestamp(float(raw_time)).isoformat()
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(raw_time, str) and raw_time.strip():
+            return raw_time
+        return None
+
+    def _resync_from_broker(self) -> bool:
+        """Rebuild today's order book from the broker; cross-check fills.
+
+        ``query_stock_orders(account)`` is authoritative for the current
+        trading day: tracked orders are updated in place and orders this
+        process has never seen (submitted before a restart, or missed by
+        callbacks) are appended. Matching is by broker order id, so running
+        it twice never duplicates an order.
+
+        ``query_stock_trades(account)`` is then used only to cross-check
+        cumulative filled volume: it can raise a stale ``filled_quantity``
+        (never above the order quantity) but never invents a fill or flips
+        an order's status. When the trade endpoint or its fields are
+        unavailable a warning is logged and the order-query values stand.
+
+        Any query failure leaves the in-memory book untouched. Returns True
+        only when the order query itself succeeded.
+        """
+        from quant_platform.trading.qmt_utils import qmt_order_to_dict
+
+        with self._resync_lock:
+            try:
+                raw_orders = self._trader.query_stock_orders(self._account)
+            except Exception as e:
+                logger.warning(
+                    "QMT resync: query_stock_orders failed: %s — serving cached orders",
+                    e,
+                )
+                return False
+            if raw_orders is None:
+                logger.warning(
+                    "QMT resync: query_stock_orders returned no result — "
+                    "serving cached orders",
+                )
+                return False
+            try:
+                broker_orders = list(raw_orders)
+            except TypeError as e:
+                logger.warning(
+                    "QMT resync: query_stock_orders returned a non-iterable "
+                    "(%s) — serving cached orders", e,
+                )
+                return False
+
+            seen: set[str] = set()
+            for raw in broker_orders:
+                d = qmt_order_to_dict(raw)
+                broker_id = str(d.get("order_id", "") or "")
+                if not broker_id or broker_id in seen:
+                    continue
+                seen.add(broker_id)
+                self._merge_broker_order(d, broker_id)
+
+            self._cross_check_filled_with_trades()
+            return True
+
+    def _merge_broker_order(self, d: dict, broker_id: str) -> None:
+        """Update one tracked order or append an unknown broker order.
+
+        Caller holds ``_resync_lock``. Updates follow the callback path's
+        monotonic rules (no terminal downgrade, no shrinking fills) because
+        the same snapshot can race a callback.
+        """
+        from quant_platform.trading.qmt_utils import (
+            from_qmt_code,
+            from_qmt_order_type,
+            from_qmt_price_type,
+            qmt_status_to_internal,
+        )
+
+        status = OrderStatus.PENDING
+        raw_status = d.get("order_status")
+        if raw_status is not None:
+            try:
+                status = qmt_status_to_internal(int(raw_status))
+            except (TypeError, ValueError):
+                status = OrderStatus.PENDING
+        traded = self._as_int(d.get("traded_volume"), 0)
+        traded_price = self._as_float(d.get("traded_price"), 0.0)
+
+        for order in self._orders:
+            if str(order.broker_order_id) != broker_id:
+                continue
+            if order.status not in self._TERMINAL_STATUSES:
+                if not (order.status == OrderStatus.PARTIAL
+                        and status in (OrderStatus.PENDING, OrderStatus.SUBMITTED)):
+                    order.status = status
+            if traded > int(order.filled_quantity or 0):
+                order.filled_quantity = (
+                    min(traded, int(order.quantity)) if order.quantity > 0 else traded
+                )
+            if traded_price > 0:
+                order.filled_price = traded_price
+            order.updated_at = datetime.now().isoformat()
+            return
+
+        # Unknown order: submitted before this process started (or missed by
+        # the callback chain). Rebuild it from the broker snapshot.
+        quantity = self._as_int(d.get("order_volume"), 0)
+        order = Order(
+            code=from_qmt_code(str(d.get("code", "") or "")),
+            side=from_qmt_order_type(d.get("order_type")),
+            order_type=from_qmt_price_type(d.get("price_type")),
+            quantity=quantity,
+            price=self._as_float(d.get("price"), 0.0),
+            filled_quantity=min(traded, quantity) if quantity > 0 else traded,
+            filled_price=traded_price,
+            status=status,
+            broker_order_id=broker_id,
+        )
+        status_msg = str(d.get("status_msg", "") or "")
+        if status_msg:
+            order.error_msg = status_msg
+        created_at = self._created_at_from_broker(d.get("order_time"))
+        if created_at:
+            order.created_at = created_at
+        self._orders.append(order)
+        logger.info(
+            "QMT resync: recovered broker order %s (%s %s x%d, status=%s)",
+            broker_id, order.side.value, order.code, order.quantity,
+            order.status.value,
+        )
+
+    def _cross_check_filled_with_trades(self) -> None:
+        """Raise stale cumulative fills from ``query_stock_trades`` (best effort).
+
+        Trades only ever increase ``filled_quantity`` up to the order
+        quantity; they never create orders, lower fills, or change status.
+        Any failure warns; R10 does not fabricate trade data.
+        """
+        from quant_platform.trading.qmt_utils import qmt_trade_to_dict
+
+        try:
+            raw_trades = self._trader.query_stock_trades(self._account)
+        except Exception as e:
+            logger.warning(
+                "QMT resync: query_stock_trades failed: %s — "
+                "filled volume not cross-checked", e,
+            )
+            return
+        if raw_trades is None:
+            logger.warning(
+                "QMT resync: query_stock_trades returned no result — "
+                "filled volume not cross-checked",
+            )
+            return
+        try:
+            trades = list(raw_trades)
+        except TypeError as e:
+            logger.warning(
+                "QMT resync: query_stock_trades returned a non-iterable "
+                "(%s) — filled volume not cross-checked", e,
+            )
+            return
+
+        traded_by_order: dict[str, int] = {}
+        for raw in trades:
+            d = qmt_trade_to_dict(raw)
+            broker_id = str(d.get("order_id", "") or "")
+            if not broker_id:
+                continue
+            volume = self._as_int(d.get("quantity", d.get("volume")), 0)
+            if volume > 0:
+                traded_by_order[broker_id] = (
+                    traded_by_order.get(broker_id, 0) + volume
+                )
+
+        for order in self._orders:
+            traded = traded_by_order.get(str(order.broker_order_id or ""))
+            if traded is None:
+                continue
+            current = int(order.filled_quantity or 0)
+            if traded <= current:
+                continue
+            if order.quantity > 0:
+                traded = min(traded, int(order.quantity))
+            if traded > current:
+                logger.info(
+                    "QMT resync: trades report %d filled for order %s (had %d)",
+                    traded, order.order_id, current,
+                )
+                order.filled_quantity = traded
+                order.updated_at = datetime.now().isoformat()
+
+    def _maybe_resync(self) -> None:
+        """Refresh the order book from the broker at most once per TTL.
+
+        The TTL also rate-limits failed attempts: a broken query endpoint is
+        retried at most once per ``resync_ttl`` seconds rather than on every
+        poll. Failures degrade to the in-memory book (warning only).
+        """
+        now = self._clock_fn()
+        last = self._last_resync_at
+        if last is not None and (now - last) < self._resync_ttl:
+            return
+        self._last_resync_at = now
+        try:
+            self._resync_from_broker()
+        except Exception as e:
+            logger.warning(
+                "QMT resync failed unexpectedly: %s — serving cached orders", e,
+            )
+
     # ── Order lifecycle ──
 
     #: Statuses after which no further broker callback may change the order.
@@ -1291,6 +1627,13 @@ class QMTBroker(BrokerInterface):
     def place_order(self, order: Order) -> Order:
         """Submit an order to QMT.
 
+        Lazy reconnect runs first (``_ensure_connected``). When the broker is
+        unreachable this raises ``BrokerConnectionError`` and
+        ``order_stock`` is never called — order submission fails closed.
+        A resync failure after a *successful* reconnect does not block the
+        order: the order gateway is reachable, only the reconciliation query
+        failed.
+
         Converts internal Order to xtquant params, submits, and tracks.
         The order status will be updated asynchronously via callbacks.
 
@@ -1299,11 +1642,7 @@ class QMTBroker(BrokerInterface):
         ``broker_order_id`` marked the order SUBMITTED even though QMT never
         accepted it, and no callback could ever arrive for it.
         """
-        if not self._connected:
-            order.status = OrderStatus.REJECTED
-            order.error_msg = "QMT not connected"
-            self._orders.append(order)
-            return order
+        self._ensure_connected()
 
         try:
             from quant_platform.trading.qmt_utils import to_qmt_code, to_qmt_order_type, to_qmt_price_type
@@ -1363,11 +1702,13 @@ class QMTBroker(BrokerInterface):
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a submitted order.
 
-        Returns True if the cancel request was sent successfully.
-        The actual cancellation is confirmed asynchronously via callback.
+        Reconnects first (``BrokerConnectionError`` when the broker cannot be
+        reached — cancelling blind would report success without a broker
+        acknowledgement). Returns True if the cancel request was sent
+        successfully. The actual cancellation is confirmed asynchronously via
+        callback.
         """
-        if not self._connected:
-            return False
+        self._ensure_connected()
 
         for o in self._orders:
             if o.order_id == order_id and o.broker_order_id:
@@ -1399,15 +1740,18 @@ class QMTBroker(BrokerInterface):
     def get_positions(self) -> list[Position] | None:
         """Query current positions from QMT.
 
-        Returns the cached book when disconnected or when the query raises,
-        and **None** when the terminal answers with no result at all. None
-        means "unknown": `query_stock_positions` returning None used to be
-        converted to `[]`, which the engine and health check read as a flat
-        account -- one transient failure made the engine buy a duplicate
-        stake and prune the persisted book (D6).
+        Reconnects first; when the broker stays unreachable this raises
+        ``BrokerConnectionError`` (fail loud: a fabricated flat book is more
+        dangerous than an error).
+
+        Returns the cached book when the query raises, and **None** when the
+        terminal answers with no result at all. None means "unknown":
+        `query_stock_positions` returning None used to be converted to `[]`,
+        which the engine and health check read as a flat account -- one
+        transient failure made the engine buy a duplicate stake and prune the
+        persisted book (D6).
         """
-        if not self._connected:
-            return list(self._positions.values())
+        self._ensure_connected()
 
         try:
             from quant_platform.trading.qmt_utils import from_qmt_code, qmt_position_to_dict
@@ -1438,6 +1782,22 @@ class QMTBroker(BrokerInterface):
             return list(self._positions.values())
 
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
+        """Return tracked orders, refreshed from the broker at most per TTL.
+
+        Entry point for lazy reconnect: a down link is re-established first
+        (``BrokerConnectionError`` when that fails — a read path must not
+        silently serve a stale book as if it were the broker's answer).
+
+        Once connected, the broker's order/trade books are reconciled into
+        memory at most once per ``resync_ttl`` seconds (default 2s), so a
+        polling caller does not hit QMT on every call. Within the TTL the
+        in-memory book can be up to ``resync_ttl`` seconds old — that bound
+        is the documented freshness contract. If the resync query itself
+        fails, a warning is logged and the current in-memory list is
+        returned unchanged (read-path degradation).
+        """
+        self._ensure_connected()
+        self._maybe_resync()
         if status:
             return [o for o in self._orders if o.status == status]
         return list(self._orders)
@@ -1445,17 +1805,19 @@ class QMTBroker(BrokerInterface):
     def get_account(self) -> dict:
         """Get account balance from QMT.
 
-        Falls back to internal cash tracking if query fails.
+        Reconnects first; when the broker stays unreachable this raises
+        ``BrokerConnectionError`` (fail loud rather than serving a synthetic
+        balance). Falls back to internal cash tracking when the asset query
+        itself fails.
         """
+        self._ensure_connected()
+
         base = {
             "connected": self._connected,
             "broker": "qmt",
             "mode": self._mode,
             "account_id": self._account_id,
         }
-
-        if not self._connected:
-            return {**base, "cash": self._initial_cash, "total_equity": self._initial_cash}
 
         try:
             asset = self._trader.query_stock_asset(self._account)

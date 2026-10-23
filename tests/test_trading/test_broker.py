@@ -314,11 +314,11 @@ class TestQMTBroker:
         result = broker.connect(blocking=False)
         assert not result
 
-    def test_place_order_not_connected(self):
-        broker = QMTBroker(account="test")
+    def test_place_order_not_connected_fails_closed(self):
+        broker = QMTBroker(account="test", sleep_fn=lambda _delay: None)
         order = Order(code="600519", side=OrderSide.BUY, quantity=100, price=1800)
-        result = broker.place_order(order)
-        assert result.status == OrderStatus.REJECTED
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            broker.place_order(order)
 
     def test_to_xt_code_shanghai(self):
         from quant_platform.trading.qmt_utils import to_qmt_code

@@ -62,7 +62,7 @@
 |------|------|
 | 实时行情 | AKShare 全市场快照 / 东方财富 WebSocket 推送 / Level 2 盘口 |
 | Paper Trading | 延迟模拟、部分成交、撤单失败、LOB 撮合、A 股规则（T+1/涨跌停/手数） |
-| 实盘接口 | QMT（xtquant）实盘 broker，代码格式自动转换；连接失败直接中止（fail closed），不会自动回退模拟盘 |
+| 实盘接口 | QMT（xtquant）实盘 broker，代码格式自动转换；断线后懒重连（指数退避，重连失败抛 BrokerConnectionError 且绝不下单）+ 连接/轮询时从券商幂等回查当日委托与成交（query_stock_orders/query_stock_trades，get_orders 2 秒 TTL）；连接失败直接中止（fail closed），不会自动回退模拟盘 |
 | 实时风控 | 仓位/行业/日亏损/回撤限额 + 5 级风险等级 + Kill Switch 熔断 |
 | 执行算法 | TWAP / VWAP / Iceberg + SmartRouter 智能路由 + TCA 成本分析 |
 | 运行内核 | EventBus（异步/背压/死信队列）+ StateMachine + 审计日志 + 调度器 |
