@@ -241,8 +241,11 @@ class BacktestEngine:
                 Buys are blocked there.
             limit_down: (date x asset) True where the asset closed
                 limit-down. Sells are blocked there.
-            daily_volume: (date x asset) traded value in CNY, fed to the
-                proportional/impact slippage models (B8).
+            daily_volume: (date x asset) traded **volume in shares** (the
+                provider boundary unit). Used for the R8 capacity cap as
+                ``adv = (volume * close).rolling(20, min_periods=5).mean()``
+                (CNY), and converted to CNY before being handed to the
+                cost model's proportional/impact slippage models.
             volatility: (date x asset) daily volatility estimate for the
                 impact model. When omitted and an impact/proportional model
                 is configured, a 20-day rolling std of ``returns`` shifted by
@@ -298,6 +301,45 @@ class BacktestEngine:
         # One optimizer instance for the whole run, so its fallback counter
         # accumulates; a fresh instance per rebalance hid every fallback.
         optimizer = self._get_optimizer()
+
+        # R8 cost/capacity knobs are implemented by the MVO optimizer only
+        # (see portfolio/optimizers.py). Say so instead of silently ignoring
+        # them when another optimizer is configured.
+        if self.optimizer_name != "mean_variance" and (
+            self.constraints.transaction_cost_bps > 0
+            or self.constraints.turnover_penalty > 0
+            or self.constraints.max_participation > 0
+        ):
+            logger.warning(
+                "transaction_cost_bps/turnover_penalty/max_participation are "
+                "implemented for the mean_variance optimizer only; "
+                "optimizer=%s ignores them",
+                self.optimizer_name,
+            )
+
+        # R8 capacity: ADV in CNY is the 20-session mean of volume (shares)
+        # x close, using the same adjusted price panel as the rest of the
+        # engine (consistent with backtest/capacity.py and the monitor's
+        # capacity gauge). Only computed when the participation cap is
+        # configured; the default path never touches this.
+        capacity_adv_panel = None
+        capacity_adv_warned = False
+        if self.constraints.max_participation > 0:
+            if daily_volume is None:
+                logger.warning(
+                    "max_participation=%.3f is configured but run() received "
+                    "no daily_volume panel; the capacity constraint is "
+                    "disabled for this backtest",
+                    self.constraints.max_participation,
+                )
+                capacity_adv_warned = True
+            else:
+                volume_shares = daily_volume.reindex(
+                    index=prices.index, columns=prices.columns,
+                )
+                capacity_adv_panel = (
+                    volume_shares * prices
+                ).rolling(20, min_periods=5).mean()
 
         for i, rdate in enumerate(rebalance_dates):
             logger.debug("Rebalance %d/%d: %s", i + 1, len(rebalance_dates), str(rdate)[:10])
@@ -370,6 +412,26 @@ class BacktestEngine:
                 self.identity_covariance_fallbacks += 1
 
             # Optimize
+            adv_for_optimizer = None
+            aum_for_optimizer = None
+            if self.constraints.max_participation > 0:
+                # Decision-time portfolio value: the engine has not replayed
+                # P&L yet at this point, so the documented AUM convention is
+                # the run's initial capital (constant across rebalances).
+                aum_for_optimizer = float(self.initial_capital)
+                if capacity_adv_panel is not None and rdate in capacity_adv_panel.index:
+                    adv_row = capacity_adv_panel.loc[rdate].reindex(sig.index)
+                    if adv_row.notna().any() and bool((adv_row > 0).any()):
+                        # NaN ADV entries are passed through: the optimizer
+                        # keeps max_weight for those names and logs them.
+                        adv_for_optimizer = adv_row
+                    elif not capacity_adv_warned:
+                        capacity_adv_warned = True
+                        logger.warning(
+                            "Rebalance %s: no positive ADV is available for "
+                            "any candidate asset; optimizing without the "
+                            "capacity cap", str(rdate)[:10],
+                        )
             fallbacks_before = optimizer.fallback_count
             weights = optimizer.optimize(
                 signal=sig,
@@ -377,6 +439,8 @@ class BacktestEngine:
                 prices=prices.loc[rdate].reindex(sig.index) if rdate in prices.index else None,
                 prev_weights=prev_weights,
                 sector_map=sector_map.reindex(sig.index) if sector_map is not None else None,
+                adv=adv_for_optimizer,
+                aum=aum_for_optimizer,
             )
             fell_back = optimizer.fallback_count > fallbacks_before
             fallback_reason = optimizer.last_fallback_reason if fell_back else None
@@ -409,6 +473,7 @@ class BacktestEngine:
             limit_down=limit_down,
             daily_volume=daily_volume,
             volatility=volatility,
+            prices=prices,
         )
 
         # M13: only rebalances that actually reached an execution day belong
@@ -603,8 +668,15 @@ class BacktestEngine:
         limit_down: pd.DataFrame | None = None,
         daily_volume: pd.DataFrame | None = None,
         volatility: pd.DataFrame | None = None,
+        prices: pd.DataFrame | None = None,
     ) -> None:
         """Simulate daily P&L with costs and an execution-day tradability gate.
+
+        ``daily_volume`` is a share-volume panel (provider unit). When
+        ``prices`` is supplied it is converted to CNY (volume x close) before
+        being handed to the cost model, whose ``daily_volume`` argument is
+        documented in CNY. Callers that omit ``prices`` keep the legacy
+        pass-through (used by unit tests that only exercise the gate logic).
 
         Between executions, weights drift with price movements. On an
         execution date, the new weights take effect at that close, turnover is
@@ -650,6 +722,7 @@ class BacktestEngine:
             if down_panel is None:
                 down_panel = pd.DataFrame(False, index=all_dates, columns=columns)
         volume_panel = self._align_float(daily_volume, all_dates, columns)
+        price_panel = self._align_float(prices, all_dates, columns)
 
         vol_panel = self._align_float(volatility, all_dates, columns)
         if (
@@ -765,6 +838,16 @@ class BacktestEngine:
                             volume_row = volume_row.fillna(
                                 float(volume_row.median())
                             )
+                            if price_panel is not None and date in price_panel.index:
+                                # Shares -> CNY traded value, the cost model's
+                                # documented unit.
+                                volume_row = volume_row * price_panel.loc[date]
+                                if volume_row.notna().any():
+                                    volume_row = volume_row.fillna(
+                                        float(volume_row.median())
+                                    )
+                                else:
+                                    volume_row = None
                         else:
                             volume_row = None
 

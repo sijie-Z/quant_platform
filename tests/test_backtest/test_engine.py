@@ -659,6 +659,120 @@ class TestUniverseBuyGate:
         )
 
 
+class TestCapacityWiring:
+    """R8: the engine hands the optimizer ADV in CNY = volume (shares) x close,
+    averaged over 20 sessions, plus the run's AUM convention."""
+
+    N_ASSETS = 12
+    N_DAYS = 120
+
+    @staticmethod
+    def _inputs():
+        rng = np.random.default_rng(5)
+        dates = pd.bdate_range("2023-01-02", periods=TestCapacityWiring.N_DAYS)
+        assets = [f"S{i:02d}" for i in range(TestCapacityWiring.N_ASSETS)]
+        prices = pd.DataFrame(
+            100 * np.exp(np.cumsum(
+                rng.normal(0, 0.01, (len(dates), len(assets))), axis=0,
+            )),
+            index=dates, columns=assets,
+        )
+        returns = prices.pct_change(fill_method=None).shift(-1)
+        signal = pd.DataFrame(1.0, index=dates, columns=assets)
+        volume = pd.DataFrame(
+            rng.integers(100_000, 2_000_000, (len(dates), len(assets))),
+            index=dates, columns=assets,
+        ).astype(float)
+        return prices, returns, signal, volume
+
+    @staticmethod
+    def _run(constraints, daily_volume, inputs=None):
+        prices, returns, signal, _volume = inputs or TestCapacityWiring._inputs()
+
+        class RecordingOptimizer:
+            fallback_count = 0
+            last_fallback_reason = None
+
+            def __init__(self):
+                self.calls = []
+
+            def optimize(self, signal=None, **kwargs):
+                self.calls.append({**kwargs, "signal": signal})
+                return pd.Series(
+                    1.0 / len(signal), index=signal.index, dtype=float,
+                )
+
+        engine = BacktestEngine(
+            initial_capital=10_000_000,
+            rebalance_frequency="monthly",
+            constraints=constraints,
+        )
+        recorder = RecordingOptimizer()
+        engine._get_optimizer = lambda: recorder
+        engine.run(
+            signal=signal, prices=prices, returns=returns,
+            benchmark_returns=None, sector_map=None,
+            daily_volume=daily_volume,
+        )
+        return engine, recorder, prices, _volume
+
+    def test_adv_is_volume_times_close_rolling_20(self):
+        constraints = PortfolioConstraints(
+            max_participation=0.10, max_turnover=1.0,
+        )
+        inputs = self._inputs()
+        prices, volume = inputs[0], inputs[3]
+        engine, recorder, _, _ = self._run(
+            constraints, daily_volume=volume, inputs=inputs,
+        )
+        expected = (volume * prices).rolling(20, min_periods=5).mean()
+        rdates = list(engine.optimizer_outcomes)
+        assert rdates, "the engine never called the optimizer"
+        assert len(recorder.calls) == len(rdates)
+
+        for rdate, call in zip(rdates, recorder.calls, strict=True):
+            adv = call["adv"]
+            assert adv is not None, f"no ADV passed at {rdate.date()}"
+            assert call["aum"] == pytest.approx(engine.initial_capital)
+            expected_row = expected.loc[rdate].reindex(call["signal"].index)
+            pd.testing.assert_series_equal(
+                adv.sort_index(), expected_row.sort_index(),
+                rtol=1e-12, atol=1e-9,
+            )
+            # The CNY ADV must not be the raw share count.
+            assert not np.allclose(
+                adv.to_numpy(), volume.loc[rdate].reindex(adv.index).to_numpy(),
+            )
+
+    def test_capacity_off_by_default_passes_none(self):
+        inputs = self._inputs()
+        constraints = PortfolioConstraints(max_turnover=1.0)
+        engine, recorder, _, _ = self._run(
+            constraints, daily_volume=inputs[3], inputs=inputs,
+        )
+        assert recorder.calls
+        for call in recorder.calls:
+            assert call["adv"] is None
+            assert call["aum"] is None
+
+    def test_configured_capacity_without_volume_warns_and_passes_none(self, caplog):
+        constraints = PortfolioConstraints(
+            max_participation=0.10, max_turnover=1.0,
+        )
+        with caplog.at_level("WARNING"):
+            engine, recorder, _, _ = self._run(
+                constraints, daily_volume=None,
+            )
+        assert any(
+            "no daily_volume panel" in record.getMessage()
+            for record in caplog.records
+        )
+        assert recorder.calls
+        for call in recorder.calls:
+            assert call["adv"] is None
+            assert call["aum"] == pytest.approx(engine.initial_capital)
+
+
 class TestWeeklyIsoYearBoundary:
     """B2: weekly rebalances group by ISO year + ISO week, chronologically."""
 
