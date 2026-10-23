@@ -38,7 +38,7 @@ import logging
 import pandas as pd
 import pytest
 import quant_platform.data.providers.tushare_loader as mod
-from quant_platform.data.providers.base import read_cache_manifest
+from quant_platform.data.providers.base import expected_data_end, read_cache_manifest
 from quant_platform.data.providers.tushare_loader import TushareProvider
 
 DATES = ["20240102", "20240103", "20240104"]
@@ -741,6 +741,92 @@ def test_full_fetch_resets_window_markers(tmp_path):
     manifest = read_cache_manifest(prov._cache_file())
     assert manifest["st_window_refresh"] == "not_attempted"
     assert manifest["st_covered_until"] == SAMPLE_END.strftime("%Y-%m-%d")
+
+
+def test_successful_window_coverage_never_moves_into_the_future(tmp_path):
+    """A future config end_date must not push ST coverage into the future."""
+    prov = provider(tmp_path)
+    prov._st_namechange = open_st_feed()
+    prov._st_fetch_status = "ok"
+    prov._prices = price_panel()
+    prov._st_covered_until = SAMPLE_END
+    empty_window = pd.DataFrame(columns=mod._ST_NAMECHANGE_COLUMNS)
+    future = pd.Timestamp("2099-01-01")
+
+    prov._refresh_st_after_update(
+        RecordingWindow(result=empty_window), SAMPLE_END, future,
+        ["600001.SH"],
+    )
+
+    assert prov._st_last_window_refresh == "ok"
+    assert prov._st_covered_until == expected_data_end(future)
+    assert prov._st_covered_until <= pd.Timestamp.now().normalize()
+
+
+def test_loaded_future_coverage_is_clamped(tmp_path):
+    api = FakeTushareSTAPI({
+        "600001.SH": [
+            row("600001.SH", "ST AAA", "20230101", None, "20221220"),
+        ],
+    })
+    prov = provider(tmp_path)
+    seed_full_provider(prov, api)
+    prov._st_covered_until = pd.Timestamp("2099-01-01")
+    cache_file = prov._cache_file()
+    prov._save_to_cache(cache_file)
+
+    reloaded = provider(tmp_path)
+    reloaded._load_from_cache(cache_file)
+
+    assert reloaded._st_covered_until == expected_data_end("2099-01-01")
+    assert reloaded._st_covered_until <= pd.Timestamp.now().normalize()
+
+
+def test_partial_full_fetch_does_not_claim_complete_coverage(tmp_path):
+    api = FakeTushareSTAPI(
+        {"600001.SH": [
+            row("600001.SH", "ST AAA", "20230101", None, "20221220"),
+        ]},
+        failing_codes=("600002.SZ",),
+    )
+    prov = provider(tmp_path)
+    prov._ts_api = api
+
+    prov._load_or_fetch_all()
+
+    assert prov._st_fetch_status == "partial"
+    assert prov._st_covered_until is None
+    manifest = read_cache_manifest(prov._cache_file())
+    assert manifest["st_covered_until"] is None
+    identity = provider(tmp_path).cache_identity()["st_fetch_status"]
+    assert identity.startswith("partial|")
+    assert "|failed=1" in identity
+
+
+def test_fingerprint_handles_non_dataframe_and_float_dates(tmp_path):
+    assert mod.TushareProvider._namechange_fingerprint({"not": "a frame"}) == (
+        "invalid"
+    )
+    assert mod.TushareProvider._parse_namechange_date(20230110.0) == (
+        pd.Timestamp("2023-01-10")
+    )
+    assert mod.TushareProvider._parse_namechange_date("20230110.0") == (
+        pd.Timestamp("2023-01-10")
+    )
+
+    api = FakeTushareSTAPI({
+        "600001.SH": [
+            row("600001.SH", "ST AAA", 20230110.0, "20230227", 20230107.0),
+        ],
+    })
+    prov = provider(tmp_path)
+    prov._prices = price_panel()
+
+    episode = prov._fetch_st_episodes(api, ["600001.SH"]).iloc[0]
+
+    assert episode["trigger_date"] == pd.Timestamp("2023-01-10")
+    assert episode["announce_date"] == pd.Timestamp("2023-01-07")
+    assert episode["end_date"] == pd.Timestamp("2023-02-27")
 
 
 def test_legacy_v5_manifest_is_retired(tmp_path):

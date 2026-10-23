@@ -45,6 +45,7 @@ from quant_platform.data.providers.base import (
     deduplicate_panel,
     empty_corporate_actions,
     exchange_sessions,
+    expected_data_end,
     incremental_fetch_start,
     incremental_marker_extra,
     last_day_missing_symbols,
@@ -799,10 +800,11 @@ class TushareProvider(DataProvider):
         episodes = manifest.get("st_episode_count", "unknown")
         window = manifest.get("st_window_refresh", "unknown")
         feed = manifest.get("st_feed_fingerprint", "unknown")
+        failed = len(manifest.get("st_failed_symbols", []) or [])
         suffix = "|window_failed=1" if window == "failed" else ""
         return (
             f"{status}|available={available}|episodes={episodes}"
-            f"|feed={feed}{suffix}"
+            f"|feed={feed}|failed={failed}{suffix}"
         )
 
     def cache_universe(
@@ -1021,8 +1023,10 @@ class TushareProvider(DataProvider):
                 pd.to_datetime(covered_raw, errors="coerce")
                 if covered_raw else pd.NaT
             )
+            # A v6 cache written with a future requested_end may carry a
+            # future boundary; clamp it to what could be known now.
             self._st_covered_until = (
-                covered.normalize() if pd.notna(covered) else None
+                expected_data_end(covered) if pd.notna(covered) else None
             )
             self.st_failed_symbols = [
                 str(code) for code in manifest.get("st_failed_symbols", [])
@@ -1191,10 +1195,15 @@ class TushareProvider(DataProvider):
         logger.info("  Fetching ST name-change history...")
         episodes = self._fetch_st_episodes(api, all_codes)
         # A full fetch rebuilds the feed from scratch: any incremental-window
-        # failure marker is cleared and coverage is complete through the
-        # panel's last day (R14 review N13).
+        # failure marker is cleared. Coverage is complete only when every
+        # symbol produced a usable reply; a partial/unavailable feed must not
+        # claim complete historical coverage (R14 review N13/N19).
         self._st_last_window_refresh = "not_attempted"
-        self._st_covered_until = panel_last_date(self._prices)
+        self._st_covered_until = (
+            panel_last_date(self._prices)
+            if self._st_fetch_status == "ok"
+            else None
+        )
         logger.info("  ST episodes: %d", len(episodes))
 
     def _fetch_constituents(self, api) -> pd.DataFrame:
@@ -1550,6 +1559,10 @@ class TushareProvider(DataProvider):
         if pd.isna(value):
             return pd.NaT
         text = str(value).strip()
+        if text.endswith(".0"):
+            # A numeric column round-tripped through HDF5/parquet arrives as
+            # 20230110.0; strip the float suffix before strict parsing.
+            text = text[:-2]
         if text in ("", "None", "nan", "NaT"):
             return pd.NaT
         return pd.to_datetime(text, format="%Y%m%d", errors="coerce")
@@ -1559,6 +1572,8 @@ class TushareProvider(DataProvider):
         """Stable short hash of the raw ST feed (part of the cache identity)."""
         if frame is None:
             return "none"
+        if not isinstance(frame, pd.DataFrame):
+            return "invalid"
         if len(frame) == 0:
             return "empty"
         columns = [c for c in _ST_NAMECHANGE_COLUMNS if c in frame.columns]
@@ -1703,7 +1718,11 @@ class TushareProvider(DataProvider):
                     self._st_covered_until = window_start
             else:
                 self._st_last_window_refresh = "ok"
-                new_coverage = pd.Timestamp(requested_end).normalize()
+                # Never claim coverage beyond what could have been observed:
+                # a future requested_end (a common config value) must not push
+                # the boundary into the future, because the next window would
+                # then start there and skip genuinely new announcements.
+                new_coverage = expected_data_end(requested_end)
                 if (
                     self._st_covered_until is None
                     or new_coverage > self._st_covered_until
