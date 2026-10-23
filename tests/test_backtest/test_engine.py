@@ -773,6 +773,37 @@ class TestCapacityWiring:
             assert call["aum"] == pytest.approx(engine.initial_capital)
 
 
+    def test_share_volume_is_converted_to_cny_for_the_cost_model(self):
+        """R8 redefined run(daily_volume=...) as a share panel. The cost
+        model still expects CNY, so the engine must multiply by close before
+        handing the row over (the old pass-through would overstate the
+        participation rate by 1/price)."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="D")
+        returns = pd.DataFrame(0.0, index=dates, columns=["A", "B"])
+        prices = pd.DataFrame(10.0, index=dates, columns=["A", "B"])
+        volume = pd.DataFrame(1_000_000.0, index=dates, columns=["A", "B"])
+
+        engine = BacktestEngine(
+            initial_capital=1_000_000,
+            rebalance_frequency="monthly",
+            cost_model=CostModel(
+                commission=0, stamp_tax=0, slippage=0.001,
+                slippage_model="proportional", min_commission=0,
+                transfer_fee=0,
+            ),
+            constraints=PortfolioConstraints(max_turnover=1.0),
+        )
+        engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
+        engine._simulate_pnl(returns, daily_volume=volume, prices=prices)
+
+        # Buy 1,000,000 CNY of A against 10,000,000 CNY daily traded value:
+        # 10% participation -> slippage 0.001 * sqrt(0.10).
+        expected_cost = 0.001 * np.sqrt(1_000_000.0 / (1_000_000.0 * 10.0))
+        assert engine.daily_returns.loc[dates[1]] == pytest.approx(
+            -expected_cost
+        )
+
+
 class TestWeeklyIsoYearBoundary:
     """B2: weekly rebalances group by ISO year + ISO week, chronologically."""
 
