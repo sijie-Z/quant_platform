@@ -722,7 +722,12 @@ class BacktestEngine:
             if down_panel is None:
                 down_panel = pd.DataFrame(False, index=all_dates, columns=columns)
         volume_panel = self._align_float(daily_volume, all_dates, columns)
-        price_panel = self._align_float(prices, all_dates, columns)
+        # Only needed to turn share volume into CNY for the cost model; skip
+        # the full-panel copy on the default (no-volume) path.
+        price_panel = (
+            self._align_float(prices, all_dates, columns)
+            if daily_volume is not None else None
+        )
 
         vol_panel = self._align_float(volatility, all_dates, columns)
         if (
