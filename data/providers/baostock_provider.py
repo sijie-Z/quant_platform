@@ -18,7 +18,10 @@ Contract notes
   ``turn`` in percent).
 * Financials are returned as a ``(date, asset)`` panel keyed to the first
   trading day on/after each report's publication date, with ``publish_date``
-  retained for point-in-time filtering and no backward fill.
+  retained for point-in-time filtering and no backward fill.  A report
+  without a usable ``pubDate`` has no honest visibility date and is dropped
+  (with a warning); the fiscal period end is never used as a substitute,
+  because that would make the figures visible weeks before the announcement.
 * The stock universe includes delisted names (``status=0``) with
   ``delisting_date``; the sample for a requested range is built from names
   whose [listing, delisting] window overlaps that range.
@@ -80,7 +83,10 @@ CACHE_DIR = Path(__file__).parent.parent.parent / ".cache" / "baostock"
 # caches (D13).
 # v3: price semantics changed from pre-adjusted hfq levels (adj_factor=1) to
 # raw OHLCV plus a derived divisor; v2 files must never be replayed.
-_CACHE_VERSION = "v3"
+# v4: financial panels no longer fabricate visibility dates for reports whose
+# pubDate is missing or unparseable; v3 financial caches may contain those
+# look-ahead rows and must never be replayed either.
+_CACHE_VERSION = "v4"
 #: Basis of the stored ``close`` column (raw traded price).
 _PRICE_ADJUSTMENT = "raw"
 #: Basis of ``close / adj_factor`` when adjustment is enabled.
@@ -1515,8 +1521,12 @@ class BaostockDataProvider(DataProvider):
         """Quarterly fundamentals as a PIT ``(date, asset)`` panel.
 
         Each report is keyed to the first trading day on/after its
-        publication date (``pubDate``; when absent, the first trading day
-        after the period end with a warning).  Columns: market_cap,
+        publication date (``pubDate``).  A report whose ``pubDate`` is
+        missing or unparseable is dropped with a warning -- the period end is
+        not a visibility date, and using it would leak figures before they
+        were announced.  If no report row has a usable publication date the
+        fetch raises :class:`DataFetchIncompleteError` rather than returning
+        a panel built from fabricated dates.  Columns: market_cap,
         total_assets, net_assets, revenue, net_profit, roe, pb_ratio,
         pe_ratio, asset_growth, publish_date.  No backward fill.
         """
@@ -1590,6 +1600,9 @@ class BaostockDataProvider(DataProvider):
 
         records: list[dict] = []
         failed: set[str] = set()
+        report_rows = 0
+        dropped_no_pub = 0
+        dropped_after_end = 0
 
         for code in codes:
             bs_code = _to_bs_code(code)
@@ -1607,6 +1620,7 @@ class BaostockDataProvider(DataProvider):
                     break
                 if profit is None:
                     continue
+                report_rows += 1
 
                 balance = self._balance_row(bs, bs_code, year, quarter)
                 stat_date = _as_date(profit.get("statDate"))
@@ -1617,25 +1631,24 @@ class BaostockDataProvider(DataProvider):
                 total_share = _as_float(profit.get("totalShare"))
 
                 if pd.isna(pub_date):
-                    # Fallback: first trading day strictly after period end.
-                    if pd.notna(stat_date):
-                        pos = trading_dates.searchsorted(stat_date, side="right")
-                        if pos < len(trading_dates):
-                            pub_date = trading_dates[pos]
-                            logger.warning(
-                                "Report %s %sQ%s has no pubDate; using first "
-                                "trading day after period end (%s)",
-                                bs_code, year, quarter, pub_date.date(),
-                            )
-                if pd.isna(pub_date):
-                    logger.warning(
-                        "Report %s %sQ%s has neither pubDate nor a usable "
-                        "statDate; dropping it", bs_code, year, quarter,
+                    # No publication date -> no honest visibility date. The
+                    # fiscal period end is NOT a substitute: reports are
+                    # usually announced weeks later, so keying the row to the
+                    # first trading day after the period end would expose
+                    # figures before they existed (look-ahead).
+                    dropped_no_pub += 1
+                    logger.debug(
+                        "Report %s %sQ%s has no usable pubDate; dropping it "
+                        "instead of fabricating a visibility date "
+                        "(statDate=%s)",
+                        bs_code, year, quarter,
+                        stat_date.date() if pd.notna(stat_date) else "n/a",
                     )
                     continue
 
                 pos = trading_dates.searchsorted(pub_date, side="left")
                 if pos >= len(trading_dates):
+                    dropped_after_end += 1
                     continue  # published after the sample ends
                 visible_date = trading_dates[pos]
 
@@ -1683,11 +1696,30 @@ class BaostockDataProvider(DataProvider):
             if code_failed:
                 failed.add(str(code).zfill(6))
 
+        if dropped_no_pub:
+            logger.warning(
+                "baostock: dropped %d/%d financial rows without a usable "
+                "publish date",
+                dropped_no_pub, report_rows,
+            )
         if failed:
             raise DataFetchIncompleteError(
                 "Baostock financial fetch incomplete: "
                 f"{len(failed)} symbol(s) failed after retries "
                 f"(e.g. {sorted(failed)[:10]})"
+            )
+        if not records and report_rows and dropped_no_pub == report_rows:
+            raise DataFetchIncompleteError(
+                f"Baostock financials: none of the {report_rows} report "
+                "row(s) has a usable pubDate; refusing to fabricate "
+                "visibility dates from fiscal period ends, so no "
+                "point-in-time panel can be built"
+            )
+        if dropped_after_end and not records:
+            logger.warning(
+                "baostock: %d financial row(s) were published after the "
+                "sample end; returning an empty panel",
+                dropped_after_end,
             )
         if not records:
             return _empty_financials()

@@ -4,13 +4,16 @@ Covers D03 (documented (date, asset) financial panel over the requested
 range, PIT publish_date, pipeline market-cap), D04 (per-symbol failure is
 never cached; retry/refetch), D05/D06 (no fabricated is_st, delisted names
 and an expiring universe cache), D19 (asset index name, fields=, exchange
-mapping, versioned cache keys) and D22 (fields contract).
+mapping, versioned cache keys) and D22 (fields contract), plus the R5
+look-ahead fix: reports without a usable ``pubDate`` are dropped instead of
+being made visible at the fiscal period end.
 
 No network access: the baostock module is replaced with a fake.
 """
 
 from __future__ import annotations
 
+import logging
 import sys
 import types
 
@@ -61,12 +64,18 @@ class FakeBaostock:
         transient_fail_once=(),
         empty_financials=False,
         only_quarters=None,
+        missing_pub_codes=(),
+        all_missing_pub=False,
+        pub_offset_days=25,
     ):
         self.basic_rows = list(basic_rows or [])
         self.fail_codes = set(fail_codes)
         self.transient_fail_once = set(transient_fail_once)
         self.empty_financials = empty_financials
         self.only_quarters = set(only_quarters) if only_quarters else None
+        self.missing_pub_codes = set(missing_pub_codes)
+        self.all_missing_pub = all_missing_pub
+        self.pub_offset_days = pub_offset_days
         self.basic_query_count = 0
         self.history_calls = []
         self.profit_calls = []
@@ -120,9 +129,13 @@ class FakeBaostock:
         if self.only_quarters is not None and (year, quarter) not in self.only_quarters:
             return FakeResultSet([], fields=PROFIT_FIELDS)
         qend = _quarter_end(year, quarter)
-        pub = qend + pd.Timedelta(days=25)
+        pub = qend + pd.Timedelta(days=self.pub_offset_days)
+        if self.all_missing_pub or code in self.missing_pub_codes:
+            pub_text = ""  # baostock returns an empty string for no pubDate
+        else:
+            pub_text = pub.strftime("%Y-%m-%d")
         return FakeResultSet([[
-            code, pub.strftime("%Y-%m-%d"), qend.strftime("%Y-%m-%d"),
+            code, pub_text, qend.strftime("%Y-%m-%d"),
             "10.0", "30.0", "40.0", "100000000", "1.5",
             "1000000000", "100000000", "50000000",
         ]], fields=PROFIT_FIELDS)
@@ -349,3 +362,119 @@ def test_pipeline_runs_and_market_cap_accessor_works(tmp_path, monkeypatch):
         "market_cap", "total_assets", "net_assets", "revenue",
         "net_profit", "roe", "pb_ratio", "pe_ratio", "asset_growth",
     }
+
+
+# ----------------------------------------------------------------------
+# R5: a missing pubDate is dropped, never replaced by the period end
+# ----------------------------------------------------------------------
+
+def test_row_without_pubdate_is_dropped_not_visible_at_period_end(
+    tmp_path, monkeypatch,
+):
+    """The period end is not a visibility date.
+
+    The old provider keyed a report with no ``pubDate`` to the first trading
+    day after its fiscal period end (2024-01-01 for 2023Q4 here), i.e. weeks
+    before the figures existed in public form -- a textbook look-ahead. Such
+    a row must be dropped while reports with a real announcement date keep
+    the published-date mapping.
+    """
+    fake = FakeBaostock(
+        basic_rows=universe_rows(),
+        only_quarters=[(2023, 4)],
+        missing_pub_codes={"sh.600002"},
+    )
+    provider = make_provider(fake, tmp_path, monkeypatch)
+
+    fin = provider.get_financials("2024-01-01", "2024-01-31")
+
+    # The dated report appears exactly on its announcement date (2024-01-25).
+    dated = fin.xs("600001", level="asset")
+    assert dated["market_cap"].notna().any()
+    assert dated["market_cap"].dropna().index.min() == pd.Timestamp("2024-01-25")
+    assert dated["publish_date"].dropna().unique().tolist() == [
+        pd.Timestamp("2024-01-25")
+    ]
+
+    # The undated report never becomes visible -- in particular not on
+    # 2024-01-01, which the old period-end fallback fabricated.
+    undated = fin.xs("600002", level="asset")
+    assert undated["market_cap"].isna().all()
+    assert undated["publish_date"].isna().all()
+
+
+def test_visible_dates_never_precede_publish_dates(tmp_path, monkeypatch):
+    """Regression pin: every visible value appears on/after its announcement.
+
+    The 2023Q4 reports are announced 45 days after the period end
+    (2024-02-14). Under the old period-end fallback the undated asset was
+    visible from 2024-01-01, roughly six weeks before the real announcement;
+    the pin is that the undated asset has no visible value at all and the
+    dated one is not visible before its publication date.
+    """
+    fake = FakeBaostock(
+        basic_rows=universe_rows(),
+        only_quarters=[(2023, 4)],
+        missing_pub_codes={"sh.600002"},
+        pub_offset_days=45,
+    )
+    provider = make_provider(fake, tmp_path, monkeypatch)
+
+    fin = provider.get_financials("2024-01-01", "2024-03-31")
+    true_announcement = pd.Timestamp("2023-12-31") + pd.Timedelta(days=45)
+
+    dated = fin.xs("600001", level="asset")
+    assert dated["market_cap"].dropna().index.min() >= true_announcement
+    assert dated["publish_date"].dropna().unique().tolist() == [true_announcement]
+
+    # Sweep: no non-null fundamental is visible before its publish_date.
+    rows = fin.reset_index()
+    visible = rows[rows["market_cap"].notna()]
+    assert not visible.empty
+    assert (visible["date"] >= visible["publish_date"]).all()
+
+    undated = fin.xs("600002", level="asset")
+    assert undated["market_cap"].isna().all()
+
+
+def test_all_rows_without_pubdate_raise_instead_of_fabricating(
+    tmp_path, monkeypatch,
+):
+    """A panel with no usable announcement date must fail closed.
+
+    Returning an empty or period-end-keyed panel would either hide a broken
+    data source or fabricate look-ahead; the provider raises
+    ``DataFetchIncompleteError`` and caches nothing.
+    """
+    fake = FakeBaostock(
+        basic_rows=universe_rows(),
+        only_quarters=[(2023, 4)],
+        all_missing_pub=True,
+    )
+    provider = make_provider(
+        fake, tmp_path, monkeypatch, cache_enabled=True,
+    )
+
+    with pytest.raises(DataFetchIncompleteError, match="point-in-time"):
+        provider.get_financials("2024-01-01", "2024-01-31")
+
+    assert list(tmp_path.glob("fin_*")) == []
+
+
+def test_dropped_rows_are_summarized_in_a_warning(
+    tmp_path, monkeypatch, caplog,
+):
+    fake = FakeBaostock(
+        basic_rows=universe_rows(),
+        only_quarters=[(2023, 4)],
+        missing_pub_codes={"sh.600002"},
+    )
+    provider = make_provider(fake, tmp_path, monkeypatch)
+
+    with caplog.at_level(logging.WARNING):
+        fin = provider.get_financials("2024-01-01", "2024-01-31")
+
+    assert "dropped 1/" in caplog.text
+    assert "without a usable publish date" in caplog.text
+    # The rest of the panel is still usable.
+    assert fin["market_cap"].notna().any()
