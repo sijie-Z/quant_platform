@@ -11,6 +11,8 @@ calendar date, not the exchange's.
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 import time
 from datetime import datetime as real_datetime
 from zoneinfo import ZoneInfo
@@ -284,3 +286,127 @@ def test_rollover_uses_exchange_clock_not_host_clock(tmp_path, monkeypatch):
     assert engine._day_start_equity == 123.0, (
         "the daily P&L baseline must not reset on a host-local date change"
     )
+
+
+# ── R12: ledger baseline written once per successful start ──
+
+def _baseline_rows(store) -> list[dict]:
+    conn = sqlite3.connect(store._db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM ledger_baselines ORDER BY id"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def test_start_writes_one_ledger_baseline(tmp_path, monkeypatch):
+    db = str(tmp_path / "baseline.db")
+    store = Store(db)
+    broker = SimulatedBroker(initial_cash=1_000_000)
+    broker.connect()
+    assert _buy(broker).status == OrderStatus.FILLED
+    engine = _engine(broker, store, monkeypatch)
+
+    engine.start()
+    try:
+        rows = _baseline_rows(store)
+        assert len(rows) == 1
+        baseline = store.get_latest_ledger_baseline(
+            "default", "live_engine:default",
+        )
+        assert baseline["cash"] == pytest.approx(
+            broker.get_account()["cash"],
+        )
+        assert baseline["positions"]["600519"]["quantity"] == 2000
+        assert baseline["tenant_id"] == "default"
+    finally:
+        engine.stop()
+
+    assert len(_baseline_rows(store)) == 1
+
+
+def test_restart_writes_a_new_baseline_row(tmp_path, monkeypatch):
+    db = str(tmp_path / "baseline_restart.db")
+    store1 = Store(db)
+    broker1 = SimulatedBroker(initial_cash=1_000_000)
+    broker1.connect()
+    assert _buy(broker1).status == OrderStatus.FILLED
+    engine1 = _engine(broker1, store1, monkeypatch)
+    engine1.start()
+    try:
+        first = store1.get_latest_ledger_baseline(
+            "default", "live_engine:default",
+        )
+    finally:
+        engine1.stop()
+
+    broker2 = SimulatedBroker(initial_cash=1_000_000)
+    store2 = Store(db)
+    engine2 = _engine(broker2, store2, monkeypatch)
+    engine2.start()
+    try:
+        latest = store2.get_latest_ledger_baseline(
+            "default", "live_engine:default",
+        )
+        rows = _baseline_rows(store2)
+    finally:
+        engine2.stop()
+
+    assert len(rows) == 2, "a restart appends, it does not replace"
+    assert latest["id"] > first["id"]
+    assert latest["positions"]["600519"]["quantity"] == 2000
+
+
+def test_unknown_broker_positions_write_no_baseline(
+    tmp_path, monkeypatch, caplog,
+):
+    store = Store(str(tmp_path / "baseline_unknown.db"))
+    broker = SimulatedBroker(initial_cash=100_000)
+    broker.connect()
+    monkeypatch.setattr(broker, "get_positions", lambda: None)
+    engine = _engine(broker, store, monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="quant_platform"):
+        engine._write_ledger_baseline()
+
+    assert store.get_latest_ledger_baseline() is None
+    assert any(
+        "Ledger baseline not written" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_missing_broker_cash_fails_loud_and_writes_nothing(
+    tmp_path, monkeypatch,
+):
+    store = Store(str(tmp_path / "baseline_nocash.db"))
+    broker = SimulatedBroker(initial_cash=100_000)
+    broker.connect()
+    monkeypatch.setattr(broker, "get_account", lambda: {"total_equity": 1.0})
+    engine = _engine(broker, store, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="cash"):
+        engine._write_ledger_baseline()
+
+    assert store.get_latest_ledger_baseline() is None
+
+
+def test_a_disconnected_broker_is_not_baselined(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "baseline_disconnected.db"))
+    broker = SimulatedBroker(initial_cash=100_000)
+    broker.connect()
+    monkeypatch.setattr(
+        broker, "get_account",
+        lambda: {"connected": False, "cash": 1_000_000.0},
+    )
+    engine = _engine(broker, store, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="disconnected"):
+        engine._write_ledger_baseline()
+
+    assert store.get_latest_ledger_baseline() is None

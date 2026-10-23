@@ -685,3 +685,171 @@ class TestDailyReconciliationResults:
             "2026-10-20")["status"] == "failed"
         assert len(reopened.get_orders()) == 1, "existing rows are untouched"
 
+    def test_basis_is_persisted(self, store):
+        """R12: the expected-side basis travels with the durable result."""
+        store.save_reconciliation_result(self._result())
+        assert store.get_reconciliation_result(
+            "2026-10-20")["basis"] == "trade_ledger"
+
+        store.save_reconciliation_result(
+            self._result(date="2026-10-21", basis="direct"),
+        )
+        assert store.get_reconciliation_result("2026-10-21")["basis"] == "direct"
+
+    def test_an_existing_results_table_gains_the_basis_column(self, tmp_path):
+        """CREATE TABLE IF NOT EXISTS cannot add a column, so an R11-era
+        database must be migrated in place."""
+        import sqlite3
+
+        db = str(tmp_path / "legacy_basis.db")
+        conn = sqlite3.connect(db)
+        conn.execute("""
+            CREATE TABLE reconciliation_results (
+                date TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                status TEXT NOT NULL,
+                n_positions INTEGER DEFAULT 0,
+                n_mismatched INTEGER DEFAULT 0,
+                cash_diff REAL,
+                total_mismatch_value REAL,
+                details TEXT DEFAULT '[]',
+                tolerances TEXT DEFAULT '{}'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        reopened = Store(db)
+        reopened.save_reconciliation_result(self._result(
+            date="2026-10-20", status="passed",
+        ))
+
+        assert reopened.get_reconciliation_result(
+            "2026-10-20")["basis"] == "trade_ledger"
+
+
+class TestLedgerBaselines:
+    """R12: append-only broker baselines the trade ledger derives from."""
+
+    @staticmethod
+    def _baseline(**overrides):
+        baseline = {
+            "created_at": "2026-10-20T09:00:00",
+            "tenant_id": "default",
+            "engine_state_key": "live_engine:default",
+            "cash": 100_000.0,
+            "positions_json": {
+                "600519": {"quantity": 100, "avg_cost": 45.0},
+            },
+            "note": "test",
+        }
+        baseline.update(overrides)
+        return baseline
+
+    def test_round_trip(self, store):
+        row_id = store.save_ledger_baseline(self._baseline())
+
+        baseline = store.get_latest_ledger_baseline(
+            "default", "live_engine:default",
+        )
+
+        assert baseline["id"] == row_id
+        assert baseline["cash"] == pytest.approx(100_000.0)
+        assert baseline["positions"]["600519"]["quantity"] == 100
+        assert baseline["created_at"] == "2026-10-20T09:00:00"
+        assert baseline["engine_state_key"] == "live_engine:default"
+        assert baseline["note"] == "test"
+
+    def test_restarts_append_and_the_newest_id_wins(self, store):
+        first_id = store.save_ledger_baseline(self._baseline())
+        # Same created_at on purpose: ordering must be by insert id.
+        second_id = store.save_ledger_baseline(self._baseline(
+            cash=99_000.0, positions_json={},
+        ))
+
+        latest = store.get_latest_ledger_baseline()
+
+        assert second_id > first_id
+        assert latest["id"] == second_id
+        assert latest["cash"] == pytest.approx(99_000.0)
+
+    def test_filters_by_tenant_and_engine_state_key(self, store):
+        store.save_ledger_baseline(self._baseline())
+        store.save_ledger_baseline(self._baseline(
+            tenant_id="other", engine_state_key="live_engine:other", cash=1.0,
+        ))
+
+        assert store.get_latest_ledger_baseline(
+            "default", "live_engine:default")["cash"] == pytest.approx(100_000.0)
+        assert store.get_latest_ledger_baseline(
+            "other", "live_engine:other")["cash"] == pytest.approx(1.0)
+        assert store.get_latest_ledger_baseline("missing", "") is None
+        # An empty filter leaves that column unscoped.
+        assert store.get_latest_ledger_baseline(
+            "", "live_engine:other")["cash"] == pytest.approx(1.0)
+        assert store.get_latest_ledger_baseline(
+            "other", "")["cash"] == pytest.approx(1.0)
+
+    def test_cash_is_required_and_must_be_finite(self, store):
+        missing = self._baseline()
+        del missing["cash"]
+        with pytest.raises(ValueError, match="cash"):
+            store.save_ledger_baseline(missing)
+
+        with pytest.raises(ValueError, match="finite"):
+            store.save_ledger_baseline(self._baseline(cash=float("nan")))
+
+    def test_positions_may_be_json_text(self, store):
+        store.save_ledger_baseline(
+            self._baseline(positions_json='{"600519": 100}'),
+        )
+        assert store.get_latest_ledger_baseline()["positions"] == {
+            "600519": 100,
+        }
+
+    def test_malformed_positions_are_rejected(self, store):
+        with pytest.raises(ValueError, match="JSON"):
+            store.save_ledger_baseline(self._baseline(positions_json="{nope"))
+        with pytest.raises(ValueError, match="positions"):
+            store.save_ledger_baseline(self._baseline(positions_json=[1, 2]))
+
+    def test_an_existing_database_gains_the_table(self, tmp_path):
+        import sqlite3
+
+        db = str(tmp_path / "legacy_baseline.db")
+        first = Store(db)
+        first.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0})
+        first.close()
+
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE ledger_baselines")
+        conn.commit()
+        conn.close()
+
+        reopened = Store(db)
+        assert reopened.get_latest_ledger_baseline() is None
+        reopened.save_ledger_baseline(self._baseline())
+
+        assert reopened.get_latest_ledger_baseline()["cash"] == pytest.approx(
+            100_000.0,
+        )
+        assert len(reopened.get_orders()) == 1, "existing rows are untouched"
+
+    def test_unreadable_positions_json_raises(self, store):
+        """Degrading to {} could 'pass' a flat broker account."""
+        import sqlite3
+
+        conn = sqlite3.connect(store._db_path)
+        conn.execute(
+            "INSERT INTO ledger_baselines "
+            "(created_at, tenant_id, engine_state_key, cash, positions_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-10-20T09:00:00", "default", "", 1.0, "{nope"),
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(ValueError, match="unreadable"):
+            store.get_latest_ledger_baseline()
+

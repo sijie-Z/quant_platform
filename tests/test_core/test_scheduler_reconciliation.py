@@ -1,17 +1,20 @@
-"""R11: daily books-vs-broker reconciliation wired into the EOD path.
+"""R11/R12: daily books-vs-broker reconciliation wired into the EOD path.
 
-expected = Store position ledger + the day's P&L snapshot cash;
-actual   = broker positions + broker account cash.
+expected = trade ledger derived from the engine-start ledger baseline plus the
+fills stored after it (R12); actual = broker positions + broker account cash.
 
 The broker contract is strict: ``get_positions() is None`` means the book is
 unknown, never flat. An unknown comparison is persisted as ``status
-"unknown"`` and never as a pass.
+"unknown"`` and never as a pass. Without a baseline the day is unknown with
+reason ``no_ledger_baseline`` -- the Store position book is never used as a
+fallback expected leg.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
+import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -27,10 +30,14 @@ TZ = ZoneInfo("Asia/Shanghai")
 DAY = "2026-10-20"
 
 
-def _scheduler(tmp_path, clock, *, broker=None, bus=None, name="recon.db"):
+def _scheduler(
+    tmp_path, clock, *, broker=None, bus=None, name="recon.db",
+    tenant_id="", engine_state_key="",
+):
     store = Store(str(tmp_path / name))
     scheduler = TradingScheduler(
         PortfolioStateMachine(), store, bus or EventBus(), broker=broker,
+        tenant_id=tenant_id, engine_state_key=engine_state_key,
     )
     scheduler._now = lambda: clock[0]
     return scheduler, store
@@ -39,10 +46,44 @@ def _scheduler(tmp_path, clock, *, broker=None, bus=None, name="recon.db"):
 def _seed_store_position(
     store, code="600519", quantity=100, price=50.0, avg_cost=45.0,
 ):
+    """Seed the persisted position book (R12: NOT the expected side)."""
     store.save_position({
         "code": code, "quantity": quantity, "available": quantity,
         "avg_cost": avg_cost, "current_price": price,
         "market_value": quantity * price,
+    })
+
+
+def _seed_baseline(
+    store, *, positions=None, cash=100_000.0, created_at=f"{DAY}T09:00:00",
+    tenant="default", engine_state_key="",
+):
+    return store.save_ledger_baseline({
+        "created_at": created_at,
+        "tenant_id": tenant,
+        "engine_state_key": engine_state_key,
+        "cash": cash,
+        "positions_json": positions or {},
+        "note": "test baseline",
+    })
+
+
+def _save_trade(
+    store, *, code="600519", side="buy", quantity=100, price=10.0,
+    commission=0.0, tax=0.0, executed_at=f"{DAY}T10:00:00",
+    tenant="default",
+):
+    store.save_trade({
+        "trade_id": f"t-{uuid.uuid4().hex[:8]}",
+        "tenant_id": tenant,
+        "order_id": "ord-test",
+        "code": code,
+        "side": side,
+        "quantity": quantity,
+        "price": price,
+        "commission": commission,
+        "tax": tax,
+        "executed_at": executed_at,
     })
 
 
@@ -94,13 +135,21 @@ class TestPassedReconciliation:
             cash=95_000.0,
         )
         scheduler, store = _scheduler(tmp_path, clock, broker=broker, bus=bus)
-        _seed_store_position(store)
+        # The Store book deliberately disagrees with the ledger: R12's
+        # expected side is the baseline, never the persisted book.
+        _seed_store_position(store, quantity=500)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+        )
 
         scheduler._tick()
 
         row = store.get_reconciliation_result(DAY)
         assert row is not None
         assert row["status"] == "passed"
+        assert row["basis"] == "trade_ledger"
         assert row["n_positions"] == 1
         assert row["n_mismatched"] == 0
         assert row["cash_diff"] == pytest.approx(0.0)
@@ -115,6 +164,7 @@ class TestPassedReconciliation:
         ):
             assert key in payload
         assert payload["status"] == "passed"
+        assert payload["basis"] == "trade_ledger"
         assert payload["passes"] is True
         assert payload["n_mismatched"] == 0
         assert payload["cash_diff"] == pytest.approx(0.0)
@@ -134,7 +184,11 @@ class TestPassedReconciliation:
             cash=95_000.0,
         )
         scheduler, store = _scheduler(tmp_path, clock, broker=broker, bus=bus)
-        _seed_store_position(store)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+        )
 
         scheduler._tick()
         scheduler._tick()
@@ -157,7 +211,14 @@ class TestFailedReconciliation:
             cash=95_000.0,
         )
         scheduler, store = _scheduler(tmp_path, clock, broker=broker, bus=bus)
-        _seed_store_position(store, quantity=100)
+        # Store book agrees with the broker; the ledger (100) does not. The
+        # failure must come from the ledger, not from the persisted book.
+        _seed_store_position(store, quantity=90)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+        )
 
         with caplog.at_level(logging.ERROR, logger="quant_platform"):
             scheduler._tick()
@@ -191,7 +252,11 @@ class TestFailedReconciliation:
             cash=95_000.0,
         )
         scheduler, store = _scheduler(tmp_path, clock, broker=broker)
-        _seed_store_position(store, quantity=100)  # diff 5 <= 10
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+        )  # diff 5 <= 10
 
         scheduler._tick()
 
@@ -208,6 +273,7 @@ class TestFailedReconciliation:
         bus.subscribe("eod.reconciliation", events.append)
         broker = FakeBroker(positions=[], cash=80_000.0)
         scheduler, store = _scheduler(tmp_path, clock, broker=broker, bus=bus)
+        _seed_baseline(store, positions={}, cash=100_000.0)
         store.save_pnl_snapshot({
             "timestamp": f"{DAY}T15:05:00", "total_equity": 100_000.0,
             "cash": 100_000.0, "market_value": 0.0, "n_positions": 0,
@@ -236,6 +302,7 @@ class TestFailedReconciliation:
         clock = [datetime(2026, 10, 20, 15, 10, tzinfo=TZ)]
         broker = FakeBroker(positions=[], cash=99_500.0)  # diff 500 > 100
         scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_baseline(store, positions={}, cash=100_000.0)
         store.save_pnl_snapshot({
             "timestamp": f"{DAY}T15:05:00", "total_equity": 100_000.0,
             "cash": 100_000.0, "market_value": 0.0, "n_positions": 0,
@@ -257,7 +324,11 @@ class TestUnknownBook:
         bus.subscribe("eod.reconciliation", events.append)
         broker = FakeBroker(positions=None, cash=100_000.0)
         scheduler, store = _scheduler(tmp_path, clock, broker=broker, bus=bus)
-        _seed_store_position(store)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+        )
 
         scheduler._tick()
 
@@ -271,6 +342,7 @@ class TestUnknownBook:
     def test_no_broker_attached_is_unknown(self, tmp_path):
         clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
         scheduler, store = _scheduler(tmp_path, clock)
+        _seed_baseline(store, positions={}, cash=100_000.0)
         store.save_engine_state(
             {"portfolio_value": 100_000.0, "cash": 100_000.0, "positions": []},
             "live_engine:test",
@@ -292,6 +364,7 @@ class TestUnknownBook:
             },
         )
         scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_baseline(store, positions={}, cash=100_000.0)
         store.save_pnl_snapshot({
             "timestamp": f"{DAY}T15:05:00", "total_equity": 100_000.0,
             "cash": 100_000.0, "market_value": 0.0, "n_positions": 0,
@@ -304,7 +377,7 @@ class TestUnknownBook:
         assert row["status"] == "unknown"
         assert row["cash_diff"] is None
 
-    def test_an_unreadable_store_book_is_unknown_not_empty(
+    def test_an_unreadable_ledger_baseline_is_unknown_not_empty(
         self, tmp_path, monkeypatch,
     ):
         clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
@@ -314,19 +387,34 @@ class TestUnknownBook:
             cash=95_000.0,
         )
         scheduler, store = _scheduler(tmp_path, clock, broker=broker)
-        _seed_store_position(store)
+        _seed_baseline(store, cash=95_000.0)
 
-        def boom(tenant_id=""):
+        def boom(tenant_id="", engine_state_key=""):
             raise RuntimeError("database is locked")
 
-        monkeypatch.setattr(store, "get_positions", boom)
+        monkeypatch.setattr(store, "get_latest_ledger_baseline", boom)
 
         scheduler._tick()
 
         row = store.get_reconciliation_result(DAY)
         assert row["status"] == "unknown", (
-            "an unreadable expected book must not be reconciled as empty"
+            "an unreadable expected source must not be reconciled as empty"
         )
+
+    def test_an_unreadable_trade_ledger_is_unknown(self, tmp_path, monkeypatch):
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        broker = FakeBroker(positions=[], cash=100_000.0)
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_baseline(store, positions={}, cash=100_000.0)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(store, "get_trades_for_export", boom)
+
+        scheduler._tick()
+
+        assert store.get_reconciliation_result(DAY)["status"] == "unknown"
 
     def test_a_broker_position_without_a_code_is_unknown(self, tmp_path):
         """A malformed position must not be dropped (that would look flat)."""
@@ -336,11 +424,178 @@ class TestUnknownBook:
             cash=95_000.0,
         )
         scheduler, store = _scheduler(tmp_path, clock, broker=broker)
-        _seed_store_position(store)
+        _seed_baseline(store, cash=95_000.0)
 
         scheduler._tick()
 
         assert store.get_reconciliation_result(DAY)["status"] == "unknown"
+
+
+class TestTradeLedgerBasis:
+    """R12: expected = startup baseline + stored fills, actual = broker."""
+
+    def test_fills_since_the_baseline_move_the_expected_book(self, tmp_path):
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        bus = EventBus()
+        events = []
+        bus.subscribe("eod.reconciliation", events.append)
+        # Trade at 50, broker mark at 60: expected is valued at the broker's
+        # price, so the price difference alone cannot fail the comparison.
+        broker = FakeBroker(
+            positions=[Position(code="600519", quantity=120,
+                                current_price=60.0, avg_cost=48.0)],
+            cash=93_998.0,
+        )
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker, bus=bus)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+        )
+        _save_trade(
+            store, quantity=20, price=50.0, commission=2.0,
+            executed_at=f"{DAY}T10:00:00",
+        )
+
+        scheduler._tick()
+
+        row = store.get_reconciliation_result(DAY)
+        assert row["status"] == "passed"
+        detail = row["details"][0]
+        assert detail["expected_shares"] == 120
+        assert detail["actual_shares"] == 120
+        assert detail["expected_price"] == pytest.approx(60.0)
+        assert row["cash_diff"] == pytest.approx(0.0)
+        assert events[-1].data["basis"] == "trade_ledger"
+
+    def test_a_two_share_mismatch_fails_with_asset_details(self, tmp_path):
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        broker = FakeBroker(
+            positions=[Position(code="600519", quantity=102,
+                                current_price=50.0, avg_cost=45.0)],
+            cash=95_000.0,
+        )
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+        )
+
+        scheduler._tick()
+
+        row = store.get_reconciliation_result(DAY)
+        assert row["status"] == "failed"
+        detail = {d["asset"]: d for d in row["details"]}["600519"]
+        assert detail["expected_shares"] == 100
+        assert detail["actual_shares"] == 102
+
+    def test_a_one_yuan_cash_difference_is_within_tolerance(self, tmp_path):
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        broker = FakeBroker(positions=[], cash=99_999.0)
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_baseline(store, positions={}, cash=100_000.0)
+
+        scheduler._tick()
+
+        row = store.get_reconciliation_result(DAY)
+        assert row["status"] == "passed"
+        assert row["cash_diff"] == pytest.approx(1.0)
+
+    def test_a_fill_before_the_baseline_is_excluded(self, tmp_path):
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        broker = FakeBroker(
+            positions=[Position(code="600519", quantity=100,
+                                current_price=50.0, avg_cost=45.0)],
+            cash=95_000.0,
+        )
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+        )
+        _save_trade(
+            store, quantity=500, price=10.0,
+            executed_at=f"{DAY}T08:59:59",
+        )
+
+        scheduler._tick()
+
+        assert store.get_reconciliation_result(DAY)["status"] == "passed"
+
+    def test_a_fill_at_the_baseline_instant_is_applied(self, tmp_path):
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        broker = FakeBroker(
+            positions=[Position(code="600519", quantity=110,
+                                current_price=50.0, avg_cost=45.0)],
+            cash=99_900.0,
+        )
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=100_000.0,
+            created_at=f"{DAY}T09:00:00",
+        )
+        _save_trade(
+            store, quantity=10, price=10.0,
+            executed_at=f"{DAY}T09:00:00",
+        )
+
+        scheduler._tick()
+
+        assert store.get_reconciliation_result(DAY)["status"] == "passed"
+
+    def test_fills_from_another_tenant_are_excluded(self, tmp_path):
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        broker = FakeBroker(
+            positions=[Position(code="600519", quantity=100,
+                                current_price=50.0, avg_cost=45.0)],
+            cash=95_000.0,
+        )
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+            tenant="default",
+        )
+        _save_trade(
+            store, quantity=999, price=10.0, tenant="other",
+            executed_at=f"{DAY}T10:00:00",
+        )
+
+        scheduler._tick()
+
+        assert store.get_reconciliation_result(DAY)["status"] == "passed"
+
+
+class TestNoLedgerBaseline:
+    def test_no_baseline_is_unknown_never_a_pass(self, tmp_path):
+        """Without a baseline the comparison cannot honestly run, even when
+        the Store book happens to match the broker."""
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        bus = EventBus()
+        events = []
+        bus.subscribe("eod.reconciliation", events.append)
+        broker = FakeBroker(
+            positions=[Position(code="600519", quantity=100,
+                                current_price=50.0, avg_cost=45.0)],
+            cash=95_000.0,
+        )
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker, bus=bus)
+        _seed_store_position(store)  # matches the broker; must not be used
+
+        scheduler._tick()
+
+        row = store.get_reconciliation_result(DAY)
+        assert row["status"] == "unknown"
+        assert row["cash_diff"] is None
+        assert row["basis"] == "trade_ledger"
+        assert events[-1].data["status"] == "unknown"
+        assert events[-1].data["passes"] is False
+        assert events[-1].data["reason"] == "no_ledger_baseline"
 
 
 class TestBackfillAndHistoricalDays:
@@ -351,6 +606,7 @@ class TestBackfillAndHistoricalDays:
         bus.subscribe("eod.reconciliation", events.append)
         broker = FakeBroker(positions=[], cash=100_000.0)
         scheduler, store = _scheduler(tmp_path, clock, broker=broker, bus=bus)
+        _seed_baseline(store, positions={}, cash=100_000.0)
         store.save_pnl_snapshot({
             "timestamp": f"{DAY}T15:05:00", "total_equity": 100_000.0,
             "cash": 100_000.0, "market_value": 0.0, "n_positions": 0,
@@ -407,7 +663,11 @@ class TestToleranceConfiguration:
             cash=95_000.0,
         )
         scheduler, store = _scheduler(tmp_path, clock, broker=broker)
-        _seed_store_position(store)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0,
+        )
 
         scheduler._tick()
 
