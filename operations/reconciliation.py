@@ -22,7 +22,7 @@ class PositionRow:
     expected_price: float
     actual_price: float
     diff: int = 0
-    tolerance: int = 0
+    tolerance: float = 0
 
     @property
     def is_matched(self) -> bool:
@@ -64,7 +64,7 @@ def reconcile(
     actual_positions: dict[str, tuple[int, float]],
     expected_cash: float,
     actual_cash: float,
-    tolerance: int = 0,
+    tolerance: float = 0,
     cash_tolerance: float = 1000.0,
     cash_tolerance_bps: float = 0.0,
     mismatch_materiality: float = 0.0,
@@ -173,7 +173,8 @@ def _book_from(items) -> dict[str, tuple[int, float]]:
     Accepts both shapes so broker ``Position`` instances and Store row
     dicts share one conversion. A row without an asset code raises: silently
     dropping it would let a malformed broker answer reconcile as a flat
-    book. Missing/invalid share counts become 0.
+    book. A missing (None) share count is 0; a non-numeric or non-integral
+    one raises for the same reason.
     """
     book: dict[str, tuple[int, float]] = {}
     for item in items:
@@ -192,10 +193,20 @@ def _book_from(items) -> dict[str, tuple[int, float]]:
             raise ValueError(
                 f"position row has no asset code (would reconcile as flat): {item!r}"
             )
-        try:
-            share_count = int(shares or 0)
-        except (TypeError, ValueError):
+        if shares is None:
             share_count = 0
+        else:
+            try:
+                share_value = float(shares)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"position share count is not a number: {shares!r}"
+                ) from exc
+            if not math.isfinite(share_value) or not share_value.is_integer():
+                raise ValueError(
+                    f"position share count is not a finite integer: {shares!r}"
+                )
+            share_count = int(share_value)
         asset = str(code)
         if asset in book:
             # Duplicates only occur for a merged (tenant-less) Store read or

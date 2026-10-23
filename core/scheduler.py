@@ -857,6 +857,14 @@ class TradingScheduler:
         ``broker.get_positions()``. Cash: expected from the day's P&L
         snapshot, actual from ``broker.get_account()['cash']``. Tolerances
         come from the ``QUANT_RECON_*`` values parsed at construction.
+
+        Cash-basis caveat (R11 review): the task book fixes expected cash to
+        the day's Store P&L snapshot, and on the normal EOD path that
+        snapshot's cash is itself sourced from ``broker.get_account()`` (S2
+        precedence). The cash arm therefore mainly detects drift between the
+        two queries and snapshots sourced from engine state; a fully
+        independent cash check needs ledger cash derived from fills, which
+        is a follow-up rather than a change to the specified basis here.
         """
         timestamp = self._naive_local(self._now())
         tolerances = dict(self._recon_tolerances)
@@ -1012,7 +1020,9 @@ class TradingScheduler:
 
         The EOD snapshot is written under the store's default tenant (the
         snapshot dict carries no tenant_id), so this read is deliberately
-        unscoped — the same basis ``save_pnl_and_mark_eod`` writes with.
+        unscoped — the same basis ``save_pnl_and_mark_eod`` writes with. In
+        a multi-tenant deployment every EOD snapshot shares that default
+        tenant; tenant-scoped EOD snapshots are a separate change.
         """
         try:
             rows = self._store.get_pnl_history(

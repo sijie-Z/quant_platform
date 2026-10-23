@@ -246,3 +246,15 @@ class TestStorePositionsAdapter:
         ]
 
         assert positions_from_store(rows) == {"600519": (125, 48.0)}
+
+    def test_a_non_integral_share_count_fails_loud(self):
+        """Truncating a malformed count to 0 would shrink the leg silently."""
+        with pytest.raises(ValueError, match="share count"):
+            positions_from_store([{"code": "600519", "quantity": "abc"}])
+        with pytest.raises(ValueError, match="share count"):
+            positions_from_store([{"code": "600519", "quantity": 100.7}])
+
+    def test_a_numeric_string_share_count_is_accepted(self):
+        assert positions_from_store(
+            [{"code": "600519", "quantity": "100"}],
+        ) == {"600519": (100, 0.0)}
