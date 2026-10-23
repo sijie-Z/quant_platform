@@ -92,7 +92,15 @@ STALE_TMP_SECONDS = 3600.0
 #    *exits* instead of keeping every former member forever. Panels cached
 #    under 5 carry the old "once a member, always a member" universe and the
 #    fused mask; they must not be replayed.
-DATA_SCHEMA_VERSION = 6
+# 7: two reasons. (a) R6c changed the `excluded_mask` semantics: factor levels
+#    and signal membership are now computed from the uncropped price history
+#    before any exclusion, so a cached factor/signal stage produced under the
+#    old cropped panel must not be replayed. (b) R7a adds the Baostock ST
+#    cache fields: the daily panel persists the observed `isST` side column
+#    and providers derive ST episodes from it; provider caches written under
+#    6 have no ST evidence and would silently disable ST screening on real
+#    data, so they must not be replayed either.
+DATA_SCHEMA_VERSION = 7
 
 # Bump when the key recipe itself changes, so entries written by an older
 # recipe cannot collide with new ones.

@@ -252,7 +252,7 @@ quant_platform/
 | Walk-Forward OOS 指标覆盖 train+test（BUG-21） | 已修复：OOS 指标只取测试窗 | `backtest/walkforward.py` |
 | 财务数据未按 publish_date 过滤 | 已修复：合成数据按公告日 reindex；provider 提供公告日时按公告日 | `data/providers/synthetic.py`、`data/pipeline.py` |
 | 行业中性化只用静态 map | 已修复：按日期的 `sector_panel` 接入中性化 | `factors/processing.py`、`main.py` |
-| ST 过滤用全样本 `is_st` | 已修复：按公告日构建 `tradable_mask`；无 ST 历史的数据源显式标记不可用 | `data/pipeline.py`、`data/providers/*` |
+| ST 过滤用全样本 `is_st` | 已修复：按公告日构建 `tradable_mask`；Baostock 由日线 `isST` 派生 ST episode，无 ST 历史的数据源显式标记不可用 | `data/pipeline.py`、`data/providers/*` |
 | ML CV 按 (日期, 股票) 拍平、训练/测试共享日期（BUG-23） | 已修复：按日期切分 + purge/embargo | `alpha/ml_signal.py` |
 | 成本模型系统性减半（BUG-03） | 已修复：印花税仅卖出、按资产拆分买卖名义额 | `backtest/cost_model.py`、`backtest/engine.py` |
 

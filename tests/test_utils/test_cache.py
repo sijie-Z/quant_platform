@@ -209,8 +209,8 @@ class TestCacheRetention:
             assert list(cache.cache_dir.glob("*.meta.json")) == []
 
 
-class TestSchemaVersionBumpR6b:
-    def test_data_schema_version_is_six(self):
-        """R6b changed the universe PIT semantics; entries written under 5
-        (fused mask, membership never exits) must be invalidated."""
-        assert DATA_SCHEMA_VERSION == 6
+class TestSchemaVersionBumpR7a:
+    def test_data_schema_version_is_seven(self):
+        """R6c changed the excluded_mask semantics and R7a adds the Baostock
+        ST cache fields; entries written under 6 must be invalidated."""
+        assert DATA_SCHEMA_VERSION == 7

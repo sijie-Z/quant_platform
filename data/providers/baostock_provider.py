@@ -25,9 +25,16 @@ Contract notes
 * The stock universe includes delisted names (``status=0``) with
   ``delisting_date``; the sample for a requested range is built from names
   whose [listing, delisting] window overlaps that range.
-* There is no ST history in this source.  ``st_available`` is False and no
-  ``is_st`` column is fabricated (an all-False flag would silently pretend
-  that ST screening works).
+* ST history is derived from the daily ``isST`` column, requested in the same
+  ``query_history_k_data_plus`` call as the prices (no extra request).  A run
+  of consecutive ``isST == "1"`` observations is one episode whose
+  ``announce_date`` is the first day ST was actually observed (conservative
+  point-in-time: nothing is inferred before the fetched sample) and whose
+  ``trigger_date`` equals ``announce_date``, because baostock exposes no
+  earlier announcement date.  ``st_available`` is True only when the derived
+  episode table is non-empty; a response without ``isST`` (missing column or
+  only empty values) yields an empty episode table rather than a fabricated
+  ``is_st`` flag.
 * Per-symbol failures are retried; if any symbol still fails the fetch
   raises :class:`DataFetchIncompleteError` and nothing is cached.
 """
@@ -89,7 +96,11 @@ CACHE_DIR = Path(__file__).parent.parent.parent / ".cache" / "baostock"
 # v5: asset_growth is now a same-quarter-last-year ratio resolved on the full
 # fetched report sequence; v4 panels may carry growth values computed across a
 # shifted positional window and must not be replayed.
-_CACHE_VERSION = "v5"
+# v6: the daily price query also requests ``isST`` and the observed flag is
+# persisted in the panel as the side column ``_is_st_observed`` so derived ST
+# episodes survive cache reloads; v5 panels carry no ST evidence and must not
+# be replayed (they would silently disable ST screening on real data).
+_CACHE_VERSION = "v6"
 #: Basis of the stored ``close`` column (raw traded price).
 _PRICE_ADJUSTMENT = "raw"
 #: Basis of ``close / adj_factor`` when adjustment is enabled.
@@ -120,6 +131,13 @@ _FINANCIAL_COLUMNS = [
 _PRICE_COLUMNS = [
     "open", "high", "low", "close", "preclose", "volume", "amount",
     "turnover", "pct_chg", "pe_ttm", "pb_mrq", "vwap", "adj_factor",
+]
+#: Side column carried only inside the cached daily panel: the raw ``isST``
+#: observation.  Never exposed on the price contract (``get_prices`` drops it).
+_ST_OBSERVED_COLUMN = "_is_st_observed"
+#: Episode table contract, identical to SyntheticDataProvider's.
+_ST_EPISODE_COLUMNS = [
+    "asset", "trigger_date", "announce_date", "end_date", "is_st",
 ]
 
 
@@ -296,6 +314,10 @@ def _empty_financials() -> pd.DataFrame:
     return pd.DataFrame(index=index, columns=_FINANCIAL_COLUMNS)
 
 
+def _empty_st_timeseries() -> pd.DataFrame:
+    return pd.DataFrame(columns=_ST_EPISODE_COLUMNS)
+
+
 class BaostockDataProvider(DataProvider):
     """Real A-share market data from baostock.
 
@@ -306,8 +328,9 @@ class BaostockDataProvider(DataProvider):
     - Permanent CSV caching (historical data is immutable)
     - First run ~60-120s for full stock universe, subsequent runs <1s from cache
 
-    ``st_available`` is False: baostock exposes no ST history (``status`` is
-    the listing status, not an ST flag), so no ``is_st`` column is fabricated.
+    ``st_available`` is True when the daily ``isST`` column produced at least
+    one ST episode; the episode table is derived conservatively (see
+    :meth:`get_st_timeseries`) and no ``is_st`` metadata column is fabricated.
     """
 
     price_adjustment = _PRICE_ADJUSTMENT
@@ -334,8 +357,13 @@ class BaostockDataProvider(DataProvider):
         self.adjustment_factor_available = mode == "hfq"
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self._bs = None
-        # No point-in-time ST history is supplied by this source.
+        #: True only after a non-empty ST episode table was derived; False when
+        #: the source omitted ``isST`` or no sample day was flagged ST.
         self.st_available = False
+        #: Derived ST episode table (``None`` = not resolved yet, so a later
+        #: ``get_prices`` can still populate it).  Empty means "resolved: no
+        #: ST evidence".
+        self._st_timeseries: pd.DataFrame | None = None
         # Universe sample pinned by `cache_universe()` so the pipeline cache
         # key and the actual fetch use the *same* symbols even if the
         # underlying stock list changes between resolution and fetch.
@@ -679,8 +707,32 @@ class BaostockDataProvider(DataProvider):
 
     @staticmethod
     def _history_fields() -> str:
+        # ``isST`` rides along with the price query (a separate ST query would
+        # double the per-symbol network calls).  It is parsed into the side
+        # column ``_is_st_observed`` and never enters the price contract.
         return ("date,code,open,high,low,close,preclose,volume,amount,"
-                "turn,pctChg,peTTM,pbMRQ")
+                "turn,pctChg,peTTM,pbMRQ,isST")
+
+    @staticmethod
+    def _rows_to_frame(rows: list[list[str]], fields: list[str]) -> pd.DataFrame:
+        """Build the daily frame, tolerating an interface without ``isST``.
+
+        Older/stand-in baostock implementations may ignore the requested field
+        list and return the thirteen legacy columns.  ``isST`` is the trailing
+        optional field, so short rows are padded with empty strings (i.e.
+        "no ST information") instead of poisoning the frame; wider rows are a
+        genuine contract violation and raise.
+        """
+        width = len(fields)
+        if any(len(row) > width for row in rows):
+            raise RuntimeError(
+                "query_history_k_data_plus returned rows wider than the "
+                f"requested fields ({width})"
+            )
+        if all(len(row) == width for row in rows):
+            return pd.DataFrame(rows, columns=fields)
+        padded = [list(row) + [""] * (width - len(row)) for row in rows]
+        return pd.DataFrame(padded, columns=fields)
 
     def _fetch_one_history(self, bs, bs_code: str, start_date: str, end_date: str,
                            adjustflag: str) -> list[list[str]]:
@@ -793,10 +845,19 @@ class BaostockDataProvider(DataProvider):
         if not all_rows:
             return _empty_prices()
 
-        cols = ["date", "code", "open", "high", "low", "close",
-                "preclose", "volume", "amount", "turn", "pctChg", "peTTM", "pbMRQ"]
-        df = pd.DataFrame(all_rows, columns=cols)
+        fields = self._history_fields().split(",")
+        df = self._rows_to_frame(all_rows, fields)
         df["code"] = df["code"].apply(_from_bs_code)
+        # ``isST`` is auxiliary data, not a price column: keep it in the cached
+        # panel as ``_is_st_observed`` (so episodes survive a reload) and drop
+        # it from the public frame in `get_prices`.
+        if "isST" in df.columns:
+            df = df.rename(columns={"isST": _ST_OBSERVED_COLUMN})
+        else:  # defensive: _rows_to_frame always materialises the column
+            df[_ST_OBSERVED_COLUMN] = ""
+        df[_ST_OBSERVED_COLUMN] = (
+            df[_ST_OBSERVED_COLUMN].fillna("").astype(str).str.strip()
+        )
 
         # Convert to numeric
         for c in ["open", "high", "low", "close", "preclose", "volume",
@@ -1012,17 +1073,114 @@ class BaostockDataProvider(DataProvider):
             codes.add(str(i).zfill(6))
         return codes
 
+    # ------------------------------------------------------------------
+    # ST history (derived from the daily isST field)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _derive_st_episodes(panel: pd.DataFrame | None) -> pd.DataFrame:
+        """Derive conservative ST episodes from observed ``isST`` flags.
+
+        Rules (also documented on :meth:`get_st_timeseries`):
+
+        * an episode is a run of consecutive observed trading days whose flag
+          is ``"1"``; an unknown/blank flag breaks the run (nothing is
+          assumed about days without evidence);
+        * ``announce_date`` is the first day ST was observed -- baostock has no
+          earlier announcement date and none is inferred;
+        * ``end_date`` is the last ST day of the run, or the last sample day
+          when the sample ends while the stock is still ST;
+        * ``trigger_date`` equals ``announce_date`` (no fabricated lag).
+        """
+        if (
+            panel is None
+            or panel.empty
+            or _ST_OBSERVED_COLUMN not in panel.columns
+        ):
+            return _empty_st_timeseries()
+        flags = panel[_ST_OBSERVED_COLUMN].astype("string").str.strip()
+        known = flags.isin(["0", "1"]).to_numpy(dtype=bool)
+        if not bool(known.any()):
+            return _empty_st_timeseries()
+        is_st = (flags == "1").fillna(False).to_numpy(dtype=bool)
+        # 0 = observed not-ST, 1 = observed ST, 2 = unknown (breaks a run).
+        state = np.full(len(flags), 2, dtype=np.int8)
+        state[known] = is_st[known].astype(np.int8)
+        frame = pd.DataFrame({
+            "asset": panel.index.get_level_values("asset").astype(str),
+            "date": pd.DatetimeIndex(panel.index.get_level_values("date")),
+            "state": state,
+        }).sort_values(["asset", "date"], kind="stable")
+        same_asset = frame["asset"].eq(frame["asset"].shift())
+        state_change = frame["state"].ne(frame["state"].shift())
+        frame["run"] = (~same_asset | state_change).cumsum()
+        st_runs = frame[frame["state"] == 1]
+        if st_runs.empty:
+            return _empty_st_timeseries()
+        episodes = st_runs.groupby("run", sort=True).agg(
+            asset=("asset", "first"),
+            announce_date=("date", "min"),
+            end_date=("date", "max"),
+        ).reset_index(drop=True)
+        episodes["trigger_date"] = episodes["announce_date"]
+        episodes["is_st"] = True
+        return episodes[_ST_EPISODE_COLUMNS]
+
+    def _ingest_st_episodes(self, panel: pd.DataFrame | None) -> pd.DataFrame:
+        """Replace the resolved episode table from a full daily panel."""
+        episodes = self._derive_st_episodes(panel)
+        self._st_timeseries = episodes
+        self.st_available = not episodes.empty
+        if episodes.empty:
+            logger.info("Baostock ST history: no ST episodes in the sample")
+        else:
+            logger.info("Baostock ST history: %d episode(s)", len(episodes))
+        return episodes
+
+    def _resolve_st_timeseries(self) -> pd.DataFrame:
+        """Resolve the episode table lazily (from a pinned range or prices).
+
+        The pipeline loads point-in-time data *before* it asks for prices, so
+        on the standard pinned-universe path this fetches the same raw daily
+        panel `get_prices` will use -- the later call is a cache hit, so the
+        network request count is unchanged. Without a pinned range and without
+        a prior `get_prices` call there is no honest date range to ask for, so
+        the table stays empty rather than guessing one.
+        """
+        if self._st_timeseries is not None:
+            return self._st_timeseries
+        if self._pinned_range is None or not self._pinned_price_codes:
+            self._st_timeseries = _empty_st_timeseries()
+            self.st_available = False
+            return self._st_timeseries
+        start, end = self._pinned_range
+        try:
+            panel = self._fetch_daily_data(
+                self._pinned_price_codes, start, end, adjustflag="3",
+            )
+        except Exception as exc:  # ST history must never abort a run
+            logger.warning(
+                "Baostock ST history unavailable (%s); reporting no ST "
+                "history for this run", exc,
+            )
+            self._st_timeseries = _empty_st_timeseries()
+            self.st_available = False
+            return self._st_timeseries
+        return self._ingest_st_episodes(panel)
+
     def get_metadata(self) -> pd.DataFrame:
         """Get stock metadata, including delisted names with ``outDate``.
 
-        ``is_st`` is intentionally absent (``st_available`` is False): the
-        source has no ST history and an all-False column would silently
-        disable ST screening.
+        ``is_st`` is intentionally absent: a whole-sample boolean would silently
+        disable per-date ST screening. ST information is exposed as the
+        episode table from :meth:`get_st_timeseries`, and
+        ``attrs["st_available"]`` is True exactly when that table is non-empty.
         """
         cache_key = f"metadata_{self._cache_version()}"
+        st_available = not self._resolve_st_timeseries().empty
         cached = self._load_cache(cache_key)
         if cached is not None:
-            cached.attrs["st_available"] = False
+            cached.attrs["st_available"] = st_available
             return cached
 
         records = self._get_universe_records()
@@ -1065,15 +1223,31 @@ class BaostockDataProvider(DataProvider):
             logger.warning("industry map unavailable: %s", exc)
 
         result = df[["sector", "market_cap_group", "listing_date", "delisting_date"]]
-        result.attrs["st_available"] = False
+        result.attrs["st_available"] = st_available
         self._save_cache(cache_key, result)
         return result
 
     def get_st_timeseries(self) -> pd.DataFrame:
-        """Explicitly expose that no ST history is available."""
-        return pd.DataFrame(
-            columns=["asset", "trigger_date", "announce_date", "end_date", "is_st"]
-        )
+        """ST episodes derived from the daily ``isST`` observations.
+
+        Derivation (point-in-time, no fabrication):
+
+        * for each asset, consecutive observed trading days with
+          ``isST == "1"`` form one episode; a blank/unknown flag breaks the
+          run because nothing is known about that day;
+        * ``announce_date`` is the first day ST was *observed* -- baostock
+          exposes no earlier announcement date, so nothing is inferred before
+          the fetched sample (conservative: a stock already ST on the sample's
+          first day is announced from that first day, not earlier);
+        * ``end_date`` is the run's last ST day; if the sample ends while the
+          stock is still ST, it is the sample's last day;
+        * ``trigger_date`` equals ``announce_date``;
+        * ``is_st`` is True.
+
+        Returns the empty contract frame when the source did not return
+        ``isST`` (missing column or only empty values): no flag is fabricated.
+        """
+        return self._resolve_st_timeseries().copy()
 
     # ------------------------------------------------------------------
     # Corporate actions (best effort)
@@ -1297,6 +1471,12 @@ class BaostockDataProvider(DataProvider):
                 codes, start_date, end_date, adjustflag="3",
             )
 
+        if not raw.empty:
+            # Side channel: the same daily response also carries ``isST``;
+            # derive the episode table here (cache hits included) before the
+            # auxiliary column is dropped from the public price frame.
+            self._ingest_st_episodes(raw)
+
         if raw.empty:
             empty = self._project_price_fields(raw, fields)
         elif self.adjustment_mode == "raw":
@@ -1395,6 +1575,8 @@ class BaostockDataProvider(DataProvider):
                 self._data_status["reason"] = sidecar.get("reason")
                 self._last_status_path = self._cache_path(key3)
 
+        if _ST_OBSERVED_COLUMN in df.columns:
+            df = df.drop(columns=[_ST_OBSERVED_COLUMN])
         df = self._project_price_fields(df, fields)
         df.attrs.update({
             "price_basis": "raw",
@@ -2454,6 +2636,10 @@ class BaostockDataProvider(DataProvider):
             write_incremental_status(self._cache_path(key_new), status)
             return self._remember_status(status, source="cache_manifest")
 
+        # The appended panel is now authoritative: re-derive ST episodes from
+        # the merged raw flags (windows are fetched without touching the
+        # in-memory table, so this is the only ingest for an incremental run).
+        self._ingest_st_episodes(merged)
         self._fallback_panel = None
         self._fallback_range = None
         status = self._payload(
