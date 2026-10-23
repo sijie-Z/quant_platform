@@ -570,6 +570,94 @@ class TestTradeLedgerBasis:
 
         assert store.get_reconciliation_result(DAY)["status"] == "passed"
 
+    def test_an_unpriced_mismatch_cannot_be_absorbed_by_materiality(
+        self, tmp_path, monkeypatch,
+    ):
+        """A vanished expected position with no broker mark and no baseline
+        cost is worth 0; materiality must not turn that into a pass."""
+        monkeypatch.setenv("QUANT_RECON_MATERIALITY", "1000000")
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        bus = EventBus()
+        events = []
+        bus.subscribe("eod.reconciliation", events.append)
+        broker = FakeBroker(positions=[], cash=100_000.0)
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker, bus=bus)
+        # Bare quantity: no avg_cost to value the missing leg.
+        _seed_baseline(store, positions={"600519": 100}, cash=100_000.0)
+
+        scheduler._tick()
+
+        row = store.get_reconciliation_result(DAY)
+        assert row["status"] == "failed"
+        assert events[-1].data["reason"].startswith("unpriced mismatch")
+
+    def test_the_engine_scoped_tenant_and_key_select_only_their_baseline(
+        self, tmp_path,
+    ):
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        broker = FakeBroker(
+            positions=[Position(code="600519", quantity=120,
+                                current_price=50.0, avg_cost=45.0)],
+            cash=94_000.0,
+        )
+        scheduler, store = _scheduler(
+            tmp_path, clock, broker=broker,
+            tenant_id="default", engine_state_key="live_engine:default",
+        )
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=95_000.0, tenant="default",
+            engine_state_key="live_engine:default",
+        )
+        _save_trade(
+            store, quantity=20, price=50.0,
+            executed_at=f"{DAY}T10:00:00", tenant="default",
+        )
+        # Newer, mismatching row under another scope must stay invisible.
+        _seed_baseline(
+            store, positions={}, cash=1.0,
+            tenant="other", engine_state_key="live_engine:other",
+        )
+
+        scheduler._tick()
+
+        assert store.get_reconciliation_result(DAY)["status"] == "passed"
+
+    def test_the_newest_baseline_is_used_and_older_fills_are_not_reapplied(
+        self, tmp_path,
+    ):
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        broker = FakeBroker(
+            positions=[Position(code="600519", quantity=150,
+                                current_price=50.0, avg_cost=45.0)],
+            cash=99_500.0,
+        )
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 100, "avg_cost": 45.0}},
+            cash=100_000.0, created_at=f"{DAY}T09:00:00",
+        )
+        # Recorded before the restart baseline and already baked into it: if
+        # the older baseline were used, expected would be 600 shares and
+        # 95,000 cash and the comparison would fail.
+        _save_trade(
+            store, quantity=500, price=10.0,
+            executed_at=f"{DAY}T09:30:00",
+        )
+        _seed_baseline(
+            store,
+            positions={"600519": {"quantity": 150, "avg_cost": 45.0}},
+            cash=99_500.0, created_at=f"{DAY}T10:00:00",
+        )
+
+        scheduler._tick()
+
+        row = store.get_reconciliation_result(DAY)
+        assert row["status"] == "passed"
+        assert row["details"][0]["expected_shares"] == 150
+
 
 class TestNoLedgerBaseline:
     def test_no_baseline_is_unknown_never_a_pass(self, tmp_path):

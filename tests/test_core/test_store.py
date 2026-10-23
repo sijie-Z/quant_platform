@@ -698,7 +698,8 @@ class TestDailyReconciliationResults:
 
     def test_an_existing_results_table_gains_the_basis_column(self, tmp_path):
         """CREATE TABLE IF NOT EXISTS cannot add a column, so an R11-era
-        database must be migrated in place."""
+        database must be migrated in place -- and its old rows must stay
+        unlabelled (their basis was not the trade ledger)."""
         import sqlite3
 
         db = str(tmp_path / "legacy_basis.db")
@@ -716,10 +717,20 @@ class TestDailyReconciliationResults:
                 tolerances TEXT DEFAULT '{}'
             )
         """)
+        conn.execute(
+            "INSERT INTO reconciliation_results (date, timestamp, status) "
+            "VALUES ('2026-10-19', '2026-10-19T15:05:00', 'passed')",
+        )
         conn.commit()
         conn.close()
 
         reopened = Store(db)
+
+        legacy = reopened.get_reconciliation_result("2026-10-19")
+        assert legacy["basis"] is None, (
+            "an R11-era outcome must not be relabelled as trade_ledger"
+        )
+
         reopened.save_reconciliation_result(self._result(
             date="2026-10-20", status="passed",
         ))
@@ -798,6 +809,17 @@ class TestLedgerBaselines:
 
         with pytest.raises(ValueError, match="finite"):
             store.save_ledger_baseline(self._baseline(cash=float("nan")))
+
+    def test_created_at_is_required(self, store):
+        """Defaulting it would silently mix the exchange clock with the
+        host-clock fill stamps the ledger compares against."""
+        missing = self._baseline()
+        del missing["created_at"]
+        with pytest.raises(ValueError, match="created_at"):
+            store.save_ledger_baseline(missing)
+
+        with pytest.raises(ValueError, match="created_at"):
+            store.save_ledger_baseline(self._baseline(created_at=""))
 
     def test_positions_may_be_json_text(self, store):
         store.save_ledger_baseline(

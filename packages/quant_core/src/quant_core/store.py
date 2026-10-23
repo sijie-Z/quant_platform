@@ -417,7 +417,10 @@ class Store:
                     tolerances TEXT DEFAULT '{}',
                     -- R12: which expected-side basis the outcome used
                     -- ('trade_ledger': startup baseline + stored fills).
-                    basis TEXT DEFAULT 'trade_ledger'
+                    -- Deliberately no DEFAULT: rows written before this
+                    -- column existed must stay NULL (their basis was Store
+                    -- positions + snapshot cash), never be mislabelled.
+                    basis TEXT
                 );
 
                 -- R12: immutable broker-state baselines captured when the
@@ -463,15 +466,17 @@ class Store:
                     "ALTER TABLE nav_history ADD COLUMN accrued_perf_fee REAL DEFAULT 0"
                 )
             # R12: databases written before the trade-ledger basis carry no
-            # `basis` column; CREATE TABLE IF NOT EXISTS cannot add it.
+            # `basis` column; CREATE TABLE IF NOT EXISTS cannot add it. The
+            # added column gets no default on purpose: existing rows were
+            # produced by the R11 basis (Store positions + snapshot cash) and
+            # must stay NULL rather than inherit a "trade_ledger" label.
             recon_cols = {
                 r["name"]
                 for r in conn.execute("PRAGMA table_info(reconciliation_results)")
             }
             if "basis" not in recon_cols:
                 conn.execute(
-                    "ALTER TABLE reconciliation_results "
-                    "ADD COLUMN basis TEXT DEFAULT 'trade_ledger'"
+                    "ALTER TABLE reconciliation_results ADD COLUMN basis TEXT"
                 )
 
             # Create tenant_id indexes after migration
@@ -1208,12 +1213,21 @@ class Store:
         stored after ``created_at``. ``cash`` is required and must be a finite
         number: recording a missing balance as 0 would make every later cash
         comparison meaningless (the caller must fail loud instead).
+        ``created_at`` is required as well -- defaulting it to the exchange
+        clock would silently mix timestamp domains with the host-clock fill
+        stamps the ledger compares against.
 
         ``positions_json`` accepts either a mapping (serialized here) or an
         already-encoded JSON object; a non-mapping value is rejected. Rows are
         never updated -- a restart appends a new row and readers take the
         newest id, so the derivation never applies old fills twice.
         """
+        created_at = str(baseline.get("created_at") or "")
+        if not created_at:
+            raise ValueError(
+                "ledger baseline created_at is required: the ledger's "
+                "fill-cutoff comparison needs an explicit timestamp basis"
+            )
         cash = baseline.get("cash")
         try:
             cash_value = float(cash)
@@ -1257,7 +1271,7 @@ class Store:
                 "(created_at, tenant_id, engine_state_key, cash, "
                 " positions_json, note) VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    str(baseline.get("created_at") or exchange_now_iso()),
+                    created_at,
                     str(baseline.get("tenant_id") or "default"),
                     str(baseline.get("engine_state_key") or ""),
                     cash_value,

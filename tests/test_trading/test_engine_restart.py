@@ -88,6 +88,9 @@ def test_restart_refuses_when_broker_and_store_disagree(tmp_path, monkeypatch):
 
     assert engine._thread is None
     assert engine._running is False
+    assert _baseline_rows(store) == [], (
+        "a blocked start must not leave a ledger baseline behind"
+    )
 
 
 def test_restart_restores_kill_switch_cash_and_positions(tmp_path, monkeypatch):

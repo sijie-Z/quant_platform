@@ -874,6 +874,13 @@ class TradingScheduler:
         price for the same asset (baseline ``avg_cost`` only when the asset is
         missing from the broker book), so only quantities and cash are
         compared -- a price-basis difference cannot manufacture a mismatch.
+
+        Coverage: only fills persisted in the ``trades`` table move the
+        expected leg. Adapters that fill asynchronously (QMT/XTP) do not
+        persist their fills there today, so such a day fails loudly against
+        the stale baseline rather than passing; persisting async fills is a
+        separate change (R12 scope forbids changing the broker/engine fill
+        path).
         """
         timestamp = self._naive_local(self._now())
         tolerances = dict(self._recon_tolerances)
@@ -987,11 +994,26 @@ class TradingScheduler:
             mismatch_materiality=tolerances["materiality"],
         )
         status = "passed" if report.passes else "failed"
+        reason = None
+        if status == "passed":
+            # Materiality must not absorb a mismatch we cannot value: an
+            # expected-only leg with no broker mark and no baseline cost is
+            # worth 0 in total_mismatch_value, so QUANT_RECON_MATERIALITY>0
+            # would otherwise hide a vanished position as a pass.
+            unpriced = sorted(
+                row.asset for row in report.details
+                if not row.is_matched
+                and max(float(row.expected_price),
+                        float(row.actual_price)) <= 0
+            )
+            if unpriced:
+                status = "failed"
+                reason = "unpriced mismatch: " + ", ".join(unpriced)
         if status == "failed":
             self._log_reconciliation_failure(
                 report, tolerances, float(ledger["cash"]), float(actual_cash),
             )
-        return {
+        result = {
             "date": target,
             "timestamp": timestamp,
             "status": status,
@@ -1015,6 +1037,9 @@ class TradingScheduler:
             ],
             "tolerances": tolerances,
         }
+        if reason:
+            result["reason"] = reason
+        return result
 
     @staticmethod
     def _log_reconciliation_failure(

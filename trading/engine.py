@@ -1591,6 +1591,13 @@ class LiveTradingEngine:
         the health check blocks trading, and a baseline built from a failed
         query would be wrong. A missing/non-finite account cash raises --
         recording 0 would make every later cash comparison meaningless.
+
+        ``created_at`` is stamped *after* both broker queries: a fill absorbed
+        before the stamp is presumed part of the baseline and excluded from
+        the ledger by the ``>=`` boundary, so the only ambiguous window is a
+        same-tick fill (~1 ms) rather than the whole broker query latency
+        (stamping first would make every fill during the queries eligible for
+        double counting).
         """
         try:
             account = self._broker.get_account()
