@@ -523,12 +523,28 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
             ).reindex(weights.index)
             above = weights > cap_series + 1e-9
             if bool(above.any()):
+                n_above = int(above.sum())
+                weights = weights.where(~above, cap_series)
+                # Refill the clipped weight out of names that still have
+                # headroom under their cap, so a fully fundable book stays
+                # fully invested; any residual (caps exhausted) stays cash.
+                deficit = 1.0 - float(weights.sum())
+                if deficit > 1e-12:
+                    headroom = (cap_series - weights).clip(lower=0.0).fillna(
+                        0.0
+                    )
+                    room = float(headroom.sum())
+                    if room > 0.0:
+                        weights = weights + headroom * (
+                            min(deficit, room) / room
+                        )
                 logger.warning(
                     "MVO: the post-turnover blend exceeded the ADV capacity "
-                    "cap for %d asset(s); clipping to the cap (the sum may "
-                    "fall marginally below 1)", int(above.sum()),
+                    "cap for %d asset(s); clipped to the cap and refilled "
+                    "available headroom (residual cash %.3e). The engine's "
+                    "execution-day turnover clamp still applies.",
+                    n_above, max(0.0, 1.0 - float(weights.sum())),
                 )
-                weights = weights.where(~above, cap_series)
         return weights
 
 

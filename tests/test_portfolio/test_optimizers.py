@@ -373,16 +373,29 @@ def test_default_cost_fields_reproduce_the_pre_r8_decision():
         assert w.max() <= 0.10 + 1e-6
 
 
-def test_transaction_cost_without_prev_weights_is_a_no_op():
-    """Task spec: with ``prev_weights is None`` the cost term is 0."""
-    signal, cov, sectors, _ = _regression_case()
-    baseline = MeanVarianceOptimizer(_regression_constraints()).optimize(
-        signal, cov, sector_map=sectors,
+def test_transaction_cost_without_prev_weights_is_a_no_op_even_with_shorts():
+    """Task spec: with ``prev_weights is None`` the cost term is 0.
+
+    Shorting is enabled so ``sum|w| != 1``: if the implementation wrongly
+    treated a missing previous book as all-zero weights, the linear cost term
+    would penalise gross exposure and change the solution. (In the long-only
+    case ``sum|w| == 1`` is a constant and such a test would be vacuous.)
+    """
+    _, signal, cov, sectors, _ = _cost_aware_case()
+    shared = dict(
+        max_weight=0.10, max_sector_exposure=0.30, max_turnover=1.0,
+        risk_aversion=1.0, long_only=False,
     )
+    baseline = MeanVarianceOptimizer(
+        PortfolioConstraints(**shared)
+    ).optimize(signal, cov, sector_map=sectors)
     costly = MeanVarianceOptimizer(
-        _regression_constraints(transaction_cost_bps=50.0)
+        PortfolioConstraints(transaction_cost_bps=100.0, **shared)
     ).optimize(signal, cov, sector_map=sectors)
 
+    # The case is not vacuous: the default solution really is short.
+    assert (baseline < -1e-6).any()
+    assert float(baseline.abs().sum()) > 1.5
     pd.testing.assert_series_equal(
         costly.sort_index(), baseline.sort_index(), atol=1e-12, rtol=0,
     )
@@ -572,6 +585,43 @@ def test_missing_adv_assets_keep_max_weight_and_are_logged(caplog):
     # under max_weight).
     assert weights.loc[names[5]] > 0.02 + 1e-6
     assert weights.loc[names[5]] <= 0.10 + 1e-6
+
+
+def test_post_turnover_blend_refills_a_capacity_clipped_book():
+    """m1: when the post-solve turnover blend adds back a previous book that
+    exceeds the new ADV caps, clipping alone used to leave the target badly
+    under-invested (sum << 1). The clipped weight must be refilled from
+    remaining headroom; the residual is cash."""
+    n = 40
+    names = [f"S{i:02d}" for i in range(n)]
+    signal = pd.Series(
+        np.r_[np.full(10, 0.5), np.full(20, 0.2), np.zeros(10)], index=names,
+    )
+    # S39 is deliberately outside the covariance universe (held, dropped).
+    cov = pd.DataFrame(
+        np.eye(39) * 0.0004, index=names[:39], columns=names[:39],
+    )
+    sectors = pd.Series([f"SEC{i % 4}" for i in range(n)], index=names)
+    prev = pd.Series(0.0, index=names)
+    prev.loc[names[10:20]] = 0.075
+    prev.loc[names[39]] = 0.25
+    adv = pd.Series(1e9, index=names)
+    adv.loc[names[10:20]] = 0.03 * 1e7 / 0.10
+    adv.loc[names[39]] = 0.02 * 1e7 / 0.10
+
+    optimizer = MeanVarianceOptimizer(PortfolioConstraints(
+        max_weight=0.10, max_sector_exposure=0.30, max_turnover=0.10,
+        risk_aversion=1.0, max_participation=0.10,
+    ))
+    weights = optimizer.optimize(
+        signal, cov, prev_weights=prev, sector_map=sectors,
+        adv=adv, aum=1e7,
+    )
+
+    assert optimizer.fallback_count == 0
+    # Fully funded again, and the old in-universe holdings respect the cap.
+    assert weights.sum() == pytest.approx(1.0, abs=1e-9)
+    assert weights.loc[names[10:20]].max() <= 0.03 + 1e-9
 
 
 def test_infeasible_capacity_falls_back_with_a_warning(caplog):
