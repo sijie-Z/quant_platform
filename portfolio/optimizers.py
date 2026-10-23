@@ -831,6 +831,10 @@ def _ensure_psd(cov: np.ndarray) -> np.ndarray:
 
     trace = float(np.trace(sym))
     scale = trace / n
+    if not np.isfinite(eigvals).all():
+        raise ValueError(
+            "covariance eigendecomposition produced non-finite eigenvalues"
+        )
     min_eig = float(eigvals[0])
 
     n_negative = int((eigvals < 0.0).sum())
@@ -842,7 +846,15 @@ def _ensure_psd(cov: np.ndarray) -> np.ndarray:
     if ridge:
         sym[np.diag_indices(n)] += ridge
 
-    if scale > 0.0 and min_eig < _PSD_SINGULARITY_LOG_THRESHOLD * scale:
+    if scale > 0.0:
+        material_repair = (
+            min_eig < _PSD_SINGULARITY_LOG_THRESHOLD * scale
+        )
+    else:
+        # A covariance with non-positive trace is not a valid covariance at
+        # all; clipping it to zero must never be silent either.
+        material_repair = True
+    if material_repair:
         logger.info(
             "Covariance near-singular: n=%d, trace/n=%.3e, min_eig=%.3e, "
             "negative_eigenvalues_clipped=%d, added_ridge=%.3e "
