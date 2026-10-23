@@ -520,6 +520,12 @@ class TushareProvider(DataProvider):
         forward-filled between snapshot dates: a constituent stays a member
         until the next snapshot says otherwise.  Dates before the first
         snapshot are False (unknown, never assumed to be members).
+
+        Every snapshot row lists both current members (True) and non-members
+        (False), so a plain forward fill propagates an explicit *exit* as
+        faithfully as an inclusion.  An earlier implementation masked the
+        False cells to NaN first, which made a name that ever entered the
+        index a member for the rest of the sample.
         """
         if self._constituent_history is None:
             self._load_or_fetch_all()
@@ -542,8 +548,10 @@ class TushareProvider(DataProvider):
             if members:
                 mask.loc[pd.Timestamp(trade_date), members] = True
 
-        # A snapshot describes membership *until the next snapshot*.
-        mask = mask.where(mask, np.nan).ffill().fillna(False).astype(bool)
+        # A snapshot describes membership *until the next snapshot*: forward
+        # fill both True (inclusion persists) and False (explicit exit), then
+        # default dates before the first snapshot to non-members.
+        mask = mask.ffill().fillna(False).astype(bool)
         mask = mask.loc[pd.Timestamp(start_date):pd.Timestamp(end_date)]
         return mask
 

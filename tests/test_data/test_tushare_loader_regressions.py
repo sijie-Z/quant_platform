@@ -382,6 +382,41 @@ def test_universe_mask_alias(tmp_path):
     )
 
 
+def test_membership_exit_is_forward_filled_not_erased(tmp_path):
+    """R6b: a snapshot that drops a name must end its membership.
+
+    Snapshot 1 (Jan 2) = {A, B}; snapshot 2 (Jan 4) = {A}.  The provider's
+    mask is snapshot-dated, so the consumer (``DataPipeline``) reindexes it
+    onto the price grid and forward-fills.  That forward fill must carry the
+    explicit False from snapshot 2, leaving B a member only between the two
+    snapshots; dates before snapshot 1 stay non-members.
+    """
+    prov = provider(tmp_path)
+    prov._constituent_history = pd.DataFrame([
+        {"trade_date": "20240102", "ts_code": "600001.SH"},
+        {"trade_date": "20240102", "ts_code": "600002.SH"},
+        {"trade_date": "20240104", "ts_code": "600001.SH"},
+    ])
+
+    snapshots = prov.get_index_membership_mask("2024-01-01", "2024-01-05")
+    assert snapshots.loc[pd.Timestamp("2024-01-02"), "600002.SH"]
+    assert not snapshots.loc[pd.Timestamp("2024-01-04"), "600002.SH"]
+
+    # Mirror the documented consumer contract: reindex to a daily grid and
+    # forward-fill between snapshots (dates before the first stay False).
+    grid = pd.bdate_range("2024-01-01", "2024-01-05")
+    filled = snapshots.reindex(grid).ffill().fillna(False).astype(bool)
+
+    assert not filled.loc[:pd.Timestamp("2024-01-01")].to_numpy().any()
+    # Between the snapshots B is still a member...
+    assert filled.loc[pd.Timestamp("2024-01-03"), "600002.SH"]
+    # ...and once snapshot 2 drops B, it stays out for good.
+    assert not filled.loc[pd.Timestamp("2024-01-04"):, "600002.SH"].any()
+    assert filled.loc[pd.Timestamp("2024-01-03"):, "600001.SH"].all()
+    # B's exit must not affect A.
+    assert filled.loc[pd.Timestamp("2024-01-02"), "600001.SH"]
+
+
 # ----------------------------------------------------------------------
 # D17: benchmark Series after reload; atomic + corrupt cache handling
 # ----------------------------------------------------------------------
