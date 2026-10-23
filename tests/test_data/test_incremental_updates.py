@@ -61,6 +61,7 @@ class RangeTushareAPI:
         omit_last_day_for: set[str] | None = None,
         adj_full_omit_codes: set[str] | None = None,
         universe_extra_from: tuple[str, str] | None = None,
+        st_rows: dict[str, list[dict]] | None = None,
     ):
         self.codes = list(codes or CODES)
         self.raw_close = dict(raw_close or {
@@ -74,6 +75,8 @@ class RangeTushareAPI:
         self.omit_last_day_for = set(omit_last_day_for or ())
         self.adj_full_omit_codes = set(adj_full_omit_codes or ())
         self.universe_extra_from = universe_extra_from
+        self.st_rows = {key: list(rows) for key, rows in (st_rows or {}).items()}
+        self.namechange_calls: list[tuple] = []
         self.daily_calls = 0
 
     def _window(self, start_date: str, end_date: str) -> list[str]:
@@ -196,6 +199,29 @@ class RangeTushareAPI:
             for day in self._window(start_date, end_date)
         ])
 
+    def namechange(self, ts_code=None, start_date=None, end_date=None, fields=None):
+        """Per-code history, or a market-wide window keyed on either date."""
+        self.namechange_calls.append((ts_code, start_date, end_date))
+        if ts_code:
+            return pd.DataFrame(self.st_rows.get(ts_code, []))
+        start = pd.Timestamp(start_date) if start_date else None
+        end = pd.Timestamp(end_date) if end_date else None
+        rows = []
+        for code_rows in self.st_rows.values():
+            for item in code_rows:
+                stamps = [
+                    pd.Timestamp(value)
+                    for value in (item.get("start_date"), item.get("ann_date"))
+                    if value
+                ]
+                if any(
+                    (start is None or stamp >= start)
+                    and (end is None or stamp <= end)
+                    for stamp in stamps
+                ):
+                    rows.append(item)
+        return pd.DataFrame(rows)
+
 
 def tushare_provider(cache_dir, end_date=REQUESTED_END, api=None):
     provider = TushareProvider(
@@ -286,6 +312,61 @@ def test_append_three_sessions_equals_full_fetch(tmp_path):
     assert incremental_pipeline.data_freshness["last_complete_date"] == (
         REQUESTED_END
     )
+
+
+def test_incremental_update_rederives_open_st_episodes(tmp_path):
+    """R14/F1: an open-ended ST episode must follow the panel end on append."""
+    api = RangeTushareAPI(st_rows={
+        "600001.SH": [{
+            "ts_code": "600001.SH", "name": "ST AAA",
+            "start_date": "20230101", "end_date": None,
+            "ann_date": "20221220", "change_reason": "ST",
+        }],
+    })
+    seeded = _seed_cache(tmp_path, api=api)
+    assert seeded.st_available is True
+    assert seeded.get_st_timeseries().iloc[0]["end_date"] == pd.Timestamp(
+        CACHED_END
+    )
+
+    updated = tushare_provider(tmp_path, api=api)
+    status = updated.update("2024-01-01", REQUESTED_END)
+    assert status["performed"] is True
+    assert status["incomplete"] is False
+
+    episodes = updated.get_st_timeseries()
+    assert len(episodes) == 1
+    # The same instance must see the extended bound, not the stale cache end.
+    assert episodes.iloc[0]["end_date"] == pd.Timestamp(REQUESTED_END)
+    assert episodes.iloc[0]["announce_date"] == pd.Timestamp("2022-12-20")
+    assert updated.st_available is True
+
+
+def test_incremental_update_ingests_name_changes_from_the_appended_window(
+    tmp_path,
+):
+    """R14/F1: a name change after the cache was built must become visible."""
+    _seed_cache(tmp_path)
+
+    api = RangeTushareAPI(st_rows={
+        "600002.SH": [{
+            "ts_code": "600002.SH", "name": "*ST BBB",
+            "start_date": "20240110", "end_date": None,
+            "ann_date": "20240109", "change_reason": "ST",
+        }],
+    })
+    updated = tushare_provider(tmp_path, api=api)
+    status = updated.update("2024-01-01", REQUESTED_END)
+    assert status["performed"] is True
+    assert status["incomplete"] is False
+
+    episodes = updated.get_st_timeseries()
+    assert len(episodes) == 1
+    assert episodes.iloc[0]["asset"] == "600002.SH"
+    assert episodes.iloc[0]["announce_date"] == pd.Timestamp("2024-01-09")
+    assert episodes.iloc[0]["trigger_date"] == pd.Timestamp("2024-01-10")
+    assert episodes.iloc[0]["end_date"] == pd.Timestamp(REQUESTED_END)
+    assert updated.st_available is True
 
 
 def test_boundary_overlap_is_refetched_and_deduplicated(tmp_path):

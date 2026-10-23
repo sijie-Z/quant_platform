@@ -11,13 +11,21 @@ Pins the new behaviour:
   invented beyond the evidence;
 * adjacent/overlapping ST intervals merge; non-ST renames are ignored;
 * one symbol's failure retries twice, is recorded, and never aborts the rest;
-  a completely unavailable endpoint yields the empty contract table and
-  ``st_available == False`` (no fabrication);
+  a completely unavailable endpoint (exceptions *or* None replies) yields the
+  empty contract table and ``st_available == False`` (no fabrication);
+* duplicate ``(ts_code, name, start_date)`` rows prefer the one with a
+  recorded ``end_date`` regardless of row order;
 * ``get_metadata().attrs["st_available"]`` always agrees with the episode
   table, and the raw feed survives a cache round-trip; a cache built while
   the endpoint was unavailable stores no ``/st_namechange`` key and is NOT
-  replayed as "no ST names";
+  replayed as "no ST names"; a partial cache repeats its warning on reload;
+* ``cache_identity()`` tracks the feed state so a degraded run cannot share
+  the pipeline cache key with a healthy one;
 * ``DATA_SCHEMA_VERSION`` and the provider cache version were bumped.
+
+The incremental-update re-derivation (open-ended episodes follow the panel
+end; window name changes are ingested) is pinned in
+``tests/test_data/test_incremental_updates.py``.
 
 No network access: the Tushare API is replaced with a fake.
 """
@@ -201,17 +209,48 @@ def test_missing_announce_date_falls_back_to_effective_start(tmp_path):
 
 
 def test_missing_end_date_fills_the_price_sample_last_day(tmp_path):
+    """The fill is the panel's last day, not the requested end date."""
     api = FakeTushareSTAPI({
         "600001.SH": [
             row("600001.SH", "ST AAA", "20230501", ann="20230425"),
         ],
     })
-    prov = provider(tmp_path)
-    prov._prices = price_panel()
+    prov = TushareProvider(
+        token="x" * 12,
+        start_date="2024-01-01",
+        end_date="2024-01-31",  # requested end, deliberately != panel end
+        cache_dir=tmp_path,
+        max_retries=2,
+        retry_backoff=0.0,
+    )
+    prov._prices = price_panel()  # panel ends 2024-01-04
 
     episode = prov._fetch_st_episodes(api, ["600001.SH"]).iloc[0]
 
     assert episode["end_date"] == SAMPLE_END
+    assert episode["end_date"] != pd.Timestamp("2024-01-31")
+
+
+def test_open_ended_episode_without_prices_is_dropped_not_invented(tmp_path, caplog):
+    """No price sample: an open interval has no honest bound and is dropped."""
+    api = FakeTushareSTAPI({
+        "600001.SH": [
+            row("600001.SH", "ST AAA", "20230501", ann="20230425"),
+            row("600001.SH", "ST OLD", "20200101", "20200630", "20191220"),
+        ],
+    })
+    prov = provider(tmp_path)
+    prov._prices = None
+
+    with caplog.at_level(logging.WARNING):
+        episodes = prov._fetch_st_episodes(api, ["600001.SH"])
+
+    # The closed episode is still reported; the open one is not invented.
+    assert len(episodes) == 1
+    assert episodes.iloc[0]["trigger_date"] == pd.Timestamp("2020-01-01")
+    assert episodes.iloc[0]["end_date"] == pd.Timestamp("2020-06-30")
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("cannot be bounded" in message for message in messages)
 
 
 def test_unparseable_announce_date_conservatively_falls_back_to_start(tmp_path):
@@ -329,6 +368,41 @@ def test_all_symbols_failing_yields_empty_contract_and_unavailable(tmp_path, cap
                for message in messages)
 
 
+def test_none_responses_are_failures_not_an_empty_ok_feed(tmp_path):
+    """A None reply is "no usable response", never "endpoint says no ST"."""
+    api = FakeTushareSTAPI()
+    api.namechange = lambda ts_code, fields=None: None
+    prov = provider(tmp_path)
+    prov._prices = price_panel()
+
+    episodes = prov._fetch_st_episodes(api, CODES)
+
+    assert episodes.empty
+    assert prov._st_fetch_status == "unavailable"
+    assert prov._st_namechange is None
+    assert prov.st_failed_symbols == CODES
+    assert prov.st_available is False
+
+
+@pytest.mark.parametrize("closed_first", [True, False])
+def test_duplicate_namechange_rows_prefer_the_recorded_end(
+    tmp_path, closed_first,
+):
+    """Tushare ships an open and a closed row for the same change; row order
+    must not decide whether the episode runs to the sample end."""
+    closed = row("600001.SH", "ST AAA", "20230110", "20230227", "20230107")
+    open_ = row("600001.SH", "ST AAA", "20230110", None, "20230107")
+    ordered = [closed, open_] if closed_first else [open_, closed]
+    api = FakeTushareSTAPI({"600001.SH": ordered})
+    prov = provider(tmp_path)
+    prov._prices = price_panel()
+
+    episode = prov._fetch_st_episodes(api, ["600001.SH"]).iloc[0]
+
+    assert episode["end_date"] == pd.Timestamp("2023-02-27")
+    assert episode["end_date"] != SAMPLE_END
+
+
 def test_large_universe_logs_estimate_but_fetches_every_symbol(tmp_path, caplog):
     api = FakeTushareSTAPI()
     prov = provider(tmp_path)
@@ -420,6 +494,65 @@ def test_unavailable_feed_is_not_replayed_from_cache(tmp_path, caplog):
     assert any("no usable st history" in message for message in messages)
     assert any("does not mean every stock is non-st" in message
                for message in messages)
+
+
+def test_partial_reload_repeats_the_failure_warning(tmp_path, caplog):
+    api = FakeTushareSTAPI(
+        {"600001.SH": [
+            row("600001.SH", "ST AAA", "20220425", "20230510", "20220420"),
+        ]},
+        failing_codes=("600002.SZ",),
+    )
+    prov = provider(tmp_path)
+    seed_full_provider(prov, api)
+    cache_file = prov._cache_file()
+    prov._save_to_cache(cache_file)
+
+    reloaded = provider(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        reloaded._load_from_cache(cache_file)
+
+    assert reloaded._st_fetch_status == "partial"
+    assert reloaded.st_available is True
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("partial" in message and "600002.SZ" in message
+               for message in messages)
+
+
+def test_cache_identity_tracks_the_st_feed_state(tmp_path):
+    """A degraded data panel must not share a pipeline cache key with a
+    healthy one, and a deleted cache gets a fresh identity token."""
+    api = FakeTushareSTAPI({
+        "600001.SH": [
+            row("600001.SH", "ST AAA", "20220425", "20230510", "20220420"),
+        ],
+    })
+    prov = provider(tmp_path)
+    missing = prov.cache_identity()["st_fetch_status"]
+    assert missing.startswith("missing:")
+
+    seed_full_provider(prov, api)
+    prov._save_to_cache(prov._cache_file())
+    assert provider(tmp_path).cache_identity()["st_fetch_status"] == "ok"
+
+    degraded_dir = tmp_path / "degraded"
+    degraded_dir.mkdir()
+    degraded = provider(degraded_dir)
+    seed_full_provider(degraded, FakeTushareSTAPI(fail_all_namechange=True))
+    degraded._save_to_cache(degraded._cache_file())
+    assert (
+        provider(degraded_dir).cache_identity()["st_fetch_status"]
+        == "unavailable"
+    )
+
+    degraded_cache = degraded._cache_file()
+    degraded_cache.unlink()
+    degraded_cache.with_name(
+        f"{degraded_cache.name}.manifest.json"
+    ).unlink()
+    after_delete = provider(degraded_dir).cache_identity()["st_fetch_status"]
+    assert after_delete.startswith("missing:")
+    assert after_delete != missing
 
 
 def test_full_fetch_derives_episodes_and_caches_them(tmp_path):

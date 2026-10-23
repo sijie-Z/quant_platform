@@ -195,6 +195,10 @@ class TushareProvider(DataProvider):
         #: Symbols whose namechange call failed after all attempts (reporting
         #: surface; also recorded in the cache manifest).
         self.st_failed_symbols: list[str] = []
+        #: Per-instance token used only by :meth:`_st_identity_status` when no
+        #: provider cache exists, so a deleted cache never collides with a
+        #: previously cached degraded (ST-off) data-stage panel.
+        self._st_identity_nonce = uuid.uuid4().hex
         # Where get_benchmark() data came from: "index_daily" or
         # "equal_weight_fallback". Recorded in the cache manifest and pipeline
         # provenance so a degraded benchmark is not mistaken for CSI 300.
@@ -385,9 +389,12 @@ class TushareProvider(DataProvider):
         * ``end_date`` is the recorded ``end_date``; when it is empty the
           interval is capped at the next recorded name change minus one day,
           or, for a name still in force, at the last day of the price sample
-          (same rule as the Baostock R7a feed);
-        * adjacent/overlapping ST intervals of one asset are merged (earliest
-          announce/trigger, latest end); non-ST renames are ignored;
+          (same rule as the Baostock R7a feed; without a price sample the
+          open interval is dropped rather than bounded by the requested end);
+        * duplicate name-change rows are collapsed in favour of a row that
+          records an ``end_date``; adjacent/overlapping ST intervals of one
+          asset are merged (earliest announce/trigger, latest end); non-ST
+          renames are ignored;
         * ``is_st`` is True.
 
         Returns the empty contract frame when the endpoint was unavailable or
@@ -718,7 +725,12 @@ class TushareProvider(DataProvider):
                 logger.warning("Could not delete stale cache %s: %s", path, exc)
 
     def cache_identity(self) -> dict:
-        """Selection inputs that change the fetched panel (used in the key)."""
+        """Selection inputs that change the fetched panel (used in the key).
+
+        ``st_fetch_status`` is part of the identity: a data-stage panel built
+        while the ST feed was unavailable must not be reused after the feed
+        recovers (the pipeline cache key would otherwise be identical).
+        """
         return {
             "provider": "tushare",
             "adjustment": _PRICE_ADJUSTMENT,
@@ -728,7 +740,23 @@ class TushareProvider(DataProvider):
             "start_date": self.start_date,
             "end_date": self.end_date,
             "synthetic": False,
+            "st_fetch_status": self._st_identity_status(),
         }
+
+    def _st_identity_status(self) -> str:
+        """ST-feed state for the pipeline cache identity (R14 mitigation).
+
+        Reads only the provider-cache sidecar (never the network). When no
+        valid cache exists for this selection a per-instance token is
+        returned, so a cache deleted to recover from an outage can never
+        collide with a degraded data-stage panel cached under the earlier
+        "cache missing" identity.
+        """
+        cache_file = self._cache_file()
+        if not cache_file.exists() or not self._cache_manifest_valid(cache_file):
+            return f"missing:{self._st_identity_nonce}"
+        manifest = read_cache_manifest(cache_file) or {}
+        return str(manifest.get("st_fetch_status", "unknown"))
 
     def cache_universe(
         self,
@@ -948,17 +976,40 @@ class TushareProvider(DataProvider):
                     derived if derived is not None else _empty_st_timeseries()
                 )
             else:
-                self._st_namechange = None
+                # No key: either the endpoint was unavailable (the manifest
+                # says so) or it answered "ok" with zero rows (a zero-row
+                # feed stores an empty fixed-format key, but older readers
+                # may see none). The manifest disambiguates; "ok + no rows"
+                # is an empty feed, not an unavailable endpoint.
+                if self._st_fetch_status in ("ok", "partial"):
+                    self._st_namechange = _empty_namechange()
+                else:
+                    self._st_namechange = None
                 self._st_timeseries = _empty_st_timeseries()
             self.st_available = not self._st_timeseries.empty
 
         if self._st_fetch_status == "unavailable":
             logger.warning(
                 "Cached Tushare panel carries no usable ST history "
-                "(namechange unavailable when it was fetched); st_available="
-                "False -- ST screening fails closed, this does NOT mean every "
-                "stock is non-ST. Delete/refresh the cache to retry."
+                "(namechange unavailable when it was fetched); "
+                "st_available=False -- ST screening is unavailable for this "
+                "run and ST names may remain eligible. This does NOT mean "
+                "every stock is non-ST. Refresh the provider cache (delete "
+                "the .h5 or use --force) to retry."
             )
+        elif self._st_fetch_status == "partial":
+            logger.warning(
+                "Cached Tushare ST history is partial: %d symbol(s) failed "
+                "when fetched (e.g. %s); their ST status is unknown, not "
+                "non-ST.",
+                len(self.st_failed_symbols),
+                sorted(self.st_failed_symbols)[:10],
+            )
+            if self.st_available:
+                logger.info(
+                    "ST history: %d episode(s) derived from cached namechange",
+                    len(self._st_timeseries),
+                )
         elif self.st_available:
             logger.info(
                 "ST history: %d episode(s) derived from cached namechange",
@@ -993,9 +1044,18 @@ class TushareProvider(DataProvider):
                     store["constituents"] = self._constituent_history
                 # Only a fetched feed is evidence.  ``None`` (endpoint
                 # unavailable) deliberately leaves the key out so a reload
-                # cannot replay an empty table as a complete answer.
+                # cannot replay an empty table as a complete answer.  Table
+                # format keeps the string columns native (fixed format would
+                # pickle them and emit a PerformanceWarning).
                 if self._st_namechange is not None:
-                    store["st_namechange"] = self._st_namechange
+                    if len(self._st_namechange):
+                        store.put(
+                            "st_namechange", self._st_namechange, format="table",
+                        )
+                    else:
+                        # Table format silently drops a zero-row frame; the
+                        # fixed format round-trips the empty contract.
+                        store["st_namechange"] = self._st_namechange
             with provider_cache_lock(cache_file.parent) as locked:
                 if not locked:
                     raise TimeoutError(
@@ -1245,8 +1305,9 @@ class TushareProvider(DataProvider):
         if self._st_fetch_status == "unavailable":
             logger.warning(
                 "Tushare ST history unavailable (namechange produced no usable "
-                "response); st_available=False -- ST screening fails closed for "
-                "this run. This is NOT evidence that every stock is non-ST."
+                "response); st_available=False -- ST screening is unavailable "
+                "for this run and ST names may remain eligible. This is NOT "
+                "evidence that every stock is non-ST."
             )
         elif episodes.empty:
             logger.info(
@@ -1278,8 +1339,8 @@ class TushareProvider(DataProvider):
         if len(codes) > _ST_FETCH_WARN_THRESHOLD:
             logger.warning(
                 "ST namechange: universe has %d symbols; one API call per "
-                "symbol (~%.1f min at %.2f s/call). Fetching every symbol "
-                "(silent skipping is not allowed).",
+                "symbol (~%.1f min at %.2f s/call, retries excluded). Fetching "
+                "every symbol (silent skipping is not allowed).",
                 len(codes),
                 len(codes) * _ST_FETCH_SECONDS_PER_CALL / 60.0,
                 _ST_FETCH_SECONDS_PER_CALL,
@@ -1297,7 +1358,22 @@ class TushareProvider(DataProvider):
                     code, _ST_FETCH_ATTEMPTS, exc,
                 )
                 continue
-            if df is not None and len(df):
+            if df is None:
+                failed.append(str(code))
+                logger.warning(
+                    "namechange returned no frame (None) for %s; treating it "
+                    "as a failure (unknown ST status, not non-ST)", code,
+                )
+                continue
+            if not isinstance(df, pd.DataFrame):
+                failed.append(str(code))
+                logger.warning(
+                    "namechange returned %s instead of a DataFrame for %s; "
+                    "treating it as a failure",
+                    type(df).__name__, code,
+                )
+                continue
+            if len(df):
                 frames.append(df)
 
         if not codes:
@@ -1310,28 +1386,147 @@ class TushareProvider(DataProvider):
         if not frames:
             return _empty_namechange(), failed
         try:
+            raw = self._combine_namechange_frames(frames, codes)
+        except ValueError as exc:
+            logger.warning(
+                "namechange response is unusable (%s); marking ST history "
+                "unavailable", exc,
+            )
+            self._st_fetch_status = "unavailable"
+            return None, failed
+        return raw, failed
+
+    @staticmethod
+    def _dedupe_namechange_rows(raw: pd.DataFrame) -> pd.DataFrame:
+        """Deduplicate name-change rows, preferring a recorded ``end_date``.
+
+        Tushare returns duplicates for the same ``(ts_code, name,
+        start_date)`` where one row has ``end_date=None`` and the other the
+        real end. The open row would otherwise force the "next rename" /
+        sample-end fill and over-extend the episode, so the closed row wins.
+        """
+        frame = raw.copy()
+        frame["_code_key"] = frame["ts_code"].astype("string").fillna("").str.strip()
+        frame["_name_key"] = frame["name"].astype("string").fillna("").str.strip()
+        frame["_start_key"] = (
+            frame["start_date"].astype("string").fillna("").str.strip()
+        )
+        if "end_date" in frame.columns:
+            closed = frame["end_date"].map(TushareProvider._row_has_value)
+        else:
+            closed = pd.Series(False, index=frame.index, dtype=bool)
+        frame["_closed"] = closed.astype(bool)
+        frame = frame.sort_values(
+            ["_code_key", "_name_key", "_start_key", "_closed"],
+            kind="stable", ascending=[True, True, True, False],
+        ).drop_duplicates(
+            subset=["_code_key", "_name_key", "_start_key"], keep="first",
+        )
+        return frame.drop(
+            columns=["_code_key", "_name_key", "_start_key", "_closed"],
+        ).reset_index(drop=True)
+
+    @staticmethod
+    def _row_has_value(value) -> bool:
+        """Whether a raw ``namechange`` cell carries a usable value."""
+        if pd.isna(value):
+            return False
+        return str(value).strip() not in ("", "None", "nan", "NaT")
+
+    def _combine_namechange_frames(
+        self, frames: list[pd.DataFrame], codes: list[str],
+    ) -> pd.DataFrame:
+        """Combine raw namechange frames into a deduplicated evidence table.
+
+        Rows for symbols outside the requested universe are dropped, missing
+        optional columns are added as NA, and exact name-change duplicates
+        are collapsed with :meth:`_dedupe_namechange_rows`. Raises
+        :class:`ValueError` when the response cannot be assembled or lacks
+        the columns the episode contract needs.
+        """
+        try:
             raw = pd.concat(frames, ignore_index=True)
         except Exception as exc:  # noqa: BLE001 - a broken feed is not fatal
-            logger.warning(
-                "namechange response could not be assembled (%s); marking "
-                "ST history unavailable", exc,
-            )
-            self._st_fetch_status = "unavailable"
-            return None, failed
+            raise ValueError(f"could not assemble namechange frames: {exc}") from exc
         required = {"ts_code", "name", "start_date"}
-        if not required.issubset(raw.columns):
-            logger.warning(
-                "namechange response is missing required column(s) %s; "
-                "ST history is unusable and will be marked unavailable",
-                sorted(required - set(raw.columns)),
-            )
-            self._st_fetch_status = "unavailable"
-            return None, failed
+        missing = sorted(required - set(raw.columns))
+        if missing:
+            raise ValueError(f"missing required column(s) {missing}")
         for column in _ST_NAMECHANGE_COLUMNS:
             if column not in raw.columns:
                 raw[column] = pd.NA
-        raw = raw.loc[:, _ST_NAMECHANGE_COLUMNS]
-        return raw, failed
+        raw = raw.loc[:, _ST_NAMECHANGE_COLUMNS].copy()
+        allowed = {str(code) for code in codes}
+        raw = raw.loc[raw["ts_code"].astype(str).isin(allowed)]
+        return self._dedupe_namechange_rows(raw)
+
+    def _refresh_st_after_update(
+        self, api, marker, requested_end, codes: list[str],
+    ) -> None:
+        """Keep the ST episode table truthful across an incremental append.
+
+        Two best-effort steps (an ST failure never aborts the update):
+
+        * fetch name changes announced/effective in the appended window with
+          one market-wide call and merge them into the cached feed -- without
+          this, a name change made after the cache was built would stay
+          invisible until a full refresh;
+        * re-derive the episodes against the *extended* panel, because an
+          open-ended ST interval is capped at the panel's last day and would
+          otherwise stop masking the appended sessions.
+
+        A window-only response is never allowed to stand in for a missing
+        full feed (it would silently lose every older episode), so recovery
+        from an unavailable feed still requires a full refresh.
+        """
+        if self._st_namechange is None:
+            if self._st_fetch_status == "unavailable":
+                logger.warning(
+                    "ST history is still unavailable; an incremental update "
+                    "cannot rebuild it (a window-only feed would miss older "
+                    "episodes). Refresh the provider cache to retry."
+                )
+            return
+        if api is not None:
+            window_start = max(
+                pd.Timestamp(marker).normalize() - pd.Timedelta(days=30),
+                pd.Timestamp(self.start_date).normalize(),
+            )
+            try:
+                fresh = self._call_with_retries(
+                    "namechange window",
+                    api.namechange,
+                    start_date=window_start.strftime("%Y%m%d"),
+                    end_date=pd.Timestamp(requested_end).strftime("%Y%m%d"),
+                    fields=_NAMECHANGE_FIELDS,
+                )
+            except Exception as exc:  # noqa: BLE001 - ST feed is best effort
+                logger.warning(
+                    "Incremental ST name-change refresh failed (%s); keeping "
+                    "the cached feed (name changes after it was built stay "
+                    "invisible until a full refresh)", exc,
+                )
+            else:
+                if isinstance(fresh, pd.DataFrame) and len(fresh):
+                    try:
+                        self._st_namechange = self._combine_namechange_frames(
+                            [self._st_namechange, fresh], codes,
+                        )
+                    except ValueError as exc:
+                        logger.warning(
+                            "namechange window rows could not be merged (%s); "
+                            "keeping the cached ST feed", exc,
+                        )
+                elif fresh is None:
+                    logger.warning(
+                        "namechange window returned no frame (None); keeping "
+                        "the cached ST feed"
+                    )
+        derived = self._safe_derive_st_episodes(self._st_namechange)
+        self._st_timeseries = (
+            derived if derived is not None else _empty_st_timeseries()
+        )
+        self.st_available = not self._st_timeseries.empty
 
     def _fetch_namechange_for_code(self, api, code: str) -> pd.DataFrame:
         """One symbol's ``namechange`` call: initial attempt + two retries."""
@@ -1386,7 +1581,12 @@ class TushareProvider(DataProvider):
         * a missing ``end_date`` is capped at the day before the next recorded
           name change of that asset -- any later rename proves the ST name
           ended -- or, when the ST name is still in force, at the price
-          sample's last day (same rule as the Baostock R7a feed);
+          sample's last day (same rule as the Baostock R7a feed). Without a
+          price sample the open interval is dropped, never bounded at the
+          requested end date;
+        * duplicate ``(ts_code, name, start_date)`` rows are collapsed first,
+          keeping a row with a recorded ``end_date`` over an open duplicate
+          (Tushare ships both for the same change);
         * adjacent (next start no later than the day after the current end)
           or overlapping ST intervals of one asset are merged, keeping the
           earliest announce/trigger and the latest end.
@@ -1402,8 +1602,7 @@ class TushareProvider(DataProvider):
             return _empty_st_timeseries()
 
         sample_end = panel_last_date(self._prices)
-        if sample_end is None:
-            sample_end = pd.Timestamp(self.end_date).normalize()
+        raw = self._dedupe_namechange_rows(raw)
 
         frame = pd.DataFrame({
             "asset": [
@@ -1455,13 +1654,26 @@ class TushareProvider(DataProvider):
                 start = row["start"]
                 end = row["end"]
                 if pd.isna(end):
-                    later = starts.iloc[idx + 1:].dropna()
+                    # Only a *strictly later* rename bounds the interval; a
+                    # row sharing this start date describes the same change
+                    # (duplicates are collapsed above) and is ambiguous.
+                    later = starts.iloc[idx + 1:]
+                    later = later[later > start]
                     if len(later):
                         end = later.iloc[0] - pd.Timedelta(days=1)
-                    else:
+                    elif sample_end is not None:
                         # Still ST at the end of the fetched history: the
                         # episode is open only up to the price sample's end.
                         end = sample_end
+                    else:
+                        # Without a price sample there is no honest bound;
+                        # drop the open interval instead of inventing one.
+                        logger.warning(
+                            "namechange: open-ended ST interval for %s "
+                            "cannot be bounded (no price sample); dropping it",
+                            asset,
+                        )
+                        continue
                 if end < start:
                     end = start
                 announce = row["ann"] if pd.notna(row["ann"]) else start
@@ -2193,8 +2405,10 @@ class TushareProvider(DataProvider):
         overlap session; verify the constituent universe is unchanged (a
         change forces a full refetch); merge with ``keep="last"``; refresh
         ``adj_factor`` for the whole cached range; refetch financials,
-        metadata and benchmark for the requested range; and publish
-        data+manifest atomically under the provider cache lock.
+        metadata and benchmark for the requested range; refresh the ST feed
+        for the appended window and re-derive episodes against the extended
+        panel; and publish data+manifest atomically under the provider cache
+        lock.
 
         Any partial response returns ``incomplete=True`` with the old cache
         untouched -- the marker only advances after a complete publish.
@@ -2489,6 +2703,10 @@ class TushareProvider(DataProvider):
             )
         self._financials = financials
         self._benchmark = benchmark
+
+        # ST feed: append window name changes and re-derive episodes against
+        # the extended panel (an open ST interval is capped at the panel end).
+        self._refresh_st_after_update(api, marker, requested_end, codes)
 
         extra = incremental_marker_extra(
             last_complete_date=new_marker,
