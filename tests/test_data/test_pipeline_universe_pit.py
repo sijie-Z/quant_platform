@@ -326,8 +326,10 @@ class TestMembershipExit:
         assert universe["000003.SZ"].iloc[:EXIT_DAY].all()
         assert not universe["000003.SZ"].iloc[EXIT_DAY:].any()
 
-        # The exit does not remove C from the factor universe / sellability:
-        # `tradable_mask` remains membership-free.
+        # The exit does not remove C from `tradable_mask` / sellability.
+        # `tradable_mask` remains membership-free; the research-input
+        # exclusion is applied separately in `get_factor_prices` (R6c; see
+        # test_factor_pit_membership.py).
         _assert_tradable_is_membership_free(pipeline)
         assert pipeline.universe_pit["applied"] is True
         assert pipeline.universe_mask.index.equals(dates)
