@@ -1655,9 +1655,12 @@ class LiveTradingEngine:
                 book[code] = {"quantity": quantity, "avg_cost": avg_cost}
 
         self._store.save_ledger_baseline({
-            "created_at": (
-                self._exchange_now().replace(tzinfo=None).isoformat()
-            ),
+            # Same clock as broker fill stamps (`Order.updated_at` is host
+            # wall-clock in every adapter): the ledger's `executed_at >=
+            # created_at` boundary must compare timestamps from one clock.
+            # A Shanghai-labelled baseline on a non-Shanghai host would
+            # exclude every later fill and fail the EOD comparison.
+            "created_at": datetime.now().isoformat(),
             "tenant_id": self._tenant_id,
             "engine_state_key": self._engine_state_key,
             "cash": cash_value,
