@@ -106,6 +106,9 @@ class PortfolioOptimizer(ABC):
         cov_matrix: pd.DataFrame | None = None,
         prices: pd.Series | None = None,
         prev_weights: pd.Series | None = None,
+        sector_map: pd.Series | None = None,
+        adv: pd.Series | None = None,
+        aum: float | None = None,
     ) -> pd.Series:
         """Compute target weights.
 
@@ -114,6 +117,11 @@ class PortfolioOptimizer(ABC):
             cov_matrix: (asset x asset) covariance matrix.
             prices: Current close prices per asset.
             prev_weights: Previous period weights for turnover constraint.
+            sector_map: Asset -> sector mapping.
+            adv: Optional (asset) average daily traded value in CNY. Used by
+                optimizers that implement the R8 capacity cap; ignored
+                elsewhere.
+            aum: Optional portfolio value in CNY paired with ``adv``.
 
         Returns:
             Target weights (sum to 1.0).
@@ -137,7 +145,12 @@ class EqualWeightOptimizer(PortfolioOptimizer):
         prices: pd.Series | None = None,
         prev_weights: pd.Series | None = None,
         sector_map: pd.Series | None = None,
+        adv: pd.Series | None = None,
+        aum: float | None = None,
     ) -> pd.Series:
+        # ``adv`` / ``aum`` are accepted for API parity but not used: equal
+        # weight is not an optimization problem, so the R8 cost terms and
+        # capacity cap do not apply here (documented scope).
         # Select top stocks by signal
         positive = signal[signal > 0].dropna()
         if len(positive) == 0:
@@ -184,6 +197,8 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
     .. math::
 
         \\max_w \\; s \\, \\alpha' w - \\gamma \\, w' (252 \\Sigma_{daily}) w
+                  - c \\sum_i |w_i - w^{prev}_i|
+                  - \\lambda \\sum_i (w_i - w^{prev}_i)^2
 
     where ``alpha`` is the rank signal in ``[-0.5, 0.5]``, ``s`` is
     :data:`ALPHA_ANNUAL_SCALE` (0.04, i.e. the full rank span represents a
@@ -194,8 +209,27 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
     of the textbook ``mu'w - (gamma/2) w'Sigma w`` objective.  Do not pass an
     already-annualized covariance matrix; it would be annualized twice.
 
+    The R8 cost terms use ``c = constraints.transaction_cost_bps / 1e4``
+    (one-way cost per unit of two-way turnover) and
+    ``\\lambda = constraints.turnover_penalty``.  Each term is added only when
+    its coefficient is positive **and** ``prev_weights`` is supplied; with the
+    default coefficients of 0 the objective, variables and constraints are
+    exactly the pre-R8 problem (bit-identical decision).
+
+    Capacity (R8): when ``constraints.max_participation > 0`` and the caller
+    supplies both ``adv`` (per-asset average daily traded value in CNY) and a
+    positive ``aum``, every asset's upper bound becomes
+    ``min(max_weight, max_participation * adv_i / aum)``.  Assets with a
+    missing or non-positive ADV keep the plain ``max_weight`` cap and the
+    count is logged -- silently treating a missing quote as zero liquidity
+    would make most of the universe untradeable.  If the caps sum to less
+    than 1.0 the capacity-constrained problem cannot be funded; the optimizer
+    records a warning and falls back to equal weight (which ignores the ADV
+    cap; the fallback is counted and the reason is exposed).
+
     Subject to: sum(w) = 1, long-only (unless ``long_only=False``, in which
-    case the solver bound is -0.1), w <= max_weight, sector constraints.
+    case the solver bound is -0.1), w <= max_weight (or the capacity caps
+    above), sector constraints.
     """
 
     def optimize(
@@ -205,6 +239,8 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
         prices: pd.Series | None = None,
         prev_weights: pd.Series | None = None,
         sector_map: pd.Series | None = None,
+        adv: pd.Series | None = None,
+        aum: float | None = None,
     ) -> pd.Series:
         import math
 
@@ -275,12 +311,89 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
         w = cp.Variable(n)
         expected_return = ALPHA_ANNUAL_SCALE * (alpha_vec @ w)
         risk = cp.quad_form(w, cov_annual)
-        objective = cp.Maximize(expected_return - self.constraints.risk_aversion * risk)
+        objective_terms = expected_return - self.constraints.risk_aversion * risk
 
+        # R8: transaction-cost / quadratic-turnover terms. They are built only
+        # when the coefficient is positive and previous weights exist, so the
+        # default (0) configuration constructs exactly the pre-R8 objective.
+        # Holdings dropped from the candidate set are constants here: they are
+        # not decision variables and their |0 - prev| cost cannot move the
+        # argmax, so they stay out of these sums (the turnover constraint
+        # below still accounts for them).
+        cost_prev = None
+        if prev_weights is not None and (
+            self.constraints.transaction_cost_bps > 0
+            or self.constraints.turnover_penalty > 0
+        ):
+            cost_prev = prev_weights.reindex(assets, fill_value=0.0).values
+        if cost_prev is not None and self.constraints.transaction_cost_bps > 0:
+            objective_terms = objective_terms - (
+                self.constraints.transaction_cost_bps / 1e4
+            ) * cp.sum(cp.abs(w - cost_prev))
+        if cost_prev is not None and self.constraints.turnover_penalty > 0:
+            objective_terms = objective_terms - (
+                self.constraints.turnover_penalty
+            ) * cp.sum_squares(w - cost_prev)
+        objective = cp.Maximize(objective_terms)
+
+        # R8 capacity cap: w_i <= max_participation * ADV_i / AUM. Engaged
+        # only when the participation rate, the ADV series and a positive AUM
+        # are all supplied. Missing / non-positive ADV assets keep the plain
+        # max_weight cap (and are logged): treating a missing quote as zero
+        # liquidity would make most of the universe untradeable, while
+        # skipping the cap silently would overstate capacity.
+        capacity_caps = None
+        if (
+            self.constraints.max_participation > 0
+            and adv is not None
+            and aum is not None
+            and float(aum) > 0
+        ):
+            adv_series = pd.Series(adv, dtype=float).reindex(assets)
+            adv_values = adv_series.to_numpy(dtype=float)
+            usable = np.isfinite(adv_values) & (adv_values > 0)
+            capacity_caps = np.full(n, float(self.constraints.max_weight))
+            capacity_caps[usable] = np.minimum(
+                capacity_caps[usable],
+                float(self.constraints.max_participation)
+                * adv_values[usable]
+                / float(aum),
+            )
+            n_unusable = int((~usable).sum())
+            if n_unusable:
+                logger.warning(
+                    "MVO capacity: %d/%d assets have no positive ADV; the "
+                    "participation cap is not applied to them "
+                    "(max_weight still binds)", n_unusable, n,
+                )
+            if float(capacity_caps.sum()) < 1.0 - 1e-9:
+                return self._equal_weight_fallback(
+                    signal, cov_matrix, prices, prev_weights, sector_map,
+                    "capacity caps sum to "
+                    f"{float(capacity_caps.sum()):.4f} < 1.0 under "
+                    f"max_participation={self.constraints.max_participation} "
+                    f"and aum={float(aum):.0f}; the capacity-constrained "
+                    "problem cannot be funded (equal-weight fallback ignores "
+                    "the ADV cap)",
+                )
+        elif self.constraints.max_participation > 0:
+            # Configured but not usable: the caller (BacktestEngine) logs the
+            # user-facing warning. Keep a trace for direct API users.
+            logger.debug(
+                "MVO capacity configured (max_participation=%.3f) but "
+                "adv/aum were not supplied (adv=%s, aum=%s); optimizing "
+                "without the ADV cap",
+                self.constraints.max_participation, adv is not None, aum,
+            )
+
+        upper_bound = (
+            self.constraints.max_weight
+            if capacity_caps is None else capacity_caps
+        )
         constraints_list = [
             cp.sum(w) == 1.0,
             w >= 0 if self.constraints.long_only else w >= -0.1,
-            w <= self.constraints.max_weight,
+            w <= upper_bound,
         ]
 
         # Sector constraint (skip if all assets are in the same sector — infeasible otherwise)
@@ -430,7 +543,12 @@ class RiskParityOptimizer(PortfolioOptimizer):
         prices: pd.Series | None = None,
         prev_weights: pd.Series | None = None,
         sector_map: pd.Series | None = None,
+        adv: pd.Series | None = None,
+        aum: float | None = None,
     ) -> pd.Series:
+        # ``adv`` / ``aum`` are accepted for API parity but not implemented
+        # for risk parity in R8 (documented scope: the cost terms and the
+        # capacity cap are MVO-only this round).
         import cvxpy as cp
 
         if cov_matrix is None:
