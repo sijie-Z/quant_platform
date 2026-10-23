@@ -591,7 +591,8 @@ def test_post_turnover_blend_refills_a_capacity_clipped_book():
     """m1: when the post-solve turnover blend adds back a previous book that
     exceeds the new ADV caps, clipping alone used to leave the target badly
     under-invested (sum << 1). The clipped weight must be refilled from
-    remaining headroom; the residual is cash."""
+    remaining headroom -- and that refill must respect the sector caps too
+    (the previous book used here is sector-compliant)."""
     n = 40
     names = [f"S{i:02d}" for i in range(n)]
     signal = pd.Series(
@@ -601,10 +602,19 @@ def test_post_turnover_blend_refills_a_capacity_clipped_book():
     cov = pd.DataFrame(
         np.eye(39) * 0.0004, index=names[:39], columns=names[:39],
     )
+    # Sector layout: the held names fill SEC0/1/2 to their caps (0.30/0.225/
+    # 0.225) and S39 puts SEC3 at 0.25 -- the previous book is compliant.
     sectors = pd.Series([f"SEC{i % 4}" for i in range(n)], index=names)
+    sectors.loc[names[10:14]] = "SEC0"
+    sectors.loc[names[14:17]] = "SEC1"
+    sectors.loc[names[17:20]] = "SEC2"
+    sectors.loc[names[39]] = "SEC3"
     prev = pd.Series(0.0, index=names)
     prev.loc[names[10:20]] = 0.075
     prev.loc[names[39]] = 0.25
+    prev_sectors = prev.groupby(sectors).sum()
+    assert prev_sectors.max() <= 0.30 + 1e-12
+
     adv = pd.Series(1e9, index=names)
     adv.loc[names[10:20]] = 0.03 * 1e7 / 0.10
     adv.loc[names[39]] = 0.02 * 1e7 / 0.10
@@ -622,6 +632,8 @@ def test_post_turnover_blend_refills_a_capacity_clipped_book():
     # Fully funded again, and the old in-universe holdings respect the cap.
     assert weights.sum() == pytest.approx(1.0, abs=1e-9)
     assert weights.loc[names[10:20]].max() <= 0.03 + 1e-9
+    # The refill must not push any sector over its cap.
+    assert weights.groupby(sectors).sum().max() <= 0.30 + 1e-9
 
 
 def test_infeasible_capacity_falls_back_with_a_warning(caplog):

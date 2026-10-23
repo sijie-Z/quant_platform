@@ -533,6 +533,27 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
                     headroom = (cap_series - weights).clip(lower=0.0).fillna(
                         0.0
                     )
+                    # Sector caps must hold on the refill too: cap each
+                    # sector's total headroom at its remaining room and scale
+                    # the per-asset headroom inside the sector so the sum
+                    # cannot exceed it. Names outside the sector map are not
+                    # covered by the sector constraint.
+                    if (
+                        sector_map is not None
+                        and self.constraints.max_sector_exposure < 1.0
+                    ):
+                        sectors = sector_map.reindex(weights.index)
+                        totals = weights.groupby(sectors).sum()
+                        sector_room = (
+                            float(self.constraints.max_sector_exposure)
+                            - totals
+                        ).clip(lower=0.0)
+                        hr_by_sector = headroom.groupby(sectors).sum()
+                        scale = (
+                            sector_room
+                            / hr_by_sector.where(hr_by_sector > 0.0)
+                        ).clip(upper=1.0).fillna(0.0)
+                        headroom = headroom * sectors.map(scale).fillna(1.0)
                     room = float(headroom.sum())
                     if room > 0.0:
                         weights = weights + headroom * (
