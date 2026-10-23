@@ -548,6 +548,14 @@ class LiveTradingEngine:
             self._bus.publish("engine.start_blocked", {"error": str(e)}, source="engine")
             raise
 
+        # R13: absorb fills the broker executed while this process was down
+        # (or that its asynchronous callback never handed to the engine)
+        # BEFORE the ledger baseline is stamped. The baseline's broker book
+        # already contains those fills, so trades written before its
+        # ``created_at`` are baked into the baseline instead of being
+        # replayed by the EOD ledger (which would double count them).
+        self._sync_broker_fills()
+
         # R12: broker and Store are reconciled, so the broker state is now
         # authoritative. Record it once as the trade ledger's baseline; the
         # EOD expected book is derived from this row plus later fills.
@@ -1325,6 +1333,211 @@ class LiveTradingEngine:
                 )
         self._audit_event(action, payload, reason=reason)
 
+    def _sync_broker_fills(self) -> int:
+        """Book asynchronous broker fills into the trade ledger (R13).
+
+        ``place_order`` only persists fills it observes synchronously
+        (``FILLED``/``PARTIAL``). QMT/XTP report most executions through
+        callbacks/order resyncs after returning ``SUBMITTED``, so without
+        this pass those fills never reach the ``trades`` table and the R12
+        EOD trade ledger fails loudly against a stale baseline.
+
+        Each order's *delta* is ``filled_quantity`` from the broker minus the
+        quantity already persisted for that ``order_id``. The persisted side
+        is summed from ``trades`` (``get_trade_quantity_for_order``), so a
+        replay of the same broker snapshot -- or a fill already written by
+        the synchronous ``{order_id}:fill`` path -- yields ``delta <= 0`` and
+        writes nothing. A partial order that grows from 40 to 100 produces
+        ``{order_id}:sync:40`` then ``{order_id}:sync:100`` (60 shares).
+
+        Fees: a synced fill records ``commission = tax = 0``. The broker
+        order object carries at most an order-level total that cannot be
+        attributed to one incremental print, and a pro-rata guess would
+        fabricate cash movements. The EOD cash reconciliation will surface
+        the difference as a mismatch until the broker's fee report is booked;
+        the fee gap is loud, never silent.
+
+        Events: ``order.filled`` is deliberately *not* published -- its
+        consumers treat the payload as the newly executed quantity, so
+        republishing a cumulative order state would double count. The new
+        ``order.synced`` topic carries the delta instead.
+
+        A missing/None/erroring broker book is a no-op (debug/warning): a
+        fill-sync failure must not take down the trading cycle. Returns the
+        number of trade rows written.
+        """
+        try:
+            orders = self._broker.get_orders()
+        except Exception as exc:
+            logger.warning("Broker fill sync skipped: get_orders failed: %s", exc)
+            return 0
+        if orders is None:
+            logger.debug("Broker fill sync skipped: broker order book unknown")
+            return 0
+        try:
+            order_list = list(orders)
+        except TypeError:
+            logger.warning(
+                "Broker fill sync skipped: get_orders returned %s",
+                type(orders).__name__,
+            )
+            return 0
+
+        written = 0
+        for order in order_list:
+            try:
+                written += self._sync_one_broker_order(order)
+            except Exception as exc:
+                logger.warning(
+                    "Broker fill sync skipped order %r: %s",
+                    getattr(order, "order_id", ""), exc,
+                )
+        return written
+
+    def _sync_one_broker_order(self, order) -> int:
+        """Book one broker order's fill delta; returns trades written (0/1)."""
+        try:
+            filled = int(getattr(order, "filled_quantity", 0) or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Broker fill sync: unreadable filled_quantity on order %r",
+                getattr(order, "order_id", ""),
+            )
+            return 0
+        if filled <= 0:
+            return 0
+
+        order_id = str(getattr(order, "order_id", "") or "")
+        code = str(getattr(order, "code", "") or "")
+        if not order_id or not code:
+            logger.warning(
+                "Broker fill sync: order without order_id/code skipped (%r)",
+                getattr(order, "order_id", ""),
+            )
+            return 0
+
+        persisted = self._store.get_trade_quantity_for_order(
+            order_id, self._tenant_id,
+        )
+        delta = filled - int(persisted or 0)
+        if delta <= 0:
+            return 0
+
+        side = getattr(order, "side", "")
+        side_value = str(getattr(side, "value", side) or "")
+        if side_value not in ("buy", "sell"):
+            logger.warning(
+                "Broker fill sync: order %s has unsupported side %r; skipped",
+                order_id, side_value,
+            )
+            return 0
+        status = getattr(order, "status", "")
+        status_value = str(getattr(status, "value", status) or "")
+        try:
+            filled_price = float(getattr(order, "filled_price", 0) or 0)
+        except (TypeError, ValueError):
+            filled_price = 0.0
+        try:
+            limit_price = float(getattr(order, "price", 0) or 0)
+        except (TypeError, ValueError):
+            limit_price = 0.0
+        price = filled_price if filled_price > 0 else limit_price
+        if price <= 0:
+            logger.warning(
+                "Broker fill sync: order %s has no usable fill price; "
+                "booking quantity at 0 (cash reconciliation will flag it)",
+                order_id,
+            )
+        try:
+            order_quantity = int(getattr(order, "quantity", 0) or 0)
+        except (TypeError, ValueError):
+            order_quantity = 0
+        updated_at = str(getattr(order, "updated_at", "") or "")
+        executed_at = updated_at or self._exchange_now().replace(
+            tzinfo=None,
+        ).isoformat()
+
+        trade = {
+            "trade_id": f"{order_id}:sync:{filled}",
+            "tenant_id": self._tenant_id,
+            "order_id": order_id,
+            "code": code,
+            "side": side_value,
+            "quantity": delta,
+            "price": price,
+            # Fees cannot be split per incremental print; see the method
+            # docstring. Never fabricate a commission/tax here.
+            "commission": 0,
+            "tax": 0,
+            "executed_at": executed_at,
+        }
+        order_row = {
+            "order_id": order_id,
+            "tenant_id": self._tenant_id,
+            "code": code,
+            "side": side_value,
+            "quantity": order_quantity,
+            "price": limit_price,
+            "filled_quantity": filled,
+            "filled_price": price,
+            "commission": float(getattr(order, "commission", 0) or 0),
+            "tax": float(getattr(order, "tax", 0) or 0),
+            "slippage": float(getattr(order, "slippage", 0) or 0),
+            "broker_order_id": str(getattr(order, "broker_order_id", "") or ""),
+            "error_msg": str(getattr(order, "error_msg", "") or ""),
+            "updated_at": executed_at,
+        }
+        # Never overwrite an existing row's creation time with an empty
+        # value just because a minimal DTO omitted it.
+        created_at = str(getattr(order, "created_at", "") or "")
+        if created_at:
+            order_row["created_at"] = created_at
+        if status_value:
+            order_row["status"] = status_value
+        for attempt in (1, 2):
+            try:
+                # One transaction: the order row and its trade cannot
+                # disagree, and a retry after a failed write re-uses the
+                # same deterministic trade id (a committed write makes the
+                # duplicate impossible; see _persist_fill_result).
+                self._store.save_order_with_trade(order_row, trade)
+                break
+            except Exception as exc:
+                logger.error(
+                    "Failed to persist synced fill %s (attempt %d): %s",
+                    order_id, attempt, exc,
+                )
+        else:
+            logger.critical(
+                "Synced fill %s (%d shares) could not be persisted; the "
+                "ledger will drift from the broker", order_id, delta,
+            )
+            return 0
+
+        try:
+            self._bus.publish("order.synced", {
+                "order_id": order_id,
+                "code": code,
+                "side": side_value,
+                "delta": delta,
+                "price": price,
+            }, source="broker")
+            if isinstance(self._risk, RealTimeRiskEngine):
+                self._risk.on_fill({
+                    "symbol": code,
+                    "side": side_value,
+                    "price": price,
+                    "quantity": delta,
+                })
+        except Exception as exc:
+            # The ledger write already succeeded; a broken subscriber must
+            # not abort the trading cycle (the position book is re-synced
+            # from the broker every cycle regardless).
+            logger.warning(
+                "Synced fill %s notification failed: %s", order_id, exc,
+            )
+        return 1
+
     def _persist_engine_state(self, trust_flat: bool = False) -> None:
         """Persist the restart-critical snapshot (D5).
 
@@ -1957,6 +2170,12 @@ class LiveTradingEngine:
 
         # Publish risk status
         self._bus.publish("risk.status", self._risk.get_status(), source="risk")
+
+        # R13: book fills the broker executed asynchronously (QMT/XTP report
+        # most executions after place_order returned SUBMITTED). Runs before
+        # the P&L snapshot and the position-book write so the trade ledger is
+        # complete before the scheduler reconciles at EOD.
+        self._sync_broker_fills()
 
         # Step 4: Save P&L snapshot
         account = self._broker.get_account()
