@@ -18,6 +18,20 @@ def test_negative_cost_coefficients_are_rejected(field):
         PortfolioConstraints(**{field: -0.1})
 
 
+@pytest.mark.parametrize("field", ["transaction_cost_bps", "turnover_penalty"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_non_finite_cost_coefficients_are_rejected(field, value):
+    """NaN silently disables a ``> 0`` branch; reject it instead."""
+    with pytest.raises(ValueError, match=field):
+        PortfolioConstraints(**{field: value})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_non_finite_max_participation_is_rejected(value):
+    with pytest.raises(ValueError, match="max_participation"):
+        PortfolioConstraints(max_participation=value)
+
+
 @pytest.mark.parametrize("value", [-0.01, 1.01, 2.0])
 def test_max_participation_outside_the_legal_range_is_rejected(value):
     with pytest.raises(ValueError, match="max_participation"):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -78,17 +79,26 @@ class PortfolioConstraints:
                 "target_volatility must be >= 0 (annualized), got "
                 f"{self.target_volatility!r}"
             )
-        if float(self.transaction_cost_bps) < 0.0:
+        if (
+            not math.isfinite(float(self.transaction_cost_bps))
+            or float(self.transaction_cost_bps) < 0.0
+        ):
             raise ValueError(
-                "transaction_cost_bps must be >= 0, got "
+                "transaction_cost_bps must be finite and >= 0, got "
                 f"{self.transaction_cost_bps!r}"
             )
-        if float(self.turnover_penalty) < 0.0:
+        if (
+            not math.isfinite(float(self.turnover_penalty))
+            or float(self.turnover_penalty) < 0.0
+        ):
             raise ValueError(
-                "turnover_penalty must be >= 0, got "
+                "turnover_penalty must be finite and >= 0, got "
                 f"{self.turnover_penalty!r}"
             )
-        if not (0.0 <= float(self.max_participation) <= 1.0):
+        if not (
+            math.isfinite(float(self.max_participation))
+            and 0.0 <= float(self.max_participation) <= 1.0
+        ):
             raise ValueError(
                 "max_participation must be 0 (disabled) or in (0, 1], got "
                 f"{self.max_participation!r}"
