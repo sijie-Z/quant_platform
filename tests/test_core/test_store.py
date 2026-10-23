@@ -120,6 +120,16 @@ class TestTradeQuantityForOrder:
         assert store.get_trade_quantity_for_order("o1", "other") == 60
         assert store.get_trade_quantity_for_order("o1", "missing") == 0
 
+    def test_orders_do_not_leak_into_each_other(self, store):
+        for order_id, qty in (("o1", 40), ("o2", 60)):
+            store.save_trade({
+                "trade_id": f"{order_id}-t", "order_id": order_id,
+                "code": "600519", "side": "buy", "quantity": qty,
+                "price": 10,
+            })
+        assert store.get_trade_quantity_for_order("o1") == 40
+        assert store.get_trade_quantity_for_order("o2") == 60
+
     def test_order_id_lookup_is_indexed(self, store):
         import sqlite3
 

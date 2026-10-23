@@ -18,29 +18,43 @@ Accounting contract under test:
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from quant_platform.core.events import EventBus
 from quant_platform.core.store import Store
 from quant_platform.risk.circuit_breaker import RiskMonitor
+from quant_platform.risk.healthcheck import SystemBlockError
 from quant_platform.risk.realtime_engine import RealTimeRiskEngine
 from quant_platform.trading.broker import (
     BrokerOrder,
     OrderSide,
     OrderStatus,
+    Position,
     SimulatedBroker,
 )
 from quant_platform.trading.engine import LiveTradingEngine
 
+TZ = ZoneInfo("Asia/Shanghai")
+
 
 class FakeBroker:
-    """Minimal broker exposing only the book/account the sync and baseline read."""
+    """Minimal broker exposing the book/account the sync and startup read."""
 
-    def __init__(self, orders=None, *, orders_result: str = "list"):
+    def __init__(
+        self, orders=None, *, orders_result: str = "list",
+        positions=None, cash: float = 100_000.0,
+    ):
         self.orders = list(orders or [])
         self.orders_result = orders_result
+        self.positions = list(positions or [])
+        self.cash = cash
         self.fail = False
+
+    def connect(self):
+        return True
 
     def get_orders(self, status=None):
         if self.fail:
@@ -50,10 +64,20 @@ class FakeBroker:
         return list(self.orders)
 
     def get_positions(self):
-        return []
+        return list(self.positions)
 
     def get_account(self):
-        return {"cash": 100_000.0, "total_equity": 100_000.0, "connected": True}
+        market_value = sum(float(p.market_value or 0) for p in self.positions)
+        return {
+            "cash": self.cash,
+            "market_value": market_value,
+            "total_equity": self.cash + market_value,
+            "n_positions": len(self.positions),
+            "connected": True,
+        }
+
+    def place_order(self, order):  # pragma: no cover - no orders in these tests
+        raise AssertionError("no order expected in this test")
 
 
 def _engine(tmp_path, broker, *, risk=None, bus=None) -> LiveTradingEngine:
@@ -113,6 +137,10 @@ def test_zero_fill_books_nothing_then_the_fill_is_booked_once(tmp_path):
 
     assert engine._sync_broker_fills() == 0, "replay must be idempotent"
     assert len(engine._store.get_trades()) == 1
+    # Compliance: a synced fill is a real execution and must be audited.
+    assert engine._store.get_events(topic="audit.order_filled"), (
+        "synced fills must reach the audit trail"
+    )
 
 
 def test_partial_batches_book_incremental_deltas(tmp_path):
@@ -141,9 +169,13 @@ def test_synchronous_fill_row_counts_toward_the_persisted_quantity(tmp_path):
     engine = _engine(tmp_path, broker)
     filled = _order(
         filled_quantity=100, filled_price=10.0, status=OrderStatus.FILLED,
+        broker_order_id="7777",
     )
     engine._persist_fill_result(filled)
     assert engine._store.get_trade_quantity_for_order("o-async") == 100
+    assert engine._store.get_orders()[0]["broker_order_id"] == "7777", (
+        "the sync's cross-restart dedupe depends on the wire id being stored"
+    )
 
     broker.orders = [filled]
     assert engine._sync_broker_fills() == 0, "delta is already zero"
@@ -177,32 +209,159 @@ def test_get_orders_failure_warns_and_the_cycle_still_completes(
     assert engine._store.get_trades() == []
 
 
-def test_startup_catch_up_books_fills_that_happened_while_down(tmp_path):
-    """A fresh process adopts a broker-filled order the old one left SUBMITTED."""
+def _freeze_pre_market(engine, monkeypatch) -> None:
+    """No network fetch and no cycles: 09:00 is outside the session."""
+    monkeypatch.setattr(engine, "_fetch_prices", lambda: None)
+    engine._scheduler._now = lambda: datetime(2026, 10, 20, 9, 0, tzinfo=TZ)
+
+
+def test_start_books_downtime_fills_explained_by_the_broker_book(
+    tmp_path, monkeypatch,
+):
+    """B1: a fill while the process was down moves the broker book; startup
+    adopts it because the broker's unbooked fills explain the difference."""
     store = Store(str(tmp_path / "engine.db"))
-    store.save_order({
-        "order_id": "o-down", "code": "000001", "side": "buy",
-        "quantity": 200, "price": 9.0, "status": "submitted",
+    store.save_position({
+        "code": "600519", "quantity": 100, "available": 100,
+        "avg_cost": 10.0, "current_price": 10.0, "market_value": 1000.0,
     })
     recovered = _order(
-        order_id="o-down", code="000001", quantity=200, price=9.0,
-        filled_quantity=200, filled_price=9.1,
-        status=OrderStatus.FILLED, broker_order_id="qmt-42",
+        order_id="fresh-after-restart", code="600519", quantity=200,
+        price=10.0, filled_quantity=100, filled_price=10.0,
+        status=OrderStatus.PARTIAL, broker_order_id="qmt-42",
+    )
+    broker = FakeBroker(
+        [recovered],
+        positions=[Position(
+            code="600519", quantity=200, available=200, avg_cost=10.0,
+            current_price=10.0, market_value=2000.0,
+        )],
+        cash=98_000.0,
+    )
+    engine = LiveTradingEngine(
+        broker=broker, store=store, bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+    _freeze_pre_market(engine, monkeypatch)
+
+    engine.start()
+    try:
+        assert engine._running
+        trades = store.get_trades()
+        assert [t["trade_id"] for t in trades] == [
+            "fresh-after-restart:sync:100",
+        ]
+        assert store.get_positions()[0]["quantity"] == 200
+        baseline = store.get_latest_ledger_baseline()
+        assert baseline is not None, "a confirmed startup keeps the baseline"
+        assert baseline["positions"]["600519"]["quantity"] == 200
+    finally:
+        engine.stop()
+
+
+def test_start_adopts_a_flat_book_explained_by_downtime_sells(
+    tmp_path, monkeypatch,
+):
+    """B1 (flat branch): a sell-to-flat while down explains an empty broker
+    book; a live adapter has no ``restore_positions`` to fall back on."""
+    store = Store(str(tmp_path / "engine.db"))
+    store.save_position({
+        "code": "600519", "quantity": 100, "available": 0,
+        "avg_cost": 10.0, "current_price": 10.0, "market_value": 1000.0,
+    })
+    recovered = _order(
+        order_id="fresh-sell", code="600519", side=OrderSide.SELL,
+        quantity=100, price=10.5, filled_quantity=100, filled_price=10.5,
+        status=OrderStatus.FILLED, broker_order_id="qmt-43",
+    )
+    broker = FakeBroker([recovered], positions=[], cash=101_000.0)
+    engine = LiveTradingEngine(
+        broker=broker, store=store, bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+    _freeze_pre_market(engine, monkeypatch)
+
+    engine.start()
+    try:
+        assert store.get_positions() == []
+        trades = store.get_trades()
+        assert [t["trade_id"] for t in trades] == ["fresh-sell:sync:100"]
+        assert trades[0]["side"] == "sell"
+    finally:
+        engine.stop()
+
+
+def test_start_still_refuses_unexplained_position_differences(
+    tmp_path, monkeypatch,
+):
+    store = Store(str(tmp_path / "engine.db"))
+    store.save_position({
+        "code": "600519", "quantity": 100, "available": 100,
+        "avg_cost": 10.0, "current_price": 10.0, "market_value": 1000.0,
+    })
+    broker = FakeBroker(
+        [],  # readable order book, but no fill explains the difference
+        positions=[Position(
+            code="600519", quantity=150, available=150, avg_cost=10.0,
+            current_price=10.0, market_value=1500.0,
+        )],
+    )
+    engine = LiveTradingEngine(
+        broker=broker, store=store, bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+    _freeze_pre_market(engine, monkeypatch)
+
+    with pytest.raises(SystemBlockError, match="reconciliation"):
+        engine.start()
+    assert engine._thread is None
+
+
+def test_cross_restart_recovered_order_is_not_rebooked(tmp_path):
+    """M1: QMT rebuilds a previous process's order with a fresh local id;
+    the persisted ``broker_order_id`` keeps the delta at zero."""
+    store = Store(str(tmp_path / "engine.db"))
+    store.save_order_with_trade(
+        {
+            "order_id": "old-local", "code": "600519", "side": "buy",
+            "quantity": 100, "price": 10.0, "status": "filled",
+            "filled_quantity": 100, "filled_price": 10.5,
+            "broker_order_id": "9001",
+        },
+        {
+            "trade_id": "old-local:fill", "order_id": "old-local",
+            "code": "600519", "side": "buy", "quantity": 100, "price": 10.5,
+        },
+    )
+    recovered = _order(
+        order_id="new-local", filled_quantity=100, filled_price=10.5,
+        status=OrderStatus.FILLED, broker_order_id="9001",
     )
     engine = LiveTradingEngine(
         broker=FakeBroker([recovered]), store=store,
         bus=EventBus(), risk_monitor=RiskMonitor(),
     )
 
-    assert engine._sync_broker_fills() == 1
-    trades = store.get_trades()
-    assert len(trades) == 1
-    assert trades[0]["trade_id"] == "o-down:sync:200"
-    assert trades[0]["quantity"] == 200
-    row = store.get_orders()[0]
-    assert row["status"] == "filled"
-    assert row["filled_quantity"] == 200
-    assert row["broker_order_id"] == "qmt-42"
+    assert engine._sync_broker_fills() == 0
+    assert len(store.get_trades()) == 1
+    assert store.get_trade_quantity_for_order("new-local") == 0
+
+
+def test_start_withholds_the_baseline_when_the_order_book_is_unreadable(
+    tmp_path, monkeypatch,
+):
+    """M2: a baseline whose book may contain unbooked fills would make EOD
+    count them twice; withholding it yields unknown (loud) instead."""
+    engine = LiveTradingEngine(
+        broker=FakeBroker(orders_result="none"),
+        store=Store(str(tmp_path / "engine.db")),
+        bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+    _freeze_pre_market(engine, monkeypatch)
+
+    engine.start()
+    try:
+        assert engine._running
+        assert engine._store.get_latest_ledger_baseline() is None
+    finally:
+        engine.stop()
 
 
 def test_start_syncs_fills_before_stamping_the_ledger_baseline(
@@ -211,10 +370,15 @@ def test_start_syncs_fills_before_stamping_the_ledger_baseline(
     """Fills absorbed from the broker at start are part of the baseline, so
     the EOD ledger must not replay them (R12 boundary)."""
     engine = _engine(tmp_path, SimulatedBroker(initial_cash=100_000))
+    monkeypatch.setattr(engine, "_fetch_prices", lambda: None)
     calls: list[str] = []
     stamps: dict = {}
 
     def sync(executed_at=None):
+        # The real sync confirms the (readable) order book; the fake must
+        # too, otherwise start() withholds the baseline by design.
+        engine._fill_sync_confirmed = True
+        engine._fill_sync_blocked = False
         calls.append("sync")
         stamps["sync"] = executed_at
         return 0
@@ -240,24 +404,26 @@ def test_start_syncs_fills_before_stamping_the_ledger_baseline(
 def test_startup_synced_fills_are_not_replayed_by_the_eod_ledger(tmp_path):
     """The R12 ledger applies only trades at/after the baseline stamp.
 
-    Startup catch-up books fills that the broker's *baseline book already
-    contains*, so their timestamps must sort strictly before it; otherwise
-    EOD would count the same shares twice.
+    Both guards are load-bearing and this test is sensitive to each:
+    * the broker's ``updated_at`` is in the future (QMT stamps observation
+      time, and a skewed clock must not move a pre-baseline fill into the
+      ledger) -- only the ``executed_at`` override keeps it out;
+    * ``not_before`` is in the future, so the clamp (not the wall clock)
+      must place ``created_at`` strictly after the trade.
     """
-    from datetime import datetime
-
     from quant_platform.operations.reconciliation import ledger_from_trades
 
     store = Store(str(tmp_path / "engine.db"))
     recovered = _order(
         filled_quantity=100, filled_price=10.0, status=OrderStatus.FILLED,
+        updated_at="2999-01-02T00:00:00",
     )
     engine = LiveTradingEngine(
         broker=FakeBroker([recovered]), store=store,
         bus=EventBus(), risk_monitor=RiskMonitor(),
     )
 
-    startup_sync_at = datetime.now()
+    startup_sync_at = datetime(2999, 1, 1, 0, 0, 0)
     assert engine._sync_broker_fills(
         executed_at=startup_sync_at.isoformat(),
     ) == 1
@@ -266,7 +432,12 @@ def test_startup_synced_fills_are_not_replayed_by_the_eod_ledger(tmp_path):
     baseline = store.get_latest_ledger_baseline()
     trades = store.get_trades_for_export(tenant_id="default")
     assert len(trades) == 1
-    assert trades[0]["executed_at"] < baseline["created_at"]
+    assert trades[0]["executed_at"] == startup_sync_at.isoformat(), (
+        "the startup override must win over the broker's observation stamp"
+    )
+    assert baseline["created_at"] > startup_sync_at.isoformat(), (
+        "the not_before clamp must force the baseline strictly later"
+    )
     assert ledger_from_trades(baseline, trades)["positions"] == {}, (
         "a startup-synced fill must not be replayed on top of the baseline"
     )
@@ -309,6 +480,93 @@ def test_kill_switch_cycles_still_sync_fills(tmp_path, monkeypatch):
     assert calls == ["sync"]
 
 
+def test_stale_quote_cycles_still_sync_fills(tmp_path, monkeypatch):
+    """M4: a dead feed returns before Step 4; fills must still be booked."""
+    engine = _simulated_engine(tmp_path)
+    engine._last_prices_update = "2026-10-20T09:30:00"
+    monkeypatch.setattr(engine, "_aggregate_quote_age", lambda: 9999.0)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        engine, "_sync_broker_fills",
+        lambda *args, **kwargs: calls.append("sync") or 0,
+    )
+
+    engine._execute_cycle()
+
+    assert calls == ["sync"]
+
+
+def test_unknown_position_book_cycles_still_sync_fills(tmp_path, monkeypatch):
+    """M4: the order book is a separate endpoint from the failed position query."""
+    engine = _simulated_engine(tmp_path)
+    monkeypatch.setattr(
+        engine, "_query_positions", lambda trust_flat=False: (None, False),
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        engine, "_sync_broker_fills",
+        lambda *args, **kwargs: calls.append("sync") or 0,
+    )
+
+    engine._execute_cycle()
+
+    assert calls == ["sync"]
+
+
+def test_stop_syncs_fills_after_the_final_cycle(tmp_path, monkeypatch):
+    """M4: the live loop stops cycling after the close; stop() closes the ledger."""
+    engine = _simulated_engine(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        engine, "_sync_broker_fills",
+        lambda *args, **kwargs: calls.append("sync") or 0,
+    )
+
+    engine.stop()
+
+    assert calls == ["sync"]
+
+
+class _SyncDuringPlaceBroker(FakeBroker):
+    """A broker whose place_order lets a cycle sync interleave (M5)."""
+
+    def __init__(self):
+        super().__init__()
+        self.engine: LiveTradingEngine | None = None
+
+    def place_order(self, order):
+        result = BrokerOrder(
+            order_id=order.order_id, code=order.code, side=order.side,
+            quantity=order.quantity, price=order.price,
+            filled_quantity=order.quantity, filled_price=order.price,
+            status=OrderStatus.FILLED,
+        )
+        self.orders = [result]
+        # Another thread's cycle sync runs before the engine persists the
+        # synchronous fill.
+        self.engine._sync_broker_fills()
+        return result
+
+
+def test_manual_order_fill_in_flight_is_not_double_booked(tmp_path):
+    """M5: manual_order persists outside the cycle lock; the in-flight marker
+    must keep a concurrent sync from booking the same fill as a delta."""
+    broker = _SyncDuringPlaceBroker()
+    engine = LiveTradingEngine(
+        broker=broker, store=Store(str(tmp_path / "engine.db")),
+        bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+    broker.engine = engine
+
+    result = engine.manual_order("600519", "buy", 100, 10.0)
+
+    assert result["status"] == "filled"
+    trades = engine._store.get_trades()
+    assert [t["trade_id"] for t in trades] == [f"{result['order_id']}:fill"]
+    assert engine._store.get_trade_quantity_for_order(result["order_id"]) == 100
+    assert engine._fills_in_flight == set(), "the in-flight marker must be cleared"
+
+
 def test_synced_fill_emits_order_synced_never_order_filled(tmp_path):
     bus = EventBus()
     order = _order(
@@ -334,7 +592,8 @@ def test_real_time_risk_engine_receives_the_delta_not_the_cumulative(
 ):
     risk = RealTimeRiskEngine()
     order = _order(
-        filled_quantity=100, filled_price=10.0, status=OrderStatus.PARTIAL,
+        quantity=300, filled_quantity=100, filled_price=10.0,
+        status=OrderStatus.PARTIAL,
     )
     engine = _engine(tmp_path, FakeBroker([order]), risk=risk)
 
