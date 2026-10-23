@@ -213,7 +213,7 @@ quant_platform/
 │   └── providers/
 ├── factors/                # 因子引擎：20+ 技术/基本面因子 + 处理 + 评估 + 图网络
 ├── alpha/                  # Alpha 合成：等权/IC/ICIR + ML 信号
-├── portfolio/              # 组合优化：EqualWeight / MVO / RiskParity
+├── portfolio/              # 组合优化：EqualWeight / MVO / RiskParity（MVO 支持成本/换手惩罚与 ADV 容量上限）
 ├── backtest/               # 回测：向量化引擎 + 成本模型 + WalkForward + 逐笔回测
 ├── risk/                   # 风险：VaR/Barra/蒙特卡洛/熔断/Kill Switch/Regime 检测
 ├── execution/              # 执行：OMS / TWAP/VWAP/Iceberg / TCA / 订单簿
