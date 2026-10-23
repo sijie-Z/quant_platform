@@ -65,8 +65,11 @@ class FakeBaostock:
         empty_financials=False,
         only_quarters=None,
         missing_pub_codes=(),
+        missing_pub_for=(),
+        bad_pub_codes=(),
         all_missing_pub=False,
         pub_offset_days=25,
+        balance_scale=None,
     ):
         self.basic_rows = list(basic_rows or [])
         self.fail_codes = set(fail_codes)
@@ -74,8 +77,11 @@ class FakeBaostock:
         self.empty_financials = empty_financials
         self.only_quarters = set(only_quarters) if only_quarters else None
         self.missing_pub_codes = set(missing_pub_codes)
+        self.missing_pub_for = set(missing_pub_for)
+        self.bad_pub_codes = set(bad_pub_codes)
         self.all_missing_pub = all_missing_pub
         self.pub_offset_days = pub_offset_days
+        self.balance_scale = dict(balance_scale or {})
         self.basic_query_count = 0
         self.history_calls = []
         self.profit_calls = []
@@ -130,8 +136,14 @@ class FakeBaostock:
             return FakeResultSet([], fields=PROFIT_FIELDS)
         qend = _quarter_end(year, quarter)
         pub = qend + pd.Timedelta(days=self.pub_offset_days)
-        if self.all_missing_pub or code in self.missing_pub_codes:
+        if (
+            self.all_missing_pub
+            or code in self.missing_pub_codes
+            or (code, year, quarter) in self.missing_pub_for
+        ):
             pub_text = ""  # baostock returns an empty string for no pubDate
+        elif code in self.bad_pub_codes:
+            pub_text = "not-a-date"  # unparseable -> NaT -> dropped
         else:
             pub_text = pub.strftime("%Y-%m-%d")
         return FakeResultSet([[
@@ -143,9 +155,10 @@ class FakeBaostock:
     def query_balance_data(self, code="", year=2024, quarter=4):
         qend = _quarter_end(year, quarter)
         pub = qend + pd.Timedelta(days=25)
+        scale = self.balance_scale.get((year, quarter), 2.0)
         return FakeResultSet([[
             code, pub.strftime("%Y-%m-%d"), qend.strftime("%Y-%m-%d"),
-            "50.0", "2.0",
+            "50.0", str(scale),
         ]], fields=BALANCE_FIELDS)
 
     def query_stock_industry(self):
@@ -478,3 +491,57 @@ def test_dropped_rows_are_summarized_in_a_warning(
     assert "without a usable publish date" in caplog.text
     # The rest of the panel is still usable.
     assert fin["market_cap"].notna().any()
+
+
+def test_unparseable_pubdate_is_dropped_like_a_missing_one(
+    tmp_path, monkeypatch,
+):
+    fake = FakeBaostock(
+        basic_rows=universe_rows(),
+        only_quarters=[(2023, 4)],
+        bad_pub_codes={"sh.600002"},
+    )
+    provider = make_provider(fake, tmp_path, monkeypatch)
+
+    fin = provider.get_financials("2024-01-01", "2024-01-31")
+
+    assert fin.xs("600002", level="asset")["market_cap"].isna().all()
+    assert fin.xs("600002", level="asset")["publish_date"].isna().all()
+    assert fin.xs("600001", level="asset")["market_cap"].notna().any()
+
+
+def test_asset_growth_uses_same_quarter_last_year_when_a_row_is_dropped(
+    tmp_path, monkeypatch,
+):
+    """Dropping an undated report must not shift the YoY growth window.
+
+    total_assets scales by quarter (1.0/1.1/1.2/1.3/1.5 x 1e9). 2023Q2 is
+    dropped for 600001, so a positional ``pct_change(4)`` over the surviving
+    rows would return NaN (or compare across five quarters); growth for
+    2024Q1 must still be 1.5/1.0 - 1 = 0.5 against the same quarter one year
+    earlier.
+    """
+    fake = FakeBaostock(
+        basic_rows=universe_rows(),
+        missing_pub_for={("sh.600001", 2023, 2)},
+        balance_scale={
+            (2023, 1): 1.0, (2023, 2): 1.1, (2023, 3): 1.2,
+            (2023, 4): 1.3, (2024, 1): 1.5,
+        },
+    )
+    provider = make_provider(fake, tmp_path, monkeypatch)
+
+    fin = provider.get_financials("2024-01-01", "2024-04-30")
+
+    dropped_asset = fin.xs("600001", level="asset")
+    assert dropped_asset.loc[pd.Timestamp("2024-04-25"), "asset_growth"] == (
+        pytest.approx(0.5)
+    )
+    # 2023Q4 has no 2022Q4 anchor in the fetched range, as before.
+    assert pd.isna(dropped_asset.loc[pd.Timestamp("2024-01-25"), "asset_growth"])
+
+    # A complete sequence yields the same value under the new computation.
+    complete_asset = fin.xs("600002", level="asset")
+    assert complete_asset.loc[pd.Timestamp("2024-04-25"), "asset_growth"] == (
+        pytest.approx(0.5)
+    )

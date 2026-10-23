@@ -1528,7 +1528,10 @@ class BaostockDataProvider(DataProvider):
         fetch raises :class:`DataFetchIncompleteError` rather than returning
         a panel built from fabricated dates.  Columns: market_cap,
         total_assets, net_assets, revenue, net_profit, roe, pb_ratio,
-        pe_ratio, asset_growth, publish_date.  No backward fill.
+        pe_ratio, asset_growth, publish_date.  ``asset_growth`` is the
+        year-over-year change in total assets against the same fiscal quarter
+        one year earlier, computed on the fetched report sequence before
+        undated rows are dropped.  No backward fill.
         """
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
@@ -1603,6 +1606,11 @@ class BaostockDataProvider(DataProvider):
         report_rows = 0
         dropped_no_pub = 0
         dropped_after_end = 0
+        # total_assets per (asset, fiscal year, quarter) from every fetched
+        # report, including rows later dropped from the panel. asset_growth
+        # is a same-quarter-last-year ratio computed from this basis, so
+        # dropping an undated report cannot shift the YoY window.
+        growth_assets: dict[tuple[str, int, int], float] = {}
 
         for code in codes:
             bs_code = _to_bs_code(code)
@@ -1622,6 +1630,9 @@ class BaostockDataProvider(DataProvider):
                     continue
                 report_rows += 1
 
+                # Balances are fetched before the pubDate check on purpose: a
+                # report dropped for a missing pubDate still anchors next
+                # year's same-quarter asset growth.
                 balance = self._balance_row(bs, bs_code, year, quarter)
                 stat_date = _as_date(profit.get("statDate"))
                 pub_date = _as_date(profit.get("pubDate"))
@@ -1629,6 +1640,16 @@ class BaostockDataProvider(DataProvider):
                 net_profit = _as_float(profit.get("netProfit"))
                 revenue = _as_float(profit.get("MBRevenue"))
                 total_share = _as_float(profit.get("totalShare"))
+
+                net_assets = float("nan")
+                if math.isfinite(roe_pct) and roe_pct != 0.0:
+                    net_assets = net_profit / (roe_pct / 100.0)
+                total_assets = float("nan")
+                if balance is not None:
+                    asset_to_equity = _as_float(balance.get("assetToEquity"))
+                    if math.isfinite(asset_to_equity) and math.isfinite(net_assets):
+                        total_assets = net_assets * asset_to_equity
+                growth_assets[(code, year, quarter)] = total_assets
 
                 if pd.isna(pub_date):
                     # No publication date -> no honest visibility date. The
@@ -1652,15 +1673,6 @@ class BaostockDataProvider(DataProvider):
                     continue  # published after the sample ends
                 visible_date = trading_dates[pos]
 
-                net_assets = float("nan")
-                if math.isfinite(roe_pct) and roe_pct != 0.0:
-                    net_assets = net_profit / (roe_pct / 100.0)
-                total_assets = float("nan")
-                if balance is not None:
-                    asset_to_equity = _as_float(balance.get("assetToEquity"))
-                    if math.isfinite(asset_to_equity) and math.isfinite(net_assets):
-                        total_assets = net_assets * asset_to_equity
-
                 market_cap = float("nan")
                 if math.isfinite(total_share):
                     try:
@@ -1683,6 +1695,8 @@ class BaostockDataProvider(DataProvider):
                     "date": visible_date,
                     "asset": code,
                     "stat_date": stat_date,
+                    "_year": year,
+                    "_quarter": quarter,
                     "market_cap": market_cap,
                     "total_assets": total_assets,
                     "net_assets": net_assets,
@@ -1724,12 +1738,31 @@ class BaostockDataProvider(DataProvider):
         if not records:
             return _empty_financials()
 
+        # YoY asset growth against the same fiscal quarter one year earlier,
+        # resolved on the full fetched report sequence. Doing this before the
+        # old positional pct_change(4) means a dropped undated report cannot
+        # make a later quarter compare against the wrong quarter.
+        for record in records:
+            prior_assets = growth_assets.get(
+                (
+                    record["asset"],
+                    record.pop("_year") - 1,
+                    record.pop("_quarter"),
+                ),
+                float("nan"),
+            )
+            total_assets = record["total_assets"]
+            growth = float("nan")
+            if (
+                math.isfinite(total_assets)
+                and math.isfinite(prior_assets)
+                and prior_assets != 0.0
+            ):
+                growth = total_assets / prior_assets - 1.0
+            record["asset_growth"] = growth
+
         df = pd.DataFrame(records)
         df = df.sort_values(["asset", "stat_date"])
-        df["asset_growth"] = (
-            df.groupby("asset", sort=False)["total_assets"]
-            .pct_change(4, fill_method=None)
-        )
         df = df.drop(columns=["stat_date"])
         df = df.drop_duplicates(subset=["date", "asset"], keep="last")
         df = df.set_index(["date", "asset"]).sort_index()
