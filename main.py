@@ -858,9 +858,10 @@ def _load_data(
             ohlc = {}
         if ohlc:
             metadata.attrs["factor_ohlc"] = ohlc
-        # Index-membership PIT provenance (R6a): whether the provider's
-        # per-date constituent mask actually constrained `tradable_mask`, and
-        # why not when it was refused. A plain dict, safe as a frame attr.
+        # Index-membership PIT provenance (R6a/R6b): whether the provider's
+        # per-date constituent mask was applied as the separate
+        # `universe_mask` (buys only; sells stay on `tradable_mask`), and why
+        # not when it was refused. A plain dict, safe as a frame attr.
         universe_pit = getattr(pipeline, "universe_pit", None)
         if universe_pit:
             metadata.attrs["universe_pit"] = universe_pit
@@ -1096,7 +1097,15 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
 
 
 def _execution_gates(metadata):
-    """Execution-day tradability panels attached by `_load_data`, if any."""
+    """Execution-day tradability panels attached by `_load_data`, if any.
+
+    The dict carries ``tradable_mask`` / ``universe_mask`` / ``limit_up`` /
+    ``limit_down`` (R6b split index membership out of tradability).  The
+    engine restricts buys to ``tradable_mask & universe_mask`` and sells to
+    ``tradable_mask`` only, so an index exit blocks new positions without
+    trapping a held one.  Returns ``None`` when no gates were attached (the
+    engine then treats every day as tradeable).
+    """
     attrs = getattr(metadata, "attrs", None)
     return attrs.get("execution_gates") if attrs else None
 
@@ -1106,9 +1115,11 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
     """Set up and run backtest engine. Returns results dict.
 
     ``gates`` is the pipeline's execution-day tradability set
-    (``tradable_mask``/``limit_up``/``limit_down``, normally read from
-    ``metadata.attrs["execution_gates"]``). Without it the engine fills at
-    any next-bar close, including limit-up opens and suspension days.
+    (``tradable_mask`` / ``universe_mask`` / ``limit_up`` / ``limit_down``,
+    normally read from ``metadata.attrs["execution_gates"]``). Without it the
+    engine fills at any next-bar close, including limit-up opens and
+    suspension days. ``universe_mask`` gates buys only (index membership);
+    sells remain gated by ``tradable_mask`` so an index exit can be closed.
     """
     from quant_platform.backtest.cost_model import CostModel
     from quant_platform.backtest.engine import BacktestEngine

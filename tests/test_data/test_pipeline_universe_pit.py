@@ -1,16 +1,18 @@
-"""Index-membership PIT gate (R6a).
+"""Index-membership PIT gate (R6a; buy/sell split in R6b).
 
 The provider already builds a per-date constituent mask
 (``get_index_membership_mask``), but the pipeline never consumed it: a stock
 that joined the index mid-sample was treated as a member over the whole
 sample ("样本期内成分并集").  These tests pin the gate:
 
-* per-date membership history is ANDed into ``tradable_mask``;
+* per-date membership history feeds a dedicated ``universe_mask``; the
+  ``tradable_mask`` stays membership-free so a held position can still be
+  sold after its index exit;
 * a provider whose constituent data is a single end-date snapshot is refused
   (replaying it as history is the same look-ahead);
-* providers without the hook behave exactly as before;
+* providers without the hook behave exactly as before (universe all True);
 * provenance reaches ``metadata.attrs["universe_pit"]`` through
-  ``main._load_data``;
+  ``main._load_data`` and the gates carry ``universe_mask``;
 * a column mismatch applies the intersection instead of silently excluding
   unmatched assets;
 * a mask fetch failure is fatal, not silently all-True/all-False.
@@ -33,16 +35,19 @@ DATES = pd.bdate_range("2024-01-02", periods=N_DATES, name="date")
 ASSETS = ["000001.SZ", "000002.SZ", "000003.SZ"]
 #: 000002.SZ joins the index on this business-day offset.
 INCLUSION_DAY = 60
+#: 000003.SZ leaves the index on this business-day offset (R6b exit test).
+EXIT_DAY = 120
+N_EXIT_DATES = 180
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "default.yaml"
 
 
-def _close_panel(seed: int = 17) -> pd.DataFrame:
+def _close_panel(seed: int = 17, dates: pd.DatetimeIndex = DATES) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    steps = rng.normal(0.0006, 0.009, (N_DATES, len(ASSETS)))
+    steps = rng.normal(0.0006, 0.009, (len(dates), len(ASSETS)))
     return pd.DataFrame(
         100.0 * np.exp(np.cumsum(steps, axis=0)),
-        index=DATES,
+        index=dates,
         columns=pd.Index(ASSETS, name="asset"),
     )
 
@@ -50,8 +55,14 @@ def _close_panel(seed: int = 17) -> pd.DataFrame:
 class _BaseFixtureProvider(DataProvider):
     """Deterministic provider with no membership hook (baseline behaviour)."""
 
-    def __init__(self, *, suspended_window: tuple[str, int, int] | None = None):
-        self._close = _close_panel()
+    def __init__(
+        self,
+        *,
+        suspended_window: tuple[str, int, int] | None = None,
+        n_dates: int = N_DATES,
+    ):
+        self._dates = pd.bdate_range("2024-01-02", periods=n_dates, name="date")
+        self._close = _close_panel(dates=self._dates)
         self._suspended_window = suspended_window
 
     # -- provider API ---------------------------------------------------
@@ -69,7 +80,7 @@ class _BaseFixtureProvider(DataProvider):
 
     def get_prices(self, start_date, end_date, fields=None) -> pd.DataFrame:
         index = pd.MultiIndex.from_product(
-            [DATES, ASSETS], names=["date", "asset"]
+            [self._dates, ASSETS], names=["date", "asset"]
         )
         close = self._close.stack().reindex(index).to_numpy()
         frame = pd.DataFrame(
@@ -87,7 +98,7 @@ class _BaseFixtureProvider(DataProvider):
         suspended = pd.Series(False, index=index)
         if self._suspended_window is not None:
             asset, first, last = self._suspended_window
-            window = (DATES[first], DATES[last], asset)
+            window = (self._dates[first], self._dates[last], asset)
             suspended = (
                 (index.get_level_values("date") >= window[0])
                 & (index.get_level_values("date") <= window[1])
@@ -98,7 +109,7 @@ class _BaseFixtureProvider(DataProvider):
 
     def get_financials(self, start_date, end_date) -> pd.DataFrame:
         index = pd.MultiIndex.from_product(
-            [DATES, ASSETS], names=["date", "asset"]
+            [self._dates, ASSETS], names=["date", "asset"]
         )
         return pd.DataFrame(
             {
@@ -110,14 +121,15 @@ class _BaseFixtureProvider(DataProvider):
         )
 
     def get_benchmark(self, start_date, end_date) -> pd.Series:
-        return pd.Series(0.0005, index=DATES, name="benchmark")
+        return pd.Series(0.0005, index=self._dates, name="benchmark")
 
 
 class _MembershipProvider(_BaseFixtureProvider):
     """Provider exposing a per-date constituent history.
 
     ``history_available=False`` models the single end-date snapshot fallback:
-    the hook exists but must not be trusted as history.
+    the hook exists but must not be trusted as history.  ``exit_day`` models
+    a constituent dropping out of the index at that business-day offset.
     """
 
     def __init__(
@@ -132,6 +144,8 @@ class _MembershipProvider(_BaseFixtureProvider):
         bad_mask_type: bool = False,
         extra_mask_columns: bool = False,
         outside_window_mask: bool = False,
+        inclusion_day: int = INCLUSION_DAY,
+        exit_day: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -144,6 +158,8 @@ class _MembershipProvider(_BaseFixtureProvider):
         self._bad_mask_type = bad_mask_type
         self._extra_mask_columns = extra_mask_columns
         self._outside_window_mask = outside_window_mask
+        self._inclusion_day = inclusion_day
+        self._exit_day = exit_day
 
     def get_index_membership_mask(
         self, start_date: str, end_date: str,
@@ -161,13 +177,15 @@ class _MembershipProvider(_BaseFixtureProvider):
             # A provider that ignores start/end and returns snapshots only
             # after the price window: two rows, zero usable snapshots.
             future = pd.DatetimeIndex(
-                [DATES[-1] + pd.tseries.offsets.BDay(1),
-                 DATES[-1] + pd.tseries.offsets.BDay(2)],
+                [self._dates[-1] + pd.tseries.offsets.BDay(1),
+                 self._dates[-1] + pd.tseries.offsets.BDay(2)],
                 name="date",
             )
             return pd.DataFrame(True, index=future, columns=bare)
-        mask = pd.DataFrame(True, index=DATES, columns=bare)
-        mask.iloc[:INCLUSION_DAY, 1] = False  # 000002 joins at INCLUSION_DAY
+        mask = pd.DataFrame(True, index=self._dates, columns=bare)
+        mask.iloc[:self._inclusion_day, 1] = False  # 000002 joins here
+        if self._exit_day is not None:
+            mask.iloc[self._exit_day:, 2] = False   # 000003 leaves here
         if self._extra_mask_columns:
             mask["000099"] = True
         if self._snapshot_offsets is not None:
@@ -186,31 +204,60 @@ class _HookWithoutFlagProvider(_BaseFixtureProvider):
         self, start_date: str, end_date: str,
     ) -> pd.DataFrame:
         bare = [asset.split(".")[0] for asset in ASSETS]
-        mask = pd.DataFrame(True, index=DATES, columns=bare)
+        mask = pd.DataFrame(True, index=self._dates, columns=bare)
         return mask.loc[pd.Timestamp(start_date):pd.Timestamp(end_date)]
 
 
 def _run(provider: DataProvider) -> DataPipeline:
+    dates = getattr(provider, "_dates", DATES)
     pipeline = DataPipeline(
         provider=provider,
-        start_date=str(DATES[0].date()),
-        end_date=str(DATES[-1].date()),
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
     )
     pipeline.run()
     return pipeline
 
 
+def _assert_tradable_is_membership_free(pipeline: DataPipeline) -> None:
+    """Membership must never narrow `tradable_mask` (R6b).
+
+    The fixture has no ST/suspension days, so the whole panel stays True.
+    """
+    expected = pd.DataFrame(
+        True, index=pipeline.tradable_mask.index,
+        columns=pipeline.tradable_mask.columns,
+    )
+    pd.testing.assert_frame_equal(
+        pipeline.tradable_mask, expected, check_freq=False,
+    )
+
+
+def _assert_universe_all_true(pipeline: DataPipeline) -> None:
+    universe = pipeline.universe_mask
+    assert universe is not None
+    assert universe.dtypes.eq(bool).all()
+    assert universe.all().all()
+    assert list(universe.columns) == ASSETS
+
+
 class TestMembershipMaskApplied:
-    def test_per_date_history_narrows_tradable_mask(self):
+    def test_per_date_history_narrows_universe_not_tradability(self):
         pipeline = _run(_MembershipProvider(history_available=True))
 
-        mask = pipeline.tradable_mask
-        assert list(mask.columns) == ASSETS
-        assert not mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
-        assert mask["000002.SZ"].iloc[INCLUSION_DAY:].all()
+        # R6b: membership lives in its own mask; `tradable_mask` is exactly
+        # the ST/listing/suspension mask (all True for this fixture).
+        _assert_tradable_is_membership_free(pipeline)
+
+        universe = pipeline.universe_mask
+        assert universe is not None
+        assert list(universe.columns) == ASSETS
+        assert universe.index.equals(DATES)
+        assert not universe["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        assert universe["000002.SZ"].iloc[INCLUSION_DAY:].all()
         # Members throughout are unaffected.
-        assert mask["000001.SZ"].all()
-        assert mask["000003.SZ"].all()
+        assert universe["000001.SZ"].all()
+        assert universe["000003.SZ"].all()
 
         pit = pipeline.universe_pit
         assert pit["applied"] is True
@@ -218,21 +265,18 @@ class TestMembershipMaskApplied:
         assert pit["index_code"] == "000300.SH"
         assert pit["reason"] == "per_date_constituent_history"
 
-        assert pipeline.universe_mask is not None
-        assert list(pipeline.universe_mask.columns) == ASSETS
-        assert pipeline.universe_mask.index.equals(DATES)
-        assert not pipeline.universe_mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
-        assert pipeline.universe_mask["000002.SZ"].iloc[INCLUSION_DAY:].all()
-
-        # Membership gates tradability only: the price history stays intact so
+        # Membership gates buys only: the price history stays intact so
         # factor lookbacks across the inclusion date still work.
         close = pipeline.prices["close"].unstack("asset")
         assert close["000002.SZ"].iloc[:INCLUSION_DAY].notna().all()
         assert close["000002.SZ"].iloc[INCLUSION_DAY:].notna().all()
 
-        # The execution gates consume the same narrowed mask.
+        # The execution gates carry both panels, separated.
         gates = pipeline.get_execution_gates()
-        pd.testing.assert_frame_equal(gates["tradable_mask"], mask)
+        pd.testing.assert_frame_equal(
+            gates["tradable_mask"], pipeline.tradable_mask,
+        )
+        pd.testing.assert_frame_equal(gates["universe_mask"], universe)
 
     def test_mask_labels_are_normalized(self):
         pipeline = _run(_MembershipProvider(history_available=True))
@@ -240,6 +284,33 @@ class TestMembershipMaskApplied:
         assert pipeline.universe_mask is not None
         assert "000001.SZ" in pipeline.universe_mask.columns
         assert pipeline.universe_mask["000001.SZ"].all()
+
+
+class TestMembershipExit:
+    """R6b: an index exit must end buy eligibility but not sellability."""
+
+    def test_exit_asset_leaves_universe_but_not_tradability(self):
+        provider = _MembershipProvider(
+            history_available=True, n_dates=N_EXIT_DATES, exit_day=EXIT_DAY,
+        )
+        pipeline = _run(provider)
+        dates = provider._dates
+        universe = pipeline.universe_mask
+
+        # A is a member throughout.
+        assert universe["000001.SZ"].all()
+        # B joins on day 60 and stays.
+        assert not universe["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        assert universe["000002.SZ"].iloc[INCLUSION_DAY:].all()
+        # C is a member until day 120, then exits for good.
+        assert universe["000003.SZ"].iloc[:EXIT_DAY].all()
+        assert not universe["000003.SZ"].iloc[EXIT_DAY:].any()
+
+        # The exit does not remove C from the factor universe / sellability:
+        # `tradable_mask` remains membership-free.
+        _assert_tradable_is_membership_free(pipeline)
+        assert pipeline.universe_pit["applied"] is True
+        assert pipeline.universe_mask.index.equals(dates)
 
 
 class TestSnapshotDatedMask:
@@ -254,19 +325,22 @@ class TestSnapshotDatedMask:
             history_available=True, snapshot_offsets=[10, 30, 60, 80],
         )
         pipeline = _run(provider)
-        mask = pipeline.tradable_mask
+        universe = pipeline.universe_mask
 
         # Before the first snapshot nothing is known: not members.
-        assert not mask["000001.SZ"].iloc[:10].any()
-        assert not mask["000002.SZ"].iloc[:10].any()
+        assert not universe["000001.SZ"].iloc[:10].any()
+        assert not universe["000002.SZ"].iloc[:10].any()
         # Snapshot at day 10 includes A; membership persists between
         # snapshots (day 15 is not a snapshot date).
-        assert mask["000001.SZ"].iloc[10:].all()
-        assert pipeline.universe_mask.loc[DATES[15], "000001.SZ"]
-        assert not mask["000002.SZ"].iloc[10:60].any()
+        assert universe["000001.SZ"].iloc[10:].all()
+        assert universe.loc[DATES[15], "000001.SZ"]
+        assert not universe["000002.SZ"].iloc[10:60].any()
         # Snapshot at day 60 includes B; it stays a member to the end.
-        assert mask["000002.SZ"].iloc[60:].all()
-        assert pipeline.universe_mask.loc[DATES[65], "000002.SZ"]
+        assert universe["000002.SZ"].iloc[60:].all()
+        assert universe.loc[DATES[65], "000002.SZ"]
+
+        # None of this narrows tradability (R6b).
+        _assert_tradable_is_membership_free(pipeline)
 
 
 class TestSingleSnapshotRefused:
@@ -275,9 +349,10 @@ class TestSingleSnapshotRefused:
         with caplog.at_level(logging.WARNING):
             pipeline = _run(provider)
 
-        # Nothing changed: 000002 was tradable under the ordinary rules.
+        # Nothing changed: 000002 was tradable under the ordinary rules and
+        # the universe stays neutral (all True).
         assert pipeline.tradable_mask["000002.SZ"].all()
-        assert pipeline.universe_mask is None
+        _assert_universe_all_true(pipeline)
         assert pipeline.universe_pit["applied"] is False
         assert (
             pipeline.universe_pit["reason"]
@@ -306,7 +381,7 @@ class TestNoHookProviderUnchanged:
             pipeline.tradable_mask, expected, check_freq=False
         )
 
-        assert pipeline.universe_mask is None
+        _assert_universe_all_true(pipeline)
         assert pipeline.universe_pit == {
             "applied": False,
             "source": None,
@@ -335,18 +410,18 @@ class TestColumnMismatch:
         with caplog.at_level(logging.WARNING):
             pipeline = _run(provider)
 
-        mask = pipeline.tradable_mask
+        universe = pipeline.universe_mask
         # Intersection (A, B) applied...
-        assert not mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
-        assert mask["000002.SZ"].iloc[INCLUSION_DAY:].all()
-        assert mask["000001.SZ"].all()
-        # ...and the asset with no mask column is left unchanged, not silently
+        assert not universe["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        assert universe["000002.SZ"].iloc[INCLUSION_DAY:].all()
+        assert universe["000001.SZ"].all()
+        # ...and the asset with no mask column stays a member, not silently
         # excluded.
-        assert mask["000003.SZ"].all()
+        assert universe["000003.SZ"].all()
+        assert list(universe.columns) == ASSETS
 
         assert pipeline.universe_pit["applied"] is True
-        assert pipeline.universe_mask is not None
-        assert list(pipeline.universe_mask.columns) == ["000001.SZ", "000002.SZ"]
+        _assert_tradable_is_membership_free(pipeline)
         assert any(
             "do not match the tradable panel" in record.getMessage()
             for record in caplog.records
@@ -370,7 +445,7 @@ class TestSingleSnapshotMaskShape:
             pipeline = _run(provider)
 
         assert pipeline.tradable_mask.all().all()
-        assert pipeline.universe_mask is None
+        _assert_universe_all_true(pipeline)
         assert pipeline.universe_pit["applied"] is False
         assert (
             pipeline.universe_pit["reason"]
@@ -384,6 +459,7 @@ class TestSingleSnapshotMaskShape:
     def test_missing_availability_attribute_is_refused(self):
         pipeline = _run(_HookWithoutFlagProvider())
         assert pipeline.tradable_mask.all().all()
+        _assert_universe_all_true(pipeline)
         assert pipeline.universe_pit["applied"] is False
         assert (
             pipeline.universe_pit["reason"]
@@ -398,6 +474,7 @@ class TestSingleSnapshotMaskShape:
         )
         pipeline = _run(provider)
         assert pipeline.tradable_mask.all().all()
+        _assert_universe_all_true(pipeline)
         assert pipeline.universe_pit["applied"] is False
         assert (
             pipeline.universe_pit["reason"]
@@ -410,7 +487,7 @@ class TestMaskShapeEdges:
         provider = _MembershipProvider(history_available=True, empty_mask=True)
         pipeline = _run(provider)
         assert pipeline.tradable_mask.all().all()
-        assert pipeline.universe_mask is None
+        _assert_universe_all_true(pipeline)
         assert pipeline.universe_pit["applied"] is False
         assert pipeline.universe_pit["reason"] == "empty_membership_mask"
 
@@ -429,7 +506,8 @@ class TestMaskShapeEdges:
         assert pipeline.universe_pit["applied"] is True
         assert pipeline.universe_mask is not None
         assert "000099.SZ" not in pipeline.universe_mask.columns
-        assert not pipeline.tradable_mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        assert not pipeline.universe_mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        _assert_tradable_is_membership_free(pipeline)
         assert any(
             "matching no asset" in record.getMessage()
             for record in caplog.records
@@ -454,8 +532,9 @@ class TestValidatedWrapper:
             pipeline.universe_pit["reason"]
             == "per_date_constituent_history"
         )
-        assert not pipeline.tradable_mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
-        assert pipeline.tradable_mask["000002.SZ"].iloc[INCLUSION_DAY:].all()
+        assert not pipeline.universe_mask["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        assert pipeline.universe_mask["000002.SZ"].iloc[INCLUSION_DAY:].all()
+        _assert_tradable_is_membership_free(pipeline)
 
 
 class TestMaskFailureIsFatal:
@@ -490,6 +569,16 @@ class TestMainProvenanceWiring:
         assert pit["applied"] is True
         assert pit["reason"] == "per_date_constituent_history"
         assert pit["index_code"] == "000300.SH"
+
+        # R6b: the execution gates delivered to the backtest carry the
+        # separate universe mask; tradability stays membership-free.
+        gates = metadata.attrs["execution_gates"]
+        assert "universe_mask" in gates
+        assert "tradable_mask" in gates
+        assert gates["tradable_mask"].all().all()
+        universe = gates["universe_mask"]
+        assert not universe["000002.SZ"].iloc[:INCLUSION_DAY].any()
+        assert universe["000002.SZ"].iloc[INCLUSION_DAY:].all()
 
     def test_load_data_provenance_records_refusal(self):
         from quant_platform.main import _load_data
