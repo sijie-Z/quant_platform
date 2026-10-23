@@ -22,6 +22,7 @@
 一个覆盖 **研究 → 验证 → 实盘** 全链路的 A 股量化平台：
 
 - **研究层**：20+ 因子引擎、IC/ICIR 评估、因子合成、Walk-Forward 验证、组合优化
+- **数据层**：Tushare 逐日指数成分掩码接入 PIT 交易性门禁（`universe_history_available` 为真才应用；单快照回退显式拒绝并告警，`metadata.attrs["universe_pit"]` 留痕）
 - **验证层**：Oracle IC / Known Alpha / Rank IC 对照等验证工具；No-Lookahead 契约 8 条均已实现并有回归测试守护，残余风险见「研究验证」与 HANDOVER
 - **实盘层**：实时行情、Paper Trading 模拟盘、QMT 实盘接口、实时风控熔断、执行算法
 - **展示层**：FastAPI 99 个 HTTP 端点 + WebSocket 实时推送 + Vue 3 Bloomberg 风格仪表盘

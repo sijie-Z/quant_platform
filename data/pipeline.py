@@ -8,7 +8,8 @@ Transforms raw data provider output into analysis-ready DataFrames with:
   ``KeyError``.
 - Suspension handling (forward-fill, NaN masking, derived from the data)
 - Point-in-time asset-day eligibility mask (ST episodes, listing window,
-  mid-sample delisting, suspension), no look-ahead
+  mid-sample delisting, suspension, and -- when the provider has real
+  date-stamped history -- index membership), no look-ahead
 - Date alignment across prices, financials, and benchmark
 - Derived fields (daily returns, adjusted prices)
 
@@ -186,6 +187,24 @@ class DataPipeline:
         # punch a hole in the rolling history (factor output is still blanked
         # on suspended days by `tradable_mask`).
         self._hard_eligible: pd.DataFrame | None = None
+
+        # Index-membership PIT provenance (R6a).  Filled by
+        # `_apply_pit_tradability_mask` on every run: whether the provider's
+        # per-date constituent mask was ANDed into `tradable_mask`, from
+        # where, and why not when it was refused.  `main._load_data` copies
+        # this dict into `metadata.attrs["universe_pit"]`.
+        self.universe_pit: dict = {
+            "applied": False,
+            "source": None,
+            "reason": "pipeline_not_run",
+        }
+
+        # (date x asset) constituent mask actually applied, aligned to the
+        # price dates and to the columns of `tradable_mask`.  None when no
+        # mask was applied (no hook, single-snapshot fallback, mismatch).
+        # Exposed for downstream cross-section consumers; this pipeline does
+        # not consume it itself.
+        self.universe_mask: pd.DataFrame | None = None
 
         # (date x asset) suspension flags derived inside `_clean_prices` from
         # the data itself (missing/stale/zero-volume rows), not merely from an
@@ -958,7 +977,10 @@ class DataPipeline:
 
         ``st_eligible`` keeps its original meaning (ST episodes only) for
         reporting; ``tradable_mask`` is the combined ST/listing/delisting/
-        suspension mask consumed by the factor stage.
+        suspension mask consumed by the factor stage, ANDed with the
+        provider's per-date index-membership mask when (and only when) the
+        provider has real constituent history (see
+        `_apply_universe_membership`).
 
         Delisted names: factors and signals are NaN from the delisting date,
         so the optimizer cannot open a new position.  A position still marked
@@ -995,6 +1017,7 @@ class DataPipeline:
                 index=dates, columns=assets, fill_value=False
             )
         tradable = hard_eligible & ~suspended
+        tradable = self._apply_universe_membership(tradable, dates)
 
         flat = hard_eligible.stack()
         flat = flat.reindex(prices.index, fill_value=True).astype(bool)
@@ -1027,7 +1050,151 @@ class DataPipeline:
         )
         self._hard_eligible = hard_eligible.loc[:, ever_eligible]
         self.tradable_mask = tradable.loc[:, ever_eligible]
+        if self.universe_mask is not None:
+            # Keep only the columns that survive the ever-eligible filter;
+            # never synthesize an all-False column for an unmatched asset.
+            self.universe_mask = self.universe_mask.loc[
+                :, self.universe_mask.columns.intersection(kept)
+            ]
         self.prices = prices
+
+    def _apply_universe_membership(
+        self, tradable: pd.DataFrame, dates: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        """AND the provider's per-date index-membership mask into tradability.
+
+        Only a provider that advertises *date-stamped* constituent history
+        (``universe_history_available is True``) is trusted.  A provider that
+        exposes ``get_index_membership_mask`` but whose data is a single
+        end-date snapshot would replay the final constituents over the whole
+        sample -- the same look-ahead this gate exists to remove -- so it is
+        refused with a warning and tradability is left unchanged.
+
+        The mask is aligned to the panel by date (dates the provider did not
+        return are treated as "not a member") and by asset (only the column
+        intersection is applied; assets with no mask column keep their
+        previous eligibility instead of being silently excluded).  A mask
+        fetch that raises aborts the run: silently treating a broken mask as
+        all-True or all-False would silently change the universe.
+
+        Provider contract: ``get_index_membership_mask(start, end)`` returns
+        a boolean date x asset frame covering the sample.
+        """
+        provider = self.provider
+        hook = getattr(provider, "get_index_membership_mask", None)
+        if not callable(hook):
+            self.universe_pit = {
+                "applied": False,
+                "source": None,
+                "reason": "provider_has_no_membership_mask",
+            }
+            self.universe_mask = None
+            return tradable
+
+        provenance: dict = {"applied": False, "source": "get_index_membership_mask"}
+        index_code = getattr(provider, "index_code", None)
+        if index_code:
+            provenance["index_code"] = str(index_code)
+
+        if getattr(provider, "universe_history_available", False) is not True:
+            logger.warning(
+                "%s: get_index_membership_mask is exposed but "
+                "universe_history_available is not True (single end-date "
+                "snapshot fallback). Refusing to apply it: replaying the "
+                "final constituents over the whole sample is look-ahead.",
+                provider_label(provider),
+            )
+            self.universe_pit = {
+                **provenance,
+                "reason": "single_snapshot_constituent_history",
+            }
+            self.universe_mask = None
+            return tradable
+
+        try:
+            raw = hook(str(dates[0].date()), str(dates[-1].date()))
+        except Exception as exc:
+            logger.error(
+                "%s: index-membership mask fetch failed; aborting instead of "
+                "silently keeping an unmasked tradability panel",
+                provider_label(provider),
+            )
+            raise DataQualityError(
+                f"{provider_label(provider)}: get_index_membership_mask failed "
+                f"({exc}); refusing to fall back to an unmasked universe"
+            ) from exc
+
+        if not isinstance(raw, pd.DataFrame):
+            raise DataContractError(
+                f"{provider_label(provider)}: get_index_membership_mask must "
+                f"return a pandas DataFrame, got {type(raw).__name__}"
+            )
+        if raw.empty:
+            logger.warning(
+                "%s: get_index_membership_mask returned an empty frame; "
+                "leaving tradability unchanged",
+                provider_label(provider),
+            )
+            self.universe_pit = {**provenance, "reason": "empty_membership_mask"}
+            self.universe_mask = None
+            return tradable
+
+        mask = raw.copy()
+        mask.index = pd.DatetimeIndex(pd.to_datetime(mask.index), name="date")
+        mask.columns = pd.Index(
+            [normalize_symbol(str(col)) for col in mask.columns], name="asset",
+        )
+        # A provider that mixed ``600519`` and ``600519.SH`` labels collapses
+        # onto the same column; membership is "any of the duplicate labels".
+        if mask.index.has_duplicates:
+            mask = mask.groupby(level=0).any()
+        if mask.columns.has_duplicates:
+            mask = mask.T.groupby(level=0).any().T
+        mask = mask.reindex(index=dates, fill_value=False)
+        mask = mask.fillna(False).astype(bool)
+
+        common = tradable.columns.intersection(mask.columns)
+        missing = tradable.columns.difference(mask.columns)
+        extra = mask.columns.difference(tradable.columns)
+        if len(missing) or len(extra):
+            logger.warning(
+                "%s: index-membership mask columns do not match the tradable "
+                "panel (%d asset(s) without a mask column, %d mask column(s) "
+                "matching no asset); applying the %d-column intersection and "
+                "leaving unmatched assets unchanged",
+                provider_label(provider), len(missing), len(extra), len(common),
+            )
+        if len(common) == 0:
+            logger.warning(
+                "%s: index-membership mask shares no asset with the tradable "
+                "panel; leaving tradability unchanged",
+                provider_label(provider),
+            )
+            self.universe_pit = {
+                **provenance,
+                "reason": "membership_mask_columns_do_not_match",
+            }
+            self.universe_mask = None
+            return tradable
+
+        aligned = mask.loc[:, common]
+        applied = tradable.copy()
+        applied.loc[:, common] = applied.loc[:, common] & aligned
+        self.universe_mask = aligned
+        self.universe_pit = {
+            **provenance,
+            "applied": True,
+            "reason": "per_date_constituent_history",
+        }
+        logger.info(
+            "%s: applied per-date index-membership mask to %d asset(s) over "
+            "%d date(s); %d asset-day(s) lost eligibility",
+            provider_label(provider), len(common), len(dates),
+            int(
+                (tradable.loc[:, common] & ~aligned).to_numpy().sum()
+            ),
+        )
+        return applied
 
     def get_valid_assets(self) -> pd.Index:
         """Assets eligible on at least one date of the sample."""
@@ -1733,7 +1900,9 @@ class DataPipeline:
         """(date x asset) True where a new signal/weight is allowed.
 
         False on ST days (when `exclude_st`), before listing, from the
-        delisting date onward, and on suspension days.
+        delisting date onward, on suspension days, and -- when the provider
+        supplies per-date index-membership history -- on days the asset is
+        not an index constituent.
         """
         return self.tradable_mask
 

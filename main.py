@@ -858,6 +858,12 @@ def _load_data(
             ohlc = {}
         if ohlc:
             metadata.attrs["factor_ohlc"] = ohlc
+        # Index-membership PIT provenance (R6a): whether the provider's
+        # per-date constituent mask actually constrained `tradable_mask`, and
+        # why not when it was refused. A plain dict, safe as a frame attr.
+        universe_pit = getattr(pipeline, "universe_pit", None)
+        if universe_pit:
+            metadata.attrs["universe_pit"] = universe_pit
 
     global _LAST_DATA_PROVIDER, _LAST_DATA_PROVENANCE
     _LAST_DATA_PROVIDER = resolution.get("effective_provider") or provider_name
