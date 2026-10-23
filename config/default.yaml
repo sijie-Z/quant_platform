@@ -86,8 +86,10 @@ portfolio:
     # (weights, objective, constraints) is unchanged.
     transaction_cost_bps: 0.0  # one-way turnover cost in bp added to the MVO objective
     turnover_penalty: 0.0      # quadratic penalty on (w - prev_w), smooths turnover
-    max_participation: 0.0     # ADV participation cap, e.g. 0.10 = 10% of ADV; 0 = off
-                               # (needs the engine's daily_volume panel to take effect)
+    max_participation: 0.0     # ADV participation cap, e.g. 0.10 = 10% of ADV; 0 = off.
+                               # Only enforced when BacktestEngine.run() is given both
+                               # daily_volume (shares) and raw_prices (unadjusted close);
+                               # main.py run does not supply a volume panel yet.
   covariance:
     method: "ledoit_wolf"      # sample, ledoit_wolf, ewma
     lookback: 252              # Days for covariance estimation

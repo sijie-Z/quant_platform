@@ -74,6 +74,16 @@ def test_run_backtest_forwards_both_execution_masks(monkeypatch):
     assert captured["universe_mask"] is universe
 
 
+def test_default_yaml_ships_the_cost_knobs_disabled():
+    """R8 defaults must stay 0 in the shipped config (otherwise the
+    'default path unchanged' guarantee silently breaks)."""
+    config = load_config(str(DEFAULT_CONFIG))
+    constraints = config.portfolio.constraints
+    assert constraints.transaction_cost_bps == 0.0
+    assert constraints.turnover_penalty == 0.0
+    assert constraints.max_participation == 0.0
+
+
 def test_run_backtest_forwards_cost_aware_constraint_config(monkeypatch):
     """R8: the three cost-aware knobs must reach PortfolioConstraints."""
     import quant_platform.backtest.engine as engine_mod
