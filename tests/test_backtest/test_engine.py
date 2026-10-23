@@ -852,7 +852,9 @@ class TestCapacityWiring:
         falls back to its configured fixed slippage (warning)."""
         dates = pd.date_range("2024-01-01", periods=5, freq="D")
         returns = pd.DataFrame(0.0, index=dates, columns=["A", "B"])
-        volume = pd.DataFrame(1_000_000.0, index=dates, columns=["A", "B"])
+        # 10x the traded notional so the old "treat shares as CNY" behaviour
+        # would charge 0.001*sqrt(0.1) — distinguishable from fixed 0.001.
+        volume = pd.DataFrame(10_000_000.0, index=dates, columns=["A", "B"])
 
         engine = BacktestEngine(
             initial_capital=1_000_000,
