@@ -932,6 +932,7 @@ class Store:
     def get_trade_quantity_for_broker_order(
         self, broker_order_id: str, *, tenant_id: str = "",
         code: str = "", side: str = "", since: str = "",
+        exclude_order_id: str = "",
     ) -> int:
         """Sum persisted trade quantity booked under a broker wire order id.
 
@@ -944,7 +945,10 @@ class Store:
         fill. ``since`` uses the host-local clock, the same clock the broker
         adapters stamp ``created_at`` with.
 
-        Reads ``idx_orders_broker_id`` (created with the schema).
+        ``exclude_order_id`` keeps the caller's *current* local order out of
+        the sum: the engine adds this result to the current order's own
+        trades, and counting the same rows twice would under-book the next
+        incremental fill. Reads ``idx_orders_broker_id``.
         """
         if not broker_order_id:
             return 0
@@ -966,6 +970,9 @@ class Store:
         if since:
             query += " AND o.created_at >= ?"
             params.append(since)
+        if exclude_order_id:
+            query += " AND o.order_id != ?"
+            params.append(exclude_order_id)
         with self._conn() as conn:
             row = conn.execute(query, params).fetchone()
         return int(row[0] or 0) if row is not None else 0

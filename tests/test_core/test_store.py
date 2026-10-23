@@ -192,6 +192,18 @@ class TestTradeQuantityForBrokerOrder:
         assert store.get_trade_quantity_for_broker_order("missing") == 0
         assert store.get_trade_quantity_for_broker_order("") == 0
 
+    def test_exclude_order_id_prevents_self_double_count(self, store):
+        """N0: the engine adds this sum to the current order's own trades."""
+        self._book(store, "current", "9001", 40)
+        self._book(store, "older", "9001", 10)
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", code="600519", side="buy", since="2026-10-23",
+            exclude_order_id="current",
+        ) == 10
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", code="600519", side="buy", since="2026-10-23",
+        ) == 50
+
     def test_broker_id_lookup_is_indexed(self, store):
         import sqlite3
 

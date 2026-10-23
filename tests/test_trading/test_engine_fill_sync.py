@@ -209,6 +209,119 @@ def test_get_orders_failure_warns_and_the_cycle_still_completes(
     assert engine._store.get_trades() == []
 
 
+def test_partial_batches_with_a_broker_id_book_only_the_increment(tmp_path):
+    """N0: the broker-id sum must exclude the current order's own row,
+    otherwise the second print under-books (40 + 40 counted as 80)."""
+    order = _order(
+        filled_quantity=40, filled_price=10.0, status=OrderStatus.PARTIAL,
+        broker_order_id="9001",
+    )
+    engine = _engine(tmp_path, FakeBroker([order]))
+
+    assert engine._sync_broker_fills() == 1
+    order.filled_quantity = 100
+    order.filled_price = 10.2
+    order.status = OrderStatus.FILLED
+    assert engine._sync_broker_fills() == 1
+
+    trades = {t["trade_id"]: t for t in engine._store.get_trades(limit=10)}
+    assert trades["o-async:sync:40"]["quantity"] == 40
+    assert trades["o-async:sync:100"]["quantity"] == 60
+    assert engine._store.get_trade_quantity_for_order("o-async") == 100
+
+
+def test_cross_restart_partial_fill_books_only_the_remainder(tmp_path):
+    """A previous process booked 40 under its own id; the recovered order
+    must add only the missing 60 under the new id."""
+    store = Store(str(tmp_path / "engine.db"))
+    store.save_order_with_trade(
+        {
+            "order_id": "old-local", "code": "600519", "side": "buy",
+            "quantity": 100, "price": 10.0, "status": "partial",
+            "filled_quantity": 40, "filled_price": 10.0,
+            "broker_order_id": "9001",
+        },
+        {
+            "trade_id": "old-local:fill", "order_id": "old-local",
+            "code": "600519", "side": "buy", "quantity": 40, "price": 10.0,
+        },
+    )
+    recovered = _order(
+        order_id="new-local", filled_quantity=100, filled_price=10.2,
+        status=OrderStatus.FILLED, broker_order_id="9001",
+    )
+    engine = LiveTradingEngine(
+        broker=FakeBroker([recovered]), store=store,
+        bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+
+    assert engine._sync_broker_fills() == 1
+    assert store.get_trade_quantity_for_order("new-local") == 60
+    assert store.get_trade_quantity_for_order("old-local") == 40
+    assert store.get_trade_quantity_for_broker_order(
+        "9001", code="600519", side="buy", since="2000-01-01",
+    ) == 100
+
+
+def test_committed_then_raised_write_is_treated_as_booked(
+    tmp_path, monkeypatch, caplog,
+):
+    """m8: a commit that raises afterwards must not log a false critical."""
+    order = _order(
+        filled_quantity=100, filled_price=10.0, status=OrderStatus.FILLED,
+    )
+    engine = _engine(tmp_path, FakeBroker([order]))
+    real = engine._store.save_order_with_trade
+    attempts = {"n": 0}
+
+    def flaky(order_dict, trade):
+        real(order_dict, trade)
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("connection dropped after commit")
+
+    monkeypatch.setattr(engine._store, "save_order_with_trade", flaky)
+
+    with caplog.at_level(logging.WARNING):
+        assert engine._sync_broker_fills() == 1
+
+    assert engine._fill_sync_blocked is False
+    assert engine._store.get_trade_quantity_for_order("o-async") == 100
+    assert "treating it as booked" in caplog.text
+
+
+def test_fill_syncs_are_serialised(tmp_path):
+    """N9: concurrent syncs (idle loop vs run-once cycle) must not race the
+    same snapshot into two deltas."""
+    import threading
+
+    engine = _engine(tmp_path, FakeBroker([]))
+    started = threading.Event()
+    finished = threading.Event()
+
+    def worker():
+        started.set()
+        engine._sync_broker_fills()
+        finished.set()
+
+    with engine._fill_sync_lock:
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert started.wait(timeout=2.0)
+        assert not finished.wait(timeout=0.2), (
+            "a concurrent sync must wait for the sync lock"
+        )
+    assert finished.wait(timeout=2.0)
+    thread.join(timeout=2.0)
+
+
+def test_startup_explanation_contains_iterator_errors(tmp_path):
+    """N13: `_unbooked_broker_fill_deltas` must not leak non-TypeError
+    iterator exceptions into `_restore_state`."""
+    engine = _engine(tmp_path, _ExplodingBookBroker())
+    assert engine._unbooked_broker_fill_deltas() is None
+
+
 def _freeze_pre_market(engine, monkeypatch) -> None:
     """No network fetch and no cycles: 09:00 is outside the session."""
     monkeypatch.setattr(engine, "_fetch_prices", lambda: None)

@@ -258,6 +258,11 @@ class LiveTradingEngine:
         # whole window.
         self._fills_in_flight = 0
         self._fills_in_flight_lock = threading.Lock()
+        # One sync at a time: the idle loop after the close, a run-once
+        # cycle and a manual trigger can call the sync concurrently, and two
+        # delta reads racing the same broker snapshot would each book the
+        # same fill.
+        self._fill_sync_lock = threading.Lock()
         # R13 startup-sync outcome: `confirmed` means the broker order book
         # was actually readable; `blocked` means a filled order could not be
         # booked (query/write failure) and a later cycle might retry it. Both
@@ -1446,6 +1451,10 @@ class LiveTradingEngine:
         could not be booked (and might be retried later); ``start`` uses both
         to decide whether a baseline may be written.
         """
+        with self._fill_sync_lock:
+            return self._sync_broker_fills_locked(executed_at=executed_at)
+
+    def _sync_broker_fills_locked(self, executed_at: str | None = None) -> int:
         self._fill_sync_confirmed = False
         self._fill_sync_blocked = False
         with self._fills_in_flight_lock:
@@ -1459,10 +1468,11 @@ class LiveTradingEngine:
         # QMT's get_orders() degrades to its in-memory cache -- an empty list
         # on a fresh process -- when the broker query fails. Ask the adapter's
         # raw resync path for the real outcome when it exposes one; adapters
-        # without it (paper/test) are trusted through get_orders().
+        # without it (paper/test) are trusted through get_orders(). Only the
+        # startup call needs the confirmation, so cycles skip the extra query.
         resync_probe = getattr(self._broker, "_resync_from_broker", None)
         probe_ok = True
-        if callable(resync_probe):
+        if executed_at is not None and callable(resync_probe):
             try:
                 probe_ok = bool(resync_probe())
             except Exception as exc:
@@ -1724,15 +1734,18 @@ class LiveTradingEngine:
         side_value = str(getattr(side, "value", side) or "")
         try:
             # A broker's numeric wire ids are reused across days; scope the
-            # match to the same asset/side and to order rows created on the
-            # host-local trading day (QMT reports the current exchange day's
-            # book, and order rows are stamped on the host clock).
+            # match to the same asset/side and to order rows created since
+            # the *current exchange trading day began* (converted to the
+            # host-local clock the adapters stamp `created_at` with -- a
+            # plain host-date cutoff would drop orders placed before the
+            # host's midnight on a non-Shanghai host).
             booked += self._store.get_trade_quantity_for_broker_order(
                 broker_order_id,
                 tenant_id=self._tenant_id,
                 code=code,
                 side=side_value,
-                since=datetime.now().date().isoformat(),
+                since=self._exchange_day_start_host_iso(),
+                exclude_order_id=order_id,
             )
         except Exception as exc:
             logger.warning(
@@ -1741,6 +1754,26 @@ class LiveTradingEngine:
             )
             return None
         return booked
+
+    def _exchange_day_start_host_iso(self) -> str:
+        """Start of the current exchange trading day on the host clock.
+
+        Order rows are stamped with host-local ``created_at``; the current
+        exchange day starts at 00:00 Shanghai, which can fall on the
+        previous host-local date (US/Europe). Converting the instant -- not
+        the date string -- keeps the cross-restart dedupe correct on hosts
+        outside Asia/Shanghai.
+        """
+        try:
+            day = datetime.strptime(
+                self._exchange_trading_date(), "%Y-%m-%d",
+            ).replace(tzinfo=EXCHANGE_TZ)
+            return day.astimezone().replace(tzinfo=None).isoformat()
+        except Exception:
+            # Conservative fallback: include the previous host day.
+            return (
+                datetime.now() - timedelta(days=1)
+            ).date().isoformat()
 
     def _unbooked_broker_fill_deltas(self) -> dict[str, int] | None:
         """Net signed shares the broker reports but the Store has not booked.
@@ -1764,7 +1797,11 @@ class LiveTradingEngine:
             return None
         try:
             order_list = list(orders)
-        except TypeError:
+        except Exception as exc:
+            logger.warning(
+                "Startup fill explanation skipped: broker order book could "
+                "not be iterated: %s", exc,
+            )
             return None
         deltas: dict[str, int] = {}
         for order in order_list:
