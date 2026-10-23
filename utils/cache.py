@@ -86,7 +86,13 @@ STALE_TMP_SECONDS = 3600.0
 #    from the data, and the tradability mask covers listing/delisting/
 #    suspension. Panels cached under 4 are business-day grids and must not be
 #    replayed.
-DATA_SCHEMA_VERSION = 5
+# 6: universe PIT semantics changed (R6b): index membership was split out of
+#    `tradable_mask` into a separate `universe_mask` consulted by the buy gate
+#    only, and the provider's snapshot forward fill now propagates constituent
+#    *exits* instead of keeping every former member forever. Panels cached
+#    under 5 carry the old "once a member, always a member" universe and the
+#    fused mask; they must not be replayed.
+DATA_SCHEMA_VERSION = 6
 
 # Bump when the key recipe itself changes, so entries written by an older
 # recipe cannot collide with new ones.
