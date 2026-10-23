@@ -27,8 +27,9 @@ from quant_platform.core.exchange_calendar import is_trading_day
 from quant_platform.core.state_machine import PortfolioState, PortfolioStateMachine
 from quant_platform.core.store import RetentionPolicy, Store
 from quant_platform.operations.reconciliation import (
+    expected_book_from_ledger,
+    ledger_from_trades,
     positions_from_broker,
-    positions_from_store,
     reconcile,
 )
 from quant_platform.utils.logging import get_logger
@@ -613,13 +614,14 @@ class TradingScheduler:
         snapshot for any book with no prior P&L; when neither source is
         available the day is skipped, alerted and counted instead.
 
-        R11: once the snapshot is durable, the Store position ledger and the
-        snapshot's cash (expected) are reconciled against the broker's
-        positions and account cash (actual). The outcome is persisted to
-        ``reconciliation_results`` and added to the ``eod.reconciliation``
-        event. A repeated trigger never writes a second result; a day whose
-        marker exists but whose result is missing (an upgraded database) has
-        only the result backfilled — never a second snapshot.
+        R11/R12: once the snapshot is durable, the expected book derived from
+        the engine-start baseline plus stored fills (trade ledger) is
+        reconciled against the broker's positions and account cash (actual).
+        The outcome is persisted to ``reconciliation_results`` and added to
+        the ``eod.reconciliation`` event. A repeated trigger never writes a
+        second result; a day whose marker exists but whose result is missing
+        (an upgraded database) has only the result backfilled — never a
+        second snapshot.
         """
         target = date_str or self._now().strftime("%Y-%m-%d")
         try:
@@ -769,6 +771,7 @@ class TradingScheduler:
             # is never compared against today's broker book (that would
             # fabricate an observation), so its reconciliation is unknown.
             "status": "unknown",
+            "basis": "trade_ledger",
             "passes": False,
             "n_mismatched": 0,
             "cash_diff": None,
@@ -821,7 +824,7 @@ class TradingScheduler:
     def _run_eod_reconciliation(
         self, target: str, snapshot: dict | None = None,
     ) -> dict:
-        """Compute and persist the day's books-vs-broker outcome (R11).
+        """Compute and persist the day's books-vs-broker outcome (R11/R12).
 
         Never raises: the EOD snapshot is already durable, and a broken
         reconciliation must neither undo it nor stop the event. A failure
@@ -851,33 +854,65 @@ class TradingScheduler:
     def _compute_reconciliation(
         self, target: str, snapshot: dict | None,
     ) -> dict:
-        """expected = Store ledger, actual = broker counter-book.
+        """expected = trade ledger (startup baseline + stored fills), actual = broker.
 
-        Positions: expected from ``Store.get_positions(tenant)``, actual from
-        ``broker.get_positions()``. Cash: expected from the day's P&L
-        snapshot, actual from ``broker.get_account()['cash']``. Tolerances
-        come from the ``QUANT_RECON_*`` values parsed at construction.
+        R12: the expected leg is derived from the newest ``ledger_baselines``
+        row -- the broker's cash/positions captured when the engine started --
+        plus the fills stored after it (``ledger_from_trades``). The R11
+        expected side (Store positions + the day's P&L snapshot cash) is gone:
+        on the normal EOD path that snapshot's cash came from the very broker
+        account being compared, so the cash arm was a self-comparison.
 
-        Cash-basis caveat (R11 review): the task book fixes expected cash to
-        the day's Store P&L snapshot, and on the normal EOD path that
-        snapshot's cash is itself sourced from ``broker.get_account()`` (S2
-        precedence). The cash arm therefore mainly detects drift between the
-        two queries and snapshots sourced from engine state; a fully
-        independent cash check needs ledger cash derived from fills, which
-        is a follow-up rather than a change to the specified basis here.
+        Without a baseline the comparison cannot honestly run: the result is
+        ``status="unknown"`` with reason ``no_ledger_baseline``. The Store
+        position book is never used as a fallback expected leg.
+
+        ``snapshot`` is kept for the caller's signature (its counts feed the
+        event) but no longer feeds the comparison.
+
+        Price basis: expected positions are valued at the actual (broker)
+        price for the same asset (baseline ``avg_cost`` only when the asset is
+        missing from the broker book), so only quantities and cash are
+        compared -- a price-basis difference cannot manufacture a mismatch.
         """
         timestamp = self._naive_local(self._now())
         tolerances = dict(self._recon_tolerances)
-        if snapshot is None:
-            snapshot = self._latest_pnl_snapshot(target)
-        if snapshot is None:
-            return self._unknown_reconciliation(
-                target, "no EOD P&L snapshot for the date", timestamp,
+
+        try:
+            baseline = self._store.get_latest_ledger_baseline(
+                self._tenant_id, self._engine_state_key,
             )
-        expected_cash = snapshot.get("cash")
-        if not self._is_number(expected_cash):
+        except Exception as exc:
+            logger.error(
+                "EOD reconciliation ledger baseline read failed: %s", exc,
+            )
             return self._unknown_reconciliation(
-                target, "EOD P&L snapshot has no usable cash", timestamp,
+                target, f"ledger baseline query failed: {exc}", timestamp,
+            )
+        if baseline is None:
+            return self._unknown_reconciliation(
+                target, "no_ledger_baseline", timestamp,
+            )
+        try:
+            trades = self._store.get_trades_for_export(
+                tenant_id=self._tenant_id,
+                start_date=str(baseline.get("created_at") or "")[:10],
+            )
+        except Exception as exc:
+            logger.error(
+                "EOD reconciliation trade ledger read failed: %s", exc,
+            )
+            return self._unknown_reconciliation(
+                target, f"trade ledger query failed: {exc}", timestamp,
+            )
+        try:
+            ledger = ledger_from_trades(baseline, trades)
+        except Exception as exc:
+            logger.error(
+                "EOD reconciliation ledger derivation failed: %s", exc,
+            )
+            return self._unknown_reconciliation(
+                target, f"trade ledger derivation failed: {exc}", timestamp,
             )
 
         broker = self._broker
@@ -925,22 +960,26 @@ class TradingScheduler:
                 target, "broker account has no usable cash", timestamp,
             )
 
-        try:
-            store_rows = list(self._store.get_positions(self._tenant_id) or [])
-        except Exception as exc:
-            # An unreadable expected book is unknown, not empty: reconciling
-            # against {} would report every actual position as a breach.
-            logger.error(
-                "EOD reconciliation store position query failed: %s", exc,
-            )
-            return self._unknown_reconciliation(
-                target, f"store position query failed: {exc}", timestamp,
-            )
+        actual_book = positions_from_broker(list(broker_positions))
+        # Baseline cost per asset values an expected-only leg (a position the
+        # broker book no longer lists); it never prices an asset the broker
+        # holds -- that leg uses the broker's own mark.
+        avg_costs: dict[str, float] = {}
+        for code, entry in (baseline.get("positions") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                avg_costs[str(code)] = float(entry.get("avg_cost") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        expected_book = expected_book_from_ledger(
+            ledger["positions"], actual_book, avg_costs,
+        )
 
         report = reconcile(
-            positions_from_store(store_rows),
-            positions_from_broker(list(broker_positions)),
-            float(expected_cash),
+            expected_book,
+            actual_book,
+            float(ledger["cash"]),
             float(actual_cash),
             tolerance=tolerances["shares"],
             cash_tolerance=tolerances["cash"],
@@ -950,12 +989,13 @@ class TradingScheduler:
         status = "passed" if report.passes else "failed"
         if status == "failed":
             self._log_reconciliation_failure(
-                report, tolerances, float(expected_cash), float(actual_cash),
+                report, tolerances, float(ledger["cash"]), float(actual_cash),
             )
         return {
             "date": target,
             "timestamp": timestamp,
             "status": status,
+            "basis": "trade_ledger",
             "n_positions": report.total_positions,
             "n_mismatched": report.mismatched,
             "cash_diff": report.cash_diff,
@@ -1006,6 +1046,7 @@ class TradingScheduler:
             "date": target,
             "timestamp": timestamp or self._naive_local(self._now()),
             "status": "unknown",
+            "basis": "trade_ledger",
             "n_positions": 0,
             "n_mismatched": 0,
             "cash_diff": None,
@@ -1052,6 +1093,9 @@ class TradingScheduler:
             "equity_source": source,
             "catch_up": catch_up,
             "status": result["status"],
+            # R12: the expected leg is the derived trade ledger
+            # (startup baseline + stored fills).
+            "basis": result.get("basis", "trade_ledger"),
             # An unknown comparison is not a pass (fail loud).
             "passes": result["status"] == "passed",
             "n_mismatched": result.get("n_mismatched", 0),

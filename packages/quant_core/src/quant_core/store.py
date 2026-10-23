@@ -11,6 +11,7 @@ Tables:
     config      — strategy configuration snapshots
     eod_reconciliation — once-per-day marker for the end-of-day run
     reconciliation_results — per-day books-vs-broker reconciliation outcome
+    ledger_baselines — broker-state baselines the trade ledger derives from
 
 Usage:
     store = Store('data/trading.db')
@@ -413,7 +414,28 @@ class Store:
                     cash_diff REAL,
                     total_mismatch_value REAL,
                     details TEXT DEFAULT '[]',
-                    tolerances TEXT DEFAULT '{}'
+                    tolerances TEXT DEFAULT '{}',
+                    -- R12: which expected-side basis the outcome used
+                    -- ('trade_ledger': startup baseline + stored fills).
+                    basis TEXT DEFAULT 'trade_ledger'
+                );
+
+                -- R12: immutable broker-state baselines captured when the
+                -- live engine starts. The EOD ledger derives expected
+                -- positions/cash from the newest row plus the fills stored
+                -- after it, so expected is independent of the broker
+                -- snapshot it is compared against. Restarts append rows
+                -- (history is kept; readers take the newest id).
+                -- CREATE TABLE IF NOT EXISTS is also the migration for
+                -- databases written before this table existed.
+                CREATE TABLE IF NOT EXISTS ledger_baselines (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    engine_state_key TEXT NOT NULL DEFAULT '',
+                    cash REAL NOT NULL,
+                    positions_json TEXT NOT NULL DEFAULT '{}',
+                    note TEXT DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);
@@ -439,6 +461,17 @@ class Store:
             if "accrued_perf_fee" not in nav_cols:
                 conn.execute(
                     "ALTER TABLE nav_history ADD COLUMN accrued_perf_fee REAL DEFAULT 0"
+                )
+            # R12: databases written before the trade-ledger basis carry no
+            # `basis` column; CREATE TABLE IF NOT EXISTS cannot add it.
+            recon_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(reconciliation_results)")
+            }
+            if "basis" not in recon_cols:
+                conn.execute(
+                    "ALTER TABLE reconciliation_results "
+                    "ADD COLUMN basis TEXT DEFAULT 'trade_ledger'"
                 )
 
             # Create tenant_id indexes after migration
@@ -472,6 +505,8 @@ class Store:
                     ON sessions(started_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_orders_tenant_status_created
                     ON orders(tenant_id, status, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ledger_baselines_lookup
+                    ON ledger_baselines(tenant_id, engine_state_key, id DESC);
             """)
         logger.info("Store initialized: %s", self._db_path)
 
@@ -1114,8 +1149,8 @@ class Store:
             conn.execute(
                 "INSERT OR REPLACE INTO reconciliation_results "
                 "(date, timestamp, status, n_positions, n_mismatched, "
-                " cash_diff, total_mismatch_value, details, tolerances) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " cash_diff, total_mismatch_value, details, tolerances, basis) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     result["date"],
                     result.get("timestamp") or exchange_now_iso(),
@@ -1126,6 +1161,7 @@ class Store:
                     result.get("total_mismatch_value"),
                     json.dumps(result.get("details") or []),
                     json.dumps(result.get("tolerances") or {}),
+                    result.get("basis") or "trade_ledger",
                 ),
             )
 
@@ -1161,6 +1197,120 @@ class Store:
                 "SELECT * FROM reconciliation_results ORDER BY date DESC LIMIT 1"
             ).fetchone()
         return self._reconciliation_row(row) if row is not None else None
+
+    # ── Ledger baselines (R12) ──
+
+    def save_ledger_baseline(self, baseline: dict) -> int:
+        """Insert one immutable trade-ledger baseline; returns its row id.
+
+        The baseline is the broker's authoritative cash and position book at
+        engine start; the expected EOD book is derived from it plus the fills
+        stored after ``created_at``. ``cash`` is required and must be a finite
+        number: recording a missing balance as 0 would make every later cash
+        comparison meaningless (the caller must fail loud instead).
+
+        ``positions_json`` accepts either a mapping (serialized here) or an
+        already-encoded JSON object; a non-mapping value is rejected. Rows are
+        never updated -- a restart appends a new row and readers take the
+        newest id, so the derivation never applies old fills twice.
+        """
+        cash = baseline.get("cash")
+        try:
+            cash_value = float(cash)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"ledger baseline cash must be a number, got {cash!r}"
+            ) from exc
+        if not math.isfinite(cash_value):
+            raise ValueError(
+                f"ledger baseline cash must be finite, got {cash!r}"
+            )
+        positions = baseline.get(
+            "positions_json", baseline.get("positions", {}),
+        )
+        if positions is None:
+            positions = {}
+        if isinstance(positions, str):
+            try:
+                decoded = json.loads(positions)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"ledger baseline positions_json is not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(decoded, dict):
+                raise ValueError(
+                    "ledger baseline positions must encode a JSON object, "
+                    f"got {type(decoded).__name__}"
+                )
+            positions_json = positions
+        else:
+            if not isinstance(positions, dict):
+                raise ValueError(
+                    "ledger baseline positions must be a mapping, "
+                    f"got {type(positions).__name__}"
+                )
+            positions_json = json.dumps(positions)
+
+        with self._lock, self._conn() as conn:
+            cursor = conn.execute(
+                "INSERT INTO ledger_baselines "
+                "(created_at, tenant_id, engine_state_key, cash, "
+                " positions_json, note) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(baseline.get("created_at") or exchange_now_iso()),
+                    str(baseline.get("tenant_id") or "default"),
+                    str(baseline.get("engine_state_key") or ""),
+                    cash_value,
+                    positions_json,
+                    str(baseline.get("note") or ""),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_latest_ledger_baseline(
+        self, tenant_id: str = "", engine_state_key: str = "",
+    ) -> dict | None:
+        """Newest baseline (highest id) matching the filters, or None.
+
+        An empty ``tenant_id``/``engine_state_key`` does not filter that
+        column -- the Store's usual unscoped-read convention, which keeps a
+        stand-alone scheduler (no tenant/key) usable. Ordering is by the
+        autoincrement id, not ``created_at``: a restart within the same
+        timestamp still selects the row written last.
+
+        ``positions`` is decoded from ``positions_json``. Unreadable JSON
+        raises instead of degrading to an empty book: an empty expected book
+        could otherwise "pass" a flat broker account.
+        """
+        query = "SELECT * FROM ledger_baselines WHERE 1=1"
+        params: list = []
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if engine_state_key:
+            query += " AND engine_state_key = ?"
+            params.append(engine_state_key)
+        query += " ORDER BY id DESC LIMIT 1"
+        with self._conn() as conn:
+            row = conn.execute(query, params).fetchone()
+        if row is None:
+            return None
+        baseline = dict(row)
+        raw = baseline.get("positions_json")
+        try:
+            decoded = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"ledger baseline {baseline.get('id')} has unreadable "
+                f"positions_json: {exc}"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise ValueError(
+                f"ledger baseline {baseline.get('id')} positions must be a "
+                f"JSON object, got {type(decoded).__name__}"
+            )
+        baseline["positions"] = decoded
+        return baseline
 
 
     # ── Signals ──

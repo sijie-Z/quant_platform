@@ -548,6 +548,11 @@ class LiveTradingEngine:
             self._bus.publish("engine.start_blocked", {"error": str(e)}, source="engine")
             raise
 
+        # R12: broker and Store are reconciled, so the broker state is now
+        # authoritative. Record it once as the trade ledger's baseline; the
+        # EOD expected book is derived from this row plus later fills.
+        self._write_ledger_baseline()
+
         # Pre-flight health check
         health = HealthCheck(
             event_bus=self._bus,
@@ -1571,6 +1576,98 @@ class LiveTradingEngine:
         # Persist the reconciled snapshot so a crash right after start does
         # not lose the reconciliation.
         self._persist_engine_state()
+
+    def _write_ledger_baseline(self) -> None:
+        """Record the broker's book as the trade ledger's baseline (R12).
+
+        Called exactly once per process start, after ``_restore_state`` has
+        reconciled broker and Store, so the broker state is trustworthy. The
+        EOD expected book is derived from this row plus the fills stored after
+        its ``created_at``; a restart appends a new row (fills from before it
+        are already baked into the restored broker book, so history is never
+        applied twice).
+
+        An unknown broker book (``get_positions() is None``) writes nothing:
+        the health check blocks trading, and a baseline built from a failed
+        query would be wrong. A missing/non-finite account cash raises --
+        recording 0 would make every later cash comparison meaningless.
+        """
+        try:
+            account = self._broker.get_account()
+        except Exception as exc:
+            raise RuntimeError(
+                f"ledger baseline: broker account query failed: {exc}"
+            ) from exc
+        if not isinstance(account, dict):
+            raise RuntimeError(
+                "ledger baseline: broker account payload is not a dict "
+                f"({type(account).__name__})"
+            )
+        if account.get("connected") is False:
+            # QMT/XTP serve an initial-cash placeholder when disconnected.
+            raise RuntimeError(
+                "ledger baseline: broker reports disconnected; refusing to "
+                "record placeholder balances"
+            )
+        cash = account.get("cash")
+        try:
+            cash_value = float(cash)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "ledger baseline: broker account has no usable cash "
+                f"({cash!r})"
+            ) from exc
+        if not math.isfinite(cash_value):
+            raise RuntimeError(
+                f"ledger baseline: broker cash is not finite ({cash!r})"
+            )
+
+        positions, known = self._query_positions(trust_flat=True)
+        if not known:
+            logger.warning(
+                "Ledger baseline not written: broker position book is unknown",
+            )
+            return
+
+        book: dict[str, dict] = {}
+        for pos in positions or []:
+            row = self._position_row(pos)
+            code = str(row.get("code") or "")
+            if not code:
+                raise RuntimeError(
+                    f"ledger baseline: position row has no asset code: {row!r}"
+                )
+            try:
+                quantity = int(row.get("quantity") or 0)
+                avg_cost = float(row.get("avg_cost") or 0.0)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"ledger baseline: malformed position row for {code}: "
+                    f"{row!r}"
+                ) from exc
+            if code in book:
+                # Two rows for one asset: net the quantity and keep the first
+                # known cost (the ledger only needs the net book).
+                book[code]["quantity"] += quantity
+                if not book[code]["avg_cost"] and avg_cost:
+                    book[code]["avg_cost"] = avg_cost
+            else:
+                book[code] = {"quantity": quantity, "avg_cost": avg_cost}
+
+        self._store.save_ledger_baseline({
+            "created_at": (
+                self._exchange_now().replace(tzinfo=None).isoformat()
+            ),
+            "tenant_id": self._tenant_id,
+            "engine_state_key": self._engine_state_key,
+            "cash": cash_value,
+            "positions_json": book,
+            "note": f"live engine start (session {self._session_id})",
+        })
+        logger.info(
+            "Ledger baseline written: cash=%.2f, %d position(s)",
+            cash_value, len(book),
+        )
 
     def _execute_cycle(self) -> CycleResult:
         """Run one cycle, serialised against the background loop.

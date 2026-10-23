@@ -3,15 +3,19 @@
 实盘和模拟最大的区别: 模拟永远不会出现"以为买了但没成交"的情况。
 这个模块每天跑一次, 检测偏差。
 
-Runtime caller: the scheduler's end-of-day path reconciles the Store ledger
-(expected) against the broker counter-book (actual) and persists the result
-(see `core.scheduler.TradingScheduler._do_eod_reconciliation`).
+Runtime caller: the scheduler's end-of-day path derives the expected book
+from the engine-start baseline plus the stored fills (a trade ledger,
+independent of the broker snapshot it is compared against) and reconciles it
+against the broker counter-book (actual); see
+`core.scheduler.TradingScheduler._do_eod_reconciliation`.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass
@@ -249,5 +253,230 @@ def positions_from_store(rows: list[dict] | None) -> dict[str, tuple[int, float]
 
     ``None`` maps to ``{}``: the Store query has no unknown-book state (it
     raises on failure instead), so there is nothing honest to preserve.
+
+    Superseded as the scheduler's expected leg in R12 (expected now derives
+    from the startup baseline + stored fills); kept for callers that really
+    mean the persisted book.
     """
     return _book_from(rows or [])
+
+
+# ── Trade-ledger derivation (R12) ──
+
+def _parse_iso_timestamp(value) -> datetime | None:
+    """Naive ISO timestamp -> datetime, or None when unparsable/empty."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _at_or_after(executed_at, created_at: str) -> bool:
+    """Whether a fill's timestamp is at/after the baseline timestamp.
+
+    Parsed datetimes are compared so equal instants written with different
+    fractional precision count as equal (`>=` is inclusive: a fill stamped
+    exactly at the baseline instant belongs to the ledger). Only when either
+    side is unparsable is the comparison done on the raw ISO strings, which
+    are lexicographically ordered for the naive basis the Store writes.
+    """
+    executed = str(executed_at or "")
+    baseline_ts = str(created_at or "")
+    if not baseline_ts:
+        return True
+    trade_dt = _parse_iso_timestamp(executed)
+    base_dt = _parse_iso_timestamp(baseline_ts)
+    if (
+        trade_dt is not None
+        and base_dt is not None
+        and (trade_dt.tzinfo is None) == (base_dt.tzinfo is None)
+    ):
+        return trade_dt >= base_dt
+    return executed >= baseline_ts
+
+
+def _as_share_count(value, what: str) -> int:
+    """Finite integral share count; anything else fails loud."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{what} is not a number: {value!r}") from exc
+    if not math.isfinite(number) or not number.is_integer():
+        raise ValueError(f"{what} is not a finite integer: {value!r}")
+    return int(number)
+
+
+def _as_float(value, what: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{what} is not a number: {value!r}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{what} is not finite: {value!r}")
+    return number
+
+
+def _baseline_book(baseline: dict) -> dict[str, dict]:
+    """Decode a baseline's positions into ``code -> {quantity, avg_cost}``.
+
+    Accepts the decoded mapping (``baseline["positions"]``, as returned by
+    ``Store.get_latest_ledger_baseline``) or the raw ``positions_json``
+    text/mapping. Values may be a bare quantity or a mapping with
+    ``quantity``/``qty``/``shares`` and an optional ``avg_cost``. A malformed
+    entry raises: silently dropping it would shrink the expected book.
+    """
+    raw = baseline.get("positions")
+    if raw is None:
+        raw = baseline.get("positions_json")
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"baseline positions_json is not valid JSON: {exc}"
+            ) from exc
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "baseline positions must be a mapping, "
+            f"got {type(raw).__name__}"
+        )
+
+    book: dict[str, dict] = {}
+    for code, entry in raw.items():
+        asset = str(code or "")
+        if not asset:
+            raise ValueError(
+                f"baseline position row has no asset code: {entry!r}"
+            )
+        avg_cost = 0.0
+        if isinstance(entry, dict):
+            quantity = entry.get(
+                "quantity", entry.get("qty", entry.get("shares")),
+            )
+            avg_cost = entry.get("avg_cost", 0.0) or 0.0
+        else:
+            quantity = entry
+        book[asset] = {
+            "quantity": _as_share_count(
+                quantity, f"baseline {asset} quantity",
+            ),
+            "avg_cost": _as_float(
+                avg_cost, f"baseline {asset} avg_cost",
+            ),
+        }
+    return book
+
+
+def ledger_from_trades(baseline: dict, trades: list[dict]) -> dict:
+    """Derive the expected book from a broker baseline + stored fills.
+
+    Args:
+        baseline: a ``ledger_baselines`` row (or equivalent mapping) with
+            ``cash``, ``created_at`` and positions (``positions`` decoded or
+            ``positions_json`` text). Cash and positions are the broker's
+            authoritative state when the engine started.
+        trades: ``Store.get_trades``/``get_trades_for_export`` rows.
+
+    Only fills with ``executed_at >= baseline.created_at`` and the baseline's
+    tenant are applied (a fill stamped exactly at the baseline instant is
+    included). Quantities are net -- buy +qty, sell -qty -- with no T+1
+    simulation, because the comparison is against the closing net book.
+    Cash moves by the full principal plus fees::
+
+        cash = baseline.cash
+             - Σ(buy  quantity*price + commission + tax)
+             + Σ(sell quantity*price - commission - tax)
+
+    Negative quantities (short books) and negative cash (short proceeds are
+    not modelled; fee/dividend drift) are returned as-is -- they are
+    observations for the reconciliation, not errors.
+
+    Price basis: the returned mapping carries quantities only. Callers value
+    the expected leg at the broker's (actual) prices -- see
+    :func:`expected_book_from_ledger` -- so a price-basis difference cannot
+    manufacture a share mismatch; only quantities and cash are compared.
+    """
+    cash = _as_float(baseline.get("cash"), "baseline cash")
+    created_at = str(baseline.get("created_at") or "")
+    if not created_at:
+        raise ValueError(
+            "baseline has no created_at; the ledger cannot tell which fills "
+            "predate it"
+        )
+    tenant = str(baseline.get("tenant_id") or "")
+    positions = {
+        code: entry["quantity"]
+        for code, entry in _baseline_book(baseline).items()
+    }
+
+    for trade in trades or []:
+        trade_tenant = str(trade.get("tenant_id") or "default")
+        if tenant and trade_tenant != tenant:
+            continue
+        if not _at_or_after(trade.get("executed_at"), created_at):
+            continue
+        code = str(trade.get("code") or "")
+        if not code:
+            raise ValueError(f"trade has no asset code: {trade!r}")
+        side = str(trade.get("side") or "").strip().lower()
+        quantity = _as_share_count(
+            trade.get("quantity"), f"trade {trade.get('trade_id')!r} quantity",
+        )
+        price = _as_float(
+            trade.get("price"), f"trade {trade.get('trade_id')!r} price",
+        )
+        commission = _as_float(
+            trade.get("commission") or 0.0,
+            f"trade {trade.get('trade_id')!r} commission",
+        )
+        tax = _as_float(
+            trade.get("tax") or 0.0,
+            f"trade {trade.get('trade_id')!r} tax",
+        )
+        if side in ("buy", "b"):
+            positions[code] = positions.get(code, 0) + quantity
+            cash -= quantity * price + commission + tax
+        elif side in ("sell", "s"):
+            positions[code] = positions.get(code, 0) - quantity
+            cash += quantity * price - commission - tax
+        else:
+            raise ValueError(
+                f"trade {trade.get('trade_id')!r} has unsupported side "
+                f"{trade.get('side')!r}"
+            )
+
+    # A net-zero position is flat, not a holding: drop it so the expected
+    # book mirrors the broker's (which never lists closed rows).
+    positions = {
+        code: quantity for code, quantity in positions.items() if quantity != 0
+    }
+    return {"positions": positions, "cash": cash}
+
+
+def expected_book_from_ledger(
+    ledger_positions: dict[str, int],
+    actual_positions: dict[str, tuple[int, float]],
+    avg_costs: dict[str, float] | None = None,
+) -> dict[str, tuple[int, float]]:
+    """Value the ledger's quantities at the broker's marks (R12).
+
+    Expected prices come from the actual (broker) book for the same asset, so
+    the two legs are valued identically and only quantities and cash are
+    compared. An expected-only asset (absent from the broker book) falls back
+    to its baseline ``avg_cost`` when known, then to 0.0, so materiality
+    accounting does not value a vanished position at zero when a cost exists.
+    """
+    avg_costs = avg_costs or {}
+    book: dict[str, tuple[int, float]] = {}
+    for code, quantity in (ledger_positions or {}).items():
+        actual = actual_positions.get(code)
+        if actual is not None and float(actual[1]) > 0:
+            price = float(actual[1])
+        else:
+            price = float(avg_costs.get(code) or 0.0)
+        book[str(code)] = (int(quantity), price)
+    return book
