@@ -3,13 +3,14 @@
 实盘和模拟最大的区别: 模拟永远不会出现"以为买了但没成交"的情况。
 这个模块每天跑一次, 检测偏差。
 
-Note: this is an operations API with no runtime caller yet (the scheduler's
-EOD path uses its own reconciliation marker). It is kept for the scheduler
-wiring tracked as R52 rather than deleted.
+Runtime caller: the scheduler's end-of-day path reconciles the Store ledger
+(expected) against the broker counter-book (actual) and persists the result
+(see `core.scheduler.TradingScheduler._do_eod_reconciliation`).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -145,3 +146,94 @@ def reconcile(
         passes=passes,
         details=details,
     )
+
+
+# ── Input adapters for the scheduler's EOD books-vs-broker check (R11) ──
+
+def _mark_price(current_price, avg_cost) -> float:
+    """Mark price for one leg: the current price when positive, else cost.
+
+    Both adapters use this rule so expected and actual positions are valued
+    on the same basis. Only positive finite values are accepted — a zero mark
+    must fall back to cost rather than value a mismatch at 0.
+    """
+    for candidate in (current_price, avg_cost):
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+    return 0.0
+
+
+def _book_from(items) -> dict[str, tuple[int, float]]:
+    """Build the ``reconcile()`` mapping from Position objects or dict rows.
+
+    Accepts both shapes so broker ``Position`` instances and Store row
+    dicts share one conversion. Rows without an asset code are skipped;
+    missing/invalid share counts become 0.
+    """
+    book: dict[str, tuple[int, float]] = {}
+    for item in items:
+        if isinstance(item, dict):
+            code = item.get("code")
+            shares = item.get("quantity", item.get("shares", 0))
+            price = _mark_price(item.get("current_price"), item.get("avg_cost"))
+        else:
+            code = getattr(item, "code", None)
+            shares = getattr(item, "quantity", 0)
+            price = _mark_price(
+                getattr(item, "current_price", 0.0),
+                getattr(item, "avg_cost", 0.0),
+            )
+        if not code:
+            continue
+        try:
+            share_count = int(shares or 0)
+        except (TypeError, ValueError):
+            share_count = 0
+        asset = str(code)
+        if asset in book:
+            # Duplicates only occur for a merged (tenant-less) Store read or
+            # a broker that reports one asset twice. Summing shares and
+            # keeping the higher mark mirrors reconcile()'s one-sided
+            # valuation at max(expected, actual) price.
+            prior_shares, prior_price = book[asset]
+            book[asset] = (prior_shares + share_count, max(prior_price, price))
+        else:
+            book[asset] = (share_count, price)
+    return book
+
+
+def positions_from_broker(positions: list | None) -> dict[str, tuple[int, float]]:
+    """Broker ``Position`` list -> ``reconcile()``'s positions mapping.
+
+    ``None`` is the broker interface's "query failed, book unknown" answer
+    (``trading/broker.py: BrokerInterface.get_positions``). It is rejected
+    here so an unknown book can never be reconciled as a flat one; callers
+    must handle the unknown state explicitly. An empty list is a confirmed
+    flat account and maps to ``{}``.
+
+    Price basis: ``current_price`` when positive, else ``avg_cost``.
+    """
+    if positions is None:
+        raise ValueError(
+            "broker positions are unknown (None), not an empty book; "
+            "handle the unknown state before reconciling"
+        )
+    return _book_from(positions)
+
+
+def positions_from_store(rows: list[dict] | None) -> dict[str, tuple[int, float]]:
+    """Store ``get_positions()`` rows -> ``reconcile()``'s positions mapping.
+
+    Rows are the dicts returned by ``Store.get_positions`` (``code``,
+    ``quantity``, ``avg_cost``, ``current_price``). Price basis:
+    ``current_price`` when positive (the ledger's mark), else ``avg_cost`` —
+    the same rule as ``positions_from_broker`` so both legs are valued alike.
+
+    ``None`` maps to ``{}``: the Store query has no unknown-book state (it
+    raises on failure instead), so there is nothing honest to preserve.
+    """
+    return _book_from(rows or [])

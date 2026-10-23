@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from quant_platform.operations.reconciliation import reconcile
+from quant_platform.operations.reconciliation import (
+    positions_from_broker,
+    positions_from_store,
+    reconcile,
+)
+from quant_platform.trading.broker import Position
 
 
 class TestMissingLegValuation:
@@ -162,3 +167,77 @@ class TestCashAndMaterialityThresholds:
         assert absorbed.total_mismatch_value == pytest.approx(500.0)
         assert absorbed.passes is True
         assert exposed.passes is False
+
+
+class TestBrokerPositionsAdapter:
+    """R11: broker Position list -> reconcile() mapping."""
+
+    def test_shares_and_mark_price(self):
+        book = positions_from_broker([
+            Position(code="600519", quantity=100, current_price=50.0,
+                     avg_cost=45.0),
+            Position(code="000001", quantity=200, current_price=10.0,
+                     avg_cost=11.0),
+        ])
+
+        assert book == {"600519": (100, 50.0), "000001": (200, 10.0)}
+
+    def test_a_missing_mark_falls_back_to_cost(self):
+        book = positions_from_broker([
+            Position(code="600519", quantity=100, current_price=0.0,
+                     avg_cost=45.0),
+        ])
+
+        assert book == {"600519": (100, 45.0)}
+
+    def test_an_empty_list_is_a_confirmed_flat_book(self):
+        assert positions_from_broker([]) == {}
+
+    def test_none_is_unknown_not_flat(self):
+        """The broker contract: None means the query failed. Treating it as
+        an empty book would silently 'pass' a missing account."""
+        with pytest.raises(ValueError, match="unknown"):
+            positions_from_broker(None)
+
+    def test_duplicate_assets_merge(self):
+        book = positions_from_broker([
+            Position(code="600519", quantity=100, current_price=50.0),
+            Position(code="600519", quantity=50, current_price=55.0),
+        ])
+
+        assert book["600519"] == (150, 55.0)
+
+
+class TestStorePositionsAdapter:
+    """R11: Store.get_positions() rows -> reconcile() mapping."""
+
+    def test_rows_convert_with_the_store_mark(self):
+        rows = [
+            {"code": "600519", "quantity": 100, "avg_cost": 45.0,
+             "current_price": 50.0},
+            {"code": "000001", "quantity": 200, "avg_cost": 11.0,
+             "current_price": 10.0},
+        ]
+
+        assert positions_from_store(rows) == {
+            "600519": (100, 50.0), "000001": (200, 10.0),
+        }
+
+    def test_a_zero_mark_falls_back_to_cost(self):
+        rows = [{"code": "600519", "quantity": 100, "avg_cost": 45.0,
+                 "current_price": 0.0}]
+
+        assert positions_from_store(rows) == {"600519": (100, 45.0)}
+
+    def test_none_and_empty_mean_no_rows(self):
+        assert positions_from_store(None) == {}
+        assert positions_from_store([]) == {}
+
+    def test_duplicate_tenant_rows_merge(self):
+        """A tenant-less read merges tenants holding one ticker."""
+        rows = [
+            {"code": "600519", "quantity": 100, "avg_cost": 45.0},
+            {"code": "600519", "quantity": 25, "avg_cost": 48.0},
+        ]
+
+        assert positions_from_store(rows) == {"600519": (125, 48.0)}
