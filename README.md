@@ -291,6 +291,7 @@ quant_platform/
 | WebSocket token 传输 | 仅接受 `bearer.<token>` 子协议（时序安全比较）；`?token=` 查询串已移除，非 RFC-7230 字符的 token 需更换 |
 | 价格基准 | 已统一：provider 交付 raw OHLCV + 复权因子（Tushare/Baostock 同一约定），`get_raw_close()` 供成交/估值，`get_adjusted_close()` 供研究；仅 Postgres/Adata 尚未声明基准，货币路径 fail closed |
 | 数据更新 | `run --incremental` / `cache refresh --incremental` 增量追加（边界去重、复权因子全量刷新、完成标记与新鲜度门禁）；Tushare/Baostock 支持，合成数据源回退全量 |
+| 财务公告日 | Baostock 财报必须带公告日（`pubDate`）；缺失/不可解析的行会被丢弃并告警，不会用期末日伪造可见日（否则构成前视） |
 | 交易所日历 | 内置休市表覆盖至 2026 年；2027 年休市日需通过 `QUANT_EXCHANGE_HOLIDAYS` 追加 |
 | 回测交易性 | 执行日已按 `tradable_mask` / 涨跌停阻断成交；整手约束在执行层生效，向量化回测仍为权重层面 |
 | 可选依赖 | `adata` 为 `>=1.0.0`（其余依赖精确锁定）。仅当 `data.validated: true` 时作为第二数据源做 metadata/财务跨源校验；其 `get_prices()` 明确不支持（无价格基准声明），不可用时记录警告并跳过校验（不阻断主数据源） |
