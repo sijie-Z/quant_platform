@@ -981,11 +981,13 @@ class DataPipeline:
 
         ``st_eligible`` keeps its original meaning (ST episodes only) for
         reporting; ``tradable_mask`` is the combined ST/listing/delisting/
-        suspension mask consumed by the factor stage.  Index membership is
-        *not* folded into it (R6b): the provider's per-date constituent mask
-        is built as the separate ``universe_mask`` so the backtest can gate
-        buys on membership while still allowing an index exit to be sold
-        (see `_apply_universe_membership`).
+        suspension mask.  Index membership is *not* folded into it (R6b):
+        the provider's per-date constituent mask is built as the separate
+        ``universe_mask`` so the backtest can gate buys on membership while
+        still allowing an index exit to be sold (see
+        `_apply_universe_membership`).  ``get_factor_prices`` merges that
+        ``universe_mask`` into its research ``excluded_mask`` (R6c), so the
+        factor stage sees membership even though ``tradable_mask`` does not.
 
         Delisted names: factors and signals are NaN from the delisting date,
         so the optimizer cannot open a new position.  A position still marked
@@ -1944,9 +1946,23 @@ class DataPipeline:
         The full asset-day eligibility mask travels in
         ``attrs["excluded_mask"]``: factor computation forward-fills the price
         path for level continuity, and it must re-blank these rows instead of
-        resurrecting ST, pre-listing, delisted or suspended names.  It is the
-        same `tradable_mask` used for volume/turnover and, via main.py, for
-        the raw factor panels and the final signal.
+        resurrecting ST, pre-listing, delisted or suspended names.  When the
+        provider's per-date index-membership history was applied
+        (``universe_pit["applied"]``), the mask also excludes asset-days on
+        which the name was not an index constituent (R6c), so research
+        inputs -- the raw factor panels and, via main.py, the final signal --
+        take values only where the asset was both tradeable and a member on
+        that date.
+
+        Membership is a research-input exclusion only.  The price panel is
+        not cropped: a name that joins the index later keeps its earlier
+        price history, so its first live factor value is computed from that
+        history; only the output cells before inclusion are blanked.
+        ``get_tradable_mask()`` and ``get_execution_gates()`` keep their R6b
+        semantics (no membership), so an index exit never blocks a sale.
+        When no per-date membership history was applied (no hook, or the
+        single-snapshot fallback), ``excluded_mask`` is bit-for-bit
+        ``~tradable_mask`` as before.
         """
         close = self.prices["close_adj"].unstack("asset")
         if self._suspended is not None and not self._suspended.empty:
@@ -1955,11 +1971,21 @@ class DataPipeline:
             )
             close = close.mask(suspended)
         if self.tradable_mask is not None and not self.tradable_mask.empty:
-            close.attrs["excluded_mask"] = (
-                ~self.tradable_mask
-            ).reindex(
+            excluded = (~self.tradable_mask).reindex(
                 index=close.index, columns=close.columns, fill_value=True,
             )
+            if (
+                self.universe_pit.get("applied") is True
+                and self.universe_mask is not None
+                and not self.universe_mask.empty
+            ):
+                # Align the membership panel to the price panel first; any
+                # asset-day it does not cover is excluded (fail closed, the
+                # same policy as the tradability reindex above).
+                excluded = excluded | (~self.universe_mask).reindex(
+                    index=close.index, columns=close.columns, fill_value=True,
+                )
+            close.attrs["excluded_mask"] = excluded
         return self._tag_price_panel(close, self.adjusted_price_basis)
 
     def get_tradable_mask(self) -> pd.DataFrame | None:
@@ -1967,9 +1993,13 @@ class DataPipeline:
 
         False on ST days (when `exclude_st`), before listing, from the
         delisting date onward, and on suspension days.  Index membership is
-        deliberately *not* included (R6b): it is a separate `universe_mask`
-        consulted by the backtest buy gate only, so an index exit does not
-        remove the asset from the factor cross-section nor block its sale.
+        deliberately *not* included (R6b): this is the execution-layer
+        tradability mask, so an index exit never narrows it and a held
+        position can always be sold.  Research inputs carry the membership
+        narrowing separately -- `get_factor_prices()` folds the applied
+        `universe_mask` into its ``excluded_mask`` (R6c) -- while this
+        method's return value and `get_execution_gates()` keep their R6b
+        semantics unchanged.
         """
         return self.tradable_mask
 
