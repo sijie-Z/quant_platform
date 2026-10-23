@@ -660,8 +660,10 @@ class TestUniverseBuyGate:
 
 
 class TestCapacityWiring:
-    """R8: the engine hands the optimizer ADV in CNY = volume (shares) x close,
-    averaged over 20 sessions, plus the run's AUM convention."""
+    """R8: the engine hands the optimizer ADV in CNY = volume (shares) x
+    raw (unadjusted) close, averaged over 20 sessions, plus the run's AUM
+    convention. Without raw prices the cap is refused, never computed on the
+    adjusted research panel."""
 
     N_ASSETS = 12
     N_DAYS = 120
