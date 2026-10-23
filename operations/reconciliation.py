@@ -399,6 +399,11 @@ def ledger_from_trades(baseline: dict, trades: list[dict]) -> dict:
     the expected leg at the broker's (actual) prices -- see
     :func:`expected_book_from_ledger` -- so a price-basis difference cannot
     manufacture a share mismatch; only quantities and cash are compared.
+
+    Limitation: only fills move the ledger. Corporate actions (splits, cash
+    dividends) applied by a paper broker are not trade rows, so a book that
+    applied them without a matching fill will surface as a mismatch (loud),
+    not a false pass.
     """
     cash = _as_float(baseline.get("cash"), "baseline cash")
     created_at = str(baseline.get("created_at") or "")
