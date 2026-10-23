@@ -171,8 +171,9 @@ def _book_from(items) -> dict[str, tuple[int, float]]:
     """Build the ``reconcile()`` mapping from Position objects or dict rows.
 
     Accepts both shapes so broker ``Position`` instances and Store row
-    dicts share one conversion. Rows without an asset code are skipped;
-    missing/invalid share counts become 0.
+    dicts share one conversion. A row without an asset code raises: silently
+    dropping it would let a malformed broker answer reconcile as a flat
+    book. Missing/invalid share counts become 0.
     """
     book: dict[str, tuple[int, float]] = {}
     for item in items:
@@ -188,7 +189,9 @@ def _book_from(items) -> dict[str, tuple[int, float]]:
                 getattr(item, "avg_cost", 0.0),
             )
         if not code:
-            continue
+            raise ValueError(
+                f"position row has no asset code (would reconcile as flat): {item!r}"
+            )
         try:
             share_count = int(shares or 0)
         except (TypeError, ValueError):

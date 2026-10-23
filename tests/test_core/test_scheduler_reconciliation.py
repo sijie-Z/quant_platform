@@ -328,6 +328,20 @@ class TestUnknownBook:
             "an unreadable expected book must not be reconciled as empty"
         )
 
+    def test_a_broker_position_without_a_code_is_unknown(self, tmp_path):
+        """A malformed position must not be dropped (that would look flat)."""
+        clock = [datetime(2026, 10, 20, 15, 5, tzinfo=TZ)]
+        broker = FakeBroker(
+            positions=[Position(quantity=100, current_price=50.0)],
+            cash=95_000.0,
+        )
+        scheduler, store = _scheduler(tmp_path, clock, broker=broker)
+        _seed_store_position(store)
+
+        scheduler._tick()
+
+        assert store.get_reconciliation_result(DAY)["status"] == "unknown"
+
 
 class TestBackfillAndHistoricalDays:
     def test_a_missing_result_is_backfilled_without_a_new_snapshot(self, tmp_path):

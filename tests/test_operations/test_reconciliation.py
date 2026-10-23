@@ -207,6 +207,11 @@ class TestBrokerPositionsAdapter:
 
         assert book["600519"] == (150, 55.0)
 
+    def test_a_position_without_a_code_fails_loud(self):
+        """Dropping it silently would reconcile a malformed answer as flat."""
+        with pytest.raises(ValueError, match="asset code"):
+            positions_from_broker([Position(quantity=100, current_price=50.0)])
+
 
 class TestStorePositionsAdapter:
     """R11: Store.get_positions() rows -> reconcile() mapping."""
