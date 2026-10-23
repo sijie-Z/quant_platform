@@ -1159,17 +1159,21 @@ class DataPipeline:
             mask = mask.groupby(level=0).any()
         if mask.columns.has_duplicates:
             mask = mask.T.groupby(level=0).any().T
-        # A table with a single distinct snapshot date cannot prove per-date
-        # history, no matter what the provider's flag says.  This is the
-        # documented single-end-date fallback shape (a provider cache can
-        # round-trip it into a "history" table and flip the flag on reload);
-        # applying it would blank every earlier day.
-        snapshot_count = len(mask.index)
+        # A table with a single distinct snapshot date inside the price window
+        # cannot prove per-date history, no matter what the provider's flag
+        # says.  This is the documented single-end-date fallback shape (a
+        # provider cache can round-trip it into a "history" table and flip the
+        # flag on reload); applying it would blank every earlier day.  The
+        # check is deliberately conservative: a legitimate short sample that
+        # only contains one snapshot is refused too (the gate is skipped and
+        # data is left unchanged) because the two cases are indistinguishable
+        # from the mask alone.
+        snapshot_count = len(mask.index.intersection(dates))
         if snapshot_count < 2:
             logger.warning(
                 "%s: index-membership mask has only %d distinct snapshot "
-                "date(s); refusing to apply a single end-date snapshot as "
-                "per-date history",
+                "date(s) inside the price window; refusing to apply a "
+                "single-snapshot mask as per-date history",
                 provider_label(owner), snapshot_count,
             )
             self.universe_pit = {

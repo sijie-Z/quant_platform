@@ -131,6 +131,7 @@ class _MembershipProvider(_BaseFixtureProvider):
         empty_mask: bool = False,
         bad_mask_type: bool = False,
         extra_mask_columns: bool = False,
+        outside_window_mask: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -142,6 +143,7 @@ class _MembershipProvider(_BaseFixtureProvider):
         self._empty_mask = empty_mask
         self._bad_mask_type = bad_mask_type
         self._extra_mask_columns = extra_mask_columns
+        self._outside_window_mask = outside_window_mask
 
     def get_index_membership_mask(
         self, start_date: str, end_date: str,
@@ -155,6 +157,15 @@ class _MembershipProvider(_BaseFixtureProvider):
         # Bare codes on purpose: the pipeline must normalize mask labels just
         # like every other provider panel.
         bare = [asset.split(".")[0] for asset in ASSETS]
+        if self._outside_window_mask:
+            # A provider that ignores start/end and returns snapshots only
+            # after the price window: two rows, zero usable snapshots.
+            future = pd.DatetimeIndex(
+                [DATES[-1] + pd.tseries.offsets.BDay(1),
+                 DATES[-1] + pd.tseries.offsets.BDay(2)],
+                name="date",
+            )
+            return pd.DataFrame(True, index=future, columns=bare)
         mask = pd.DataFrame(True, index=DATES, columns=bare)
         mask.iloc[:INCLUSION_DAY, 1] = False  # 000002 joins at INCLUSION_DAY
         if self._extra_mask_columns:
@@ -372,6 +383,20 @@ class TestSingleSnapshotMaskShape:
 
     def test_missing_availability_attribute_is_refused(self):
         pipeline = _run(_HookWithoutFlagProvider())
+        assert pipeline.tradable_mask.all().all()
+        assert pipeline.universe_pit["applied"] is False
+        assert (
+            pipeline.universe_pit["reason"]
+            == "single_snapshot_constituent_history"
+        )
+
+    def test_snapshots_outside_the_price_window_are_refused(self):
+        # Two snapshot rows but zero usable dates in the price window would
+        # otherwise ffill to an all-False mask and empty the universe.
+        provider = _MembershipProvider(
+            history_available=True, outside_window_mask=True,
+        )
+        pipeline = _run(provider)
         assert pipeline.tradable_mask.all().all()
         assert pipeline.universe_pit["applied"] is False
         assert (
