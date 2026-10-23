@@ -585,6 +585,19 @@ class TestStaleCallbacksCannotDowngrade:
         assert order.status == OrderStatus.PARTIAL
         assert order.filled_quantity == 40
 
+    def test_stale_unreported_callback_does_not_demote_submitted(self):
+        broker, order = self._broker_with_order(OrderStatus.SUBMITTED)
+
+        class StaleXtOrder:
+            order_id = 12345
+            order_status = 48  # ORDER_UNREPORTED, stale pre-report snapshot
+            traded_volume = 0
+            traded_price = 0.0
+
+        broker._on_order_update(StaleXtOrder())
+
+        assert order.status == OrderStatus.SUBMITTED
+
 
 # ── R10: lazy reconnect, broker resync, get_orders TTL ──
 
@@ -1050,8 +1063,31 @@ class TestConnectHousekeeping:
             broker._StockAccount = MagicMock()
             assert broker.connect(blocking=False) is False
         old_trader.stop.assert_called_once()
+        # The failed replacement session is released too (no session leak).
+        new_trader.stop.assert_called_once()
         # The old session is gone; a failed reconnect must not claim to be up.
         assert broker._connected is False
+
+    def test_connect_interrupted_during_subscribe_reports_failure(
+        self, mock_xtquant,
+    ):
+        """A disconnect landing in the subscribe window must not let connect()
+        return True, and must not start a nested lazy reconnect."""
+        broker = QMTBroker(account="sim001")
+        with patch.object(broker, "_HAS_XTQUANT", True):
+            trader = MagicMock()
+            trader.connect.return_value = 0
+
+            def subscribe(_account):
+                broker._connected = False  # on_disconnected lands here
+
+            trader.subscribe.side_effect = subscribe
+            broker._XtQuantTrader = MagicMock(return_value=trader)
+            broker._StockAccount = MagicMock()
+            assert broker.connect(blocking=False) is False
+        assert broker._connected is False
+        assert broker._XtQuantTrader.call_count == 1  # no nested reconnect
+        trader.stop.assert_called()                   # dropped session cleaned
 
     def test_connect_invalidates_resync_ttl(self, mock_xtquant):
         broker = QMTBroker(account="sim001")

@@ -1260,12 +1260,7 @@ class QMTBroker(BrokerInterface):
             # A retry (or manual reconnect) must not leak the previous trader
             # session into miniQMT: stop it before opening a new one. Until
             # the new session is confirmed, the broker is disconnected.
-            if self._trader is not None:
-                try:
-                    self._trader.stop()
-                except Exception:
-                    pass
-                self._trader = None
+            self._stop_quiescent_trader()
             self._connected = False
             self._session_id = int(datetime.now().timestamp() % 2147483647)
             self._trader = self._XtQuantTrader(self._server, self._session_id)
@@ -1329,22 +1324,49 @@ class QMTBroker(BrokerInterface):
                     pass
                 logger.info("QMT connected. Account: %s, Server: %s, Mode: %s",
                           self._account_id, self._server, self._mode)
-                self._update_account_snapshot()
-                return True
+                # Hold the re-entrancy guard while snapshotting: if the link
+                # drops inside this window, get_account() must not start a
+                # nested lazy reconnect inside connect() itself.
+                previous_active = getattr(self._reconnect_state, "active", False)
+                self._reconnect_state.active = True
+                try:
+                    if self._connected:
+                        self._update_account_snapshot()
+                finally:
+                    self._reconnect_state.active = previous_active
+                if self._connected:
+                    return True
+                logger.warning(
+                    "QMT link dropped during connect (session %d); reporting failure",
+                    self._session_id,
+                )
+                self._stop_quiescent_trader()
+                return False
 
             logger.error("QMT connect returned: %s", result)
+            self._stop_quiescent_trader()
             return False
 
         except Exception as e:
             logger.error("QMT connection error: %s", e)
             self._connected = False
+            self._stop_quiescent_trader()
             return False
+
+    def _stop_quiescent_trader(self) -> None:
+        """Best-effort stop and release of the current trader session."""
+        trader = self._trader
+        self._trader = None
+        if trader is not None:
+            try:
+                trader.stop()
+            except Exception:
+                pass
 
     def disconnect(self) -> bool:
         """Gracefully disconnect from QMT."""
         try:
-            if self._trader:
-                self._trader.stop()
+            self._stop_quiescent_trader()
             self._connected = False
             logger.info("QMT disconnected")
             return True
@@ -1699,6 +1721,12 @@ class QMTBroker(BrokerInterface):
         failure. A non-positive result is a rejection: storing it as
         ``broker_order_id`` marked the order SUBMITTED even though QMT never
         accepted it, and no callback could ever arrive for it.
+
+        Returns the tracked order. If a concurrent resync recovered the same
+        broker order before this call appended it, the returned instance is
+        that recovered (already tracked) order rather than the argument, so
+        callers must use the return value — as the engine and live runner
+        already do.
         """
         self._ensure_connected()
 
@@ -1773,7 +1801,8 @@ class QMTBroker(BrokerInterface):
             order.status = OrderStatus.REJECTED
             order.error_msg = str(e)
             order.updated_at = datetime.now().isoformat()
-            self._orders.append(order)
+            with self._resync_lock:
+                self._orders.append(order)
             logger.error("QMT place_order error: %s", e)
             return order
 
@@ -1868,11 +1897,13 @@ class QMTBroker(BrokerInterface):
 
         Once connected, the broker's order/trade books are reconciled into
         memory at most once per ``resync_ttl`` seconds (default 2s), so a
-        polling caller does not hit QMT on every call. Within the TTL the
-        in-memory book can be up to ``resync_ttl`` seconds old — that bound
-        is the documented freshness contract. If the resync query itself
-        fails, a warning is logged and the current in-memory list is
-        returned unchanged (read-path degradation).
+        polling caller does not hit QMT on every call. While resyncs keep
+        succeeding, the in-memory book is at most ``resync_ttl`` seconds old;
+        while the broker query keeps failing, the TTL only rate-limits the
+        retries and the returned book is the last successfully merged
+        snapshot (that staleness is what the warning signals). If the resync
+        query itself fails, a warning is logged and the current in-memory
+        list is returned unchanged (read-path degradation).
         """
         self._ensure_connected()
         self._maybe_resync()
@@ -2015,6 +2046,16 @@ class QMTBroker(BrokerInterface):
                         and status in (OrderStatus.PENDING, OrderStatus.SUBMITTED)):
                     logger.debug(
                         "Ignoring stale QMT update %s for partially filled order %s",
+                        status.value, order.order_id,
+                    )
+                    break
+                if (order.status == OrderStatus.SUBMITTED
+                        and status == OrderStatus.PENDING):
+                    # UNREPORTED/WAIT_REPORTING arriving after a REPORTED
+                    # callback is a stale pre-report snapshot; demoting it
+                    # would make cancel_order refuse a live order.
+                    logger.debug(
+                        "Ignoring stale QMT update %s for submitted order %s",
                         status.value, order.order_id,
                     )
                     break
