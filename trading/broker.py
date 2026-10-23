@@ -1258,13 +1258,15 @@ class QMTBroker(BrokerInterface):
 
         try:
             # A retry (or manual reconnect) must not leak the previous trader
-            # session into miniQMT: stop it before opening a new one.
+            # session into miniQMT: stop it before opening a new one. Until
+            # the new session is confirmed, the broker is disconnected.
             if self._trader is not None:
                 try:
                     self._trader.stop()
                 except Exception:
                     pass
                 self._trader = None
+            self._connected = False
             self._session_id = int(datetime.now().timestamp() % 2147483647)
             self._trader = self._XtQuantTrader(self._server, self._session_id)
             self._account = self._StockAccount(self._account_id, "STOCK")

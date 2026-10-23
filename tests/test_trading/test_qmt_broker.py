@@ -1040,6 +1040,7 @@ class TestReconnectEdgeCases:
 class TestConnectHousekeeping:
     def test_connect_stops_previous_trader(self, mock_xtquant):
         broker = QMTBroker(account="sim001")
+        broker._connected = True
         old_trader = MagicMock()
         broker._trader = old_trader
         with patch.object(broker, "_HAS_XTQUANT", True):
@@ -1049,6 +1050,8 @@ class TestConnectHousekeeping:
             broker._StockAccount = MagicMock()
             assert broker.connect(blocking=False) is False
         old_trader.stop.assert_called_once()
+        # The old session is gone; a failed reconnect must not claim to be up.
+        assert broker._connected is False
 
     def test_connect_invalidates_resync_ttl(self, mock_xtquant):
         broker = QMTBroker(account="sim001")
