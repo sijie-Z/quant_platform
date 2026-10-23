@@ -86,7 +86,10 @@ CACHE_DIR = Path(__file__).parent.parent.parent / ".cache" / "baostock"
 # v4: financial panels no longer fabricate visibility dates for reports whose
 # pubDate is missing or unparseable; v3 financial caches may contain those
 # look-ahead rows and must never be replayed either.
-_CACHE_VERSION = "v4"
+# v5: asset_growth is now a same-quarter-last-year ratio resolved on the full
+# fetched report sequence; v4 panels may carry growth values computed across a
+# shifted positional window and must not be replayed.
+_CACHE_VERSION = "v5"
 #: Basis of the stored ``close`` column (raw traded price).
 _PRICE_ADJUSTMENT = "raw"
 #: Basis of ``close / adj_factor`` when adjustment is enabled.

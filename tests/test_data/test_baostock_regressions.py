@@ -545,3 +545,34 @@ def test_asset_growth_uses_same_quarter_last_year_when_a_row_is_dropped(
     assert complete_asset.loc[pd.Timestamp("2024-04-25"), "asset_growth"] == (
         pytest.approx(0.5)
     )
+
+
+def test_dropped_prior_year_row_still_anchors_asset_growth(
+    tmp_path, monkeypatch,
+):
+    """The growth anchor may be invisible; only its total_assets is used.
+
+    Dropping the same-quarter-last-year report (2023Q1 for 600001) must not
+    remove 2024Q1 growth: the anchor's total_assets feeds the ratio while the
+    anchor row itself never appears in the panel (no value before any
+    publish date, and 2023Q1's would-be announcement is absent).
+    """
+    fake = FakeBaostock(
+        basic_rows=universe_rows(),
+        missing_pub_for={("sh.600001", 2023, 1)},
+        balance_scale={(2023, 1): 1.0, (2024, 1): 1.5},
+    )
+    provider = make_provider(fake, tmp_path, monkeypatch)
+
+    fin = provider.get_financials("2024-01-01", "2024-04-30")
+
+    asset = fin.xs("600001", level="asset")
+    assert asset.loc[pd.Timestamp("2024-04-25"), "asset_growth"] == (
+        pytest.approx(0.5)
+    )
+    # The dropped anchor row is never visible: 2023Q1's pubDate would have
+    # been 2023-04-25, which no surviving row carries.
+    assert (
+        pd.Timestamp("2023-04-25")
+        not in asset["publish_date"].dropna().unique()
+    )
