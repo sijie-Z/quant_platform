@@ -636,6 +636,38 @@ def test_post_turnover_blend_refills_a_capacity_clipped_book():
     assert weights.groupby(sectors).sum().max() <= 0.30 + 1e-9
 
 
+def test_refill_skips_sector_room_for_a_single_sector_universe():
+    """The solver deliberately skips the sector constraint when every
+    candidate is in one sector; the refill must mirror that guard. Applying
+    sector room there would leave needless cash (review observation B)."""
+    n = 40
+    names = [f"S{i:02d}" for i in range(n)]
+    signal = pd.Series(
+        np.r_[np.full(10, 0.5), np.full(20, 0.2), np.zeros(10)], index=names,
+    )
+    cov = pd.DataFrame(
+        np.eye(39) * 0.0004, index=names[:39], columns=names[:39],
+    )
+    sectors = pd.Series("SEC0", index=names)
+    prev = pd.Series(0.0, index=names)
+    prev.loc[names[10:20]] = 0.075
+    prev.loc[names[39]] = 0.25
+    adv = pd.Series(1e9, index=names)
+    adv.loc[names[10:20]] = 0.03 * 1e7 / 0.10
+
+    optimizer = MeanVarianceOptimizer(PortfolioConstraints(
+        max_weight=0.10, max_sector_exposure=0.30, max_turnover=0.10,
+        risk_aversion=1.0, max_participation=0.10,
+    ))
+    weights = optimizer.optimize(
+        signal, cov, prev_weights=prev, sector_map=sectors,
+        adv=adv, aum=1e7,
+    )
+
+    assert optimizer.fallback_count == 0
+    assert weights.sum() == pytest.approx(1.0, abs=1e-9)
+
+
 def test_infeasible_capacity_falls_back_with_a_warning(caplog):
     """e: caps that cannot fund the book must warn and use the existing
     equal-weight fallback, never crash and never silently ignore the cap."""

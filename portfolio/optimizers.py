@@ -537,10 +537,14 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
                     # sector's total headroom at its remaining room and scale
                     # the per-asset headroom inside the sector so the sum
                     # cannot exceed it. Names outside the sector map are not
-                    # covered by the sector constraint.
+                    # covered by the sector constraint. Mirror the solver's
+                    # own guard: with a single-sector candidate set the
+                    # sector constraint is skipped, so the refill must skip
+                    # it too (otherwise it would leave needless cash).
                     if (
                         sector_map is not None
                         and self.constraints.max_sector_exposure < 1.0
+                        and len(unique_sectors) > 1
                     ):
                         sectors = sector_map.reindex(weights.index)
                         totals = weights.groupby(sectors).sum()
