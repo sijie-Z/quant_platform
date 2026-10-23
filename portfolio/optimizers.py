@@ -310,7 +310,15 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
         cov_annual = cov * TRADING_DAYS_PER_YEAR
         w = cp.Variable(n)
         expected_return = ALPHA_ANNUAL_SCALE * (alpha_vec @ w)
-        risk = cp.quad_form(w, cov_annual)
+        # `_ensure_psd` guarantees the matrix is PSD by construction, but
+        # cvxpy still tries to *certify* that with a shift-invert ARPACK call.
+        # On healthy (not merely singular) Ledoit-Wolf covariances that
+        # certification fails to converge, every solver raises while the
+        # problem is being built, and the rebalance falls back to equal
+        # weight -- the exact failure this hardening round removes. psd_wrap
+        # skips the redundant certification; the optimisation problem itself
+        # is unchanged.
+        risk = cp.quad_form(w, cp.psd_wrap(cov_annual))
         objective_terms = expected_return - self.constraints.risk_aversion * risk
 
         # R8: transaction-cost / quadratic-turnover terms. They are built only
@@ -661,8 +669,11 @@ class RiskParityOptimizer(PortfolioOptimizer):
         # (v_i <= cap*sum(v), sum_sector v <= cap*sum(v)).  They are invariant
         # to the scaling of v, so they constrain the normalized portfolio
         # exactly while keeping the problem convex.
+        # psd_wrap: same reason as in the mean-variance objective -- the
+        # matrix is PSD by construction (_ensure_psd) and cvxpy's ARPACK
+        # certification can fail on a healthy covariance.
         objective = cp.Minimize(
-            0.5 * cp.quad_form(v, cov) - cp.sum(cp.log(v)) / n
+            0.5 * cp.quad_form(v, cp.psd_wrap(cov)) - cp.sum(cp.log(v)) / n
         )
         constraints_list = [v >= 1e-9]
         if self.constraints.max_weight < 1.0:
@@ -751,20 +762,91 @@ class RiskParityOptimizer(PortfolioOptimizer):
         )
 
 
+# Relative diagonal ridge added by ``_ensure_psd``: ``1e-8 * trace(C) / n``.
+# Expressed as a fraction of the average variance so it is scale-free.
+_PSD_RIDGE_SCALE = 1e-8
+# A covariance whose smallest eigenvalue is below this fraction of the average
+# variance is treated as materially singular and reported at INFO.
+_PSD_SINGULARITY_LOG_THRESHOLD = 1e-6
+
+
 def _ensure_psd(cov: np.ndarray) -> np.ndarray:
-    """Ensure matrix is positive semi-definite by fixing eigenvalues.
+    """Return a symmetric PSD copy of ``cov`` with a relative diagonal ridge.
 
-    Handles NaN/inf gracefully by falling back to identity + small off-diagonal.
+    The repair is deliberately conservative:
+
+    1. Non-finite entries are cleaned with the same convention as
+       ``portfolio.covariance`` (corrupted entries -> 0, finite variances kept
+       on the diagonal) and the event is logged. The old implementation
+       silently replaced the entire matrix with ``eye(n) * 0.9 + 0.1 / n``,
+       which turned a data problem into a plausible-looking but fake risk
+       model.
+    2. The matrix is symmetrised as ``(C + C.T) / 2``.
+    3. Negative eigenvalues are clipped to zero. The matrix is rebuilt from
+       the eigendecomposition only when clipping actually changed something:
+       rebuilding a healthy matrix perturbs it at the last bit, and cvxpy's
+       PSD certification (a shift-invert ARPACK call) fails to converge on
+       the rebuilt Ledoit-Wolf covariance, which used to push every solver
+       into the equal-weight fallback.
+    4. A relative diagonal ridge ``1e-8 * trace(C) / n`` is added. On a
+       well-conditioned matrix this is a ~1e-8 relative perturbation (weights
+       move by far less than 1e-6); on a rank-deficient T<N covariance it
+       lifts the null space so the QP stays solvable.
+    5. Material repairs (smallest eigenvalue below ``1e-6 * trace/n``) are
+       logged at INFO once per call so a singular covariance is never masked
+       silently. T (the number of observations) is not known here; the engine
+       logs it with the rebalance.
+
+    Raises:
+        ValueError: if ``cov`` is not a non-empty square matrix, or the
+            eigendecomposition fails. Structural problems are caller bugs and
+            must not be hidden behind a synthetic covariance.
     """
-    # Check for invalid values
-    if np.any(~np.isfinite(cov)):
-        n = cov.shape[0]
-        return np.eye(n) * 0.9 + 0.1 / n
+    cov = np.asarray(cov, dtype=float)
+    if cov.ndim != 2 or cov.shape[0] != cov.shape[1] or cov.shape[0] == 0:
+        raise ValueError(
+            f"covariance must be a non-empty square matrix, got shape {cov.shape}"
+        )
+    n = cov.shape[0]
 
+    if not np.isfinite(cov).all():
+        raw_variances = np.diag(cov).copy()
+        cleaned = np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
+        diagonal = np.where(np.isfinite(raw_variances), raw_variances, 0.0)
+        np.fill_diagonal(cleaned, diagonal)
+        logger.warning(
+            "Covariance contained %d non-finite entries; cleaned them to zero "
+            "(finite variances kept on the diagonal) before the PSD repair",
+            int((~np.isfinite(cov)).sum()),
+        )
+        cov = cleaned
+
+    sym = 0.5 * (cov + cov.T)
     try:
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        eigvals = np.maximum(eigvals, 1e-8)
-        return eigvecs @ np.diag(eigvals) @ eigvecs.T
-    except np.linalg.LinAlgError:
-        n = cov.shape[0]
-        return np.eye(n) * 0.9 + 0.1 / n
+        eigvals, eigvecs = np.linalg.eigh(sym)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(
+            f"covariance eigendecomposition failed: {exc}"
+        ) from exc
+
+    trace = float(np.trace(sym))
+    scale = trace / n
+    min_eig = float(eigvals[0])
+
+    n_negative = int((eigvals < 0.0).sum())
+    if n_negative:
+        sym = (eigvecs * np.maximum(eigvals, 0.0)) @ eigvecs.T
+        sym = 0.5 * (sym + sym.T)
+
+    ridge = _PSD_RIDGE_SCALE * scale if scale > 0.0 else 0.0
+    if ridge:
+        sym[np.diag_indices(n)] += ridge
+
+    if scale > 0.0 and min_eig < _PSD_SINGULARITY_LOG_THRESHOLD * scale:
+        logger.info(
+            "Covariance near-singular: n=%d, trace/n=%.3e, min_eig=%.3e, "
+            "negative_eigenvalues_clipped=%d, added_ridge=%.3e "
+            "(%.0e x trace/n)",
+            n, scale, min_eig, n_negative, ridge, _PSD_RIDGE_SCALE,
+        )
+    return sym
