@@ -954,6 +954,22 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
     # received a signal and a target weight.
     excluded = prices.attrs.get("excluded_mask") if prices is not None else None
 
+    # R6c: `excluded_mask` is the *output* mask (tradability AND index
+    # membership), but factor levels must still be computed from the full
+    # price history: a name that joins the index later must not restart its
+    # momentum warm-up at the inclusion date.  `get_factor_prices` also
+    # carries the tradability-only mask; swap it onto a shallow copy for the
+    # factor calls, so ST/listing/suspension rows stay masked on the input
+    # side exactly as before while membership rows are blanked only on the
+    # output side (and on non-applied/fallback paths the two masks coincide).
+    factor_input = prices
+    if prices is not None:
+        tradable_excluded = prices.attrs.get("tradable_excluded_mask")
+        if tradable_excluded is not None:
+            factor_input = prices.copy(deep=False)
+            factor_input.attrs = dict(prices.attrs)
+            factor_input.attrs["excluded_mask"] = tradable_excluded
+
     fin_unstacked = financials.unstack("asset") if financials is not None else None
     if fin_unstacked is not None and excluded is not None:
         fin_unstacked = mask_financials(fin_unstacked, excluded)
@@ -987,9 +1003,9 @@ def _compute_factors(prices, returns, financials, metadata, turnover=None, confi
                 if panel is not None:
                     kwargs[field] = panel
             if inst.category.value == "fundamental" and fin_unstacked is not None:
-                result = inst.run(prices, fin_unstacked, **kwargs)
+                result = inst.run(factor_input, fin_unstacked, **kwargs)
             else:
-                result = inst.run(prices, **kwargs)
+                result = inst.run(factor_input, **kwargs)
             raw_factors[result.name] = result.values
         except Exception as e:
             logger.warning("Failed to compute %s: %s", factor_name, e)

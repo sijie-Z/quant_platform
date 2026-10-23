@@ -259,6 +259,16 @@ class TestMembershipReachesResearchInputs:
         )
         pd.testing.assert_frame_equal(excluded, expected, check_freq=False)
 
+        # The factor-input mask is the pre-R6c formula; only the output mask
+        # carries membership (factors must see the earlier price history).
+        pd.testing.assert_frame_equal(
+            prices.attrs["tradable_excluded_mask"], _expected_excluded(pipeline),
+            check_freq=False,
+        )
+        assert (
+            excluded & ~prices.attrs["tradable_excluded_mask"]
+        ).any().any()
+
         # The price panel itself is not cropped: B's pre-inclusion prices and
         # C's post-exit prices remain so factor lookbacks stay possible.
         close = pipeline.get_close()
@@ -288,22 +298,52 @@ class TestMembershipReachesResearchInputs:
         )
         pd.testing.assert_frame_equal(excluded, expected, check_freq=False)
 
-    def test_technical_factor_is_blank_outside_membership(self, pipeline):
+    def test_technical_factor_uses_earlier_history_but_blanks_pre_inclusion(
+        self, pipeline,
+    ):
         processed = _compute_factors(pipeline)
         values = processed["momentum_1m"]
 
         # A always a member: momentum is live once the lookback warms up.
         assert values["000001.SZ"].iloc[MOMENTUM_WARMUP:].notna().all()
 
-        # B: all NaN before inclusion, live again after the warm-up rebuilt
-        # from the (uncropped) earlier price history.
+        # B: the output is blanked before inclusion and live *from the
+        # inclusion day itself* -- the level is computed from the uncropped
+        # earlier price history, not re-warmed after inclusion (task §2.4).
         assert values["000002.SZ"].iloc[:INCLUSION_DAY].isna().all()
-        first_live = INCLUSION_DAY + MOMENTUM_WARMUP
-        assert values["000002.SZ"].iloc[first_live:].notna().all()
+        assert values["000002.SZ"].iloc[INCLUSION_DAY:].notna().all()
 
-        # C: live while a member, NaN from the exit onward.
+        # Independent reference: momentum on the raw panel with no
+        # eligibility attrs at all. B's post-inclusion values must match it,
+        # proving the earlier history was actually used.
+        raw_prices = pipeline.get_factor_prices().copy(deep=True)
+        raw_prices.attrs = {}
+        reference = Momentum1M().run(raw_prices).values
+        pd.testing.assert_series_equal(
+            values["000002.SZ"].iloc[INCLUSION_DAY:],
+            reference["000002.SZ"].iloc[INCLUSION_DAY:],
+        )
+
+        # C: live while a member, NaN from the exit onward even though its
+        # price history stays present (output masking, not a cropped panel).
         assert values["000003.SZ"].iloc[:EXIT_DAY].iloc[MOMENTUM_WARMUP:].notna().all()
         assert values["000003.SZ"].iloc[EXIT_DAY:].isna().all()
+
+    def test_compute_factors_leaves_caller_price_attrs_untouched(self, pipeline):
+        """The input-mask swap must be a shallow copy, not an in-place edit."""
+        from quant_platform import main as cli
+
+        prices = pipeline.get_factor_prices()
+        original = prices.attrs["excluded_mask"]
+        cli._compute_factors(
+            prices,
+            pipeline.returns,
+            pipeline.financials,
+            pipeline.metadata,
+            turnover=pipeline.get_turnover(),
+            config=_factor_config(),
+        )
+        assert prices.attrs["excluded_mask"] is original
 
     def test_signal_is_blank_outside_membership(self, pipeline):
         processed = _compute_factors(pipeline)
@@ -352,6 +392,10 @@ class TestNoMembershipHistoryUnchanged:
 
         pd.testing.assert_frame_equal(
             excluded, _expected_excluded(pipeline), check_freq=False,
+        )
+        # Without applied membership the input and output masks coincide.
+        pd.testing.assert_frame_equal(
+            prices.attrs["tradable_excluded_mask"], excluded, check_freq=False,
         )
         # Provenance: the pipeline did not apply a membership mask at all.
         assert pipeline.universe_pit["applied"] is False

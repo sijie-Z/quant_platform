@@ -1954,15 +1954,22 @@ class DataPipeline:
         take values only where the asset was both tradeable and a member on
         that date.
 
-        Membership is a research-input exclusion only.  The price panel is
-        not cropped: a name that joins the index later keeps its earlier
-        price history, so its first live factor value is computed from that
-        history; only the output cells before inclusion are blanked.
+        Membership is a research-input *output* exclusion only.  The price
+        panel is not cropped: a name that joins the index later keeps its
+        earlier price history, because its factor levels must be computed from
+        that history, not re-warmed from the inclusion date.  To make that
+        possible without re-introducing excluded rows into factor inputs,
+        ``attrs["tradable_excluded_mask"]`` carries the tradability-only
+        exclusion (the pre-R6c formula).  ``main._compute_factors`` swaps that
+        panel attribute in for the ``inst.run(...)`` call and re-applies the
+        combined ``excluded_mask`` to the factor outputs, so only the output
+        cells before inclusion (and on/after an exit) are blanked.  The
+        signal-level mask is the combined one.
         ``get_tradable_mask()`` and ``get_execution_gates()`` keep their R6b
         semantics (no membership), so an index exit never blocks a sale.
         When no per-date membership history was applied (no hook, or the
         single-snapshot fallback), ``excluded_mask`` is bit-for-bit
-        ``~tradable_mask`` as before.
+        ``~tradable_mask`` as before and the two masks coincide.
         """
         close = self.prices["close_adj"].unstack("asset")
         if self._suspended is not None and not self._suspended.empty:
@@ -1971,9 +1978,10 @@ class DataPipeline:
             )
             close = close.mask(suspended)
         if self.tradable_mask is not None and not self.tradable_mask.empty:
-            excluded = (~self.tradable_mask).reindex(
+            tradable_excluded = (~self.tradable_mask).reindex(
                 index=close.index, columns=close.columns, fill_value=True,
             )
+            excluded = tradable_excluded
             if (
                 self.universe_pit.get("applied") is True
                 and self.universe_mask is not None
@@ -1985,6 +1993,7 @@ class DataPipeline:
                 excluded = excluded | (~self.universe_mask).reindex(
                     index=close.index, columns=close.columns, fill_value=True,
                 )
+            close.attrs["tradable_excluded_mask"] = tradable_excluded
             close.attrs["excluded_mask"] = excluded
         return self._tag_price_panel(close, self.adjusted_price_basis)
 
