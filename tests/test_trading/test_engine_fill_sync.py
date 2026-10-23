@@ -35,7 +35,7 @@ from quant_platform.trading.engine import LiveTradingEngine
 
 
 class FakeBroker:
-    """Minimal broker exposing only the order book the sync reads."""
+    """Minimal broker exposing only the book/account the sync and baseline read."""
 
     def __init__(self, orders=None, *, orders_result: str = "list"):
         self.orders = list(orders or [])
@@ -48,6 +48,12 @@ class FakeBroker:
         if self.orders_result == "none":
             return None
         return list(self.orders)
+
+    def get_positions(self):
+        return []
+
+    def get_account(self):
+        return {"cash": 100_000.0, "total_equity": 100_000.0, "connected": True}
 
 
 def _engine(tmp_path, broker, *, risk=None, bus=None) -> LiveTradingEngine:
@@ -206,18 +212,64 @@ def test_start_syncs_fills_before_stamping_the_ledger_baseline(
     the EOD ledger must not replay them (R12 boundary)."""
     engine = _engine(tmp_path, SimulatedBroker(initial_cash=100_000))
     calls: list[str] = []
-    monkeypatch.setattr(
-        engine, "_sync_broker_fills", lambda: calls.append("sync") or 0,
-    )
-    monkeypatch.setattr(
-        engine, "_write_ledger_baseline", lambda: calls.append("baseline"),
-    )
+    stamps: dict = {}
+
+    def sync(executed_at=None):
+        calls.append("sync")
+        stamps["sync"] = executed_at
+        return 0
+
+    def baseline(not_before=None):
+        calls.append("baseline")
+        stamps["baseline"] = not_before
+
+    monkeypatch.setattr(engine, "_sync_broker_fills", sync)
+    monkeypatch.setattr(engine, "_write_ledger_baseline", baseline)
 
     engine.start()
     try:
         assert calls[:2] == ["sync", "baseline"]
+        # The baseline stamp is forced strictly after the sync's stamp.
+        assert stamps["sync"] is not None
+        assert stamps["baseline"] is not None
+        assert stamps["baseline"].isoformat() == stamps["sync"]
     finally:
         engine.stop()
+
+
+def test_startup_synced_fills_are_not_replayed_by_the_eod_ledger(tmp_path):
+    """The R12 ledger applies only trades at/after the baseline stamp.
+
+    Startup catch-up books fills that the broker's *baseline book already
+    contains*, so their timestamps must sort strictly before it; otherwise
+    EOD would count the same shares twice.
+    """
+    from datetime import datetime
+
+    from quant_platform.operations.reconciliation import ledger_from_trades
+
+    store = Store(str(tmp_path / "engine.db"))
+    recovered = _order(
+        filled_quantity=100, filled_price=10.0, status=OrderStatus.FILLED,
+    )
+    engine = LiveTradingEngine(
+        broker=FakeBroker([recovered]), store=store,
+        bus=EventBus(), risk_monitor=RiskMonitor(),
+    )
+
+    startup_sync_at = datetime.now()
+    assert engine._sync_broker_fills(
+        executed_at=startup_sync_at.isoformat(),
+    ) == 1
+    engine._write_ledger_baseline(not_before=startup_sync_at)
+
+    baseline = store.get_latest_ledger_baseline()
+    trades = store.get_trades_for_export(tenant_id="default")
+    assert len(trades) == 1
+    assert trades[0]["executed_at"] < baseline["created_at"]
+    assert ledger_from_trades(baseline, trades)["positions"] == {}, (
+        "a startup-synced fill must not be replayed on top of the baseline"
+    )
 
 
 def test_each_cycle_syncs_before_saving_the_pnl_snapshot(
@@ -240,6 +292,21 @@ def test_each_cycle_syncs_before_saving_the_pnl_snapshot(
     engine._execute_cycle()
 
     assert calls == ["sync", "pnl"]
+
+
+def test_kill_switch_cycles_still_sync_fills(tmp_path, monkeypatch):
+    """A sustained kill switch returns before the normal end-of-cycle sync."""
+    engine = _simulated_engine(tmp_path)
+    engine._risk.activate_kill_switch("test")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        engine, "_sync_broker_fills",
+        lambda *args, **kwargs: calls.append("sync") or 0,
+    )
+
+    engine._execute_cycle()
+
+    assert calls == ["sync"]
 
 
 def test_synced_fill_emits_order_synced_never_order_filled(tmp_path):

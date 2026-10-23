@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -553,13 +553,17 @@ class LiveTradingEngine:
         # BEFORE the ledger baseline is stamped. The baseline's broker book
         # already contains those fills, so trades written before its
         # ``created_at`` are baked into the baseline instead of being
-        # replayed by the EOD ledger (which would double count them).
-        self._sync_broker_fills()
+        # replayed by the EOD ledger (which would double count them). The
+        # explicit stamp guarantees that ordering even when the host clock
+        # has coarse granularity (Windows ticks ~15 ms) or the broker's
+        # ``updated_at`` is observation time rather than execution time.
+        startup_sync_at = datetime.now()
+        self._sync_broker_fills(executed_at=startup_sync_at.isoformat())
 
         # R12: broker and Store are reconciled, so the broker state is now
         # authoritative. Record it once as the trade ledger's baseline; the
         # EOD expected book is derived from this row plus later fills.
-        self._write_ledger_baseline()
+        self._write_ledger_baseline(not_before=startup_sync_at)
 
         # Pre-flight health check
         health = HealthCheck(
@@ -1333,7 +1337,7 @@ class LiveTradingEngine:
                 )
         self._audit_event(action, payload, reason=reason)
 
-    def _sync_broker_fills(self) -> int:
+    def _sync_broker_fills(self, executed_at: str | None = None) -> int:
         """Book asynchronous broker fills into the trade ledger (R13).
 
         ``place_order`` only persists fills it observes synchronously
@@ -1365,6 +1369,12 @@ class LiveTradingEngine:
         A missing/None/erroring broker book is a no-op (debug/warning): a
         fill-sync failure must not take down the trading cycle. Returns the
         number of trade rows written.
+
+        ``executed_at`` overrides the per-order stamp for every trade this
+        call writes. The startup catch-up passes the process's pre-baseline
+        clock so those fills sort strictly before the R12 ``ledger_baselines``
+        row that bakes them in (see ``start``); per-cycle syncs leave it
+        unset and use the broker's ``updated_at``.
         """
         try:
             orders = self._broker.get_orders()
@@ -1386,7 +1396,9 @@ class LiveTradingEngine:
         written = 0
         for order in order_list:
             try:
-                written += self._sync_one_broker_order(order)
+                written += self._sync_one_broker_order(
+                    order, executed_at=executed_at,
+                )
             except Exception as exc:
                 logger.warning(
                     "Broker fill sync skipped order %r: %s",
@@ -1394,7 +1406,7 @@ class LiveTradingEngine:
                 )
         return written
 
-    def _sync_one_broker_order(self, order) -> int:
+    def _sync_one_broker_order(self, order, executed_at: str | None = None) -> int:
         """Book one broker order's fill delta; returns trades written (0/1)."""
         try:
             filled = int(getattr(order, "filled_quantity", 0) or 0)
@@ -1453,9 +1465,11 @@ class LiveTradingEngine:
         except (TypeError, ValueError):
             order_quantity = 0
         updated_at = str(getattr(order, "updated_at", "") or "")
-        executed_at = updated_at or self._exchange_now().replace(
-            tzinfo=None,
-        ).isoformat()
+        trade_executed_at = (
+            executed_at
+            or updated_at
+            or self._exchange_now().replace(tzinfo=None).isoformat()
+        )
 
         trade = {
             "trade_id": f"{order_id}:sync:{filled}",
@@ -1469,7 +1483,7 @@ class LiveTradingEngine:
             # docstring. Never fabricate a commission/tax here.
             "commission": 0,
             "tax": 0,
-            "executed_at": executed_at,
+            "executed_at": trade_executed_at,
         }
         order_row = {
             "order_id": order_id,
@@ -1485,7 +1499,7 @@ class LiveTradingEngine:
             "slippage": float(getattr(order, "slippage", 0) or 0),
             "broker_order_id": str(getattr(order, "broker_order_id", "") or ""),
             "error_msg": str(getattr(order, "error_msg", "") or ""),
-            "updated_at": executed_at,
+            "updated_at": trade_executed_at,
         }
         # Never overwrite an existing row's creation time with an empty
         # value just because a minimal DTO omitted it.
@@ -1790,7 +1804,7 @@ class LiveTradingEngine:
         # not lose the reconciliation.
         self._persist_engine_state()
 
-    def _write_ledger_baseline(self) -> None:
+    def _write_ledger_baseline(self, not_before: datetime | None = None) -> None:
         """Record the broker's book as the trade ledger's baseline (R12).
 
         Called exactly once per process start, after ``_restore_state`` has
@@ -1811,6 +1825,13 @@ class LiveTradingEngine:
         same-tick fill (~1 ms) rather than the whole broker query latency
         (stamping first would make every fill during the queries eligible for
         double counting).
+
+        ``not_before`` is the startup fill sync's clock (R13): the stamp is
+        forced strictly later than it so trades absorbed before the baseline
+        sort before the boundary even on a coarse host clock. Without this a
+        same-tick startup fill would be counted twice at EOD -- once by the
+        baseline book, once by the ledger's ``executed_at >= created_at``
+        rule.
         """
         try:
             account = self._broker.get_account()
@@ -1874,13 +1895,16 @@ class LiveTradingEngine:
             else:
                 book[code] = {"quantity": quantity, "avg_cost": avg_cost}
 
+        created_at = datetime.now()
+        if not_before is not None and created_at <= not_before:
+            created_at = not_before + timedelta(microseconds=1)
         self._store.save_ledger_baseline({
             # Same clock as broker fill stamps (`Order.updated_at` is host
             # wall-clock in every adapter): the ledger's `executed_at >=
             # created_at` boundary must compare timestamps from one clock.
             # A Shanghai-labelled baseline on a non-Shanghai host would
             # exclude every later fill and fail the EOD comparison.
-            "created_at": datetime.now().isoformat(),
+            "created_at": created_at.isoformat(),
             "tenant_id": self._tenant_id,
             "engine_state_key": self._engine_state_key,
             "cash": cash_value,
@@ -2001,6 +2025,10 @@ class LiveTradingEngine:
             cycle.n_positions = account.get("n_positions", 0)
             self._deleverage(cycle)
             self._halt("kill switch active")
+            # R13: a sustained kill switch returns before the normal
+            # end-of-cycle sync; book fills that landed asynchronously
+            # while the engine sat halted so the ledger still closes.
+            self._sync_broker_fills()
             # D5: the kill state itself must survive a restart.
             self._persist_engine_state(
                 trust_flat=self._has_filled_sell(cycle.orders),
