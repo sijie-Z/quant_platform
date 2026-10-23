@@ -312,8 +312,9 @@ class CostModel:
                     self._slippage_fallback_warned = True
                     logger.warning(
                         "slippage_model=%r is not in use: compute_costs() was "
-                        "given no %s. Falling back to fixed slippage of %.1f "
-                        "bps -- the configured model is NOT what is running.",
+                        "given no %s; using a fallback to fixed slippage of "
+                        "%.1f bps -- the configured model is NOT what is "
+                        "running.",
                         self.slippage_model,
                         " or ".join(missing) or "supporting inputs",
                         self.slippage * 10000,

@@ -463,6 +463,7 @@ class TestImpactCostScalesWithParticipation:
         )
 
     def test_vector_cost_rises_with_participation(self):
+        pytest.importorskip("quant_core")
         model = self._model()
         notional = 1_000_000.0
         transfers = 0.0  # transfer_fee=0
@@ -483,6 +484,7 @@ class TestImpactCostScalesWithParticipation:
         assert costs[2] == pytest.approx(notional * 0.02 * np.sqrt(1.0))
 
     def test_scalar_cost_rises_with_participation(self):
+        pytest.importorskip("quant_core")
         model = self._model()
         notional = 1_000_000.0
         costs = [
@@ -510,7 +512,7 @@ class TestImpactCostScalesWithParticipation:
         assert impact_cost == pytest.approx(fixed.compute_costs(1_000_000.0))
         messages = [r.getMessage() for r in caplog.records]
         assert any(
-            "Falling back to fixed" in m and "daily_volume" in m
+            "fallback to fixed" in m and "daily_volume" in m
             for m in messages
         ), messages
 

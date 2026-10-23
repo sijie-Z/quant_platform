@@ -119,7 +119,7 @@ costs:
   # cost model warns once and falls back to fixed slippage, so the config
   # can never silently describe a model that is not running.
   slippage_model: "impact"
-  impact_model: "composite" # composite, almgren_chriss, square_root
+  impact_model: "composite" # scalar single-order path; the vectorised backtest path uses the documented square-root rule
 
 # --- Risk ---
 risk:
