@@ -60,6 +60,9 @@ class FakeBaostockST:
     ``include_is_st=False`` mimics an older interface that ignores the
     requested field list and returns the thirteen legacy columns.
     ``default_flag`` lets a test return blank values instead of ``"0"``.
+    ``omit_is_st_codes`` makes only those symbols return 13 columns, i.e. a
+    mixed flag column with blanks (the CSV-round-trip trap).
+    ``fail_history=True`` makes every history call raise (transient outage).
     """
 
     def __init__(
@@ -68,11 +71,15 @@ class FakeBaostockST:
         *,
         include_is_st: bool = True,
         default_flag: str = "0",
+        omit_is_st_codes: tuple[str, ...] = (),
+        fail_history: bool = False,
         codes: tuple[str, ...] = (CODE, OTHER),
     ):
         self.flags = flags or {}
         self.include_is_st = include_is_st
         self.default_flag = default_flag
+        self.omit_is_st_codes = set(omit_is_st_codes)
+        self.fail_history = fail_history
         self.codes = list(codes)
         self.history_calls: list[tuple[str, str, list[str]]] = []
         self.basic_query_count = 0
@@ -104,14 +111,21 @@ class FakeBaostockST:
         requested = [part for part in str(fields).split(",") if part]
         six = code.split(".")[-1]
         self.history_calls.append((six, adjustflag, requested))
+        if self.fail_history:
+            raise RuntimeError("simulated history outage")
         start = pd.Timestamp(start_date) if start_date else None
         end = pd.Timestamp(end_date) if end_date else None
+        window = [
+            day for day in SESSIONS
+            if (start is None or day >= start) and (end is None or day <= end)
+        ]
+        if code == "sh.000300":
+            return FakeResultSet(
+                [[str(day.date()), "1000.0", "990.0", "0.1"] for day in window],
+                fields=["date", "close", "preclose", "pctChg"],
+            )
         rows = []
-        for day in SESSIONS:
-            if start is not None and day < start:
-                continue
-            if end is not None and day > end:
-                continue
+        for day in window:
             # Raw and hfq series coincide (adj_factor = 1): only the index,
             # the close column and the ST side field matter here.
             price = 10.0
@@ -120,10 +134,27 @@ class FakeBaostockST:
                 f"{price - 0.2}", f"{price}", f"{price}", "10000",
                 f"{price * 10000}", "2.5", "1.0", "15.0", "2.0",
             ]
-            if self.include_is_st and "isST" in requested:
+            if (
+                self.include_is_st
+                and "isST" in requested
+                and six not in self.omit_is_st_codes
+            ):
                 row.append(self.flags.get(six, {}).get(day, self.default_flag))
             rows.append(row)
         return FakeResultSet(rows, fields=requested)
+
+    def query_profit_data(self, code="", year=2024, quarter=4):
+        return FakeResultSet(
+            [], fields=["code", "pubDate", "statDate", "roeAvg", "npMargin",
+                       "gpMargin", "netProfit", "epsTTM", "MBRevenue",
+                       "totalShare", "liqaShare"],
+        )
+
+    def query_balance_data(self, code="", year=2024, quarter=4):
+        return FakeResultSet(
+            [], fields=["code", "pubDate", "statDate", "liabilityToAsset",
+                       "assetToEquity"],
+        )
 
 
 def make_provider(fake, monkeypatch, cache_dir, *, cache_enabled=False,
@@ -328,3 +359,144 @@ def test_pipeline_mask_is_effective_from_announce_date_only(
     assert pipe.get_st_status(SESSIONS[8]) == set()
     assert CODE in pipe.get_st_status(SESSIONS[9])
     assert CODE not in pipe.get_st_status(SESSIONS[20])
+
+
+def test_pipeline_run_end_to_end_applies_st_episodes(tmp_path, monkeypatch):
+    """The real pipeline order (metadata -> PIT load -> prices) must still
+    screen ST: the pre-price resolution fetches the raw panel and the later
+    get_prices is a cache/memo hit."""
+    fake = FakeBaostockST(flags={CODE: _flags_for(SESSIONS[9:20])})
+    provider = make_provider(fake, monkeypatch, tmp_path)
+    provider.cache_universe(start_date=START, end_date=END)
+
+    pipe = DataPipeline(
+        provider, START, END, exclude_st=True, exclude_suspended=False,
+    )
+    pipe.run()
+
+    canonical = f"{CODE}.SH"
+    assert len(pipe._st_timeseries) == 1
+    assert pipe.metadata.attrs.get("st_available") is True
+    assert pipe.st_eligible is not None
+    assert bool(pipe.st_eligible.loc[SESSIONS[8], canonical]) is True
+    assert bool(pipe.st_eligible.loc[SESSIONS[9], canonical]) is False
+    assert bool(pipe.st_eligible.loc[SESSIONS[19], canonical]) is False
+    assert bool(pipe.st_eligible.loc[SESSIONS[20], canonical]) is True
+
+
+# ----------------------------------------------------------------------
+# Reviewer-driven hardening: CSV fallback, transient failures, re-pins,
+# request counts and hfq field projection
+# ----------------------------------------------------------------------
+
+def _no_parquet(*_args, **_kwargs):
+    raise ImportError("pyarrow unavailable (simulated)")
+
+
+def test_csv_fallback_round_trip_with_mixed_blanks_keeps_episodes(
+    tmp_path, monkeypatch,
+):
+    """A mixed "1"/blank flag column read back from CSV must not be inferred
+    as float64 (the reload would silently lose every ST episode)."""
+    fake = FakeBaostockST(
+        flags={CODE: _flags_for(SESSIONS[9:20])},
+        omit_is_st_codes=(OTHER,),  # mixed column: "0"/"1" plus blanks
+    )
+    cache_dir = tmp_path / "csv_cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", _no_parquet)
+
+    first = make_provider(fake, monkeypatch, cache_dir, cache_enabled=True)
+    first.cache_universe(start_date=START, end_date=END)
+    first.get_prices(START, END)
+    assert len(first.get_st_timeseries()) == 1
+
+    key = first._daily_cache_key(first._pinned_price_codes, START, END, "3")
+    csv_path = first._cache_path(key).with_suffix(".csv")
+    assert csv_path.exists()
+    cached = first._load_cache(key)
+    assert str(
+        cached.loc[(SESSIONS[9], CODE), mod._ST_OBSERVED_COLUMN]
+    ) == "1"
+
+    second = make_provider(fake, monkeypatch, cache_dir, cache_enabled=True)
+    second.cache_universe(start_date=START, end_date=END)
+    reloaded = second.get_st_timeseries()
+
+    assert len(reloaded) == 1
+    assert reloaded.iloc[0]["announce_date"] == SESSIONS[9]
+    assert second.st_available is True
+
+
+def test_transient_st_fetch_failure_is_retried_not_latched(
+    tmp_path, monkeypatch,
+):
+    fake = FakeBaostockST(
+        flags={CODE: _flags_for(SESSIONS[9:20])}, fail_history=True,
+    )
+    provider = make_provider(fake, monkeypatch, tmp_path)
+    provider.cache_universe(start_date=START, end_date=END)
+
+    assert provider.get_st_timeseries().empty
+    assert provider.st_available is False
+    calls_after_failure = len(fake.history_calls)
+
+    fake.fail_history = False
+    episodes = provider.get_st_timeseries()
+
+    assert len(episodes) == 1
+    assert provider.st_available is True
+    assert len(fake.history_calls) > calls_after_failure
+
+
+def test_repin_invalidates_episodes_from_the_previous_range(
+    tmp_path, monkeypatch,
+):
+    fake = FakeBaostockST(flags={CODE: _flags_for(SESSIONS[-4:])})
+    provider = make_provider(fake, monkeypatch, tmp_path)
+
+    provider.cache_universe(start_date=START, end_date=END)
+    assert len(provider.get_st_timeseries()) == 1
+
+    # The new range ends before the ST run: episodes from the old range must
+    # not leak into it.
+    provider.cache_universe(
+        start_date=START, end_date=str(SESSIONS[30].date()),
+    )
+    assert provider.get_st_timeseries().empty
+
+
+def test_pinned_pipeline_order_fetches_each_symbol_once(
+    tmp_path, monkeypatch,
+):
+    for cache_enabled in (True, False):
+        fake = FakeBaostockST(flags={CODE: _flags_for(SESSIONS[9:20])})
+        cache_dir = tmp_path / f"cache_{cache_enabled}"
+        cache_dir.mkdir()
+        provider = make_provider(
+            fake, monkeypatch, cache_dir,
+            cache_enabled=cache_enabled, adjustment="hfq",
+        )
+        provider.cache_universe(start_date=START, end_date=END)
+
+        provider.get_metadata()  # pre-price ST resolution
+        prices = provider.get_prices(START, END)
+
+        assert mod._ST_OBSERVED_COLUMN not in prices.columns
+        raw_calls = [call for call in fake.history_calls if call[1] == "3"]
+        hfq_calls = [call for call in fake.history_calls if call[1] == "1"]
+        assert len(raw_calls) == len(fake.codes), cache_enabled
+        assert len(hfq_calls) == len(fake.codes), cache_enabled
+
+
+def test_hfq_fields_projection_excludes_the_side_column(tmp_path, monkeypatch):
+    fake = FakeBaostockST(flags={CODE: _flags_for(SESSIONS[9:20])})
+    provider = make_provider(
+        fake, monkeypatch, tmp_path, adjustment="hfq",
+    )
+
+    sub = provider.get_prices(START, END, fields=["close", "volume"])
+
+    assert list(sub.columns) == ["close", "volume"]
+    assert len(provider.get_st_timeseries()) == 1
+

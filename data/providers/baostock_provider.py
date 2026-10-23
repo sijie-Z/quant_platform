@@ -364,6 +364,10 @@ class BaostockDataProvider(DataProvider):
         #: ``get_prices`` can still populate it).  Empty means "resolved: no
         #: ST evidence".
         self._st_timeseries: pd.DataFrame | None = None
+        #: Last full daily panel fetched by this instance (cache key, frame).
+        #: The pre-price ST resolution and the later ``get_prices`` share one
+        #: fetch through it even when the provider cache is disabled.
+        self._last_daily_panel: tuple[str, pd.DataFrame] | None = None
         # Universe sample pinned by `cache_universe()` so the pipeline cache
         # key and the actual fetch use the *same* symbols even if the
         # underlying stock list changes between resolution and fetch.
@@ -478,7 +482,16 @@ class BaostockDataProvider(DataProvider):
         universe = self._records_for_range(records, start_date, end_date)
         price_codes = _stratified_sample(universe, _MAJOR_LIST_SIZE)
         financial_codes = _stratified_sample(universe, 100)
-        self._pinned_range = self._normalise_range(start_date, end_date)
+        pinned_range = self._normalise_range(start_date, end_date)
+        if (
+            pinned_range != self._pinned_range
+            or price_codes != self._pinned_price_codes
+        ):
+            # A re-pin describes a different panel; episodes derived from the
+            # previous range must not leak into it.
+            self._st_timeseries = None
+            self.st_available = False
+        self._pinned_range = pinned_range
         self._pinned_price_codes = price_codes
         self._pinned_financial_codes = financial_codes
         return sorted(set(price_codes) | set(financial_codes))
@@ -585,6 +598,10 @@ class BaostockDataProvider(DataProvider):
         )
 
     def _discard_cache(self, key: str) -> None:
+        if self._last_daily_panel is not None and self._last_daily_panel[0] == key:
+            # A panel that failed validation must not be replayed from the
+            # in-memory reuse slot either (e.g. an unusable hfq divisor).
+            self._last_daily_panel = None
         base = self._cache_path(key)
         for path in (
             base,
@@ -626,11 +643,14 @@ class BaostockDataProvider(DataProvider):
                 # The asset column must stay a zero-filled string: pandas
                 # would otherwise infer ``000001`` as integer ``1``, and every
                 # incremental merge / hfq reindex compares labels exactly.
+                # The ST side column is read as text too: a mixed "0"/"1"/blank
+                # column would otherwise infer float64 ("1.0"), and the episode
+                # derivation would silently lose every flag on reload.
                 return pd.read_csv(
                     source,
                     index_col=[0, 1],
                     parse_dates=[0],
-                    dtype={1: str},
+                    dtype={1: str, _ST_OBSERVED_COLUMN: str},
                 )
             return pd.read_parquet(source)
         except Exception:
@@ -810,6 +830,13 @@ class BaostockDataProvider(DataProvider):
             if cached is not None and len(cached) > 0:
                 logger.info("Cache hit: %s (%d rows)", cache_key, len(cached))
                 return cached
+            memo = self._last_daily_panel
+            if memo is not None and memo[0] == cache_key and len(memo[1]) > 0:
+                logger.info(
+                    "In-memory daily panel hit: %s (%d rows)",
+                    cache_key, len(memo[1]),
+                )
+                return memo[1]
 
         self._login()
         bs = self._bs
@@ -891,6 +918,7 @@ class BaostockDataProvider(DataProvider):
 
         if use_cache:
             self._save_cache(cache_key, df)
+            self._last_daily_panel = (cache_key, df)
         return df
 
     # ------------------------------------------------------------------
@@ -1098,7 +1126,15 @@ class BaostockDataProvider(DataProvider):
             or _ST_OBSERVED_COLUMN not in panel.columns
         ):
             return _empty_st_timeseries()
-        flags = panel[_ST_OBSERVED_COLUMN].astype("string").str.strip()
+        flags = (
+            panel[_ST_OBSERVED_COLUMN]
+            .astype("string")
+            .str.strip()
+            # Defence in depth for numeric/CSV sources: a mixed flag column
+            # round-tripped through a float dtype becomes "1.0"/"0.0"; strip
+            # the trailing zeros so those days are still recognised.
+            .str.replace(r"\.0+$", "", regex=True)
+        )
         known = flags.isin(["0", "1"]).to_numpy(dtype=bool)
         if not bool(known.any()):
             return _empty_st_timeseries()
@@ -1161,11 +1197,12 @@ class BaostockDataProvider(DataProvider):
         except Exception as exc:  # ST history must never abort a run
             logger.warning(
                 "Baostock ST history unavailable (%s); reporting no ST "
-                "history for this run", exc,
+                "history for this call (the next request retries)", exc,
             )
-            self._st_timeseries = _empty_st_timeseries()
-            self.st_available = False
-            return self._st_timeseries
+            # Deliberately not memoised: a transient failure must not be
+            # latched as "this provider has no ST history"; the next call
+            # (e.g. the pipeline's follow-up load) gets another chance.
+            return _empty_st_timeseries()
         return self._ingest_st_episodes(panel)
 
     def get_metadata(self) -> pd.DataFrame:
@@ -1205,10 +1242,12 @@ class BaostockDataProvider(DataProvider):
             } for code in self._get_major_stocks_list()]
 
         if not rows:
-            return pd.DataFrame(
+            empty = pd.DataFrame(
                 columns=["sector", "market_cap_group", "listing_date", "delisting_date"],
                 index=pd.Index([], name="asset"),
             )
+            empty.attrs["st_available"] = st_available
+            return empty
 
         df = pd.DataFrame(rows).set_index("asset")
         df.index.name = "asset"
