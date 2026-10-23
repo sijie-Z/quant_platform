@@ -1364,15 +1364,25 @@ class QMTBroker(BrokerInterface):
                 pass
 
     def disconnect(self) -> bool:
-        """Gracefully disconnect from QMT."""
+        """Gracefully disconnect from QMT.
+
+        Local state is always cleared; the return value reports whether the
+        trader session stopped without raising (the old behaviour returned
+        False on a stop error but kept claiming to be connected).
+        """
+        ok = True
+        trader = self._trader
+        self._trader = None
         try:
-            self._stop_quiescent_trader()
-            self._connected = False
-            logger.info("QMT disconnected")
-            return True
+            if trader is not None:
+                trader.stop()
         except Exception as e:
             logger.error("QMT disconnect error: %s", e)
-            return False
+            ok = False
+        self._connected = False
+        if ok:
+            logger.info("QMT disconnected")
+        return ok
 
     # ── Lazy reconnect & broker reconciliation ──
 

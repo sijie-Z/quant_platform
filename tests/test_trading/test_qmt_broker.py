@@ -422,6 +422,16 @@ class TestQMTBrokerDisconnect:
         assert result is True
         assert broker._connected is False
 
+    def test_disconnect_reports_stop_failure_but_clears_state(self):
+        broker = QMTBroker(account="sim001")
+        broker._connected = True
+        trader = MagicMock()
+        trader.stop.side_effect = RuntimeError("stop failed")
+        broker._trader = trader
+        assert broker.disconnect() is False
+        assert broker._connected is False
+        assert broker._trader is None
+
 
 # ── Broker Registry ──
 
