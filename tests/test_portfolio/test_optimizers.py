@@ -828,10 +828,10 @@ def _r15_t_less_than_n_case(n_assets=101, n_observations=60):
 
     Five systematic factors plus idiosyncratic noise gives the same shape as
     the real-data reproduction (T=60 sessions, N=101 names, LW shrinkage):
-    the matrix is full-rank but its eigendecomposition reconstruction made
-    cvxpy's PSD certification raise ARPACKNoConvergence, so CLARABEL and SCS
-    both failed while the problem was being built and every rebalance fell
-    back to equal weight.
+    the matrix is full-rank and well-conditioned, yet cvxpy's shift-invert
+    ARPACK PSD certification of -cov_annual failed to converge, so CLARABEL
+    and SCS both raised while the problem was being built and every rebalance
+    fell back to equal weight.
     """
     rng = np.random.default_rng(0)
     factors = rng.normal(0.0, 0.01, size=(n_observations, 5))
@@ -907,6 +907,61 @@ def test_ensure_psd_rejects_structural_garbage():
         _ensure_psd(np.zeros((3, 2)))
     with pytest.raises(ValueError):
         _ensure_psd(np.zeros(0))
+
+
+def test_ensure_psd_warns_on_materially_invalid_covariances(caplog):
+    """A strongly indefinite or non-positive-trace matrix is a data problem.
+
+    It is still repaired to PSD (the optimizers must not crash), but the
+    event is a WARNING -- not the INFO reserved for benign rank deficiency --
+    so a corrupted risk model can never look like a successful MVO run
+    without an alarm.
+    """
+    # trace 2 > 0, eigenvalues 4 and -2: materially indefinite.
+    indefinite = np.array([[1.0, 3.0], [3.0, 1.0]])
+    with caplog.at_level("WARNING"):
+        repaired = _ensure_psd(indefinite)
+    assert np.linalg.eigvalsh(repaired).min() >= -1e-12
+    assert any(
+        "materially indefinite" in record.getMessage()
+        for record in caplog.records
+    ), "an indefinite covariance was repaired without a warning"
+
+    caplog.clear()
+    # Negative trace: not a covariance at all.
+    with caplog.at_level("WARNING"):
+        repaired = _ensure_psd(np.diag([1.0, -3.0]))
+    assert np.isfinite(repaired).all()
+    assert any(
+        "invalid" in record.getMessage() and "trace" in record.getMessage()
+        for record in caplog.records
+    ), "an invalid covariance was repaired without a warning"
+
+
+def test_risk_parity_t_less_than_n_solves_without_fallback():
+    """The RiskParity quad form takes the same psd_wrap path.
+
+    T=12 observations for its 26-name candidate set (sample covariance,
+    rank <= 11) used to be the kind of problem that could not certify PSD.
+    """
+    rng = np.random.default_rng(3)
+    t, n = 12, 60
+    dates = pd.bdate_range("2021-01-04", periods=t)
+    assets = [f"R{i:02d}" for i in range(n)]
+    cov = estimate_covariance(
+        pd.DataFrame(
+            rng.normal(0.0, 0.02, size=(t, n)), index=dates, columns=assets,
+        ),
+        method="sample", lookback=t,
+    )
+    signal = pd.Series(rng.uniform(0.1, 1.0, size=n), index=assets)
+
+    optimizer = RiskParityOptimizer(PortfolioConstraints(max_weight=0.08))
+    weights = optimizer.optimize(signal, cov)
+
+    assert optimizer.fallback_count == 0, optimizer.last_fallback_reason
+    assert float(weights.sum()) == pytest.approx(1.0, abs=1e-6)
+    assert np.isfinite(weights.to_numpy()).all()
 
 
 def test_t_less_than_n_ledoit_wolf_solves_without_equal_weight_fallback(caplog):

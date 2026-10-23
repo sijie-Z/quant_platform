@@ -311,13 +311,14 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
         w = cp.Variable(n)
         expected_return = ALPHA_ANNUAL_SCALE * (alpha_vec @ w)
         # `_ensure_psd` guarantees the matrix is PSD by construction, but
-        # cvxpy still tries to *certify* that with a shift-invert ARPACK call.
-        # On healthy (not merely singular) Ledoit-Wolf covariances that
-        # certification fails to converge, every solver raises while the
-        # problem is being built, and the rebalance falls back to equal
-        # weight -- the exact failure this hardening round removes. psd_wrap
-        # skips the redundant certification; the optimisation problem itself
-        # is unchanged.
+        # cvxpy still certifies PSD-ness with a shift-invert ARPACK call --
+        # on both +cov_annual and -cov_annual. On numerically healthy
+        # Ledoit-Wolf covariances the negative-definite direction can fail to
+        # converge (ARPACK error -1), every solver raises while the problem
+        # is being built, and the rebalance falls back to equal weight -- the
+        # exact failure this hardening round removes. psd_wrap skips the
+        # redundant certification; the optimisation problem itself is
+        # unchanged.
         risk = cp.quad_form(w, cp.psd_wrap(cov_annual))
         objective_terms = expected_return - self.constraints.risk_aversion * risk
 
@@ -671,7 +672,8 @@ class RiskParityOptimizer(PortfolioOptimizer):
         # exactly while keeping the problem convex.
         # psd_wrap: same reason as in the mean-variance objective -- the
         # matrix is PSD by construction (_ensure_psd) and cvxpy's ARPACK
-        # certification can fail on a healthy covariance.
+        # certification of +C / -C can fail to converge on a healthy
+        # covariance.
         objective = cp.Minimize(
             0.5 * cp.quad_form(v, cp.psd_wrap(cov)) - cp.sum(cp.log(v)) / n
         )
@@ -783,19 +785,26 @@ def _ensure_psd(cov: np.ndarray) -> np.ndarray:
        model.
     2. The matrix is symmetrised as ``(C + C.T) / 2``.
     3. Negative eigenvalues are clipped to zero. The matrix is rebuilt from
-       the eigendecomposition only when clipping actually changed something:
-       rebuilding a healthy matrix perturbs it at the last bit, and cvxpy's
-       PSD certification (a shift-invert ARPACK call) fails to converge on
-       the rebuilt Ledoit-Wolf covariance, which used to push every solver
-       into the equal-weight fallback.
+       the eigendecomposition only when clipping actually changed something,
+       so a healthy covariance is returned as close to the caller's input as
+       possible. (Rebuilding is not the whole story: cvxpy certifies PSD-ness
+       of both ``+C`` and ``-C`` with a shift-invert ARPACK call, and that
+       certification can fail to converge on numerically healthy
+       covariances. The deterministic protection lives at the quad form:
+       ``cp.psd_wrap``.)
     4. A relative diagonal ridge ``1e-8 * trace(C) / n`` is added. On a
        well-conditioned matrix this is a ~1e-8 relative perturbation (weights
        move by far less than 1e-6); on a rank-deficient T<N covariance it
        lifts the null space so the QP stays solvable.
-    5. Material repairs (smallest eigenvalue below ``1e-6 * trace/n``) are
-       logged at INFO once per call so a singular covariance is never masked
-       silently. T (the number of observations) is not known here; the engine
-       logs it with the rebalance.
+    5. Material repairs are never silent: a near-singular covariance
+       (smallest eigenvalue below ``1e-6 * trace/n``) is logged at INFO; a
+       materially indefinite covariance (smallest eigenvalue below
+       ``-1e-8 * trace/n``) or one whose trace is non-positive -- which is
+       not a covariance at all -- is logged at WARNING once per call. T (the
+       number of observations) is not known here; the engine logs it with the
+       rebalance.
+
+    The result is PSD up to floating-point round-off.
 
     Raises:
         ValueError: if ``cov`` is not a non-empty square matrix, or the
@@ -846,15 +855,22 @@ def _ensure_psd(cov: np.ndarray) -> np.ndarray:
     if ridge:
         sym[np.diag_indices(n)] += ridge
 
-    if scale > 0.0:
-        material_repair = (
-            min_eig < _PSD_SINGULARITY_LOG_THRESHOLD * scale
-        )
-    else:
+    if scale <= 0.0:
         # A covariance with non-positive trace is not a valid covariance at
-        # all; clipping it to zero must never be silent either.
-        material_repair = True
-    if material_repair:
+        # all; clipping it to zero must never be silence or a mere INFO.
+        logger.warning(
+            "Covariance is invalid (trace/n=%.3e <= 0): n=%d, min_eig=%.3e, "
+            "negative_eigenvalues_clipped=%d; repaired to PSD with no ridge",
+            scale, n, min_eig, n_negative,
+        )
+    elif min_eig < -1e-8 * scale:
+        logger.warning(
+            "Covariance is materially indefinite: n=%d, trace/n=%.3e, "
+            "min_eig=%.3e, negative_eigenvalues_clipped=%d; repaired to PSD "
+            "with added_ridge=%.3e",
+            n, scale, min_eig, n_negative, ridge,
+        )
+    elif min_eig < _PSD_SINGULARITY_LOG_THRESHOLD * scale:
         logger.info(
             "Covariance near-singular: n=%d, trace/n=%.3e, min_eig=%.3e, "
             "negative_eigenvalues_clipped=%d, added_ridge=%.3e "
