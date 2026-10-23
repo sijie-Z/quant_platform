@@ -19,6 +19,19 @@ class PortfolioConstraints:
         risk_aversion: Trade-off between return and risk.
         asset_universe: Cross-asset instrument registry for per-instrument
                         lot_size/multiplier lookups. If None, uses default lot_size.
+        transaction_cost_bps: One-way turnover cost in basis points added to
+                        the mean-variance objective as
+                        ``-(transaction_cost_bps / 1e4) * sum(|w - prev_w|)``.
+                        0 disables the term (default: bit-identical behaviour).
+        turnover_penalty: Quadratic turnover smoothing coefficient added to the
+                        mean-variance objective as
+                        ``-turnover_penalty * sum_squares(w - prev_w)``.
+                        0 disables the term (default: bit-identical behaviour).
+        max_participation: Capacity cap as a fraction of each asset's average
+                        daily traded value (ADV). Applied only when the caller
+                        supplies both ``adv`` and ``aum`` to the optimizer, as
+                        ``w_i <= min(max_weight, max_participation * adv_i / aum)``.
+                        0 disables the cap (default).
     """
     long_only: bool = True
     max_weight: float = 0.05
@@ -28,6 +41,9 @@ class PortfolioConstraints:
     risk_aversion: float = 1.0
     target_volatility: float = 0.0  # Annualized target vol, 0 = disabled
     asset_universe: object | None = None  # AssetUniverse, avoid circular import
+    transaction_cost_bps: float = 0.0  # One-way turnover cost in bp, 0 = off
+    turnover_penalty: float = 0.0  # Quadratic (w - prev_w) penalty, 0 = off
+    max_participation: float = 0.0  # ADV participation cap, 0 = off
 
     def __post_init__(self) -> None:
         """Reject constraints that would crash or silently change meaning.
@@ -62,6 +78,21 @@ class PortfolioConstraints:
                 "target_volatility must be >= 0 (annualized), got "
                 f"{self.target_volatility!r}"
             )
+        if float(self.transaction_cost_bps) < 0.0:
+            raise ValueError(
+                "transaction_cost_bps must be >= 0, got "
+                f"{self.transaction_cost_bps!r}"
+            )
+        if float(self.turnover_penalty) < 0.0:
+            raise ValueError(
+                "turnover_penalty must be >= 0, got "
+                f"{self.turnover_penalty!r}"
+            )
+        if not (0.0 <= float(self.max_participation) <= 1.0):
+            raise ValueError(
+                "max_participation must be 0 (disabled) or in (0, 1], got "
+                f"{self.max_participation!r}"
+            )
 
     def get_lot_size(self, symbol: str) -> int:
         """Get lot size for a specific symbol.
@@ -92,4 +123,15 @@ class PortfolioConstraints:
             max_sector_exposure=config.max_sector_exposure,
             max_turnover=config.max_turnover,
             lot_size=config.lot_size,
+            # R8 keys: tolerant getattr so older/simpler config objects that
+            # predate the cost-aware fields keep working (0 = disabled).
+            transaction_cost_bps=float(
+                getattr(config, "transaction_cost_bps", 0.0) or 0.0
+            ),
+            turnover_penalty=float(
+                getattr(config, "turnover_penalty", 0.0) or 0.0
+            ),
+            max_participation=float(
+                getattr(config, "max_participation", 0.0) or 0.0
+            ),
         )

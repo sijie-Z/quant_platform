@@ -74,6 +74,34 @@ def test_run_backtest_forwards_both_execution_masks(monkeypatch):
     assert captured["universe_mask"] is universe
 
 
+def test_run_backtest_forwards_cost_aware_constraint_config(monkeypatch):
+    """R8: the three cost-aware knobs must reach PortfolioConstraints."""
+    import quant_platform.backtest.engine as engine_mod
+
+    config = load_config(str(DEFAULT_CONFIG))
+    config.portfolio.constraints.transaction_cost_bps = 20.0
+    config.portfolio.constraints.turnover_penalty = 0.75
+    config.portfolio.constraints.max_participation = 0.1
+
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, **kwargs):
+            return {"summary": {}, "daily_returns": None, "weights_history": {}}
+
+    monkeypatch.setattr(engine_mod, "BacktestEngine", FakeEngine)
+
+    _run_backtest(config, None, None, None, None, None, None)
+
+    constraints = captured["constraints"]
+    assert constraints.transaction_cost_bps == 20.0
+    assert constraints.turnover_penalty == 0.75
+    assert constraints.max_participation == 0.1
+
+
 def test_engine_forwards_ewma_half_life_to_covariance(monkeypatch):
     import quant_platform.backtest.engine as engine_mod
     from quant_platform.backtest.engine import BacktestEngine

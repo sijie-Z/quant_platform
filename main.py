@@ -1148,6 +1148,9 @@ def _run_backtest(config, signal, prices, returns, benchmark, sector_map, financ
         max_turnover=config.portfolio.constraints.max_turnover,
         lot_size=config.portfolio.constraints.lot_size,
         risk_aversion=config.portfolio.risk_aversion,
+        transaction_cost_bps=config.portfolio.constraints.transaction_cost_bps,
+        turnover_penalty=config.portfolio.constraints.turnover_penalty,
+        max_participation=config.portfolio.constraints.max_participation,
     )
 
     cost_model = CostModel(
@@ -3499,6 +3502,9 @@ def cmd_walkforward(args) -> int:
         max_turnover=config.portfolio.constraints.max_turnover,
         lot_size=config.portfolio.constraints.lot_size,
         risk_aversion=config.portfolio.risk_aversion,
+        transaction_cost_bps=config.portfolio.constraints.transaction_cost_bps,
+        turnover_penalty=config.portfolio.constraints.turnover_penalty,
+        max_participation=config.portfolio.constraints.max_participation,
     )
 
     results = validator.run(

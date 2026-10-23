@@ -64,6 +64,11 @@ class PortfolioConstraintsConfig:
     max_sector_exposure: float = 0.30
     max_turnover: float = 0.30
     lot_size: int = 100
+    # R8 cost-aware optimizer knobs. All default to 0 = disabled, so the
+    # default backtest path is unchanged.
+    transaction_cost_bps: float = 0.0   # one-way turnover cost in bp
+    turnover_penalty: float = 0.0       # quadratic (w - prev_w) penalty
+    max_participation: float = 0.0      # ADV participation cap, (0, 1] or 0
 
 
 @dataclass

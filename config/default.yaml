@@ -82,6 +82,12 @@ portfolio:
     max_sector_exposure: 0.30  # 30% max per sector
     max_turnover: 0.30         # 30% max turnover per rebalance
     lot_size: 100              # A-share lot size
+    # R8 cost-aware MVO. All default 0 = disabled, so the default backtest
+    # (weights, objective, constraints) is unchanged.
+    transaction_cost_bps: 0.0  # one-way turnover cost in bp added to the MVO objective
+    turnover_penalty: 0.0      # quadratic penalty on (w - prev_w), smooths turnover
+    max_participation: 0.0     # ADV participation cap, e.g. 0.10 = 10% of ADV; 0 = off
+                               # (needs the engine's daily_volume panel to take effect)
   covariance:
     method: "ledoit_wolf"      # sample, ledoit_wolf, ewma
     lookback: 252              # Days for covariance estimation
