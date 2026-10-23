@@ -373,6 +373,21 @@ def test_default_cost_fields_reproduce_the_pre_r8_decision():
         assert w.max() <= 0.10 + 1e-6
 
 
+def test_transaction_cost_without_prev_weights_is_a_no_op():
+    """Task spec: with ``prev_weights is None`` the cost term is 0."""
+    signal, cov, sectors, _ = _regression_case()
+    baseline = MeanVarianceOptimizer(_regression_constraints()).optimize(
+        signal, cov, sector_map=sectors,
+    )
+    costly = MeanVarianceOptimizer(
+        _regression_constraints(transaction_cost_bps=50.0)
+    ).optimize(signal, cov, sector_map=sectors)
+
+    pd.testing.assert_series_equal(
+        costly.sort_index(), baseline.sort_index(), atol=1e-12, rtol=0,
+    )
+
+
 def _cost_aware_case(n=40):
     """A well-conditioned case where the cost terms can move the optimum.
 
