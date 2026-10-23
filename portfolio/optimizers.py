@@ -361,10 +361,15 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
             )
             n_unusable = int((~usable).sum())
             if n_unusable:
+                bad_names = [str(name) for name in adv_series.index[~usable][:5]]
+                more = n_unusable - len(bad_names)
+                bad_desc = ", ".join(bad_names) + (
+                    f" (+{more} more)" if more else ""
+                )
                 logger.warning(
-                    "MVO capacity: %d/%d assets have no positive ADV; the "
-                    "participation cap is not applied to them "
-                    "(max_weight still binds)", n_unusable, n,
+                    "MVO capacity: %d/%d assets have no positive ADV (%s); "
+                    "the participation cap is not applied to them "
+                    "(max_weight still binds)", n_unusable, n, bad_desc,
                 )
             if float(capacity_caps.sum()) < 1.0 - 1e-9:
                 return self._equal_weight_fallback(
@@ -471,9 +476,14 @@ class MeanVarianceOptimizer(PortfolioOptimizer):
                 continue
 
         if not solved:
+            reason = (
+                f"MVO solver failed ({', '.join(attempts) or 'no attempt'}, "
+                f"n={n})"
+            )
+            if capacity_caps is not None:
+                reason += " (equal-weight fallback ignores the ADV cap)"
             return self._equal_weight_fallback(
-                signal, cov_matrix, prices, prev_weights, sector_map,
-                f"MVO solver failed ({', '.join(attempts) or 'no attempt'}, n={n})",
+                signal, cov_matrix, prices, prev_weights, sector_map, reason,
             )
 
         logger.info("MVO SUCCESS: solver=%s n=%d status=%s w_min=%.4f w_max=%.4f",

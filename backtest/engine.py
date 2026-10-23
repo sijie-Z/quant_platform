@@ -213,10 +213,10 @@ class BacktestEngine:
         limit_up: pd.DataFrame | None = None,
         limit_down: pd.DataFrame | None = None,
         daily_volume: pd.DataFrame | None = None,
-        raw_prices: pd.DataFrame | None = None,
         volatility: pd.DataFrame | None = None,
         risk_free_rate: float | None = None,
         periods_per_year: float | None = None,
+        raw_prices: pd.DataFrame | None = None,
     ) -> dict:
         """Execute the backtest.
 
@@ -249,12 +249,8 @@ class BacktestEngine:
                 and for the cost model's proportional/impact slippage models.
                 ``prices`` is the adjusted research panel and must NOT be
                 used as a CNY price; without ``raw_prices`` the capacity cap
-                is disabled and the volume is passed to the cost model
-                unchanged (both paths log a warning).
-            raw_prices: (date x asset) **unadjusted** close prices (CNY),
-                e.g. ``DataPipeline.get_raw_close()``. Required to turn share
-                volume into a CNY traded value. Only used when
-                ``daily_volume`` is supplied.
+                is disabled and the volume is dropped before the cost model
+                (both paths log a warning).
             volatility: (date x asset) daily volatility estimate for the
                 impact model. When omitted and an impact/proportional model
                 is configured, a 20-day rolling std of ``returns`` shifted by
@@ -263,6 +259,10 @@ class BacktestEngine:
                 to the constructor value).
             periods_per_year: Annualization override for this run (defaults to
                 the constructor value; ``None`` infers from the return index).
+            raw_prices: (date x asset) **unadjusted** close prices (CNY),
+                e.g. ``DataPipeline.get_raw_close()``. Required to turn share
+                volume into a CNY traded value. Only used when
+                ``daily_volume`` is supplied.
 
         Returns:
             Dict with daily_returns, portfolio_values, benchmark_returns,
@@ -701,9 +701,8 @@ class BacktestEngine:
         ``raw_prices`` (unadjusted CNY close) is supplied it is converted to
         CNY (volume x raw close) before being handed to the cost model, whose
         ``daily_volume`` argument is documented in CNY. Without
-        ``raw_prices`` the panel is passed through unchanged (legacy units)
-        and a warning is logged -- the adjusted research prices must not be
-        mistaken for CNY prices.
+        ``raw_prices`` the panel is dropped (warning) so the cost model falls
+        back to its fixed slippage instead of treating share counts as CNY.
 
         Between executions, weights drift with price movements. On an
         execution date, the new weights take effect at that close, turnover is
@@ -748,19 +747,27 @@ class BacktestEngine:
                 up_panel = pd.DataFrame(False, index=all_dates, columns=columns)
             if down_panel is None:
                 down_panel = pd.DataFrame(False, index=all_dates, columns=columns)
-        volume_panel = self._align_float(daily_volume, all_dates, columns)
-        # Only needed to turn share volume into CNY for the cost model; skip
-        # the full-panel copy on the default (no-volume) path.
-        price_panel = (
-            self._align_float(raw_prices, all_dates, columns)
-            if daily_volume is not None and raw_prices is not None
-            else None
-        )
         if daily_volume is not None and raw_prices is None:
+            # A share panel cannot be handed to a cost model that expects
+            # CNY. Rather than silently overstating participation by ~price,
+            # drop the volume so the cost model falls back to its configured
+            # fixed slippage and says so.
             logger.warning(
                 "daily_volume is a share panel but raw_prices was not "
-                "supplied; passing it to the cost model unchanged (legacy "
-                "units). Pass raw_prices (unadjusted CNY close) to convert."
+                "supplied; dropping the volume so the cost model falls back "
+                "to fixed slippage. Pass raw_prices (unadjusted CNY close) "
+                "to use volume-dependent slippage."
+            )
+            volume_panel = None
+            price_panel = None
+        else:
+            volume_panel = self._align_float(daily_volume, all_dates, columns)
+            # Only needed to turn share volume into CNY for the cost model;
+            # skip the full-panel copy on the default (no-volume) path.
+            price_panel = (
+                self._align_float(raw_prices, all_dates, columns)
+                if daily_volume is not None and raw_prices is not None
+                else None
             )
 
         vol_panel = self._align_float(volatility, all_dates, columns)

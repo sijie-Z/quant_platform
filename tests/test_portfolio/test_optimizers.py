@@ -636,6 +636,45 @@ def test_post_turnover_blend_refills_a_capacity_clipped_book():
     assert weights.groupby(sectors).sum().max() <= 0.30 + 1e-9
 
 
+def test_capacity_constraint_is_solved_not_only_post_clipped():
+    """The cap must enter the QP, not just be applied after an unconstrained
+    solve. A clip-only implementation does not reproduce the constrained
+    optimum in this case (it would hold A2/A3/A4 at ~0.098 instead of
+    [0.3, 0.3, 0.3, 0.1, 0.0])."""
+    import cvxpy as cp
+
+    names = [f"A{i}" for i in range(5)]
+    signal = pd.Series([5.0, 4.0, 3.0, 2.0, 1.0], index=names)
+    cov = pd.DataFrame(
+        np.diag([4e-4, 3e-4, 2e-4, 1e-4, 5e-5]),
+        index=names, columns=names,
+    )
+    aum = 1e7
+    participation = 0.10
+    caps = np.array([0.30, 0.30, 0.30, 0.30, 0.30])
+    adv = pd.Series(caps * aum / participation, index=names)
+
+    weights = MeanVarianceOptimizer(PortfolioConstraints(
+        max_weight=1.0, max_sector_exposure=1.0, max_turnover=1.0,
+        risk_aversion=1.0, max_participation=participation,
+    )).optimize(signal, cov, adv=adv, aum=aum)
+
+    w_ref = cp.Variable(len(names))
+    problem = cp.Problem(
+        cp.Maximize(
+            0.04 * (signal.to_numpy() @ w_ref)
+            - 1.0 * cp.quad_form(w_ref, cov.to_numpy() * 252)
+        ),
+        [cp.sum(w_ref) == 1, w_ref >= 0, w_ref <= caps],
+    )
+    problem.solve(solver="CLARABEL")
+    np.testing.assert_allclose(
+        weights.to_numpy(), w_ref.value, atol=1e-6, rtol=0,
+    )
+    # The constrained optimum is not the post-clipped unconstrained one.
+    assert weights.loc["A4"] == pytest.approx(0.0, abs=1e-6)
+
+
 def test_refill_skips_sector_room_for_a_single_sector_universe():
     """The solver deliberately skips the sector constraint when every
     candidate is in one sector; the refill must mirror that guard. Applying
@@ -666,6 +705,28 @@ def test_refill_skips_sector_room_for_a_single_sector_universe():
 
     assert optimizer.fallback_count == 0
     assert weights.sum() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_solver_failure_reason_notes_the_ignored_capacity_cap(monkeypatch):
+    """m1 (review 2): every fallback under an active capacity cap must say
+    that the equal-weight result ignores the ADV cap."""
+    import cvxpy as cp
+
+    signal, cov = _make_signal_and_cov(20)
+    adv = pd.Series(1e9, index=signal.index)
+
+    def explode(self, *args, **kwargs):
+        raise RuntimeError("solver exploded")
+
+    monkeypatch.setattr(cp.Problem, "solve", explode)
+    optimizer = MeanVarianceOptimizer(PortfolioConstraints(
+        max_weight=0.10, max_participation=0.10,
+    ))
+    weights = optimizer.optimize(signal, cov, adv=adv, aum=1e7)
+
+    assert weights.sum() > 0
+    assert optimizer.fallback_count == 1
+    assert "ignores the ADV cap" in (optimizer.last_fallback_reason or "")
 
 
 def test_infeasible_capacity_falls_back_with_a_warning(caplog):

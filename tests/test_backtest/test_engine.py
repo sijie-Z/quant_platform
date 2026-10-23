@@ -846,6 +846,37 @@ class TestCapacityWiring:
         )
 
 
+    def test_share_volume_without_raw_prices_falls_back_to_fixed_slippage(self, caplog):
+        """m5 (review 2): a share panel must never be fed to a CNY cost
+        model. Without raw_prices the volume is dropped and the cost model
+        falls back to its configured fixed slippage (warning)."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="D")
+        returns = pd.DataFrame(0.0, index=dates, columns=["A", "B"])
+        volume = pd.DataFrame(1_000_000.0, index=dates, columns=["A", "B"])
+
+        engine = BacktestEngine(
+            initial_capital=1_000_000,
+            rebalance_frequency="monthly",
+            cost_model=CostModel(
+                commission=0, stamp_tax=0, slippage=0.001,
+                slippage_model="proportional", min_commission=0,
+                transfer_fee=0,
+            ),
+            constraints=PortfolioConstraints(max_turnover=1.0),
+        )
+        engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
+        with caplog.at_level("WARNING"):
+            engine._simulate_pnl(returns, daily_volume=volume)
+
+        assert any(
+            "dropping the volume" in record.getMessage()
+            for record in caplog.records
+        )
+        # Fixed slippage on the 1.0 two-way traded value, not the
+        # participation-based proportional cost.
+        assert engine.daily_returns.loc[dates[1]] == pytest.approx(-0.001)
+
+
 class TestWeeklyIsoYearBoundary:
     """B2: weekly rebalances group by ISO year + ISO week, chronologically."""
 
