@@ -363,7 +363,63 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 
 **限制**：目标与台账都基于同一 101 只 000xxx 缓存（§1）；行业映射静态（§9 #2）；2025-12 目标 pending 未执行；production targets 的 30% 行业暴露没有在组合层强制，这是与研究报告口径的已知差异（下一轮若要严格对齐，应给 `daily_signal.py` 增加 `--max-sector` 并补测试）；台账不建模整手、盘中和 T+1 日内约束。
 
-## 14. 下一步（按优先级）
+## 14. 组合构建方式对比（R25，预注册）
+
+**问题**：此前全部研究都用 MVO。协方差噪声 + 成本惩罚可能让优化器不如简单规则；若简单规则更稳，应简化生产工具。R25 用**同一信号**（R20 `ep_turn_sector`：EP + turnover20d、行业中性、IC 加权、每折 `rank(pct)−0.5` 归一化）、**同一 Walk-Forward / 成本 / 门禁 / R18 现金约束**，比较五种构建。判定规则在看到任何结果前写死（任务书 §2），全部结果列出。
+
+### 设计（预注册 5 种构建）
+
+| # | 构建 | 规则 |
+|---|---|---|
+| 1 | `mvo_baseline` | 平台 `MeanVarianceOptimizer`，R20 现约束（5% 单票、30% 行业、30% 换手、20bp 成本项、0.5 二次换手罚） |
+| 2 | `ew_top20` | 当日信号前 20 名等权（5%/票，正好在单票上限内） |
+| 3 | `ew_top30` | 前 30 名等权（1/30 = 3.33%/票） |
+| 4 | `sigprop_top30` | 前 30 名按 `rank 信号 − min(rank)` 比例配权，5% 截断后按剩余空间再归一（水填充；全部同分则等权） |
+| 5 | `rp_top30` | 前 30 名用平台 `RiskParityOptimizer`（Ledoit-Wolf 协方差、平台默认 252 日窗口），受 5% 单票上限 |
+
+- **简单规则的共同约束**：5% 单票上限；换手上限 30% 通过平台 `_limit_turnover` 与上一期**按 turnover 混合**实现（与 MVO 事后混合同口径、同一函数）；**不施加行业上限**——任务书只为简单规则预注册了 5% 单票，行业集中度作为诊断量报告（见下表），MVO 保留 30% 行业约束。简单规则没有最优化目标，20bp/0.5 只是 MVO 的目标项；五组共享同一 `CostModel`（impact、佣金 0.03%、法定印花税）。
+- **口径**：expanding WF 504/126/126、purge 5、embargo 5、月度、次日收盘成交、同日涨跌停/停牌门禁、R18 现金约束、2M 资金、OOS 2020-02-11..2025-12-31（1433 日）。DSR 为 excess（`r − 3%/252`），**N=53**；风格回归为 MKT + LOW_TURN + LOW_VOL + HIGH_EP + SMALL 的 Newey-West(5)（与 §5 同构造）。平均持仓数按执行后权重 `>1e-6` 计（更低的权重是 QP 尾部/换手混合的数值尘埃：MVO 按 `>1e-12` 会数到约 91 个，其中约 54 个 <1e-6）。
+- **成本拖累口径**：对每折测试窗内的逐笔成交成本事件求和 / (OOS 天数/252)。平台成本模型对每个非零权重差按 CNY 5 元最低佣金计费（R9 文档化的“每个调仓标的一笔订单”近似）；MVO 的 QP 尾部让它在很多小权重上付最低佣金（隐含 78.7 bps/边），简单规则名数少（16.7–20.2 bps/边）。**同一模型对五组一致，且这一近似对 MVO 不利**——结论方向因此更稳健。
+
+### 结果（净成本 OOS）
+
+| 构建 | Sharpe（平台超额） | 年化 | 最大回撤 | 年化单边换手 | 成本拖累 | DSR p（N=53） | 风格 alpha（年化） | t(alpha) | 平均持仓（OOS 执行） |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| MVO 基线（R20 约束） | **0.490** | 10.77% | −19.09% | 0.778 | 1.22% | 0.8404 | +1.22% | 0.52 | 37.5 |
+| 等权 top-20 | 0.457 | 11.85% | −26.28% | 3.142 | 1.07% | 0.8491 | +0.91% | 0.30 | 28.5 |
+| 等权 top-30 | 0.455 | 11.73% | −24.86% | 2.707 | 1.12% | 0.8504 | +0.15% | 0.07 | 33.3 |
+| 信号比例 top-30 | 0.425 | 11.11% | −25.60% | 2.975 | 1.04% | 0.8654 | +0.04% | 0.01 | 35.6 |
+| 风险平价 top-30 | **0.510** | 12.30% | −21.89% | 2.606 | 1.07% | 0.8242 | +0.90% | 0.42 | 33.3 |
+
+**判定：0/4 通过 → 保留 MVO。** 规则：简单规则须同时满足 `Sharpe > MVO`、`MDD ≥ MVO MDD − 2pp`、`年化单边换手 ≤ 1.5 × MVO`。唯一 Sharpe 更高的是风险平价 top-30（0.510 vs 0.490），但它的最大回撤 −21.89% 比 MVO 差 **2.80pp**（超过 2pp 容差），换手 2.606 是 MVO 的 **3.35 倍**（超过 1.5 倍）；其余三种 Sharpe 更低、回撤差 5.8–7.2pp、换手 3.5–4.0 倍。没有一个简单规则接近合格线，MVO 保留为默认。
+
+### 年度收益
+
+| 构建 | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 |
+|---|---:|---:|---:|---:|---:|---:|
+| MVO 基线 | +23.16% | +21.73% | −5.92% | +0.68% | +6.34% | +20.94% |
+| 等权 top-20 | +2.35% | +22.83% | +2.67% | −4.61% | +24.31% | +26.36% |
+| 等权 top-30 | +16.95% | +21.53% | −0.41% | −0.94% | +12.85% | +21.46% |
+| 信号比例 top-30 | +6.98% | +22.87% | +0.47% | −0.76% | +15.20% | +23.19% |
+| 风险平价 top-30 | +16.77% | +23.65% | +0.04% | +1.55% | +11.54% | +21.02% |
+
+### 解释与证据
+
+- **简单规则为什么输**：top-N 名单随月度 rank 信号轮换；没有目标层的换手惩罚/平滑，30% 换手上限**几乎每次调仓都顶格**（年化 2.6–3.1 vs MVO 0.78）。换手混合虽把单期换手压到 30%，但组合长期处在“上一期与本期各半”的过渡状态，持仓数反而高于名义 top-N（如等权 top-20 执行持仓 28.5），跟踪误差与成本都不低。
+- **简单规则承担了更高风险**：年化波动 18.2–19.4% vs MVO 15.9%；MKT beta 0.91–0.95 vs MVO 0.79。它们的年化收益（11.1–12.3%）高于 MVO（10.8%），相对同池日频等权的 IR 也更高（0.26–0.41），但这是**加 beta/加波动**换来的，Sharpe 反而更低（风险平价除外，见下）。简单规则彼此日收益相关 **0.975–0.996**，与 MVO 相关 0.917–0.946——仍是同一个风格篮子，只是构建方式不同。
+- **行业集中度（诊断，非约束）**：等权 top-20 目标最大行业权重 **40.0%**（790 次调仓中 81 次 >30%），信号比例 37.3%（84 次）；等权 top-30 最高恰好 30.0%、风险平价 top-30 最高 29.7%（各 0 次 >30%）。MVO 目标最大 30.0%（44 次顶格、0 违规，与 §3 一致）。**简单规则没有行业 cap，这不是它们的优势来源**：即便允许集中，它们仍输。
+- **风格归因**：五组回归 R² = 0.87–0.93；简单规则残余 alpha 仅 +0.04% ~ +0.91%/年（t 0.01–0.42），MVO 为 +1.22%（t 0.52）——**没有任何构建存在显著残余 alpha**，与 §5/§12 的结论一致。
+- **换手/成本机制**：简单规则总成交名义额 67–77M CNY（约 2M 本金的 34–38 倍），MVO 仅 18.7M；但平台最低佣金 5 元/单让 MVO 的 90 名小权重账本付出 147k CNY 成本（隐含 78.7 bps/边），简单规则付 128–140k CNY（16.7–20.2 bps/边）。总成本接近而 MVO 换手低 4 倍——**若按更现实的整手/尘埃单清理执行，MVO 的成本优势只会更大**。
+- **验证**（任务书 §3）：a) 自定义 optimizer 的 790 个目标全部满足 `sum ≤ 1+1e-6`、`max ≤ 5%+1e-6`、无负权重（等权 top-30 最大权重 3.33%，风险平价 5.00%）；b) `rp_top30` 两次独立运行指标与目标权重序列 sha256 完全一致（digest `7240ecd8…`，最终五组运行的 digest 与确定性复跑一致）；c) 简单规则直接调用平台 `_limit_turnover`，合成用例验证混合后换手恰为 30%、低于上限时原样返回；d) 基线 `mvo_baseline` Sharpe **0.4900175097** 与 R20 `ep_turn_sector` **逐位一致（delta 0.0）**。自检还包含 top-N 因果毒化测试（毒化未来行不改变当日选择、且毒化确实改变未来选择）与 OLS 合成样本系数还原。`pytest tests/test_backtest/test_walkforward.py` 33 passed；`ruff` 通过。
+- **确定性**：`rp_top30`（含 cvxpy 求解路径）两次独立运行 Sharpe/年化/MDD/DSR/年度与目标权重 digest 全部一致。
+
+### 限制
+
+与 §9 相同的池子/行业映射/成本/整手限制全部适用。补充：简单规则按预注册不设行业 cap（集中度已披露）；平台成本模型按“每个非零权重差一笔订单”收 5 元最低佣金，对多权重账本（MVO）不利、对简单规则有利，真实执行会整手取整并清理尘埃单，但回测层未建模；结论只适用于这个 101 只 `000xxx` 池 + 2M 资金 + 本平台执行模型；DSR N=53 仍是搜索次数的下界，无真正 holdout。**结论：现有证据不支持用简单规则替换 MVO；平台默认保持 MVO。**
+
+产物：`.scratch/orchestrate/r25_construct.py`、`r25_construct_2026-10-24.{json,md}`、`r25_results/`、`r25_capture/`、`r25_checks_2026-10-24.json`、`r25_determinism_2026-10-24.json`、`cc_report_R25_construct.md`、`review_R25.md`。
+
+## 15. 下一步（按优先级）
 
 1. **Forward paper 跟踪（不动钱）**：用真实行情按本组合/流程跑 3–6 个月，记录成交、滑点与风格暴露漂移；这是把“回测候选”变成“可观察假设”的最低成本方式。
 2. **正交 alpha 研究**：R23 已按预注册完成第一轮（5 个候选，§12），**零结果**——风格残差 alpha 全部不显著。下一轮若继续，应把“宽池 + 真实市值 + 新数据源”作为前置条件，而不是在同一个 101 只池里继续挖因子；任何新候选仍须预注册并计入 DSR 的 N。
@@ -374,4 +430,4 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 
 ---
 
-_生成于 2026-10-24（R19b 重写；R20 口径对齐；R22 新增 §11；R23 新增 §12「正交 alpha 筛选（预注册）」，零结果；R24 新增 §13「生产链路交叉验证」）。作者：Claude（监督—执行环）。R24 产物：`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`、`.scratch/orchestrate/gen_roll_targets.py`、`roll_targets/`（72 个目标，不入 git）、`compare_roll_wf.py`、`r24_compare_2026-10-24.json`、`cc_report_R24_roll_track.md`、`review_R24.md`。R23 产物：`.scratch/orchestrate/r23_orthogonal_2026-10-24.{json,md}`、`r23_orthogonal.py`、`r23_results/`、`r23_capture/`、`r23_checks_2026-10-24.json`、`r23_determinism_2026-10-24.json`、`cc_report_R23_orthogonal.md`、`review_R23.md`。R22 产物：`.scratch/orchestrate/r22_results/r22_voltarget_2026-10-24.{json,md}`、每组 `r22_<variant>_vt<target>_2026-10-24.{json,csv}`、`cc_report_R22_voltarget.md`、`review_R22.md`。R20 产物：`.scratch/orchestrate/real_variants2_r20_2026-10-24.{json,md}`（四变体重跑）、`real_variants2_r20_results/`、`r20_capture/`、`r20_style_attr_2026-10-24.{json,md}`、`r20_benchmark_2026-10-24.{json,md}`、`r20_cap_probe_2026-10-24.json`（15% 行业上限剂量探针）、`r20_old_vs_new_2026-10-24.json`、`r20_golden_check.py`（默认路径逐位对比 c5c919c）。R19b 产物：`.scratch/orchestrate/r19b_headline_2026-10-24.{json,md}`、`r19b_benchmark_2026-10-24.{json,md}`、`r19b_style_attr_2026-10-24.{json,md}`、`r19b_size_split_2026-10-24.{json,md}`、`r19b_ic_scan_2026-10-24.{json,md}`、`r19b_old_vs_new_2026-10-24.json`、`capacity_curve_ep_turn_oos_2026-10-24.{json,md}`。旧数字来源：`real_variants{4,5,7,9}_2026-10-24.json`（旧口径，仅用于对照）；旧基准行 0.222/4.50%/−25.71% 取自 R19b 之前的报告文本（git 历史），旧容量 1M 0.565/5 亿 0.420 取自被本轮覆盖前的 `capacity_ep_turn_oos_out.txt`（数值已固化在 `r19b_old_vs_new_2026-10-24.json`）。注意 `capacity_curve_ep_turn_2026-10-24.json` 是另一套**全期**容量配置，勿与本报告的 OOS 容量表混用。_
+_生成于 2026-10-24（R19b 重写；R20 口径对齐；R22 新增 §11；R23 新增 §12「正交 alpha 筛选（预注册）」，零结果；R24 新增 §13「生产链路交叉验证」；R25 新增 §14「组合构建方式对比（预注册）」，保留 MVO）。作者：Claude（监督—执行环）。R25 产物：`.scratch/orchestrate/r25_construct.py`、`r25_construct_2026-10-24.{json,md}`、`r25_results/`、`r25_capture/`、`r25_checks_2026-10-24.json`、`r25_determinism_2026-10-24.json`、`cc_report_R25_construct.md`、`review_R25.md`。R24 产物：`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`、`.scratch/orchestrate/gen_roll_targets.py`、`roll_targets/`（72 个目标，不入 git）、`compare_roll_wf.py`、`r24_compare_2026-10-24.json`、`cc_report_R24_roll_track.md`、`review_R24.md`。R23 产物：`.scratch/orchestrate/r23_orthogonal_2026-10-24.{json,md}`、`r23_orthogonal.py`、`r23_results/`、`r23_capture/`、`r23_checks_2026-10-24.json`、`r23_determinism_2026-10-24.json`、`cc_report_R23_orthogonal.md`、`review_R23.md`。R22 产物：`.scratch/orchestrate/r22_results/r22_voltarget_2026-10-24.{json,md}`、每组 `r22_<variant>_vt<target>_2026-10-24.{json,csv}`、`cc_report_R22_voltarget.md`、`review_R22.md`。R20 产物：`.scratch/orchestrate/real_variants2_r20_2026-10-24.{json,md}`（四变体重跑）、`real_variants2_r20_results/`、`r20_capture/`、`r20_style_attr_2026-10-24.{json,md}`、`r20_benchmark_2026-10-24.{json,md}`、`r20_cap_probe_2026-10-24.json`（15% 行业上限剂量探针）、`r20_old_vs_new_2026-10-24.json`、`r20_golden_check.py`（默认路径逐位对比 c5c919c）。R19b 产物：`.scratch/orchestrate/r19b_headline_2026-10-24.{json,md}`、`r19b_benchmark_2026-10-24.{json,md}`、`r19b_style_attr_2026-10-24.{json,md}`、`r19b_size_split_2026-10-24.{json,md}`、`r19b_ic_scan_2026-10-24.{json,md}`、`r19b_old_vs_new_2026-10-24.json`、`capacity_curve_ep_turn_oos_2026-10-24.{json,md}`。旧数字来源：`real_variants{4,5,7,9}_2026-10-24.json`（旧口径，仅用于对照）；旧基准行 0.222/4.50%/−25.71% 取自 R19b 之前的报告文本（git 历史），旧容量 1M 0.565/5 亿 0.420 取自被本轮覆盖前的 `capacity_ep_turn_oos_out.txt`（数值已固化在 `r19b_old_vs_new_2026-10-24.json`）。注意 `capacity_curve_ep_turn_2026-10-24.json` 是另一套**全期**容量配置，勿与本报告的 OOS 容量表混用。_
