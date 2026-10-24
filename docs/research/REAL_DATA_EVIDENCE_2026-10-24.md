@@ -431,18 +431,20 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 
 - `--industry-map` 读取的真实行业映射现在同时用于（a）因子行业中性化和（b）组合层 `sector_map`；`PortfolioConstraints(max_sector_exposure=0.30)` 传入 `MeanVarianceOptimizer`，平台在求解器内为每个行业加 `权重 <= 30%` 的线性约束（旧代码传 `sector_map=None`，约束被静默跳过）。
 - 新增 `--max-sector`（默认 0.30）。cap 开启但没给 `--industry-map` 时直接报错（`--max-sector 1.0` 可显式关闭），避免“声称有 cap、实际没约束”。求解后按最终目标重算行业权重：`max_sector_weight > 30% + 1e-6` → `SignalError`，拒绝写出；优化器回退（等权）记录 warning。JSON 诊断新增 `max_sector_weight`、`n_sector_cap_binding` 与 `sector_cap.{n_sectors_universe,unknown_assets_universe,n_sectors_holdings,binding_sectors,sector_weights}`。
-- 测试用 monkeypatch 捕获求解器入参，证明传入的是 6 个真实行业（不含旧 bug 的单一 `"A"`）且 `max_sector_exposure=0.30`；两行业各 50% 的端到端用例中，30% cap 使 MVO 不可行 → 等权回退把每个行业压到 30%（gross 60%），回退被显式记录。
-- 构建方式：新增 `--construction mvo|topn_ew|topn_rank|risk_parity` 与 `--top-n`（默认 30），**默认 `mvo`**，与 R25 预注册判定（0/4 简单规则合格）一致。`topn_ew` 等权；`topn_rank` 按信号 rank 比例配权（闭式 water-fill 保证单票 cap 且保持单调）；`risk_parity` 用平台 `RiskParityOptimizer`。三条路径都在选股/加权后投影到 5% 单票与 30% 行业上限（行业投影只减不增、剩余现金；换手混合后再投影一次）；无法满仓时会记录 warning。R25 的简单规则 OOS 结果**没有**在行业 cap 下重跑，本轮只提供入口，不改变“保留 MVO”的结论。
+- 测试用 monkeypatch 捕获求解器入参，证明传入的是 6 个合成 fixture 行业且 `max_sector_exposure=0.30`；真实缓存捕获为 101 只 / 38 个行业。基线的旧路径传 `sector_map=None`（约束被跳过），不是单一 `"A"`——后者是 `tools/real_data_research.py` 的旧问题（§9 #11）。两行业各 50% 的端到端用例中，30% cap 使 MVO 不可行 → 等权回退把每个行业压到 30%（gross 60%），回退被显式记录。
+- 构建方式：新增 `--construction mvo|topn_ew|topn_rank|risk_parity` 与 `--top-n`（默认 30），**默认 `mvo`**，与 R25 预注册判定（0/4 简单规则合格）一致。`topn_ew` 等权；`topn_rank` 按信号 rank 比例配权（闭式 water-fill 保证单票 cap 且保持单调）；`risk_parity` 用平台 `RiskParityOptimizer`。`topn_ew`/`topn_rank` 在加权后用闭式 water-fill 投影单票 5% cap；`risk_parity` 的单票 cap 由平台求解器施加。三条路径都在求解后投影行业 cap（只减不增、剩余现金；`risk_parity` 的行业 cap 同时也在求解器内），换手混合后再投影一次；无法满仓时会记录 warning。R25 的简单规则 OOS 结果**没有**在行业 cap 下重跑，本轮只提供入口，不改变“保留 MVO”的结论。
 
 ### 重生成与差异
 
 - **2025-12-31 目标**：26 只持仓不变，14 只 5% 顶格，最大行业权重 **14.60%**（F51），0 个行业顶格；`--max-sector 1.0` 重跑与旧目标逐位一致，加入 30% 约束后单个权重最大变动 1.86e-5（总绝对变动 3.81e-5）。
-- **72 个月滚动目标**：旧口径 5 个月 >30%（33.26/33.11/32.37/31.55/30.98%，全部 K70）→ 新口径 **0 个月 >30%**（最高 30.00%，4 个月恰好顶格，2021-03 为 29.54%）。72 个目标优化器回退 0；仅 7/72 个月持仓集合变化（集中在 2021-03..2021-07）；目标单边月换手均值 5.76%（旧 5.76%）；共同持仓的单个权重最大变动 1.04pp（cap 顶格月份）。逐月证据见 `.scratch/orchestrate/r26_target_compare_2026-10-24.md` 与 `r26_checks_2026-10-24.json`。
+- **72 个月滚动目标**：旧口径 5 个月 >30%（33.26/33.11/32.37/31.55/30.98%，全部 K70）→ 新口径 **0 个月 >30%**（最高 30.00%，4 个月恰好顶格，2021-03 为 29.54%）。72 个目标优化器回退 0；仅 7/72 个月持仓集合变化（2021-03..2021-07 为 cap 直接相关；2022-01/2022-04/2025-01 为 0.01%–0.05% 小权重越过报告阈值的数值性变化）；目标单边月换手均值 5.76%（旧 5.76%）；共同持仓的单个权重最大变动 1.04pp（cap 顶格月份）。逐月证据见 `.scratch/orchestrate/r26_target_compare_2026-10-24.md` 与 `r26_checks_2026-10-24.json`。
 - **台账**（2020-02-03..2025-12-31，1439 会话，71 次调仓）：全窗 Sharpe **0.680** / 年化 **14.72%** / MDD **−21.61%**（旧 0.676 / 14.66% / −21.59%）；与 WF 同窗（2020-02-11 起）Sharpe **0.603** / 年化 **13.39%** / MDD **−21.61%**（旧 0.599 / 13.33% / −21.59%）。成本 45,334.13 CNY（旧 45,277.86）；新旧逐日 NAV 最大差 23,040.46 CNY、日收益最大差 1.78e-3。台账与目标仍标注 `paper tracking only; style-tilt demo, not validated alpha`。
 
 ### 口径一致性（只修组合层）
 
 生产工具与 WF 回测的差异仍在：IC 权重每月末用最近 252 个观测重算（WF 每折用 train-only 数据冻结、purge/embargo 各 5 天）；日历月末调仓、次日收盘执行（WF 在每个 126 日 fold 内按引擎网格）；静态行业映射、无 ST/PIT 财务面板、无整手。本轮只把组合层行业约束对齐到 R20 研究链路，**未改 WF 引擎、`tools/paper_track.py` 或配置**；新台账因此不是 WF 的逐日复现，只是同一约束口径下的生产链路交叉验证。行业 cap 本身对全窗指标影响很小（Sharpe +0.004、年化 +0.06pp、MDD −0.01pp），不改变 §13 关于两条链路量级一致、残余 alpha 不显著的结论。
+
+**限制**：行业 cap 是目标层约束（执行漂移可能让实际持仓略超）；行业映射静态、无 effective_date，`Unknown` 作为伪行业参与 cap；`topn_ew`/`topn_rank`/`risk_parity` 在 prev 非合规时仍保证单票/行业 cap（投影+最终校验），但换手 cap 可被突破且只记录 warning——同场景 MVO 会拒绝写出；简单规则带行业 cap 的 OOS 表现未实测。
 
 产物：`docs/research/target_portfolio_2025-12-31.{json,csv}`（重生成）、`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`（重生成）、`.scratch/orchestrate/r26_target_compare_2026-10-24.{json,md}`、`r26_checks_2026-10-24.json`、`r26_compare_roll_wf_2026-10-24.json`、`cc_report_R26_prod_constraints.md`、`review_R26.md`。
 

@@ -620,7 +620,12 @@ def test_topn_rank_weights_are_monotone(tool):
 def test_risk_parity_construction_is_finite_and_capped(
     tool, panels_dir, tmp_path,
 ):
-    """Acceptance (b): risk_parity weights are finite and inside both caps."""
+    """Acceptance (b): risk_parity weights are finite and inside both caps.
+
+    The synthetic fixture has homogeneous volatilities, so risk parity is
+    close to equal weight here; non-degeneracy is covered separately by
+    ``test_risk_parity_is_non_degenerate_with_heterogeneous_covariance``.
+    """
     directory, as_of = panels_dir
     code, json_path, _ = run_tool(
         tool, directory / "panel.parquet", tmp_path / "rp",
@@ -637,6 +642,28 @@ def test_risk_parity_construction_is_finite_and_capped(
     assert float(values.sum()) <= 1.0 + 1e-6
     assert payload["diagnostics"]["max_sector_weight"] <= 0.30 + 1e-6
     assert payload["diagnostics"]["optimizer"]["name"] == "RiskParityOptimizer"
+
+
+def test_risk_parity_is_non_degenerate_with_heterogeneous_covariance(tool):
+    """Risk parity must differ from equal weight when volatilities differ."""
+    assets = [f"a{i}" for i in range(10)]
+    alpha = pd.Series(np.linspace(0.4, -0.4, len(assets)), index=assets)
+    variances = np.linspace(0.01, 0.10, len(assets))
+    cov = pd.DataFrame(
+        np.diag(variances), index=assets, columns=assets,
+    )
+    constraints = tool.PortfolioConstraints(
+        max_weight=0.20, max_sector_exposure=0.30, max_turnover=0.30,
+    )
+    weights, info = tool.build_simple_book(
+        "risk_parity", alpha, cov, None, None, constraints, len(assets), [],
+    )
+    assert info["fallback_count"] == 0
+    values = weights.to_numpy(dtype=float)
+    assert np.isfinite(values).all()
+    assert float(values.sum()) == pytest.approx(1.0)
+    assert float(values.max()) <= 0.20 + 1e-6
+    assert float(np.ptp(values)) > 1e-3
 
 
 def test_mvo_receives_the_real_sector_map(
@@ -667,7 +694,8 @@ def test_mvo_receives_the_real_sector_map(
     sector_map = captured["sector_map"]
     assert sector_map is not None
     assert sector_map.nunique() > 1
-    # The old bug passed a single dummy "A" sector; the real map has S0..S5.
+    # The baseline path passed sector_map=None (cap silently skipped); the
+    # fixture map has S0..S5, so the solver must receive multiple industries.
     assert "A" not in set(sector_map.unique())
     assert captured["max_sector_exposure"] == pytest.approx(0.30)
 
