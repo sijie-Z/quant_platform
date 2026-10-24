@@ -115,5 +115,6 @@
     "warnings": [
       "first build: one-sided turnover 0.5000 against a zero book exceeds the 0.3000 cap; the cap is not applied to a first build (nothing to trade from; the platform engine also passes prev_weights=None on its first rebalance)"
     ]
-  }
+  },
+  "disclaimer": "style tilt demo, not validated alpha -- this book is the long side of a low-turnover / value style exposure; the research found no statistically significant residual alpha. Research output only; not investment advice."
 }
