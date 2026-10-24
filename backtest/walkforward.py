@@ -149,6 +149,7 @@ class WalkForwardValidator:
         periods_per_year: float | None = None,
         execution_gates: dict | None = None,
         factor_selector: FactorSelector | None = None,
+        rank_normalize_signal: bool = False,
     ) -> dict:
         """Run walk-forward validation.
 
@@ -168,6 +169,17 @@ class WalkForwardValidator:
                 ``fold_details``; selector exceptions abort the run. Default
                 ``None`` recomputes every fold from all ``factors`` exactly as
                 before.
+            rank_normalize_signal: When True, every fold's signal is converted
+                to a cross-sectional percentile rank in ``[-0.5, 0.5]``
+                (``rank(pct=True) - 0.5``) before it reaches the engine and
+                the optimizer. The transformation uses only each row's own
+                cross-section, so it introduces no look-ahead; rows with fewer
+                than two valid values are left untouched (NaN stays NaN) and
+                the signal keeps its original values there. This matches the
+                optimizer's documented rank-alpha convention
+                (``ALPHA_ANNUAL_SCALE`` maps the full rank span to +/-2%
+                annual excess return). Default ``False`` keeps the historical
+                signal bit for bit.
             engine_kwargs: Raw BacktestEngine keyword arguments.
             cost_model, constraints, optimizer, benchmark, covariance_method,
             covariance_lookback, covariance_ewma_half_life, execution_timing,
@@ -315,6 +327,12 @@ class WalkForwardValidator:
                             np.nan, index=warmup_index, columns=signal.columns,
                         )
                         fold_signal = pd.concat([warmup, fold_signal])
+
+            if rank_normalize_signal:
+                # Align the signal with the optimizer's documented rank-alpha
+                # convention ([-0.5, 0.5]). Row-wise only: each date is
+                # ranked on its own cross-section, never across time.
+                fold_signal = self._rank_normalize_signal(fold_signal)
 
             test_prices = prices.iloc[test_sl]
             test_returns = returns.iloc[test_sl]
@@ -543,6 +561,22 @@ class WalkForwardValidator:
             fold["train_positions"] = positions[~removed]
             fold["train_days"] = len(fold["train_positions"])
             fold["embargo_ranges"] = embargo_ranges
+
+    @staticmethod
+    def _rank_normalize_signal(fold_signal: pd.DataFrame) -> pd.DataFrame:
+        """Convert a fold signal to row-wise percentile ranks in [-0.5, 0.5].
+
+        ``fold_signal.rank(axis=1, pct=True) - 0.5`` looks at one date's
+        cross-section at a time, so it cannot leak future information. Rows
+        with fewer than two valid values have no meaningful cross-sectional
+        rank (a lone asset would receive the maximum 0.5 for free); those rows
+        keep their original entries -- NaN stays NaN and any existing value is
+        left as is. With two or more valid values, ties share the average
+        rank, matching pandas' default.
+        """
+        ranked = fold_signal.rank(axis=1, pct=True) - 0.5
+        enough = fold_signal.notna().sum(axis=1) >= 2
+        return ranked.where(enough, fold_signal)
 
     @staticmethod
     def _select_fold_factors(

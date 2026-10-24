@@ -3,8 +3,11 @@
 import numpy as np
 import pandas as pd
 import pytest
+from quant_platform.alpha.combination import combine_equal_weight
+from quant_platform.backtest.engine import BacktestEngine
 from quant_platform.backtest.walkforward import WalkForwardValidator
 from quant_platform.factors.evaluation import rank_ic
+from quant_platform.portfolio.constraints import PortfolioConstraints
 
 
 class TestWalkForwardValidator:
@@ -599,3 +602,224 @@ class TestFactorSelectorContract:
                 alpha_kwargs={"method": "equal_weight"},
                 factor_selector=lambda fold, panels, fwd: ["does_not_exist"],
             )
+
+
+def _capture_engine_signals(monkeypatch):
+    """Record the signal every ``BacktestEngine.run`` call receives."""
+    captured = []
+    real_run = BacktestEngine.run
+
+    def spy(self, **kwargs):
+        captured.append(kwargs["signal"].copy())
+        return real_run(self, **kwargs)
+
+    monkeypatch.setattr(BacktestEngine, "run", spy)
+    return captured
+
+
+def _rank_panel(n_dates=220, n_assets=10, seed=21):
+    """Panel whose factor rows are permutations (known ranks, no ties)."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2021-01-01", periods=n_dates)
+    assets = [f"S{i}" for i in range(n_assets)]
+    ret = pd.DataFrame(
+        rng.normal(0.0, 0.012, (n_dates, n_assets)), index=dates, columns=assets,
+    )
+    prices = (1.0 + ret).cumprod() * 100.0
+    values = np.vstack(
+        [rng.permutation(n_assets).astype(float) for _ in range(n_dates)]
+    )
+    factor = pd.DataFrame(values, index=dates, columns=assets)
+    return ret, prices, factor
+
+
+class TestRankNormalizedSignal:
+    """R20: ``rank_normalize_signal`` maps each fold's signal to [-0.5, 0.5].
+
+    The optimizer documents a rank alpha in [-0.5, 0.5] (``ALPHA_ANNUAL_SCALE``
+    maps that span to +/-2% annual excess return); feeding it a z-score
+    composite silently changed the effective risk aversion. Ranking is
+    row-wise, so only the current cross-section is used.
+    """
+
+    def test_rows_become_cross_sectional_ranks(self, monkeypatch):
+        ret, prices, factor = _rank_panel()
+        captured = _capture_engine_signals(monkeypatch)
+        validator = WalkForwardValidator(
+            train_period=100, test_period=40, step_size=40, n_folds=1,
+        )
+
+        validator.run(
+            signal=factor, prices=prices, returns=ret,
+            benchmark_returns=ret.mean(axis=1),
+            sector_map=pd.Series("Tech", index=factor.columns),
+            factors={"f": factor},
+            alpha_kwargs={"method": "equal_weight"},
+            rank_normalize_signal=True,
+        )
+
+        assert len(captured) == 1, "one fold must produce exactly one engine run"
+        fold_signal = captured[0]
+        raw = factor.iloc[:140]  # train [0, 100) + test [100, 140)
+        assert fold_signal.index.equals(raw.index)
+
+        values = fold_signal.to_numpy(dtype=float)
+        assert np.isfinite(values).all()
+        assert values.min() >= -0.5 - 1e-12
+        assert values.max() <= 0.5 + 1e-12
+
+        # The rank preserves the cross-sectional order of the raw signal.
+        np.testing.assert_array_equal(
+            np.argsort(values, axis=1), np.argsort(raw.to_numpy(), axis=1),
+        )
+
+        # Hand-check one row against the definition rank(pct=True) - 0.5.
+        hand = pd.Series(raw.iloc[0].to_numpy()).rank(pct=True).to_numpy() - 0.5
+        np.testing.assert_allclose(values[0], hand)
+
+    def test_default_path_keeps_the_historical_signal_bit_for_bit(self, monkeypatch):
+        ret, prices, factor = _rank_panel()
+        captured = _capture_engine_signals(monkeypatch)
+        validator = WalkForwardValidator(
+            train_period=100, test_period=40, step_size=40, n_folds=1,
+        )
+
+        validator.run(
+            signal=factor, prices=prices, returns=ret,
+            benchmark_returns=ret.mean(axis=1),
+            sector_map=pd.Series("Tech", index=factor.columns),
+            factors={"f": factor},
+            alpha_kwargs={"method": "equal_weight"},
+            rank_normalize_signal=False,
+        )
+
+        expected = combine_equal_weight({"f": factor.iloc[:140]})
+        assert len(captured) == 1
+        pd.testing.assert_frame_equal(captured[0], expected)
+        # And the option is off by default: omitting it is the same run.
+        captured.clear()
+        validator.run(
+            signal=factor, prices=prices, returns=ret,
+            benchmark_returns=ret.mean(axis=1),
+            sector_map=pd.Series("Tech", index=factor.columns),
+            factors={"f": factor},
+            alpha_kwargs={"method": "equal_weight"},
+        )
+        pd.testing.assert_frame_equal(captured[0], expected)
+
+    def test_rows_with_fewer_than_two_valid_values_are_left_alone(self):
+        raw = pd.DataFrame(
+            [[1.0, 2.0, np.nan],
+             [5.0, np.nan, np.nan],
+             [np.nan, np.nan, np.nan]],
+            index=pd.bdate_range("2021-01-01", periods=3),
+            columns=["a", "b", "c"],
+        )
+        out = WalkForwardValidator._rank_normalize_signal(raw)
+
+        np.testing.assert_allclose(
+            out.iloc[0].to_numpy(dtype=float), [0.0, 0.5, np.nan],
+            equal_nan=True,
+        )
+        # A single valid value has no meaningful rank: untouched, NaN kept.
+        np.testing.assert_allclose(
+            out.iloc[1].to_numpy(dtype=float), [5.0, np.nan, np.nan],
+            equal_nan=True,
+        )
+        np.testing.assert_allclose(
+            out.iloc[2].to_numpy(dtype=float), [np.nan, np.nan, np.nan],
+            equal_nan=True,
+        )
+
+
+def _two_sector_panel(n_dates=260, n_assets=12, seed=31):
+    """Six high-signal assets in S1, six zero-signal assets in S2."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2021-01-01", periods=n_dates)
+    assets = [f"S{i}" for i in range(n_assets)]
+    ret = pd.DataFrame(
+        rng.normal(0.0, 0.012, (n_dates, n_assets)), index=dates, columns=assets,
+    )
+    prices = (1.0 + ret).cumprod() * 100.0
+    values = np.zeros((n_dates, n_assets))
+    values[:, :6] = 3.0
+    factor = pd.DataFrame(values, index=dates, columns=assets)
+    sectors = pd.Series(["S1"] * 6 + ["S2"] * 6, index=assets)
+    return ret, prices, factor, sectors
+
+
+class TestSectorCapThroughTheWalkForwardChain:
+    """R20: the research chain must feed real sectors into the optimizer.
+
+    ``MeanVarianceOptimizer`` deliberately skips sector constraints when the
+    candidate set sits in a single sector (the constraint would be either
+    redundant or infeasible). The real-data script passed
+    ``sector_map = Series("A", index=columns)``, so ``max_sector_exposure``
+    was silently skipped for every rebalance. This test drives the whole
+    walk-forward chain: the control (single sector) shows the unchecked
+    portfolio loading 60% into one sector; the real two-sector map must cap
+    every sector at 30%.
+    """
+
+    def test_real_sector_map_caps_every_sector_at_30_percent(self, monkeypatch):
+        ret, prices, factor, sectors = _two_sector_panel()
+        engine_runs = []
+        real_run = BacktestEngine.run
+
+        def spy(self, **kwargs):
+            result = real_run(self, **kwargs)
+            engine_runs.append(dict(result["weights_history"]))
+            return result
+
+        monkeypatch.setattr(BacktestEngine, "run", spy)
+        constraints = PortfolioConstraints(
+            long_only=True, max_weight=0.10, max_sector_exposure=0.30,
+            max_turnover=0.30,
+        )
+
+        def run_with(sector_map):
+            engine_runs.clear()
+            validator = WalkForwardValidator(
+                train_period=100, test_period=40, step_size=40, n_folds=1,
+            )
+            result = validator.run(
+                signal=factor, prices=prices, returns=ret,
+                benchmark_returns=ret.mean(axis=1), sector_map=sector_map,
+                constraints=constraints, factors={"f": factor},
+                alpha_kwargs={"method": "equal_weight"},
+                engine_kwargs={"initial_capital": 2_000_000},
+            )
+            return result, [dict(run) for run in engine_runs]
+
+        def sector_totals(weights):
+            by_sector = sectors.reindex(weights.index).fillna("Unknown")
+            return weights.groupby(by_sector).sum()
+
+        # Control: the old single-sector map disables the cap, and the
+        # optimizer really does put 60% into S1 (the test has teeth).
+        _, control_runs = run_with(pd.Series("A", index=factor.columns))
+        assert control_runs, "control run produced no rebalances"
+        control_max = max(
+            float(sector_totals(weights).max())
+            for run in control_runs for weights in run.values()
+        )
+        assert control_max > 0.30 + 0.05, (
+            "control with a single 'A' sector never exceeded the 30% cap; "
+            "the assertions below would not prove anything"
+        )
+
+        # Real map: every rebalance must respect the 30% sector cap.
+        result, capped_runs = run_with(sectors)
+        assert result["fold_metrics"], "no OOS metrics"
+        assert capped_runs, "capped run produced no rebalances"
+        n_rebalances = 0
+        for run in capped_runs:
+            for date, weights in run.items():
+                n_rebalances += 1
+                totals = sector_totals(weights)
+                assert float(totals.max()) <= 0.30 + 1e-6, (
+                    f"rebalance {date}: sector total {float(totals.max()):.4f} "
+                    f"exceeds max_sector_exposure=0.30 ({totals.to_dict()})"
+                )
+                assert float(weights.sum()) <= 1.0 + 1e-9
+        assert n_rebalances > 0
