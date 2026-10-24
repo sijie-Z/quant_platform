@@ -69,6 +69,10 @@ def _outputs(tmp_path: Path) -> tuple[Path, Path]:
     return tmp_path / "run.json", tmp_path / "run.md"
 
 
+def _reject_json_constant(value: str):
+    raise AssertionError(f"non-finite JSON constant {value!r} in the report")
+
+
 def test_end_to_end_smoke(tool, tmp_path):
     """Acceptance (a)/(d)/(e): small panel runs end to end, quickly, no industry map."""
     cache = tmp_path / "panel.parquet"
@@ -85,10 +89,14 @@ def test_end_to_end_smoke(tool, tmp_path):
     elapsed = time.monotonic() - started
 
     assert exit_code == 0
-    summary = json.loads(json_out.read_text(encoding="utf-8"))
+    # Strict JSON: NaN/Infinity tokens are invalid JSON and would fail here.
+    summary = json.loads(
+        json_out.read_text(encoding="utf-8"), parse_constant=_reject_json_constant,
+    )
     assert summary["n_folds"] >= 2
     assert summary["oos_days"] > 0
     assert summary["factors_used"] == ["turnover_20d"]
+    assert summary["config"]["factors_requested"] == ["turnover_20d"]
     for key in ("sharpe_ratio", "annual_return", "max_drawdown"):
         value = summary["oos_metrics"][key]
         assert value is not None, f"{key} should be finite in the report"
@@ -157,3 +165,42 @@ def test_returns_are_next_session_pct_chg(tool):
     # Adjusted path compounds pct_chg; blanked wherever close is missing.
     expected_adj = 100.0 * np.cumprod(1.0 + pct_chg / 100.0, axis=0)
     np.testing.assert_allclose(adj.to_numpy(dtype=float), expected_adj, rtol=1e-12)
+
+
+def test_industry_map_loading(tool, tmp_path):
+    """Optional industry map: 6-digit code lookup, unknown assets -> 'Unknown'."""
+    path = tmp_path / "industry.parquet"
+    pd.DataFrame(
+        {"industry": ["Bank", "Tech"]},
+        index=pd.Index(["000001", "600000"], name="code"),
+    ).to_parquet(path)
+
+    sectors = tool.load_industry_map(path, pd.Index(["000001", "600000", "999999"]))
+
+    assert sectors.to_dict() == {
+        "000001": "Bank",
+        "600000": "Tech",
+        "999999": "Unknown",
+    }
+
+
+def test_string_date_index_is_coerced(tool, tmp_path):
+    """A string-dated cache is coerced to DatetimeIndex instead of failing deep inside."""
+    dates = ["2024-01-02", "2024-01-03"]
+    index = pd.MultiIndex.from_product([dates, ["000001"]], names=["date", "asset"])
+    path = tmp_path / "string_dates.parquet"
+    pd.DataFrame(
+        {
+            "close": [10.0, 10.1],
+            "volume": [1000.0, 1100.0],
+            "turnover": [0.01, 0.01],
+            "pct_chg": [0.0, 1.0],
+        },
+        index=index,
+    ).to_parquet(path)
+
+    loaded = tool.load_panel_frame(path)
+
+    assert isinstance(loaded.index.get_level_values("date"), pd.DatetimeIndex)
+    assert loaded.index.get_level_values("date")[0] == pd.Timestamp("2024-01-02")
+

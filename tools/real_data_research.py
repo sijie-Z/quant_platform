@@ -120,6 +120,20 @@ def load_panel_frame(path: Path) -> pd.DataFrame:
         )
     if names != ["date", "asset"]:
         frame = frame.reorder_levels(["date", "asset"]).sort_index()
+    # Some parquet writers store the date level as strings; coerce it here so a
+    # string-indexed cache fails nowhere deep inside the engine (whose fold and
+    # metric code calls .year on the index).
+    dates = frame.index.get_level_values("date")
+    if not isinstance(dates, pd.DatetimeIndex):
+        parsed = pd.to_datetime(pd.Index(dates), errors="coerce")
+        if pd.isna(parsed).any():
+            raise ResearchError("cache panel has unparseable values in the 'date' level")
+        frame = frame.set_axis(
+            pd.MultiIndex.from_arrays(
+                [parsed, frame.index.get_level_values("asset")],
+                names=["date", "asset"],
+            )
+        ).sort_index()
     required = {"close", "volume", "turnover", "pct_chg"}
     missing = sorted(required.difference(frame.columns))
     if missing:
@@ -351,11 +365,16 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
     if args.industry_map:
         sector_map = load_industry_map(Path(args.industry_map), close.columns)
 
-    factor_names = parse_factor_list(args.factors)
+    factor_names = parse_factor_list(
+        args.factors if getattr(args, "factors", None) is not None
+        else ",".join(DEFAULT_FACTORS)
+    )
     factors, factors_skipped = build_factors(
         adj, volume, _turnover, factor_names,
         sector_map=sector_map,
-        strict=args.factors_explicit,
+        # Explicit --factors turns unknown names into errors; the default set
+        # degrades gracefully (short panels can legitimately lose factors).
+        strict=getattr(args, "factors", None) is not None,
     )
     if not factors:
         raise ResearchError(
@@ -363,7 +382,11 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
             f"({factors_skipped}); refusing to fabricate a result"
         )
 
-    # R9 gates: the engine reads daily_volume/raw_prices at run() time.
+    # R9 gates: the engine reads daily_volume/raw_prices at run() time. The
+    # limit panels are built from the *forward* return panel (returns[t] is
+    # session t+1's move), exactly as the validated scratch runs and the
+    # taskbook's R9 wiring specify; do not "fix" this here without changing
+    # the reference semantics and re-validating R9.
     gates = {
         "tradable_mask": close.notna() & (volume.fillna(0) > 0),
         "limit_up": returns > 0.098,
@@ -649,10 +672,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cache", default=str(DEFAULT_CACHE),
                         help="cached (date, asset) daily parquet (default: %(default)s)")
-    parser.add_argument("--start", default=None, help="first session (YYYY-MM-DD)")
-    parser.add_argument("--end", default=None, help="last session (YYYY-MM-DD)")
-    parser.add_argument("--factors", default=",".join(DEFAULT_FACTORS),
-                        help="comma-separated technical factor names (default: the 12-factor set)")
+    parser.add_argument("--start", default=None,
+                        help="first session (YYYY-MM-DD); returns are forward-labelled, "
+                             "so the last included session's label uses the next session "
+                             "from the full cache")
+    parser.add_argument("--end", default=None,
+                        help="last session (YYYY-MM-DD); same forward-label note as --start")
+    parser.add_argument("--factors", default=None,
+                        help="comma-separated technical factor names; explicit names are "
+                             "strict (unknown factors error). Default: the 12-factor set "
+                             f"({','.join(DEFAULT_FACTORS)})")
     parser.add_argument("--top-k", type=int, default=2,
                         help="factors kept per fold after BH-FDR (default: %(default)s)")
     parser.add_argument("--train", type=int, default=504, help="train window in sessions")
@@ -710,10 +739,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _validate_args(parser, args)
-    args.factors_explicit = any(
-        token == "--factors" or token.startswith("--factors=")
-        for token in (argv if argv is not None else sys.argv[1:])
-    )
     try:
         summary = run_research(args)
         json_out = Path(args.json_out) if args.json_out else None
