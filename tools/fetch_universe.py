@@ -356,7 +356,7 @@ def run(
         return 2
     try:
         codes = resolve_codes(args)
-    except (OSError, ValueError, KeyError) as exc:
+    except Exception as exc:  # user input / parquet read errors are reported, not raised
         print(f"ERROR: cannot resolve stock universe: {exc}", file=sys.stderr)
         return 2
 
@@ -364,7 +364,11 @@ def run(
     stocks_dir = out_dir / "stocks"
     stocks_dir.mkdir(parents=True, exist_ok=True)
     existing = {path.stem for path in stocks_dir.glob("*.parquet")}
-    refresh = {normalize_code(code) for code in (args.refresh or [])}
+    try:
+        refresh = {normalize_code(code) for code in (args.refresh or [])}
+    except ValueError as exc:
+        print(f"ERROR: invalid --refresh code: {exc}", file=sys.stderr)
+        return 2
     selected = set(codes)
     to_fetch = [code for code in codes if code in refresh or code not in existing]
     for code in sorted(refresh - selected):
