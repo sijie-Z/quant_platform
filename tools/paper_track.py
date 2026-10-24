@@ -24,8 +24,8 @@ Execution and accounting contract
   the cached ``close`` is already the raw CNY close. ``--raw-price-mode
   amount_over_volume`` uses ``amount / volume`` (NaN when ``amount`` is
   missing or ``volume`` is not positive), the day's CNY VWAP proxy (the
-  convention ``.scratch/orchestrate/cc_report_R30_wide.md`` validated:
-  ``volume * amount/volume == amount`` exactly). ``--raw-price-mode auto``
+  wide-pool research convention where ``volume * amount/volume == amount``
+  exactly). ``--raw-price-mode auto``
   (the default) samples up to 60 of the most recent sessions with usable
   cells and selects ``amount_over_volume`` when the sample's median
   ``|close*volume - amount| / amount`` exceeds 1% -- an adjusted close breaks
