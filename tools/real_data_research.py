@@ -78,8 +78,7 @@ from quant_platform.factors.processing import process_factor
 from quant_platform.factors.registry import get_registry
 from quant_platform.factors.technical import register_all as register_technical
 from quant_platform.portfolio.constraints import PortfolioConstraints
-from quant_platform.research.validation import FactorValidator
-from quant_platform.strategy.research_validation import select_walk_forward_factors
+from quant_platform.research.validation import FactorValidator, select_walk_forward_factors
 
 DEFAULT_FACTORS = (
     "momentum_1m",

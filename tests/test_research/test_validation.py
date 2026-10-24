@@ -2,6 +2,7 @@
 
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from quant_platform.research.validation import FactorValidator
@@ -405,3 +406,50 @@ class TestValidateSweepTrials:
         # short-circuit: p=1, observed Sharpe reported as 0.
         assert result["trials"]["short"]["dsr_p"] == 1.0
         assert result["best"]["significant"] is False
+
+
+class TestWalkForwardSelectorLayering:
+    """R28: the selector lives in CORE so lab/tools can import it.
+
+    ``tests/test_architecture/test_core_boundaries.py`` forbids lab -> live
+    imports, so ``tools/real_data_research.py`` cannot import the strategy
+    package. The implementation moved to ``research.validation``; the
+    strategy module must keep re-exporting the *same* function object so
+    existing callers and monkeypatches do not break.
+    """
+
+    def test_strategy_reexports_the_core_function(self):
+        from quant_platform.research import validation as research_validation
+        from quant_platform.strategy import research_validation as strategy_rv
+
+        assert (
+            strategy_rv.select_walk_forward_factors
+            is research_validation.select_walk_forward_factors
+        )
+
+    def test_core_selector_selects_significant_factors(self):
+        from quant_platform.factors.evaluation import ic_summary, rank_ic
+        from quant_platform.research.validation import select_walk_forward_factors
+
+        rng = np.random.default_rng(0)
+        dates = pd.bdate_range("2022-01-03", periods=160)
+        assets = [f"S{i:02d}" for i in range(25)]
+        base = rng.normal(size=(160, 25))
+        returns = pd.DataFrame(base, index=dates, columns=assets)
+        strong = pd.DataFrame(
+            base + rng.normal(scale=0.8, size=returns.shape),
+            index=dates, columns=assets,
+        )
+        noise = pd.DataFrame(
+            rng.normal(size=returns.shape), index=dates, columns=assets,
+        )
+        factors = {"strong": strong, "noise": noise}
+        ic_results = {
+            name: ic_summary(rank_ic(panel, returns))
+            for name, panel in factors.items()
+        }
+
+        result = select_walk_forward_factors(ic_results, factors, returns)
+
+        assert result["selected"] == ["strong"]
+        assert result["fallback"] is False
