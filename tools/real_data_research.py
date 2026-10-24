@@ -501,6 +501,11 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
     frame = load_panel_frame(Path(args.cache))
     panels = build_panels(frame)
+    # ``returns`` was shifted before slicing, so the last included session's
+    # label already uses the next session from the full cache (documented in
+    # --start/--end help). The buy&hold benchmark needs the same one-session
+    # lookahead for its last forward return; hand it the unsliced adj path.
+    full_adj = panels[4]
     close, volume, _turnover, returns, adj, pct = slice_panels(
         panels, args.start, args.end,
     )
@@ -611,10 +616,10 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
     # overstated significance.
     dsr = deflated_sharpe_excess(oos, num_trials)
 
-    benchmark_series = compute_benchmark_returns(returns, adj, oos.index)
+    benchmark_series = compute_benchmark_returns(returns, full_adj, oos.index)
     # Align strategy and both benchmarks on the common valid dates so all
-    # three rows cover the same observations (the buy&hold leg is undefined
-    # on the last sliced session when --end is used).
+    # three rows cover the same observations (a mid-panel --end, a skipped
+    # fold, or a delisted asset can otherwise shorten one leg).
     aligned = pd.concat(
         [
             oos.rename("strategy"),

@@ -289,6 +289,26 @@ def test_fallback_counter_counts_one_per_event(tool):
         optimizer_logger.removeHandler(counter)
 
 
+def test_buyhold_last_label_uses_next_session_from_full_panel(tool):
+    """--end: the last label needs the next full-cache session, like returns."""
+    dates = pd.bdate_range("2024-01-02", periods=5)
+    pct = pd.DataFrame({"A": [0.0, 0.01, 0.02, 0.03, 0.04]}, index=dates)
+    adj = (1.0 + pct).cumprod() * 100.0
+    returns = pct.shift(-1)
+    oos = pd.DatetimeIndex(dates[1:4])
+    sliced_returns = returns.iloc[:4]
+
+    short = tool.compute_benchmark_returns(sliced_returns, adj.iloc[:4], oos)
+    full = tool.compute_benchmark_returns(sliced_returns, adj, oos)
+
+    # With only the sliced adj path the last OOS label has no next session ...
+    assert math.isnan(short["buyhold"].iloc[-1])
+    # ... but the full path supplies it (day 3 -> day 4 is +4%), matching the
+    # forward-labelled return retained by --end.
+    assert full["buyhold"].iloc[-1] == pytest.approx(0.04)
+    assert sliced_returns.loc[dates[3], "A"] == pytest.approx(0.04)
+
+
 def test_excess_sharpe_does_not_double_subtract_risk_free(tool):
     """An excess series' Sharpe is an information ratio: rf must be zero.
 
