@@ -332,6 +332,7 @@ worker** 运行：不要给 `uvicorn` / `main.py web` 加 `--workers N` 或 `--r
 | `docs/research/` | 系统研究报告（Alpha Discovery / 市场结构 / Regime） |
 | `tools/real_data_research.py` | 真实数据研究一键复跑：缓存面板 → 技术因子 → walk-forward 选因子 → 成本感知 MVO → JSON/Markdown 报告（同日涨跌停门禁、同窗口日频/买入持有双基准、超额收益 DSR；R20 起 Walk-Forward 支持 `rank_normalize_signal` 与真实行业上限的研究链路，工具本体待接入） |
 | `tools/daily_signal.py` | 每日信号：缓存面板 → PIT 因子/Rank IC → 成本感知 MVO → 目标权重 JSON/CSV（不接 broker） |
+| `tools/paper_track.py` | 前向 Paper 跟踪：目标权重 + 缓存面板 → 幂等日频 NAV 台账 + 基准（次日收盘执行、R9 成本、权重漂移、stale 标记；只读，不接 broker） |
 
 ---
 

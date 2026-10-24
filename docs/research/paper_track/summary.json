@@ -1,0 +1,48 @@
+{
+  "as_of": "2025-06-30",
+  "benchmark": {
+    "annualized_return": 0.26442826889242177,
+    "annualized_volatility": 0.1469991347556595,
+    "definition": "equal-weight daily-rebalanced mean of the cached universe's close-to-close returns",
+    "max_drawdown": -0.0679308477113655,
+    "sharpe_ratio": 1.5947595152997742,
+    "total_return": 0.12446799371632711
+  },
+  "benchmark_definition": "equal-weight daily-rebalanced mean of the cached universe's close-to-close returns",
+  "cache_last_date": "2025-12-31",
+  "capital": 2000000.0,
+  "cash_weight_at_build": 1.1170999998366682e-06,
+  "cost_mode": "impact",
+  "costs": {
+    "pct_of_capital": 0.0006413397189999999,
+    "total_cny": 1282.679438
+  },
+  "disclaimer": "paper tracking only; style-tilt demo, not validated alpha",
+  "execution_date": "2025-07-01",
+  "first_ledger_date": "2025-07-01",
+  "last_ledger_date": "2025-12-31",
+  "max_stale_sessions": 20,
+  "n_purchased_assets": 21,
+  "n_sessions": 126,
+  "n_target_assets": 21,
+  "risk_free_rate": 0.03,
+  "since_inception": {
+    "annualized_return": 0.26853432073942884,
+    "annualized_volatility": 0.13359861249121974,
+    "final_nav": 2252584.578559,
+    "max_drawdown": -0.0449795988997267,
+    "max_drawdown_peak": "2025-09-01",
+    "max_drawdown_trough": "2025-09-29",
+    "n_stale_days": 0,
+    "sharpe_ratio": 1.7854550754043619,
+    "total_return": 0.12629228927949998
+  },
+  "stale_policy": "hold at the last valid close (return 0, flagged stale); after max_stale_sessions consecutive missing closes, liquidate at the last close and hold the proceeds as cash",
+  "target_file": ".scratch\\orchestrate\\_r21_demo\\target_2025-06-30.json",
+  "target_sha256": "e27f9510b239b8ae7ed1eba5fa29eb0944cd564b3db89b6c2d02e6c161190017",
+  "tracking": {
+    "difference": 0.001824295563172873,
+    "tracking_error": 0.07601267750718559
+  },
+  "warnings": []
+}
