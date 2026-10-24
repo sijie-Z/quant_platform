@@ -1,0 +1,159 @@
+{
+  "as_of": "2025-12-31",
+  "data_end": "2025-12-31",
+  "factors": [
+    "ep",
+    "turnover20d"
+  ],
+  "weights": {
+    "000001": 0.0499999987,
+    "000019": 0.0499999995,
+    "000026": 0.0198785462,
+    "000027": 0.0499999997,
+    "000028": 0.0499999998,
+    "000029": 0.018635443,
+    "000039": 0.0450069486,
+    "000042": 0.0125364446,
+    "000050": 0.0427554205,
+    "000061": 0.0431067883,
+    "000065": 0.0337343948,
+    "000066": 0.0499999512,
+    "000089": 0.0499999992,
+    "000096": 0.0121006302,
+    "000100": 0.0499999991,
+    "000151": 0.0001711618,
+    "000301": 0.0266980444,
+    "000333": 0.0499999998,
+    "000338": 0.0436986619,
+    "000403": 0.0499999996,
+    "000404": 0.0499999996,
+    "000409": 0.0016775045,
+    "000421": 0.0499998639,
+    "000423": 0.0499999998,
+    "000429": 0.0499999997,
+    "000498": 0.0499999997
+  },
+  "signal_date": "2025-12-31",
+  "provenance": {
+    "tool": "tools/daily_signal.py",
+    "cache": ".cache\\baostock\\daily_2018-01-01_2025-12-31_500.parquet",
+    "industry_map": ".cache\\baostock\\industry_map.parquet",
+    "industry_neutralization": true,
+    "construction": "mvo",
+    "top_n": null,
+    "max_sector": 0.3,
+    "sector_cap_enforced": true,
+    "prev_weights": null,
+    "capital_cny": 2000000.0,
+    "max_weight": 0.05,
+    "max_turnover": 0.3,
+    "risk_aversion": 1.0,
+    "transaction_cost_bps": 20.0,
+    "turnover_penalty": 0.5,
+    "covariance": "ledoit_wolf",
+    "covariance_lookback": 252,
+    "ic_lookback": 252,
+    "ic_min_obs": 20,
+    "winsorize": [
+      0.01,
+      0.99
+    ],
+    "standardize": "zscore",
+    "returns_convention": "pct_chg/100 shift(-1) computed within the panel sliced to date <= as_of; the signal date's forward label is NaN and excluded from IC and covariance"
+  },
+  "diagnostics": {
+    "history_sessions": 1942,
+    "data_lag_days": 0,
+    "universe_assets": 101,
+    "candidates": 88,
+    "n_holdings": 26,
+    "max_weight_actual": 0.0499999998,
+    "max_sector_weight": 0.1460061861,
+    "n_sector_cap_binding": 0,
+    "sector_cap": {
+      "max_sector_exposure": 0.3,
+      "enforced": true,
+      "sector_map_assets": 101,
+      "n_sectors_universe": 36,
+      "unknown_assets_universe": 0,
+      "n_sectors_holdings": 18,
+      "binding_sectors": [],
+      "sector_weights": {
+        "C26": 0.0266980444,
+        "C27": 0.0999999994,
+        "C33": 0.0450069486,
+        "C34": 0.0499999996,
+        "C36": 0.0436986619,
+        "C38": 0.0499999998,
+        "C39": 0.1427553708,
+        "D44": 0.0499999997,
+        "D45": 0.0499998639,
+        "E48": 0.0499999997,
+        "F51": 0.1460061861,
+        "F52": 0.0198785462,
+        "G54": 0.0499999997,
+        "G56": 0.0499999992,
+        "I65": 0.0016775045,
+        "J66": 0.0499999987,
+        "K70": 0.031171887600000003,
+        "L72": 0.0431067883
+      }
+    },
+    "gross_weight": 0.9999997981,
+    "cash_weight": 2.0190000005193554e-07,
+    "turnover": 0.49999989905,
+    "turnover_definition": "one_sided = 0.5 * sum(|w - w_prev|)",
+    "first_build": true,
+    "min_reported_weight": 0.0001,
+    "pruned_weight": 2.014e-07,
+    "factor_skipped": [],
+    "factor_ic": {
+      "lookback": 252,
+      "min_obs": 20,
+      "window": {
+        "start": "2024-12-18",
+        "end": "2025-12-30",
+        "n": 252,
+        "factor": "ep"
+      },
+      "per_factor": {
+        "ep": {
+          "mean_ic": 0.029124007005621528,
+          "n_obs": 252,
+          "window_start": "2024-12-18",
+          "window_end": "2025-12-30",
+          "weight": 0.44205885197761696
+        },
+        "turnover20d": {
+          "mean_ic": -0.036758639332826144,
+          "n_obs": 252,
+          "window_start": "2024-12-18",
+          "window_end": "2025-12-30",
+          "weight": -0.557941148022383
+        }
+      }
+    },
+    "signal": {
+      "composite_min": -2.291305362751381,
+      "composite_max": 1.5807903688398242,
+      "composite_mean": 4.718447854656915e-16,
+      "alpha_convention": "cross-sectional percentile rank - 0.5 (MeanVarianceOptimizer input; composite z is the delivered signal)"
+    },
+    "covariance_assets": 89,
+    "covariance_sessions": 252,
+    "covariance_input_sessions": 1941,
+    "optimizer": {
+      "name": "MeanVarianceOptimizer",
+      "construction": "mvo",
+      "top_n": null,
+      "selected": null,
+      "fallback_count": 0,
+      "fallback_reason": null,
+      "received_sector_map": true
+    },
+    "warnings": [
+      "first build: one-sided turnover 0.5000 against a zero book exceeds the 0.3000 cap; the cap is not applied to a first build (nothing to trade from; the platform engine also passes prev_weights=None on its first rebalance)"
+    ]
+  },
+  "disclaimer": "style tilt demo, not validated alpha -- this book is the long side of a low-turnover / value style exposure; the research found no statistically significant residual alpha. Research output only; not investment advice."
+}

@@ -25,20 +25,14 @@ import pandas as pd
 
 from quant_platform.alpha.pipeline import AlphaPipeline
 from quant_platform.factors.registry import get_registry
+from quant_platform.trading.signals import SIGNAL_FACTORS, composite_signal
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Default factors for live trading (all technical, need only price/volume data)
-DEFAULT_LIVE_FACTORS = [
-    "momentum_1m",
-    "momentum_3m",
-    "momentum_6m",
-    "volatility_20d",
-    "volatility_60d",
-    "rsi_14d",
-    "macd",
-]
+# Default factors for live trading (all technical, need only price/volume data).
+# Single source of truth: the shared composite in `trading/signals.py`.
+DEFAULT_LIVE_FACTORS = list(SIGNAL_FACTORS)
 
 
 class LiveSignalGenerator:
@@ -140,6 +134,19 @@ class LiveSignalGenerator:
         prices = self._price_buffer
         if len(prices) < 20:
             return {}
+
+        # Equal-weight composite: delegate to the one shared implementation in
+        # `trading/signals.py`, which the CLI LiveRunner and the web engine
+        # also call.  A separate copy here is how live paths drift apart.
+        if self._alpha_pipeline.method == "equal_weight":
+            scores = composite_signal(
+                prices,
+                factor_names=self._factor_names,
+                # Extra panels (turnover, etc.) are forwarded unchanged, just
+                # as the IC branches below pass them per factor.
+                factor_kwargs={"turnover": self._turnover_buffer},
+            ).dropna()
+            return scores.to_dict()
 
         dates = prices.index
         assets = prices.columns

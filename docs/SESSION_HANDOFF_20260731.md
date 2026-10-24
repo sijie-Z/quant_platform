@@ -1,5 +1,10 @@
 # Session 交接文档 — 2026-07-31
 
+> **STATUS: HISTORICAL RECORD — counts and file sizes are stale (2026-10). See #78.**
+> §1.4's finding (five referenced governance documents never existed) was real;
+> the dangling references were removed in 2026-10 (see #68). As of 2026-10-20 the
+> live tree has 21 CLI subcommands, 99 HTTP endpoints + 1 WebSocket, not the numbers below.
+
 > **目的**：记录本 session（2026-07-31）与用户关于 quant_platform 的完整讨论过程、架构思考、关键发现与优先级决策。
 > **读者**：其他 AI agent / 未来的会话 / 项目维护者。
 > **注意**：本文档是讨论记录，不是需求文档。所有"建议"均未经用户最终拍板，需仔细阅读"共识"与"待决"部分。

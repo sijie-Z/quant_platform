@@ -50,8 +50,19 @@ def _registered_factors() -> list[str]:
 
 def _compute(name: str, panel: pd.DataFrame) -> pd.DataFrame | None:
     """Factor output on `panel`, or None if it needs inputs beyond prices."""
+    inst = get_registry().get(name)()
+    ohlc = {
+        "open": panel.shift(1).fillna(panel),
+        "high": panel * 1.01,
+        "low": panel * 0.99,
+    }
+    extra = {
+        field: ohlc[field]
+        for field in getattr(inst, "required_inputs", ())
+        if field in ohlc
+    }
     try:
-        out = get_registry().get(name)().compute(panel)
+        out = inst.compute(panel, **extra)
     except Exception:
         return None
     return out if isinstance(out, pd.DataFrame) else None

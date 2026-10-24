@@ -23,9 +23,9 @@ logger = get_logger(__name__)
 def estimate_factor_betas(
     returns: pd.DataFrame,
     factors: dict[str, pd.DataFrame],
-    window: int = 252,
+    min_history: int = 252,
 ) -> dict[str, pd.Series]:
-    """Estimate time-varying factor betas via rolling cross-sectional regression.
+    """Estimate time-varying factor betas via daily cross-sectional regression.
 
     For each date t, run:
         r_i(t) = sum_j(beta_j * f_j(i,t)) + epsilon_i(t)
@@ -33,11 +33,18 @@ def estimate_factor_betas(
     Args:
         returns: (date x asset) daily returns
         factors: dict of factor_name -> (date x asset) factor values
-        window: rolling window for beta estimation
+        min_history: number of leading dates skipped as a warm-up period. Each
+            remaining date's betas are estimated from that date's own
+            cross-section only -- this is a daily cross-sectional regression,
+            NOT a pooled trailing-window regression. The parameter used to be
+            called ``window`` and was documented as a rolling estimation
+            window, which it never was.
 
     Returns:
         dict of factor_name -> Series of daily betas (time series)
     """
+    if min_history < 0:
+        raise ValueError(f"min_history must be >= 0, got {min_history!r}")
     factor_names = list(factors.keys())
     dates = returns.index
 
@@ -45,7 +52,7 @@ def estimate_factor_betas(
     betas = {name: [] for name in factor_names}
     beta_dates = []
 
-    for i in range(window, len(dates)):
+    for i in range(min_history, len(dates)):
         date = dates[i]
         # Get cross-sectional returns for this date
         r = returns.loc[date].dropna()
@@ -109,8 +116,19 @@ def factor_risk_decomposition(
         - factor_contributions: dict of factor -> contribution series
         - alpha_series: residual (idiosyncratic) returns
         - total_factor_return: sum of all factor contributions
-        - factor_risk_share: dict of factor -> fraction of total variance
+        - factor_risk_share: dict of factor -> Euler risk contribution share
+        - idiosyncratic_risk_share: Var(alpha) + 2*Cov(TF, alpha), over Var(P)
         - r_squared: model fit quality
+
+    Risk shares use the Euler/covariance decomposition on the sample where
+    betas are available (dates before the first beta estimate are excluded):
+    with c_j = beta_j * r_j and TF = sum_j c_j,
+
+        RC_j = Cov(c_j, TF) / Var(P)
+
+    and the idiosyncratic bucket holds Var(alpha) + 2*Cov(TF, alpha) over
+    Var(P). Because Var(P) = sum_j Cov(c_j, TF) + Var(alpha) + 2*Cov(TF, alpha),
+    the factor shares plus the idiosyncratic share sum to exactly 1.
     """
     dates = portfolio_returns.index
 
@@ -131,20 +149,54 @@ def factor_risk_decomposition(
     total_factor = sum(contributions.values())
     alpha = portfolio_returns - total_factor
 
-    # Variance decomposition
-    total_var = portfolio_returns.var()
-    factor_variances = {}
-    for name in contributions:
-        factor_variances[name] = contributions[name].var()
+    # Variance decomposition (Euler / covariance decomposition).
+    #
+    # With c_j = beta_j * r_j and TF = sum_j c_j:
+    #     Var(P) = sum_j Cov(c_j, TF) + Var(alpha) + 2*Cov(TF, alpha)
+    # so Cov(c_j, TF)/Var(P) are the factor contributions and the
+    # idiosyncratic bucket holds Var(alpha) + 2*Cov(TF, alpha). The old code
+    # used Var(c_j)/Var(P), which omitted every covariance term: on two
+    # factors correlated at 0.9 the shares summed to 57% of total variance,
+    # and with negatively correlated factors an individual share could exceed
+    # 1. The identity above makes factor shares + idiosyncratic share sum to
+    # exactly 1.
+    # Betas only exist after the ``min_history`` warm-up, so the leading dates
+    # have no factor contributions (they stay NaN through ``total_factor`` and
+    # ``alpha``). Evaluate every variance and covariance on that common valid
+    # sample: using the full portfolio_returns sample as the denominator would
+    # cover dates the numerator terms cannot see, and the Euler shares would
+    # not sum to 1.
+    valid = portfolio_returns.notna() & total_factor.notna() & alpha.notna()
+    port_valid = portfolio_returns[valid]
+    tf_valid = total_factor[valid]
+    alpha_valid = alpha[valid]
 
-    sum(factor_variances.values())
-    alpha_var = alpha.var()
+    total_var = port_valid.var()
+    alpha_var = alpha_valid.var()
 
     risk_share = {}
-    for name in factor_variances:
-        risk_share[name] = float(factor_variances[name] / total_var) if total_var > 0 else 0
+    for name, c in contributions.items():
+        cov_j = c[valid].cov(tf_valid)
+        risk_share[name] = (
+            float(cov_j / total_var)
+            if total_var > 0 and np.isfinite(total_var) and np.isfinite(cov_j)
+            else 0.0
+        )
 
-    r_squared = float(1 - alpha_var / total_var) if total_var > 0 else 0
+    cov_tf_alpha = tf_valid.cov(alpha_valid)
+    idio_share = (
+        float((alpha_var + 2.0 * cov_tf_alpha) / total_var)
+        if total_var > 0
+        and np.isfinite(total_var)
+        and np.isfinite(cov_tf_alpha)
+        else 0.0
+    )
+
+    r_squared = (
+        float(1 - alpha_var / total_var)
+        if total_var > 0 and np.isfinite(total_var)
+        else 0
+    )
 
     # Annualized contributions
     annual_contributions = {}
@@ -156,13 +208,16 @@ def factor_risk_decomposition(
         "alpha_series": alpha,
         "total_factor_return": total_factor,
         "factor_risk_share": risk_share,
+        "idiosyncratic_risk_share": idio_share,
         "factor_annual_return": annual_contributions,
         "alpha_annual_return": float(alpha.mean() * 252),
         "alpha_volatility": float(alpha.std() * np.sqrt(252)),
         "r_squared": r_squared,
-        "total_risk": float(portfolio_returns.std() * np.sqrt(252)),
-        "factor_risk": float(total_factor.std() * np.sqrt(252)),
-        "idiosyncratic_risk": float(alpha.std() * np.sqrt(252)),
+        # Risk levels use the same estimated-beta sample as the shares so the
+        # reported factor/idiosyncratic risks are mutually consistent.
+        "total_risk": float(port_valid.std() * np.sqrt(252)),
+        "factor_risk": float(tf_valid.std() * np.sqrt(252)),
+        "idiosyncratic_risk": float(alpha_valid.std() * np.sqrt(252)),
     }
 
 
@@ -181,7 +236,17 @@ def factor_contribution_summary(
 
     rows.append({
         "factor": "Alpha (idiosyncratic)",
-        "risk_share_pct": round((1 - decomposition["r_squared"]) * 100, 2),
+        # Euler decomposition: this bucket includes Var(alpha) and the
+        # 2*Cov(total_factor, alpha) cross term, so factor shares and this
+        # row sum to 100%. Fall back to 1 - r_squared for callers holding older
+        # decomposition dicts.
+        "risk_share_pct": round(
+            decomposition.get(
+                "idiosyncratic_risk_share",
+                1 - decomposition["r_squared"],
+            ) * 100,
+            2,
+        ),
         "annual_return_bps": round(decomposition["alpha_annual_return"] * 10000, 1),
         "contribution": "alpha",
     })

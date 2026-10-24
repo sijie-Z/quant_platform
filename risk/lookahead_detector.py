@@ -183,12 +183,12 @@ class LookaheadDetector:
             if signal_diff > self.threshold:
                 biased_dates.append(date)
                 logger.info(
-                    "  ⚠  %s — signal diff=%.6f (factors: %s)",
+                    "  WARNING %s - signal diff=%.6f (factors: %s)",
                     date.date(), signal_diff,
                     ", ".join(signal_diffs[-1]["biased_factors"][:5]),
                 )
             else:
-                logger.debug("  ✓ %s — signal diff=%.4e", date.date(), signal_diff)
+                logger.debug("  OK %s - signal diff=%.4e", date.date(), signal_diff)
 
             if (i + 1) % 5 == 0:
                 logger.info("  Progress: %d/%d dates checked", i + 1, len(check_dates))
@@ -222,14 +222,14 @@ class LookaheadDetector:
 
         if has_bias:
             logger.warning(
-                "⚠  Lookahead bias detected on %d/%d dates "
+                "Lookahead bias detected on %d/%d dates "
                 "(threshold=%.0e, max_signal_diff=%.6f)",
                 len(biased_dates), len(check_dates),
                 self.threshold, max_signal_diff,
             )
         else:
             logger.info(
-                "✓  No lookahead bias detected (threshold=%.0e, max_signal_diff=%.6f)",
+                "No lookahead bias detected (threshold=%.0e, max_signal_diff=%.6f)",
                 self.threshold, max_signal_diff,
             )
 
@@ -273,7 +273,7 @@ class LookaheadDetector:
         print(f"  Dates checked:  {result['dates_checked']}")
         print(f"  Threshold:      {result['threshold']:.0e}")
         print(f"  Max signal diff: {max_diff:.6f}")
-        print(f"  Has bias:       {'⚠  YES' if has_bias else '✓  NO'}")
+        print(f"  Has bias:       {'[!] YES' if has_bias else '[ok] NO'}")
 
         if has_bias:
             print(f"\n  Biased dates ({len(result['biased_dates'])}):")
@@ -282,10 +282,10 @@ class LookaheadDetector:
             if len(result['biased_dates']) > 20:
                 print(f"    ... and {len(result['biased_dates']) - 20} more")
 
-        print(f"\n  {'─' * 70}")
+        print(f"\n  {'-' * 70}")
         print("  Factor Bias Report:")
         print(f"  {'Factor':<25} {'Max Diff':>10} {'Mean Diff':>10} {'% Biased':>10}")
-        print(f"  {'─' * 55}")
+        print(f"  {'-' * 55}")
         for name, stats in sorted(
             result['factor_bias_report'].items(),
             key=lambda x: x[1]['max_diff'],

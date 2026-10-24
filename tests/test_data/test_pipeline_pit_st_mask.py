@@ -83,7 +83,12 @@ class _FixedProvider(DataProvider):
             [self._dates, self._assets], names=["date", "asset"]
         )
         return pd.DataFrame(
-            {"market_cap": 1e9, "pb": 1.5, "pe": 15.0}, index=index
+            {
+                "market_cap": 1e9, "total_assets": 2e9, "net_assets": 1e9,
+                "revenue": 1e8, "net_profit": 1e7, "roe": 0.10,
+                "pb_ratio": 1.5, "pe_ratio": 15.0, "asset_growth": 0.05,
+            },
+            index=index,
         )
 
     def get_benchmark(self, start_date, end_date) -> pd.Series:
@@ -394,3 +399,42 @@ class TestLegacyProviderFallback:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestFactorsRespectTheMask:
+    """`BaseFactor.run` blanket-`ffill()`ed the panel, resurrecting ST rows
+    that the pipeline had blanked, so ST names re-entered every factor
+    cross-section."""
+
+    @staticmethod
+    def _pipeline_with_st(name="000002.SH"):
+        announce = DATES[4]
+        pipeline = _run(
+            DATES,
+            [{
+                "asset": name,
+                "announce_date": announce,
+                "end_date": DATES[-1],
+                "is_st": True,
+            }],
+        )
+        return pipeline, announce
+
+    def test_factor_values_are_nan_while_st(self):
+        from quant_platform.factors.technical import Momentum1M
+
+        pipeline, announce = self._pipeline_with_st()
+        prices = pipeline.get_factor_prices()
+
+        values = Momentum1M(period=2).run(prices).values
+
+        assert values.loc[values.index >= announce, "000002.SH"].isna().all()
+        assert values["000003.SH"].notna().any()
+
+    def test_turnover_is_blanked_while_st(self):
+        pipeline, announce = self._pipeline_with_st()
+
+        turnover = pipeline.get_turnover()
+
+        assert turnover.loc[turnover.index >= announce, "000002.SH"].isna().all()
+        assert turnover.loc[turnover.index < announce, "000002.SH"].notna().any()

@@ -9,6 +9,9 @@ Tables:
     sessions    — trading session records
     events      — event log for audit trail
     config      — strategy configuration snapshots
+    eod_reconciliation — once-per-day marker for the end-of-day run
+    reconciliation_results — per-day books-vs-broker reconciliation outcome
+    ledger_baselines — broker-state baselines the trade ledger derives from
 
 Usage:
     store = Store('data/trading.db')
@@ -20,16 +23,156 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
+import math
+import os
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+#: Time basis for new rows in ``pnl_history``/``sessions``/``events``
+#: (S17): Asia/Shanghai wall clock, stored naive. The scheduler has always
+#: used this basis; the engine and Store defaults used the host clock, so a
+#: UTC container wrote rows eight hours off and a UTC-5 host sixteen. Legacy
+#: rows are NOT migrated (see the ops2 report): only rows written from this
+#: version on use the single documented basis.
+EXCHANGE_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def exchange_now() -> datetime:
+    """Current exchange-local (Asia/Shanghai) wall clock, naive.
+
+    Derived from the epoch clock, never from the host time zone, so changing
+    ``TZ`` or a frozen host clock cannot move the stored timestamp domain.
+    """
+    return datetime.fromtimestamp(time.time(), EXCHANGE_TZ).replace(tzinfo=None)
+
+
+def exchange_now_iso() -> str:
+    """ISO timestamp in the documented store basis (Shanghai naive)."""
+    return exchange_now().isoformat()
+
+
+def _clamp_limit(limit, default: int = 100, maximum: int = 1000) -> int:
+    """Bound a caller-supplied row limit.
+
+    SQLite treats LIMIT -1 as "no limit", so a negative query parameter could
+    dump a whole table; huge values overflow the int64 bind.
+    """
+    try:
+        value = int(limit)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, min(value, maximum))
+
+
+def _clamp_days(days, default: int = 30, maximum: int = 3650) -> int:
+    try:
+        value = int(days)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(1, min(value, maximum))
+
+
+#: Control characters openpyxl-style exporters strip; kept in sync with
+#: ``compliance/exporter._ILLEGAL_XML_CHARS`` for the standalone fallback.
+_ILLEGAL_CELL_CHARS = {
+    code: None
+    for code in list(range(0x00, 0x09)) + [0x0B, 0x0C] + list(range(0x0E, 0x20))
+}
+_DANGEROUS_CELL_PREFIXES = frozenset("=+-@\t\r")
+
+
+def _sanitize_archive_cell(value):
+    """Neutralize spreadsheet formula injection in retention archives.
+
+    The retention CSV writer echoed stored values verbatim, so a symbol or
+    error message beginning with ``=``/``+``/``-``/``@`` executed on open
+    (CWE-1236). Reuse the compliance exporter's neutralizer when it is
+    importable; the fallback mirrors it for standalone ``quant_core`` use.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        from quant_platform.compliance.exporter import _sanitize_cell
+
+        return _sanitize_cell(value)
+    except Exception:  # pragma: no cover - quant_core used without quant_platform
+        text = value.translate(_ILLEGAL_CELL_CHARS)
+        if not text:
+            return ""
+        if text[0] in _DANGEROUS_CELL_PREFIXES or ord(text[0]) < 0x20:
+            return "'" + text
+        return text
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """Per-table maximum age for the retention job (S10).
+
+    A value of ``0`` (or negative) disables retention for that table. Defaults
+    follow the task book: events 180d, signals/sessions 1y, orders/trades/P&L
+    5y, NAV 10y.
+    """
+
+    orders_days: int = 5 * 365
+    trades_days: int = 5 * 365
+    pnl_days: int = 5 * 365
+    signals_days: int = 365
+    sessions_days: int = 365
+    events_days: int = 180
+    nav_days: int = 10 * 365
+
+    @classmethod
+    def from_env(cls) -> RetentionPolicy:
+        """Build a policy from ``QUANT_RETENTION_*_DAYS`` overrides.
+
+        Unknown/unparsable values fall back to the defaults rather than
+        crashing a daemon at startup.
+        """
+        import os
+
+        defaults = cls()
+        fields = {
+            "orders_days": "QUANT_RETENTION_ORDERS_DAYS",
+            "trades_days": "QUANT_RETENTION_TRADES_DAYS",
+            "pnl_days": "QUANT_RETENTION_PNL_DAYS",
+            "signals_days": "QUANT_RETENTION_SIGNALS_DAYS",
+            "sessions_days": "QUANT_RETENTION_SESSIONS_DAYS",
+            "events_days": "QUANT_RETENTION_EVENTS_DAYS",
+            "nav_days": "QUANT_RETENTION_NAV_DAYS",
+        }
+        values = {}
+        for field, env in fields.items():
+            raw = os.environ.get(env)
+            if raw is None or raw == "":
+                values[field] = getattr(defaults, field)
+                continue
+            try:
+                values[field] = int(raw)
+            except ValueError:
+                logger.warning("Ignoring invalid %s=%r; using default", env, raw)
+                values[field] = getattr(defaults, field)
+        return cls(**values)
+
+    def is_enabled(self) -> bool:
+        return any(
+            getattr(self, field) > 0
+            for field in (
+                "orders_days", "trades_days", "pnl_days", "signals_days",
+                "sessions_days", "events_days", "nav_days",
+            )
+        )
 
 
 class Store:
@@ -43,23 +186,71 @@ class Store:
         self._db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # One long-lived connection per thread. Opening a fresh SQLite
+        # connection, re-issuing the WAL pragmas and closing it on every read
+        # and write cost ~2.8 ms per operation -- ~95x the cost of the insert
+        # itself -- and a live cycle performs hundreds of them.
+        self._local = threading.local()
         self._init_schema()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return conn
 
     @contextmanager
     def _conn(self):
-        """Get a database connection."""
-        conn = sqlite3.connect(self._db_path, timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.row_factory = sqlite3.Row
+        """Get this thread's database connection and commit/rollback."""
+        conn = self._get_connection()
         try:
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        finally:
+
+    def close(self):
+        """Close this thread's connection (call before deleting the DB file).
+
+        The WAL is checkpointed first so the committed rows live in the main
+        database file after shutdown (S16). Checkpoint failure must not stop
+        the connection from closing.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error as exc:
+                logger.warning("WAL checkpoint on close failed: %s", exc)
             conn.close()
+            self._local.conn = None
+
+    def checkpoint(self) -> None:
+        """Flush the WAL into the main database file (TRUNCATE)."""
+        with self._conn() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def vacuum(self) -> None:
+        """Rebuild the database file to return freed pages to the OS.
+
+        VACUUM cannot run inside a transaction; every write commits through
+        ``_conn`` so the connection is idle here. Failures are logged and
+        reported (a locked database must not abort a retention run).
+        """
+        conn = self._get_connection()
+        conn.execute("VACUUM")
+
+    def size_bytes(self) -> int:
+        """Size of the main database file on disk, in bytes."""
+        try:
+            return Path(self._db_path).stat().st_size
+        except OSError:
+            return 0
 
     def _init_schema(self):
         """Create tables if they don't exist."""
@@ -122,6 +313,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS pnl_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT DEFAULT 'default',
                     timestamp TEXT NOT NULL,
                     total_equity REAL NOT NULL,
                     cash REAL NOT NULL,
@@ -136,6 +328,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS signals (
                     signal_id TEXT PRIMARY KEY,
+                    tenant_id TEXT DEFAULT 'default',
                     code TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     strength REAL NOT NULL,
@@ -147,6 +340,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
+                    tenant_id TEXT DEFAULT 'default',
                     strategy_id TEXT DEFAULT '',
                     broker TEXT DEFAULT 'simulated',
                     status TEXT DEFAULT 'active',
@@ -160,6 +354,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL,
+                    tenant_id TEXT DEFAULT 'default',
                     topic TEXT NOT NULL,
                     data TEXT DEFAULT '{}',
                     source TEXT DEFAULT '',
@@ -185,13 +380,73 @@ class Store:
                     perf_fee REAL DEFAULT 0,
                     high_water_mark REAL DEFAULT 1.0,
                     daily_return REAL DEFAULT 0,
-                    cumulative_return REAL DEFAULT 0
+                    cumulative_return REAL DEFAULT 0,
+                    accrued_mgmt_fee REAL DEFAULT 0,
+                    accrued_perf_fee REAL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS engine_state (
+                    strategy_id TEXT PRIMARY KEY,
+                    state_json  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                );
+
+                -- One marker per completed end-of-day reconciliation.
+                -- CREATE TABLE IF NOT EXISTS doubles as the migration for
+                -- databases written before this table existed.
+                CREATE TABLE IF NOT EXISTS eod_reconciliation (
+                    date TEXT PRIMARY KEY,
+                    timestamp TEXT
+                );
+
+                -- Daily books-vs-broker reconciliation outcome (R11).
+                -- One row per exchange date; `cash_diff`/`total_mismatch_value`
+                -- stay NULL when the comparison could not run (status
+                -- 'unknown'), so "unknown" is never stored as a zero diff.
+                -- CREATE TABLE IF NOT EXISTS is also the migration for
+                -- databases written before this table existed.
+                CREATE TABLE IF NOT EXISTS reconciliation_results (
+                    date TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    n_positions INTEGER DEFAULT 0,
+                    n_mismatched INTEGER DEFAULT 0,
+                    cash_diff REAL,
+                    total_mismatch_value REAL,
+                    details TEXT DEFAULT '[]',
+                    tolerances TEXT DEFAULT '{}',
+                    -- R12: which expected-side basis the outcome used
+                    -- ('trade_ledger': startup baseline + stored fills).
+                    -- Deliberately no DEFAULT: rows written before this
+                    -- column existed must stay NULL (their basis was Store
+                    -- positions + snapshot cash), never be mislabelled.
+                    basis TEXT
+                );
+
+                -- R12: immutable broker-state baselines captured when the
+                -- live engine starts. The EOD ledger derives expected
+                -- positions/cash from the newest row plus the fills stored
+                -- after it, so expected is independent of the broker
+                -- snapshot it is compared against. Restarts append rows
+                -- (history is kept; readers take the newest id).
+                -- CREATE TABLE IF NOT EXISTS is also the migration for
+                -- databases written before this table existed.
+                CREATE TABLE IF NOT EXISTS ledger_baselines (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    engine_state_key TEXT NOT NULL DEFAULT '',
+                    cash REAL NOT NULL,
+                    positions_json TEXT NOT NULL DEFAULT '{}',
+                    note TEXT DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);
                 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
                 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
                 CREATE INDEX IF NOT EXISTS idx_trades_order ON trades(order_id);
+                CREATE INDEX IF NOT EXISTS idx_orders_broker_id
+                    ON orders(broker_order_id);
                 CREATE INDEX IF NOT EXISTS idx_pnl_ts ON pnl_history(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_signals_code ON signals(code);
                 CREATE INDEX IF NOT EXISTS idx_events_topic ON events(topic);
@@ -202,18 +457,72 @@ class Store:
             self._migrate_tenant_id(conn)
             # ... and give positions a tenant-scoped key
             self._migrate_positions_primary_key(conn)
+            # ... and carry cumulative fee accruals on existing NAV databases
+            nav_cols = {r["name"] for r in conn.execute("PRAGMA table_info(nav_history)")}
+            if "accrued_mgmt_fee" not in nav_cols:
+                conn.execute(
+                    "ALTER TABLE nav_history ADD COLUMN accrued_mgmt_fee REAL DEFAULT 0"
+                )
+            if "accrued_perf_fee" not in nav_cols:
+                conn.execute(
+                    "ALTER TABLE nav_history ADD COLUMN accrued_perf_fee REAL DEFAULT 0"
+                )
+            # R12: databases written before the trade-ledger basis carry no
+            # `basis` column; CREATE TABLE IF NOT EXISTS cannot add it. The
+            # added column gets no default on purpose: existing rows were
+            # produced by the R11 basis (Store positions + snapshot cash) and
+            # must stay NULL rather than inherit a "trade_ledger" label.
+            recon_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(reconciliation_results)")
+            }
+            if "basis" not in recon_cols:
+                conn.execute(
+                    "ALTER TABLE reconciliation_results ADD COLUMN basis TEXT"
+                )
 
             # Create tenant_id indexes after migration
             conn.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_orders_tenant ON orders(tenant_id);
                 CREATE INDEX IF NOT EXISTS idx_trades_tenant ON trades(tenant_id);
                 CREATE INDEX IF NOT EXISTS idx_positions_tenant ON positions(tenant_id);
+
+                -- Query-plan indexes for the default history queries.
+                --
+                -- These covered growing tables (trades/events/signals/
+                -- sessions) whose filter+sort columns had no index: every
+                -- dashboard poll did a full scan and a temp B-tree sort.
+                -- They are created *after* the tenant migration so the
+                -- composite order index works on databases written before
+                -- multi-tenancy, and `IF NOT EXISTS` keeps startup idempotent
+                -- for existing databases.
+                CREATE INDEX IF NOT EXISTS idx_trades_code_executed
+                    ON trades(code, executed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_trades_executed
+                    ON trades(executed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_topic_timestamp
+                    ON events(topic, timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_signals_consumed_generated
+                    ON signals(consumed, generated_at DESC);
+                -- The unfiltered signal query (consumed=-1) still sorts by
+                -- generated_at, so it needs a leading-column index of its own.
+                CREATE INDEX IF NOT EXISTS idx_signals_generated
+                    ON signals(generated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_sessions_started
+                    ON sessions(started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_orders_tenant_status_created
+                    ON orders(tenant_id, status, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ledger_baselines_lookup
+                    ON ledger_baselines(tenant_id, engine_state_key, id DESC);
             """)
         logger.info("Store initialized: %s", self._db_path)
 
     def _migrate_tenant_id(self, conn: sqlite3.Connection) -> None:
         """Add tenant_id column to existing tables if missing."""
-        for table in ("orders", "trades", "positions"):
+        for table in (
+            "orders", "trades", "positions", "signals", "events",
+            "pnl_history", "sessions",
+        ):
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if "tenant_id" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT DEFAULT 'default'")
@@ -265,32 +574,65 @@ class Store:
 
     # ── Orders ──
 
+    #: Columns of `orders`, in schema order. `save_order` writes only the
+    #: columns the caller actually supplies.
+    _ORDER_FIELDS = (
+        "order_id", "tenant_id", "code", "side", "order_type", "quantity",
+        "price", "filled_quantity", "filled_price", "status", "commission",
+        "tax", "slippage", "broker_order_id", "error_msg", "strategy_id",
+        "signal_id", "created_at", "updated_at",
+    )
+    #: Columns the schema declares NOT NULL without a SQL default.
+    _ORDER_REQUIRED = ("order_id", "code", "side", "quantity", "price")
+
     def save_order(self, order: dict):
-        """Save or update an order."""
+        """Insert an order, or update only the fields the caller supplied.
+
+        The previous `INSERT OR REPLACE` deleted the row and rebuilt it from
+        the incoming dict, so a later partial save -- e.g. the fill DTO a
+        broker returns, which carries neither `strategy_id` nor `signal_id`
+        -- reset every omitted column to its default. This upsert touches
+        only the caller's columns; on first insert the SQL defaults fill the
+        rest (created_at/updated_at have none, so they get a timestamp).
+        """
         with self._lock, self._conn() as conn:
-            conn.execute("""
-                    INSERT OR REPLACE INTO orders
-                    (order_id, tenant_id, code, side, order_type, quantity, price,
-                     filled_quantity, filled_price, status, commission, tax,
-                     slippage, broker_order_id, error_msg, strategy_id, signal_id,
-                     created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                order['order_id'], order.get('tenant_id', 'default'),
-                order['code'], order['side'],
-                order.get('order_type', 'limit'), order['quantity'], order['price'],
-                order.get('filled_quantity', 0), order.get('filled_price', 0),
-                order.get('status', 'pending'), order.get('commission', 0),
-                order.get('tax', 0), order.get('slippage', 0),
-                order.get('broker_order_id', ''), order.get('error_msg', ''),
-                order.get('strategy_id', ''), order.get('signal_id', ''),
-                order.get('created_at', datetime.now().isoformat()),
-                order.get('updated_at', datetime.now().isoformat()),
-            ))
+            self._save_order(conn, order)
+
+    def _save_order(self, conn: sqlite3.Connection, order: dict) -> None:
+        values = {k: order[k] for k in self._ORDER_FIELDS if k in order}
+        for key in self._ORDER_REQUIRED:
+            if key not in values:
+                raise KeyError(key)
+
+        insert = dict(values)
+        now = datetime.now().isoformat()
+        insert.setdefault("tenant_id", "default")
+        insert.setdefault("created_at", now)
+        insert.setdefault("updated_at", now)
+
+        insert_cols = [c for c in self._ORDER_FIELDS if c in insert]
+        # Only caller-supplied columns are overwritten; tenant_id keeps the
+        # row's existing value unless the caller names one.
+        update_cols = [c for c in values if c != "order_id"]
+        sql = (
+            f"INSERT INTO orders ({', '.join(insert_cols)}) "
+            f"VALUES ({', '.join('?' for _ in insert_cols)}) "
+            "ON CONFLICT(order_id) DO UPDATE SET "
+            + ", ".join(f"{c} = excluded.{c}" for c in update_cols)
+        )
+        conn.execute(sql, tuple(insert[c] for c in insert_cols))
 
     def get_orders(self, status: str = "", code: str = "", limit: int = 100,
-                   tenant_id: str = "") -> list[dict]:
-        """Get orders with optional filters."""
+                   tenant_id: str = "",
+                   start_date: str = "", end_date: str = "") -> list[dict]:
+        """Get orders with optional filters.
+
+        `start_date`/`end_date` are ISO dates (YYYY-MM-DD) applied in SQL.
+        Compliance exports used to fetch the newest `limit` rows and filter
+        afterwards, so a requested historical range could come back empty
+        once the book had more rows than the limit.
+        """
+        limit = _clamp_limit(limit)
         with self._conn() as conn:
             query = "SELECT * FROM orders WHERE 1=1"
             params: list = []
@@ -303,40 +645,173 @@ class Store:
             if code:
                 query += " AND code = ?"
                 params.append(code)
+            if start_date:
+                query += " AND created_at >= ?"
+                params.append(start_date)
+            if end_date:
+                query += " AND created_at <= ?"
+                params.append(end_date + "T23:59:59")
             query += " ORDER BY created_at DESC LIMIT ?"
             params.append(limit)
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
 
+    #: Batch size for compliance export pagination.
+    _EXPORT_BATCH = 1000
+
+    @staticmethod
+    def _widen_export_window(start_date: str, end_date: str) -> tuple[str, str]:
+        """Widen the SQL date window by a day on each side.
+
+        The exporter's Python filter remains authoritative (it normalizes
+        timezone-aware timestamps to local wall-clock time). A raw SQL bound
+        could otherwise drop a +08:00 print on the end date before Python
+        ever saw it.
+        """
+        start, end = start_date, end_date
+        if start_date:
+            try:
+                start = (
+                    datetime.fromisoformat(start_date) - timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+            except ValueError:
+                start = start_date
+        if end_date:
+            try:
+                end = (
+                    datetime.fromisoformat(end_date) + timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+            except ValueError:
+                end = end_date
+        return start, end
+
+    def get_orders_for_export(
+        self, tenant_id: str = "", start_date: str = "", end_date: str = "",
+    ) -> list[dict]:
+        """Every order in the (widened) range, pages internally.
+
+        Compliance exports need the complete record set. `get_orders` clamps
+        to 1000 rows for API safety, so an export over a larger range silently
+        lost older rows. This dedicated query has no API clamp and pages with
+        a keyset cursor instead of OFFSET.
+        """
+        start, end = self._widen_export_window(start_date, end_date)
+        collected: list[dict] = []
+        last: tuple[str, str] | None = None
+        while True:
+            query = "SELECT * FROM orders WHERE 1=1"
+            params: list = []
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            if start:
+                query += " AND created_at >= ?"
+                params.append(start)
+            if end:
+                query += " AND created_at <= ?"
+                params.append(end + "T23:59:59")
+            if last is not None:
+                query += (
+                    " AND (created_at < ? OR "
+                    "(created_at = ? AND order_id < ?))"
+                )
+                params.extend([last[0], last[0], last[1]])
+            query += " ORDER BY created_at DESC, order_id DESC LIMIT ?"
+            params.append(self._EXPORT_BATCH)
+            with self._conn() as conn:
+                batch = [dict(r) for r in conn.execute(query, params).fetchall()]
+            collected.extend(batch)
+            if len(batch) < self._EXPORT_BATCH:
+                return collected
+            last = (batch[-1]["created_at"], batch[-1]["order_id"])
+
     # ── Positions ──
+
+    _POSITION_INSERT = """
+        INSERT OR REPLACE INTO positions
+        (code, tenant_id, name, quantity, available, avg_cost, current_price,
+         market_value, unrealized_pnl, realized_pnl, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    @staticmethod
+    def _position_values(pos: dict, tenant_id: str, now: str) -> tuple:
+        code = pos["code"]
+        quantity = pos["quantity"]
+        avg_cost = pos["avg_cost"]
+        return (
+            code, pos.get("tenant_id", tenant_id),
+            pos.get("name", ""), quantity,
+            pos.get("available", quantity), avg_cost,
+            pos.get("current_price", 0), pos.get("market_value", 0),
+            pos.get("unrealized_pnl", 0), pos.get("realized_pnl", 0),
+            now,
+        )
 
     def save_position(self, pos: dict):
         """Save or update a position."""
         with self._lock, self._conn() as conn:
-            conn.execute("""
-                    INSERT OR REPLACE INTO positions
-                    (code, tenant_id, name, quantity, available, avg_cost, current_price,
-                     market_value, unrealized_pnl, realized_pnl, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                pos['code'], pos.get('tenant_id', 'default'),
-                pos.get('name', ''), pos['quantity'],
-                pos.get('available', pos['quantity']), pos['avg_cost'],
-                pos.get('current_price', 0), pos.get('market_value', 0),
-                pos.get('unrealized_pnl', 0), pos.get('realized_pnl', 0),
-                datetime.now().isoformat(),
-            ))
+            conn.execute(
+                self._POSITION_INSERT,
+                self._position_values(pos, "default", datetime.now().isoformat()),
+            )
+
+    def save_positions(
+        self,
+        positions: list[dict],
+        tenant_id: str = "",
+        prune_missing: bool = False,
+    ) -> None:
+        """Upsert a whole position book in one transaction.
+
+        The live engine used to call `save_position` once per position inside
+        a loop -- each call took the write lock and committed separately, so
+        a 50-position book cost tens of commits *per persist* (and it is
+        persisted at least twice per cycle). This writes the book with one
+        `executemany` and, when `prune_missing` is set, deletes the tenant's
+        rows that are not in the book in the same transaction. Only call it
+        with a *known* book: pruning from an unknown/empty query is what
+        erased persisted positions before (D6).
+
+        `tenant_id` (when given) is the prune scope and the default tenant for
+        rows that do not carry one; a row's own `tenant_id` still wins.
+        """
+        tenant = tenant_id or "default"
+        now = datetime.now().isoformat()
+        rows = [self._position_values(pos, tenant, now) for pos in positions or []]
+        with self._lock, self._conn() as conn:
+            if rows:
+                conn.executemany(self._POSITION_INSERT, rows)
+            if prune_missing and tenant_id:
+                codes = [row[0] for row in rows]
+                if codes:
+                    placeholders = ", ".join("?" for _ in codes)
+                    conn.execute(
+                        "DELETE FROM positions WHERE tenant_id = ? "
+                        f"AND code NOT IN ({placeholders})",
+                        [tenant_id, *codes],
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM positions WHERE tenant_id = ?",
+                        (tenant_id,),
+                    )
 
     def delete_position(self, code: str, tenant_id: str = ""):
-        """Remove a position."""
+        """Remove one tenant's position (``tenant_id`` is required).
+
+        An unscoped delete removed every tenant's row for the ticker; callers
+        must now name the tenant (``core.audit`` resolves it from
+        ``TenantContext``).
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required to delete a position")
         with self._lock, self._conn() as conn:
-            if tenant_id:
-                conn.execute(
-                    "DELETE FROM positions WHERE code = ? AND tenant_id = ?",
-                    (code, tenant_id),
-                )
-            else:
-                conn.execute("DELETE FROM positions WHERE code = ?", (code,))
+            cursor = conn.execute(
+                "DELETE FROM positions WHERE code = ? AND tenant_id = ?",
+                (code, tenant_id),
+            )
+            return cursor.rowcount
 
     def get_positions(self, tenant_id: str = "") -> list[dict]:
         """Get current positions.
@@ -362,75 +837,572 @@ class Store:
     # ── Trades ──
 
     def save_trade(self, trade: dict):
-        """Record an executed trade."""
+        """Record an executed trade.
+
+        `trade_id` defaults to a fresh uuid4, not to `order_id`: an order can
+        fill in several prints, and the old default made the second one hit
+        the `trades` UNIQUE constraint.
+        """
         with self._lock, self._conn() as conn:
-            conn.execute("""
-                    INSERT INTO trades
-                    (trade_id, tenant_id, order_id, code, side, quantity, price,
-                     commission, tax, executed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                trade.get('trade_id', trade.get('order_id', '')),
-                trade.get('tenant_id', 'default'),
-                trade['order_id'], trade['code'], trade['side'],
-                trade['quantity'], trade['price'],
-                trade.get('commission', 0), trade.get('tax', 0),
-                trade.get('executed_at', datetime.now().isoformat()),
-            ))
+            self._save_trade(conn, trade)
+
+    def _save_trade(self, conn: sqlite3.Connection, trade: dict) -> None:
+        conn.execute("""
+                INSERT INTO trades
+                (trade_id, tenant_id, order_id, code, side, quantity, price,
+                 commission, tax, executed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+            trade.get('trade_id') or uuid.uuid4().hex,
+            trade.get('tenant_id', 'default'),
+            trade['order_id'], trade['code'], trade['side'],
+            trade['quantity'], trade['price'],
+            trade.get('commission', 0), trade.get('tax', 0),
+            trade.get('executed_at', datetime.now().isoformat()),
+        ))
+
+    def save_order_with_trade(self, order: dict, trade: dict):
+        """Write an order and its fill atomically (one transaction).
+
+        The two used to be saved in separate transactions, so a failing
+        trade insert left the order row already updated and its fill -- and
+        audit record -- missing. Sharing one `_conn()` block makes the pair
+        all-or-nothing. `trade` may omit `trade_id`; a uuid4 is generated.
+        """
+        with self._lock, self._conn() as conn:
+            self._save_order(conn, order)
+            self._save_trade(conn, trade)
 
     def get_trades(self, code: str = "", limit: int = 100,
-                   tenant_id: str = "") -> list[dict]:
-        """Get trade history."""
+                   tenant_id: str = "",
+                   start_date: str = "", end_date: str = "") -> list[dict]:
+        """Get trade history.
+
+        `start_date`/`end_date` are ISO dates applied in SQL so a historical
+        export is not limited to the newest rows.
+        """
+        limit = _clamp_limit(limit)
         with self._conn() as conn:
+            query = "SELECT * FROM trades WHERE 1=1"
+            params: list = []
             if code:
-                if tenant_id:
-                    rows = conn.execute(
-                        "SELECT * FROM trades WHERE code = ? AND tenant_id = ? "
-                        "ORDER BY executed_at DESC LIMIT ?",
-                        (code, tenant_id, limit)).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT * FROM trades WHERE code = ? ORDER BY executed_at DESC LIMIT ?",
-                        (code, limit)).fetchall()
-            else:
-                if tenant_id:
-                    rows = conn.execute(
-                        "SELECT * FROM trades WHERE tenant_id = ? "
-                        "ORDER BY executed_at DESC LIMIT ?",
-                        (tenant_id, limit)).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT * FROM trades ORDER BY executed_at DESC LIMIT ?",
-                        (limit,)).fetchall()
+                query += " AND code = ?"
+                params.append(code)
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            if start_date:
+                query += " AND executed_at >= ?"
+                params.append(start_date)
+            if end_date:
+                query += " AND executed_at <= ?"
+                params.append(end_date + "T23:59:59")
+            query += " ORDER BY executed_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
+
+    def get_trade_quantity_for_order(
+        self, order_id: str, tenant_id: str = "",
+    ) -> int:
+        """Sum the trade quantity already persisted for one order (R13).
+
+        The live engine's broker-fill sync compares this against the broker's
+        cumulative ``filled_quantity`` to book only the *delta*: replaying the
+        same broker snapshot must not double-count a fill. An empty
+        ``tenant_id`` sums every tenant (matching ``get_trades``); pass the
+        engine's tenant to scope the ledger to one account.
+
+        ``order_id`` is covered by ``idx_trades_order`` (created with the
+        initial schema), so this is an indexed lookup.
+        """
+        if not order_id:
+            return 0
+        query = (
+            "SELECT COALESCE(SUM(quantity), 0) FROM trades WHERE order_id = ?"
+        )
+        params: list = [order_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        with self._conn() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
+    def get_trade_quantity_for_broker_order(
+        self, broker_order_id: str, *, tenant_id: str = "",
+        code: str = "", side: str = "", since: str = "",
+        exclude_order_id: str = "",
+    ) -> int:
+        """Sum persisted trade quantity booked under a broker wire order id.
+
+        QMT rebuilds orders it did not watch being submitted -- a previous
+        process's order after a restart, e.g. -- with a fresh local
+        ``order_id``; the broker's wire id is the only stable key. The match
+        is scoped by ``code``/``side`` and by ``since`` (an ISO date compared
+        with the order row's ``created_at``) because broker numeric ids are
+        reused across days: a global id match could swallow a genuine new
+        fill. ``since`` uses the host-local clock, the same clock the broker
+        adapters stamp ``created_at`` with.
+
+        ``exclude_order_id`` keeps the caller's *current* local order out of
+        the sum: the engine adds this result to the current order's own
+        trades, and counting the same rows twice would under-book the next
+        incremental fill. Reads ``idx_orders_broker_id``.
+        """
+        if not broker_order_id:
+            return 0
+        query = (
+            "SELECT COALESCE(SUM(t.quantity), 0) FROM trades t "
+            "JOIN orders o ON t.order_id = o.order_id "
+            "WHERE o.broker_order_id = ?"
+        )
+        params: list = [broker_order_id]
+        if tenant_id:
+            query += " AND t.tenant_id = ?"
+            params.append(tenant_id)
+        if code:
+            query += " AND o.code = ?"
+            params.append(code)
+        if side:
+            query += " AND o.side = ?"
+            params.append(side)
+        if since:
+            query += " AND o.created_at >= ?"
+            params.append(since)
+        if exclude_order_id:
+            query += " AND o.order_id != ?"
+            params.append(exclude_order_id)
+        with self._conn() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
+    def get_trades_for_export(
+        self, tenant_id: str = "", start_date: str = "", end_date: str = "",
+    ) -> list[dict]:
+        """Every trade in the (widened) range, pages internally.
+
+        See `get_orders_for_export`: compliance exports must not be truncated
+        by the 1000-row API clamp.
+        """
+        start, end = self._widen_export_window(start_date, end_date)
+        collected: list[dict] = []
+        last: tuple[str, str] | None = None
+        while True:
+            query = "SELECT * FROM trades WHERE 1=1"
+            params: list = []
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            if start:
+                query += " AND executed_at >= ?"
+                params.append(start)
+            if end:
+                query += " AND executed_at <= ?"
+                params.append(end + "T23:59:59")
+            if last is not None:
+                query += (
+                    " AND (executed_at < ? OR "
+                    "(executed_at = ? AND trade_id < ?))"
+                )
+                params.extend([last[0], last[0], last[1]])
+            query += " ORDER BY executed_at DESC, trade_id DESC LIMIT ?"
+            params.append(self._EXPORT_BATCH)
+            with self._conn() as conn:
+                batch = [dict(r) for r in conn.execute(query, params).fetchall()]
+            collected.extend(batch)
+            if len(batch) < self._EXPORT_BATCH:
+                return collected
+            last = (batch[-1]["executed_at"], batch[-1]["trade_id"])
 
     # ── P&L History ──
 
     def save_pnl_snapshot(self, snapshot: dict):
         """Save a P&L snapshot."""
         with self._lock, self._conn() as conn:
-            conn.execute("""
-                    INSERT INTO pnl_history
-                    (timestamp, total_equity, cash, market_value, daily_pnl,
-                     daily_pnl_pct, cumulative_pnl, n_positions, max_drawdown, sharpe_ratio)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                snapshot.get('timestamp', datetime.now().isoformat()),
-                snapshot['total_equity'], snapshot['cash'],
-                snapshot['market_value'], snapshot.get('daily_pnl', 0),
-                snapshot.get('daily_pnl_pct', 0), snapshot.get('cumulative_pnl', 0),
-                snapshot.get('n_positions', 0), snapshot.get('max_drawdown', 0),
-                snapshot.get('sharpe_ratio', 0),
-            ))
+            self._save_pnl(conn, snapshot)
 
-    def get_pnl_history(self, days: int = 30) -> list[dict]:
-        """Get P&L history for the last N days."""
+    def _save_pnl(self, conn: sqlite3.Connection, snapshot: dict) -> None:
+        """Insert a P&L snapshot, filling the risk columns when omitted.
+
+        ``daily_pnl``/``daily_pnl_pct``/``cumulative_pnl``/``max_drawdown``/
+        ``sharpe_ratio`` used to be written with literal ``0`` defaults (the
+        trading engine never computed them), so the compliance risk log
+        exported five permanently-zero columns. They are now derived from the
+        stored equity series at write time; an explicit non-null value from
+        the caller still wins.
+
+        Snapshots are expected to be appended in chronological order, which
+        is how the EOD path writes them. ``sharpe_ratio`` is the sample
+        mean/std of daily equity returns annualized with 252 trading days and
+        a zero risk-free rate (the risk log's own convention).
+        """
+        total_equity = float(snapshot["total_equity"])
+        cash = float(snapshot["cash"])
+        market_value = float(snapshot["market_value"])
+        tenant_id = snapshot.get("tenant_id") or "default"
+
+        rows = conn.execute(
+            "SELECT total_equity FROM pnl_history WHERE tenant_id = ? "
+            "ORDER BY timestamp, id",
+            (tenant_id,),
+        ).fetchall()
+        equity = [float(r[0]) for r in rows]
+        previous_equity = equity[-1] if equity else None
+        first_equity = equity[0] if equity else total_equity
+        equity.append(total_equity)
+
+        daily_pnl = (
+            total_equity - previous_equity if previous_equity is not None else 0.0
+        )
+        if previous_equity is not None and previous_equity != 0.0:
+            daily_pnl_pct = daily_pnl / previous_equity
+        else:
+            daily_pnl_pct = 0.0
+        cumulative_pnl = (
+            total_equity - first_equity if previous_equity is not None else 0.0
+        )
+
+        peak = equity[0]
+        max_drawdown = 0.0
+        for value in equity:
+            peak = max(peak, value)
+            if peak > 0:
+                max_drawdown = min(max_drawdown, value / peak - 1.0)
+
+        returns = [
+            equity[i] / equity[i - 1] - 1.0
+            for i in range(1, len(equity))
+            if equity[i - 1] > 0
+        ]
+        sharpe_ratio = 0.0
+        if len(returns) >= 2:
+            mean = sum(returns) / len(returns)
+            variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+            std = math.sqrt(variance)
+            if std > 0:
+                sharpe_ratio = mean / std * math.sqrt(252.0)
+
+        def _or_default(key: str, computed: float) -> float:
+            value = snapshot.get(key)
+            return computed if value is None else value
+
+        conn.execute("""
+                INSERT INTO pnl_history
+                (tenant_id, timestamp, total_equity, cash, market_value, daily_pnl,
+                 daily_pnl_pct, cumulative_pnl, n_positions, max_drawdown, sharpe_ratio)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+            tenant_id,
+            snapshot.get('timestamp', exchange_now_iso()),
+            total_equity, cash, market_value,
+            _or_default('daily_pnl', daily_pnl),
+            _or_default('daily_pnl_pct', daily_pnl_pct),
+            _or_default('cumulative_pnl', cumulative_pnl),
+            snapshot.get('n_positions', 0),
+            _or_default('max_drawdown', max_drawdown),
+            _or_default('sharpe_ratio', sharpe_ratio),
+        ))
+
+    def save_pnl_and_mark_eod(
+        self, snapshot: dict, date: str, timestamp: str | None = None,
+    ) -> bool:
+        """Write the EOD snapshot and its marker in one transaction.
+
+        The two writes were separate transactions, so a crash in between left
+        a snapshot with no marker and the next run appended a second snapshot
+        for the same day. One transaction makes the pair all-or-nothing. The
+        marker is inserted with ``OR IGNORE`` first and the snapshot is only
+        written when the insert actually claimed the day, so two racing
+        processes also produce exactly one snapshot.
+
+        Returns True when this call reconciled the day, False when another
+        run had already claimed it.
+        """
+        with self._lock, self._conn() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO eod_reconciliation (date, timestamp) "
+                "VALUES (?, ?)",
+                (date, timestamp or exchange_now_iso()),
+            )
+            if cursor.rowcount == 0:
+                return False
+            self._save_pnl(conn, snapshot)
+            return True
+
+    def get_pnl_history(self, days: int = 30,
+                        start_date: str = "", end_date: str = "",
+                        tenant_id: str = "") -> list[dict]:
+        """Get P&L history.
+
+        `days` is the default window. Explicit `start_date`/`end_date`
+        (YYYY-MM-DD) override it, so a compliance export can request a
+        period older than the default window. With `tenant_id` only that
+        tenant's snapshots are returned; without it (the default) every
+        tenant's rows are returned, which is the Store-level API contract --
+        the HTTP layer always names a tenant.
+        """
+        days = _clamp_days(days)
         with self._conn() as conn:
-            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-            rows = conn.execute(
-                "SELECT * FROM pnl_history WHERE timestamp > ? ORDER BY timestamp",
-                (cutoff,)).fetchall()
+            query = "SELECT * FROM pnl_history WHERE 1=1"
+            params: list = []
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            if start_date:
+                query += " AND timestamp >= ?"
+                params.append(start_date)
+            else:
+                cutoff = (exchange_now() - timedelta(days=days)).isoformat()
+                query += " AND timestamp > ?"
+                params.append(cutoff)
+            if end_date:
+                query += " AND timestamp <= ?"
+                params.append(end_date + "T23:59:59")
+            query += " ORDER BY timestamp"
+            rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
+
+    # ── EOD Reconciliation ──
+
+    def has_eod_reconciliation(self, date: str) -> bool:
+        """Whether the end-of-day reconciliation ran for `date` (YYYY-MM-DD)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM eod_reconciliation WHERE date = ?", (date,)
+            ).fetchone()
+            return row is not None
+
+    def mark_eod_reconciliation(self, date: str, timestamp: str | None = None):
+        """Record that the EOD reconciliation for `date` has completed.
+
+        The marker lives in SQLite so it survives a process restart; without
+        it a scheduler restarted after the close appended a second P&L
+        snapshot for the same day.
+        """
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO eod_reconciliation (date, timestamp) "
+                "VALUES (?, ?)",
+                (date, timestamp or exchange_now_iso()),
+            )
+
+    def get_last_eod_reconciliation(self) -> str:
+        """Latest exchange date (YYYY-MM-DD) with an EOD marker, or ''.
+
+        Used by the scheduler's startup catch-up scan (S3): a stand-alone
+        scheduler that was down for a few days compares this against the
+        exchange calendar and reconciles the gap.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(date) AS last_date FROM eod_reconciliation"
+            ).fetchone()
+        return str(row["last_date"] or "") if row else ""
+
+    def get_last_pnl_timestamp(self) -> str:
+        """Timestamp of the newest P&L snapshot, or '' when there is none."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(timestamp) AS last_ts FROM pnl_history"
+            ).fetchone()
+        return str(row["last_ts"] or "") if row else ""
+
+    # ── Daily reconciliation results (R11) ──
+
+    #: Allowed ``reconciliation_results.status`` values.
+    RECONCILIATION_STATUSES = ("passed", "failed", "unknown")
+
+    def save_reconciliation_result(self, result: dict) -> None:
+        """Persist one day's books-vs-broker reconciliation outcome.
+
+        Keyed by exchange date so a repeated EOD trigger can never append a
+        second row; ``INSERT OR REPLACE`` keeps the table at one row per day
+        even when two processes race the write. ``details`` and
+        ``tolerances`` are stored as JSON text.
+        """
+        status = result.get("status")
+        if status not in self.RECONCILIATION_STATUSES:
+            raise ValueError(
+                f"reconciliation status must be one of "
+                f"{self.RECONCILIATION_STATUSES}, got {status!r}"
+            )
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO reconciliation_results "
+                "(date, timestamp, status, n_positions, n_mismatched, "
+                " cash_diff, total_mismatch_value, details, tolerances, basis) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    result["date"],
+                    result.get("timestamp") or exchange_now_iso(),
+                    status,
+                    int(result.get("n_positions") or 0),
+                    int(result.get("n_mismatched") or 0),
+                    result.get("cash_diff"),
+                    result.get("total_mismatch_value"),
+                    json.dumps(result.get("details") or []),
+                    json.dumps(result.get("tolerances") or {}),
+                    result.get("basis") or "trade_ledger",
+                ),
+            )
+
+    @staticmethod
+    def _reconciliation_row(row: sqlite3.Row) -> dict:
+        """Row -> dict, decoding the two JSON columns.
+
+        Unreadable JSON degrades to the empty container instead of failing
+        the read: the status/counts are still valid audit data.
+        """
+        result = dict(row)
+        for column, empty in (("details", []), ("tolerances", {})):
+            raw = result.get(column)
+            if isinstance(raw, str):
+                try:
+                    result[column] = json.loads(raw)
+                except json.JSONDecodeError:
+                    result[column] = empty
+        return result
+
+    def get_reconciliation_result(self, date: str) -> dict | None:
+        """The reconciliation result recorded for `date` (YYYY-MM-DD), or None."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM reconciliation_results WHERE date = ?", (date,)
+            ).fetchone()
+        return self._reconciliation_row(row) if row is not None else None
+
+    def get_last_reconciliation(self) -> dict | None:
+        """The most recent reconciliation result, or None when there is none."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM reconciliation_results ORDER BY date DESC LIMIT 1"
+            ).fetchone()
+        return self._reconciliation_row(row) if row is not None else None
+
+    # ── Ledger baselines (R12) ──
+
+    def save_ledger_baseline(self, baseline: dict) -> int:
+        """Insert one immutable trade-ledger baseline; returns its row id.
+
+        The baseline is the broker's authoritative cash and position book at
+        engine start; the expected EOD book is derived from it plus the fills
+        stored after ``created_at``. ``cash`` is required and must be a finite
+        number: recording a missing balance as 0 would make every later cash
+        comparison meaningless (the caller must fail loud instead).
+        ``created_at`` is required as well -- defaulting it to the exchange
+        clock would silently mix timestamp domains with the host-clock fill
+        stamps the ledger compares against.
+
+        ``positions_json`` accepts either a mapping (serialized here) or an
+        already-encoded JSON object; a non-mapping value is rejected. Rows are
+        never updated -- a restart appends a new row and readers take the
+        newest id, so the derivation never applies old fills twice.
+        """
+        created_at = str(baseline.get("created_at") or "").strip()
+        if not created_at:
+            raise ValueError(
+                "ledger baseline created_at is required: the ledger's "
+                "fill-cutoff comparison needs an explicit timestamp basis"
+            )
+        cash = baseline.get("cash")
+        try:
+            cash_value = float(cash)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"ledger baseline cash must be a number, got {cash!r}"
+            ) from exc
+        if not math.isfinite(cash_value):
+            raise ValueError(
+                f"ledger baseline cash must be finite, got {cash!r}"
+            )
+        positions = baseline.get(
+            "positions_json", baseline.get("positions", {}),
+        )
+        if positions is None:
+            positions = {}
+        if isinstance(positions, str):
+            try:
+                decoded = json.loads(positions)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"ledger baseline positions_json is not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(decoded, dict):
+                raise ValueError(
+                    "ledger baseline positions must encode a JSON object, "
+                    f"got {type(decoded).__name__}"
+                )
+            positions_json = positions
+        else:
+            if not isinstance(positions, dict):
+                raise ValueError(
+                    "ledger baseline positions must be a mapping, "
+                    f"got {type(positions).__name__}"
+                )
+            positions_json = json.dumps(positions)
+
+        with self._lock, self._conn() as conn:
+            cursor = conn.execute(
+                "INSERT INTO ledger_baselines "
+                "(created_at, tenant_id, engine_state_key, cash, "
+                " positions_json, note) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    created_at,
+                    str(baseline.get("tenant_id") or "default"),
+                    str(baseline.get("engine_state_key") or ""),
+                    cash_value,
+                    positions_json,
+                    str(baseline.get("note") or ""),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_latest_ledger_baseline(
+        self, tenant_id: str = "", engine_state_key: str = "",
+    ) -> dict | None:
+        """Newest baseline (highest id) matching the filters, or None.
+
+        An empty ``tenant_id``/``engine_state_key`` does not filter that
+        column -- the Store's usual unscoped-read convention, which keeps a
+        stand-alone scheduler (no tenant/key) usable. Ordering is by the
+        autoincrement id, not ``created_at``: a restart within the same
+        timestamp still selects the row written last.
+
+        ``positions`` is decoded from ``positions_json``. Unreadable JSON
+        raises instead of degrading to an empty book: an empty expected book
+        could otherwise "pass" a flat broker account.
+        """
+        query = "SELECT * FROM ledger_baselines WHERE 1=1"
+        params: list = []
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if engine_state_key:
+            query += " AND engine_state_key = ?"
+            params.append(engine_state_key)
+        query += " ORDER BY id DESC LIMIT 1"
+        with self._conn() as conn:
+            row = conn.execute(query, params).fetchone()
+        if row is None:
+            return None
+        baseline = dict(row)
+        raw = baseline.get("positions_json")
+        try:
+            decoded = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"ledger baseline {baseline.get('id')} has unreadable "
+                f"positions_json: {exc}"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise ValueError(
+                f"ledger baseline {baseline.get('id')} positions must be a "
+                f"JSON object, got {type(decoded).__name__}"
+            )
+        baseline["positions"] = decoded
+        return baseline
+
 
     # ── Signals ──
 
@@ -439,28 +1411,34 @@ class Store:
         with self._lock, self._conn() as conn:
             conn.execute("""
                     INSERT OR REPLACE INTO signals
-                    (signal_id, code, direction, strength, factor_values,
+                    (signal_id, tenant_id, code, direction, strength, factor_values,
                      strategy_id, generated_at, consumed)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                signal['signal_id'], signal['code'], signal['direction'],
+                signal['signal_id'], signal.get('tenant_id', 'default'),
+                signal['code'], signal['direction'],
                 signal['strength'], json.dumps(signal.get('factor_values', {})),
                 signal.get('strategy_id', ''),
                 signal.get('generated_at', datetime.now().isoformat()),
                 signal.get('consumed', 0),
             ))
 
-    def get_signals(self, consumed: int = -1, limit: int = 100) -> list[dict]:
+    def get_signals(self, consumed: int = -1, limit: int = 100,
+                    tenant_id: str = "") -> list[dict]:
         """Get signals. consumed=-1 for all, 0 for unconsumed, 1 for consumed."""
+        limit = _clamp_limit(limit)
         with self._conn() as conn:
+            query = "SELECT * FROM signals WHERE 1=1"
+            params: list = []
             if consumed >= 0:
-                rows = conn.execute(
-                    "SELECT * FROM signals WHERE consumed = ? ORDER BY generated_at DESC LIMIT ?",
-                    (consumed, limit)).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM signals ORDER BY generated_at DESC LIMIT ?",
-                    (limit,)).fetchall()
+                query += " AND consumed = ?"
+                params.append(consumed)
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            query += " ORDER BY generated_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
             result = []
             for r in rows:
                 d = dict(r)
@@ -497,13 +1475,14 @@ class Store:
             "strategy_id": session.get("strategy_id", ""),
             "broker": session.get("broker", "simulated"),
             "status": session.get("status", "active"),
-            "started_at": session.get("started_at", datetime.now().isoformat()),
+            "started_at": session.get("started_at", exchange_now_iso()),
             "stopped_at": session.get("stopped_at", ""),
             "total_trades": session.get("total_trades", 0),
             "total_pnl": session.get("total_pnl", 0),
             "config": json.dumps(session.get("config", {})),
         }
         session_id = session["session_id"]
+        tenant_id = session.get("tenant_id") or "default"
 
         with self._lock, self._conn() as conn:
             existing = conn.execute(
@@ -512,10 +1491,10 @@ class Store:
 
             if existing is None:
                 conn.execute(
-                    "INSERT INTO sessions (session_id, strategy_id, broker, status, "
-                    "started_at, stopped_at, total_trades, total_pnl, config) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (session_id, *(values[f] for f in self._SESSION_FIELDS)),
+                    "INSERT INTO sessions (session_id, tenant_id, strategy_id, broker, "
+                    "status, started_at, stopped_at, total_trades, total_pnl, config) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (session_id, tenant_id, *(values[f] for f in self._SESSION_FIELDS)),
                 )
                 return
 
@@ -530,12 +1509,20 @@ class Store:
                 (*(merged[f] for f in self._SESSION_FIELDS), session_id),
             )
 
-    def get_sessions(self, limit: int = 20) -> list[dict]:
-        """Get trading session history."""
+    def get_sessions(self, limit: int = 20, tenant_id: str = "") -> list[dict]:
+        """Get trading session history, optionally for one tenant."""
+        # SQLite treats LIMIT -1 as unlimited; the API used to forward -1 raw.
+        limit = _clamp_limit(limit, default=20, maximum=1000)
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?",
-                (limit,)).fetchall()
+            if tenant_id:
+                rows = conn.execute(
+                    "SELECT * FROM sessions WHERE tenant_id = ? "
+                    "ORDER BY started_at DESC LIMIT ?",
+                    (tenant_id, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?",
+                    (limit,)).fetchall()
             return [dict(r) for r in rows]
 
     # ── Events (Audit Trail) ──
@@ -544,26 +1531,32 @@ class Store:
         """Log an event for audit trail."""
         with self._lock, self._conn() as conn:
             conn.execute("""
-                    INSERT INTO events (event_id, topic, data, source, timestamp, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO events (event_id, tenant_id, topic, data, source, timestamp, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (
-                event.get('event_id', ''), event.get('topic', ''),
+                event.get('event_id', ''), event.get('tenant_id', 'default'),
+                event.get('topic', ''),
                 json.dumps(event.get('data', {})),
                 event.get('source', ''), event.get('timestamp', time.time()),
-                datetime.now().isoformat(),
+                exchange_now_iso(),
             ))
 
-    def get_events(self, topic: str = "", limit: int = 100) -> list[dict]:
-        """Get event log."""
+    def get_events(self, topic: str = "", limit: int = 100,
+                   tenant_id: str = "") -> list[dict]:
+        """Get event log, optionally filtered by tenant."""
+        limit = _clamp_limit(limit)
         with self._conn() as conn:
+            query = "SELECT * FROM events WHERE 1=1"
+            params: list = []
             if topic:
-                rows = conn.execute(
-                    "SELECT * FROM events WHERE topic = ? ORDER BY timestamp DESC LIMIT ?",
-                    (topic, limit)).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM events ORDER BY timestamp DESC LIMIT ?",
-                    (limit,)).fetchall()
+                query += " AND topic = ?"
+                params.append(topic)
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
             result = []
             for r in rows:
                 d = dict(r)
@@ -601,17 +1594,20 @@ class Store:
             conn.execute("""
                     INSERT OR REPLACE INTO nav_history
                     (date, nav_total, nav_per_unit, total_units, cash, market_value,
-                     mgmt_fee, perf_fee, high_water_mark, daily_return, cumulative_return)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     mgmt_fee, perf_fee, high_water_mark, daily_return, cumulative_return,
+                     accrued_mgmt_fee, accrued_perf_fee)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                 nav['date'], nav['nav_total'], nav['nav_per_unit'],
                 nav['total_units'], nav.get('cash', 0),
                 nav.get('market_value', 0), nav.get('mgmt_fee', 0),
                 nav.get('perf_fee', 0), nav.get('high_water_mark', 1.0),
                 nav.get('daily_return', 0), nav.get('cumulative_return', 0),
+                nav.get('accrued_mgmt_fee', 0), nav.get('accrued_perf_fee', 0),
             ))
 
     def get_nav_history(self, days: int = 365 * 3) -> list[dict]:
+        days = _clamp_days(days, default=365 * 3)
         """Get NAV history for the last N days."""
         with self._conn() as conn:
             cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -634,18 +1630,267 @@ class Store:
             ).fetchone()
             return dict(row) if row else None
 
+    # ── Engine State ──
+
+    def save_engine_state(self, state: dict, strategy_id: str = "default") -> None:
+        """Persist an engine snapshot atomically (one row, one transaction).
+
+        Used by the daemon so positions, cash and the processed-date watermark
+        survive a process restart. The watermark lives in the same row, so a
+        crash cannot leave "cash updated but date not advanced" behind.
+        """
+        payload = json.dumps(state, default=str)
+        updated_at = exchange_now_iso()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO engine_state
+                   (strategy_id, state_json, updated_at) VALUES (?, ?, ?)""",
+                (strategy_id, payload, updated_at),
+            )
+
+    def get_engine_state(self, strategy_id: str = "default") -> dict | None:
+        """Load a persisted engine snapshot, or None if none exists."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT state_json FROM engine_state WHERE strategy_id=?",
+                (strategy_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["state_json"])
+
+    def get_latest_engine_state(self, tenant_id: str = "") -> tuple[str, dict] | None:
+        """Newest *engine* snapshot as ``(key, state)``, or None.
+
+        The scheduler is not constructed with the engine's tenant-scoped key
+        in every embedding (and a standalone scheduler has no engine at all),
+        so EOD equity lookup (S2) falls back to whichever engine most recently
+        persisted a snapshot. Rows written by other features into the same
+        key/value table (``risk_state:{tenant}``) and daemon replay snapshots
+        (a different schema) are not engine books: accepting them mis-sourced
+        equity. Only snapshots that carry an engine book (cash + positions)
+        are eligible; with ``tenant_id`` only that tenant's engine key is
+        considered. Unreadable JSON is ignored rather than crashing EOD.
+        """
+        query = "SELECT strategy_id, state_json FROM engine_state"
+        params: tuple = ()
+        if tenant_id:
+            query += " WHERE strategy_id = ?"
+            params = (f"live_engine:{tenant_id}",)
+        else:
+            query += " WHERE strategy_id NOT LIKE 'risk_state:%'"
+        query += " ORDER BY updated_at DESC LIMIT 20"
+        with self._conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+        for row in rows:
+            try:
+                state = json.loads(row["state_json"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring unreadable engine_state row %s", row["strategy_id"],
+                )
+                continue
+            if (
+                isinstance(state, dict)
+                and "cash" in state
+                and "positions" in state
+                and ("portfolio_value" in state or "total_equity" in state)
+            ):
+                return str(row["strategy_id"]), state
+        return None
+
+    # ── Retention (S10) ──
+
+    #: ``(table, policy field, timestamp column, date-only, primary key)``.
+    #: Deletion is always by the table's own timestamp; `orders` additionally
+    #: requires that no *retained* trade still references the row, so a policy
+    #: that keeps trades longer than orders cannot orphan fills. Deletes use
+    #: the ids of the rows that were archived, so a concurrent insert with a
+    #: historical timestamp is never deleted without an archive copy.
+    _RETENTION_TABLES = (
+        ("events", "events_days", "created_at", False, "id"),
+        ("pnl_history", "pnl_days", "timestamp", False, "id"),
+        ("signals", "signals_days", "generated_at", False, "signal_id"),
+        ("sessions", "sessions_days", "started_at", False, "session_id"),
+        ("trades", "trades_days", "executed_at", False, "trade_id"),
+        ("orders", "orders_days", "created_at", False, "order_id"),
+        ("nav_history", "nav_days", "date", True, "date"),
+    )
+
+    #: Rows deleted per SQL statement, below SQLite's bound-parameter limit.
+    _RETENTION_DELETE_CHUNK = 500
+
+    def run_retention(
+        self,
+        policy: RetentionPolicy | None = None,
+        archive_dir: str | Path | None = None,
+        vacuum: bool = True,
+        now: datetime | None = None,
+    ) -> dict:
+        """Archive then delete rows older than each table's max age.
+
+        Every eligible batch is written to a dated CSV under ``archive_dir``
+        *before* the DELETE runs (temp file + fsync + os.replace); if the
+        archive cannot be written the rows are kept. Afterwards the WAL is
+        checkpointed and, when anything was deleted, the database is
+        vacuumed. Returns per-table counts, archive paths and the resulting
+        database size (also exported as the ``store_size_bytes`` gauge).
+
+        The job is idempotent: a second run finds no eligible rows and writes
+        no archive.
+        """
+        policy = policy or RetentionPolicy()
+        now = now or exchange_now()
+        archive_root = Path(archive_dir or "data/archive")
+        result: dict = {
+            "tables": {},
+            "checkpointed": False,
+            "vacuumed": False,
+            "db_size_bytes": 0,
+        }
+        deleted_total = 0
+
+        for table, field, column, date_only, id_column in self._RETENTION_TABLES:
+            days = int(getattr(policy, field))
+            entry: dict = {
+                "enabled": days > 0, "archived": 0, "deleted": 0,
+                "archive_path": "", "cutoff": "",
+            }
+            if days <= 0:
+                result["tables"][table] = entry
+                continue
+
+            cutoff = (
+                (now - timedelta(days=days)).strftime("%Y-%m-%d")
+                if date_only
+                else (now - timedelta(days=days)).isoformat()
+            )
+            where = f"{column} < ?"
+            extra = ""
+            if table == "orders":
+                extra = (
+                    " AND NOT EXISTS (SELECT 1 FROM trades "
+                    "WHERE trades.order_id = orders.order_id)"
+                )
+            entry["cutoff"] = cutoff
+
+            with self._conn() as conn:
+                rows = [
+                    dict(row) for row in conn.execute(
+                        f"SELECT * FROM {table} WHERE {where}{extra}", (cutoff,)
+                    ).fetchall()
+                ]
+            if not rows:
+                result["tables"][table] = entry
+                continue
+
+            archive_path = None
+            try:
+                archive_root.mkdir(parents=True, exist_ok=True)
+                stamp = now.strftime("%Y%m%dT%H%M%S%f")
+                archive_path = archive_root / f"{table}_{stamp}.csv"
+                tmp_path = archive_path.with_name(archive_path.name + ".tmp")
+                with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
+                    writer = csv.DictWriter(
+                        fh, fieldnames=list(rows[0].keys()),
+                    )
+                    writer.writeheader()
+                    writer.writerows(
+                        {
+                            key: _sanitize_archive_cell(value)
+                            for key, value in row.items()
+                        }
+                        for row in rows
+                    )
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, archive_path)
+            except OSError as exc:
+                logger.critical(
+                    "Retention: archiving %s failed (%s); rows kept", table, exc,
+                )
+                entry["error"] = str(exc)
+                result["tables"][table] = entry
+                continue
+
+            entry["archive_path"] = str(archive_path)
+            entry["archived"] = len(rows)
+            ids = [row[id_column] for row in rows]
+            # SQLite's bound-variable limit (32,766 on CPython 3.12) is easily
+            # exceeded by a real backlog; one giant IN-list archived 40k rows
+            # and then failed the DELETE, so retention could never drain.
+            deleted = 0
+            chunk_size = self._RETENTION_DELETE_CHUNK
+            with self._lock, self._conn() as conn:
+                for offset in range(0, len(ids), chunk_size):
+                    chunk = ids[offset:offset + chunk_size]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    delete_where = f"{id_column} IN ({placeholders})"
+                    if extra:
+                        delete_where += extra
+                    cursor = conn.execute(
+                        f"DELETE FROM {table} WHERE {delete_where}",
+                        tuple(chunk),
+                    )
+                    if cursor.rowcount > 0:
+                        deleted += cursor.rowcount
+            entry["deleted"] = deleted
+            deleted_total += deleted
+            result["tables"][table] = entry
+            logger.info(
+                "Retention: archived and deleted %d %s row(s) older than %s",
+                deleted, table, cutoff,
+            )
+
+        try:
+            self.checkpoint()
+            result["checkpointed"] = True
+        except sqlite3.Error as exc:
+            logger.error("Retention: WAL checkpoint failed: %s", exc)
+        if vacuum and deleted_total > 0:
+            try:
+                self.vacuum()
+                result["vacuumed"] = True
+            except sqlite3.Error as exc:
+                logger.error("Retention: VACUUM failed: %s", exc)
+
+        result["db_size_bytes"] = self.size_bytes()
+        try:
+            from quant_platform.utils.metrics import get_metrics
+
+            get_metrics().gauge(
+                "store_size_bytes",
+                help="SQLite trading database file size in bytes",
+            ).set(result["db_size_bytes"])
+        except Exception:  # metrics must never break retention
+            pass
+        return result
+
     # ── Stats ──
 
-    def get_stats(self) -> dict:
-        """Get store statistics."""
+    def get_stats(self, tenant_id: str = "") -> dict:
+        """Get store statistics (optionally scoped to one tenant)."""
+        where = " WHERE tenant_id = ?" if tenant_id else ""
+        params = (tenant_id,) if tenant_id else ()
         with self._conn() as conn:
+            def _count(sql: str) -> int:
+                return conn.execute(sql, params).fetchone()[0]
+
             return {
-                "orders": conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
-                "positions": conn.execute("SELECT COUNT(*) FROM positions WHERE quantity > 0").fetchone()[0],
-                "trades": conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0],
-                "pnl_snapshots": conn.execute("SELECT COUNT(*) FROM pnl_history").fetchone()[0],
-                "signals": conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0],
-                "sessions": conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
-                "events": conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
-                "db_path": self._db_path,
+                # The real backend, not a hardcoded label. `/api/postgres/stats`
+                # always claimed "sqlite" because it never looked at the store
+                # it had constructed.
+                "backend": "sqlite",
+                "orders": _count("SELECT COUNT(*) FROM orders" + where),
+                "positions": _count(
+                    "SELECT COUNT(*) FROM positions WHERE quantity > 0"
+                    + (" AND tenant_id = ?" if tenant_id else "")
+                ),
+                "trades": _count("SELECT COUNT(*) FROM trades" + where),
+                "pnl_snapshots": _count("SELECT COUNT(*) FROM pnl_history" + where),
+                "signals": _count("SELECT COUNT(*) FROM signals" + where),
+                "sessions": _count("SELECT COUNT(*) FROM sessions" + where),
+                "events": _count("SELECT COUNT(*) FROM events" + where),
+                "db_name": Path(self._db_path).name,
+                "db_size_bytes": self.size_bytes(),
             }

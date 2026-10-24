@@ -25,12 +25,23 @@ import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
+
+# Reuse RQ3's corrected regime helpers: month labels are contemporaneous and
+# each return is attributed to its realised date (no forward-filled month-end
+# labels, no one-day cross-month leak), and %Time is measured per trading day.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run_rq3_stability import (  # noqa: E402  # isort: skip
+    classify_regimes as _rq3_classify_regimes,
+    regime_shares,
+)
 
 setup_logging()
 logger = get_logger("rd4")
 
 REAL_START = "2018-01-01"
-REAL_END = "2025-12-31"
+REAL_END = resolve_end_date()  # as-of resolved at run time
+PROVIDER = "baostock"
 
 # Focus on the proven sweet spot and its neighbors
 SIGNAL_HORIZONS = [5, 10, 20, 40, 60, 80, 120, 200]
@@ -49,43 +60,69 @@ def compound(x):
     return np.prod(1 + x) - 1 if len(x) > 0 else 0
 
 
-def classify_regimes(benchmark_returns):
-    monthly = benchmark_returns.resample("M").apply(lambda x: (1 + x).prod() - 1)
-    regimes = {}
-    for date, ret in monthly.items():
-        if ret > 0.02:
-            regimes[date] = "Bull"
-        elif ret < -0.02:
-            regimes[date] = "Bear"
-        else:
-            regimes[date] = "Sideways"
-    reg_series = pd.Series(regimes, name="regime")
-    reg_series.index = pd.DatetimeIndex(reg_series.index)
-    daily = reg_series.reindex(
-        pd.date_range(REAL_START, REAL_END, freq="D"), method="ffill"
-    )
-    daily.index.name = "date"
+def classify_regimes(benchmark_returns, trading_days=None):
+    """Contemporaneous benchmark-regime labels (RQ3 convention).
+
+    The old local copy bucketed by MonthEnd and then reindexed onto a calendar
+    day range with ``ffill``: every calendar day carried the previous
+    month-end's label, so month M traded on month M-1's regime. RQ3's corrected
+    helper labels each trading day with the regime of its own month and
+    attributes returns to their realised dates; reuse it instead of a local
+    copy that can drift again (R85).
+    """
+    daily = _rq3_classify_regimes(benchmark_returns, trading_days=trading_days)
     return daily, "基准月收益"
 
 
-def classify_volatility(returns):
-    monthly_vol = returns.mean(axis=1).resample("M").std()
+def classify_volatility(returns, trading_days=None):
+    """Contemporaneous monthly-volatility labels on trading days (R85).
+
+    Same defect class as the regime labels: the old code resampled to MonthEnd
+    and forward-filled across calendar days, so each month carried the
+    previous month's volatility bucket. Each trading day is now labelled by the
+    volatility of its OWN month, and the forward conventions of the return
+    panel are respected (a return labelled t is realised on t+1).
+    """
+    if trading_days is None:
+        trading_days = (returns.index if returns is not None
+                        else pd.DatetimeIndex([]))
+    days = pd.DatetimeIndex(trading_days).sort_values()
+
+    if returns is None or len(returns) == 0:
+        return pd.Series(np.nan, index=days, name="regime", dtype=object), "月波动率"
+
+    mean_ret = returns.mean(axis=1).sort_index().shift(1)
+    monthly_vol = mean_ret.resample(pd.offsets.MonthEnd()).std().dropna()
+    if monthly_vol.empty:
+        logger.warning("No monthly volatility — volatility labels unavailable")
+        return pd.Series(np.nan, index=days, name="regime", dtype=object), "月波动率"
+
     thirds = monthly_vol.quantile([1/3, 2/3])
-    regimes = {}
+    labels_by_month = {}
     for date, vol in monthly_vol.items():
         if vol <= thirds.iloc[0]:
-            regimes[date] = "LowVol"
+            labels_by_month[date.to_period("M")] = "LowVol"
         elif vol >= thirds.iloc[1]:
-            regimes[date] = "HighVol"
+            labels_by_month[date.to_period("M")] = "HighVol"
         else:
-            regimes[date] = "NormalVol"
-    reg_series = pd.Series(regimes, name="regime")
-    reg_series.index = pd.DatetimeIndex(reg_series.index)
-    daily = reg_series.reindex(
-        pd.date_range(REAL_START, REAL_END, freq="D"), method="ffill"
-    )
+            labels_by_month[date.to_period("M")] = "NormalVol"
+
+    day_labels = [labels_by_month.get(period, np.nan)
+                  for period in days.to_period("M")]
+    daily = pd.Series(day_labels, index=days, name="regime", dtype=object)
     daily.index.name = "date"
     return daily, "月波动率"
+
+
+def realised_regime(daily_regime):
+    """Align daily regime labels with the realised date of each return row.
+
+    Backtest holding returns use the pipeline's forward convention (row t
+    spans t -> t+1). A label series indexed by the month each return was
+    realised in must therefore be shifted back one row so a holding-period
+    return is matched with the regime of its realised date.
+    """
+    return daily_regime.sort_index().shift(-1)
 
 
 def backtest_with_regime_tracking(returns, signal_h, hold_h, daily_regime):
@@ -123,9 +160,13 @@ def backtest_with_regime_tracking(returns, signal_h, hold_h, daily_regime):
         port_ret = (hold_returns[selected.index].mean(axis=1) + 1).prod() - 1
         all_port_rets.append(port_ret)
 
-        # Determine regime for this period (modal regime during the holding window)
+        # Determine regime for this period (modal regime during the holding
+        # window). Holding returns are forward-labelled (row t spans t->t+1),
+        # and the daily labels now describe the month a return was REALISED
+        # in, so shift the label series back one row to line each return up
+        # with the regime of its realised date (R87/R85).
         period_dates = hold_returns.index
-        period_regimes = daily_regime.reindex(period_dates).dropna()
+        period_regimes = realised_regime(daily_regime).reindex(period_dates).dropna()
         if len(period_regimes) > 0:
             modal_regime = period_regimes.mode()
             regime = modal_regime.iloc[0] if len(modal_regime) > 0 else "Unknown"
@@ -134,19 +175,21 @@ def backtest_with_regime_tracking(returns, signal_h, hold_h, daily_regime):
         all_regimes.append(regime)
 
     if len(all_port_rets) < 3:
-        return {"overall": {"sharpe": np.nan, "ann_ret": 0, "n": 0}}
+        # Not enough periods: report NaN, never a fabricated 0% return.
+        return {"overall": {"sharpe": np.nan, "ann_ret": np.nan,
+                            "mdd": np.nan, "n": 0}}
 
     port_series = pd.Series(all_port_rets)
 
     # Overall
     af = np.sqrt(252 / hold_h)
-    overall_sharpe = port_series.mean() / port_series.std() * af if port_series.std() > 1e-10 else 0
+    overall_sharpe = port_series.mean() / port_series.std() * af if port_series.std() > 1e-10 else np.nan
     overall_ann = (1 + port_series.mean()) ** (252 / hold_h) - 1
     cum = (1 + port_series).cumprod()
     overall_mdd = ((cum - cum.cummax()) / cum.cummax()).min()
 
     result = {
-        "overall": {"sharpe": overall_sharpe, "ann_ret": overall_ann, "mdd": overall_mdd if not np.isnan(overall_mdd) else 0, "n": len(port_series)}
+        "overall": {"sharpe": overall_sharpe, "ann_ret": overall_ann, "mdd": overall_mdd, "n": len(port_series)}
     }
 
     # Per-regime
@@ -155,7 +198,7 @@ def backtest_with_regime_tracking(returns, signal_h, hold_h, daily_regime):
         subset = port_df[port_df["regime"] == regime_name]["return"]
         if len(subset) < 2:
             continue
-        sr = subset.mean() / subset.std() * af if subset.std() > 1e-10 else 0
+        sr = subset.mean() / subset.std() * af if subset.std() > 1e-10 else np.nan
         ar = (1 + subset.mean()) ** (252 / hold_h) - 1
         result[regime_name] = {"sharpe": sr, "ann_ret": ar, "n": len(subset)}
 
@@ -168,18 +211,32 @@ def run():
     logger.info("=" * 60)
 
     returns, benchmark = load()
+    data_start = str(returns.index.min().date())
+    data_end = str(returns.index.max().date())
+    logger.info("Data window: %s → %s (requested end %s, provider=%s)",
+                data_start, data_end, REAL_END, PROVIDER)
 
-    # Regime classifications
+    # Regime classifications. Both classifiers label each *trading day* with
+    # the regime of its own month (no calendar-day forward fill).
     classifiers = [
-        ("基准收益(Bull/Bear/Sideways)", classify_regimes(benchmark)),
-        ("波动率(Low/Normal/High)", classify_volatility(returns)),
+        ("基准收益(Bull/Bear/Sideways)",
+         classify_regimes(benchmark, trading_days=returns.index)),
+        ("波动率(Low/Normal/High)",
+         classify_volatility(returns, trading_days=returns.index)),
     ]
 
+    output_dir = _project_root / "results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     for clf_name, (daily_regime, method_desc) in classifiers:
-        counts = daily_regime.value_counts()
-        total = len(daily_regime)
+        labelled = daily_regime.dropna()
+        shares = regime_shares(labelled)
         logger.info("Classifier: %s", clf_name)
-        logger.info("  Distribution: %s", {k: f"{v/total*100:.1f}%" for k, v in counts.items()})
+        logger.info("  Labels: %d/%d trading days (%d unlabelled skipped)",
+                    len(labelled), len(daily_regime),
+                    int(daily_regime.isna().sum()))
+        logger.info("  Distribution (%% of labelled trading days): %s",
+                    {k: f"{v:.1f}%" for k, v in shares.items()})
 
         # Run key cells with regime tracking
         KEY_CELLS = [(5, 5), (20, 20), (40, 80), (80, 80), (5, 120), (40, 120), (60, 120), (20, 60)]
@@ -245,7 +302,7 @@ def run():
         state_durations = defaultdict(list)
         current_state = None
         current_start = None
-        for date, state in daily_regime.items():
+        for date, state in daily_regime.dropna().items():
             if state != current_state:
                 if current_state is not None and current_start is not None:
                     duration = (date - current_start).days
@@ -260,6 +317,17 @@ def run():
             print(f"  {state:<12} {np.mean(durations):>8.1f}d {max(durations):>8.0f}d {len(durations):>5d}")
 
         print()
+
+        # Persist the heatmap with its as-of window and provider. This script
+        # used to be console-only, so a printed result could not be told apart
+        # from a stale one (R84).
+        slug = "benchmark" if "基准" in clf_name else "volatility"
+        df_out = pd.DataFrame(all_results)
+        df_out = stamp_provenance(df_out, data_start, data_end)
+        df_out["provider"] = PROVIDER
+        out_path = output_dir / f"regime_heatmap_v4_{slug}.csv"
+        df_out.to_csv(out_path, index=False)
+        logger.info("Heatmap artifact saved: %s", out_path)
 
     print()
     print("=" * 100)

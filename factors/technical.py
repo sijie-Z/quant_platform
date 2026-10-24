@@ -55,23 +55,26 @@ class MomentumFactor(BaseFactor):
 
 
 class Momentum1M(MomentumFactor):
-    def __init__(self):
-        super().__init__(period=21, name="momentum_1m", skip=0)
+    # The fixed-period subclasses must accept an override: the YAML ships
+    # `params: {period: 21}` for every factor, and `cls(**params)` otherwise
+    # raised TypeError and fell back to defaults silently.
+    def __init__(self, period: int = 21):
+        super().__init__(period=period, name="momentum_1m", skip=0)
 
 
 class Momentum3M(MomentumFactor):
-    def __init__(self):
-        super().__init__(period=63, name="momentum_3m", skip=0)
+    def __init__(self, period: int = 63):
+        super().__init__(period=period, name="momentum_3m", skip=0)
 
 
 class Momentum6M(MomentumFactor):
-    def __init__(self):
-        super().__init__(period=126, name="momentum_6m", skip=0)
+    def __init__(self, period: int = 126):
+        super().__init__(period=period, name="momentum_6m", skip=0)
 
 
 class Momentum12M(MomentumFactor):
-    def __init__(self):
-        super().__init__(period=252, name="momentum_12m", skip=21)
+    def __init__(self, period: int = 252):
+        super().__init__(period=period, name="momentum_12m", skip=21)
 
 
 # ---------------------------------------------------------------------------
@@ -98,13 +101,13 @@ class VolatilityFactor(BaseFactor):
 
 
 class Volatility20D(VolatilityFactor):
-    def __init__(self):
-        super().__init__(period=20, name="volatility_20d")
+    def __init__(self, period: int = 20):
+        super().__init__(period=period, name="volatility_20d")
 
 
 class Volatility60D(VolatilityFactor):
-    def __init__(self):
-        super().__init__(period=60, name="volatility_60d")
+    def __init__(self, period: int = 60):
+        super().__init__(period=period, name="volatility_60d")
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +180,14 @@ class RSIFactor(BaseFactor):
         avg_loss = loss.rolling(self._period).mean()
 
         # Avoid division by zero
-        avg_loss = avg_loss.replace(0, np.nan)
-
-        rs = avg_gain / avg_loss
+        rs = avg_gain / avg_loss.replace(0, np.nan)
         rsi = 100 - 100 / (1 + rs)
+        # A window with no losses is RSI 100, not undefined. Turning the
+        # denominator into NaN silently removed strongly trending stocks from
+        # the cross-section; flat windows are neutral (50).
+        rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+        rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
+        rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
         return rsi
 
 
@@ -311,10 +318,14 @@ class BreakoutIgnitionFactor(BaseFactor):
             # Use price change magnitude as volume proxy
             volume = prices.pct_change(fill_method=None).abs()
 
-        # Return shock: z-score of k-period return vs history
+        # Return shock: z-score of k-period return vs history.
+        # Compounded return in log space: rolling.apply(lambda: prod) ran once
+        # per asset per window (~42 s at the default panel size).
         ret = prices.pct_change(fill_method=None)
-        k_ret = ret.rolling(self._ret_win).apply(
-            lambda x: (1 + x).prod() - 1 if len(x) == self._ret_win else 0
+        k_ret = np.expm1(
+            np.log1p(ret).rolling(
+                self._ret_win, min_periods=self._ret_win,
+            ).sum()
         )
         ref_mean = k_ret.rolling(self._ref_win).mean()
         ref_std = k_ret.rolling(self._ref_win).std().replace(0, np.nan)
@@ -372,95 +383,119 @@ class MACDFactor(BaseFactor):
 # ---------------------------------------------------------------------------
 # K-Line candlestick features  (inspired by Qlib Alpha158)
 # ---------------------------------------------------------------------------
+#
+# D39: these factors used to fall back to an all-zero panel (or an unrelated
+# pct_change) when the caller omitted OHLC inputs.  The fallback silently fed
+# constant zeros into the alpha combination whenever the enabled-factor list
+# included candle factors but the caller passed only `turnover` (which is what
+# main._compute_factors does today).  Each factor now declares
+# `required_inputs` and refuses to compute without them.  main.py is another
+# wave's file: the required wiring is to pass adjusted open/high/low into
+# `_compute_factors` (see D:/tmp/_orchestrate/data_pipeline_fix_report.md).
+
+
+def _require_inputs(factor_name: str, required: tuple[str, ...], kwargs) -> None:
+    """Raise an actionable error when a declared OHLC input is missing."""
+    missing = [name for name in required if kwargs.get(name) is None]
+    if missing:
+        raise ValueError(
+            f"{factor_name} requires input(s) {list(required)} from the "
+            f"caller; missing {missing}. Pass adjusted open/high/low panels "
+            "(main._compute_factors currently passes only turnover). "
+            "Returning a placeholder panel would silently inject zeros or "
+            "noise into the alpha combination."
+        )
 
 
 class CandleMidpointFactor(BaseFactor):
     """KMID: (close - open) / open. Positive = green candle."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open",)
 
     @property
     def name(self) -> str:
         return "kmid"
 
     def compute(self, prices, **kwargs):
-        o = kwargs.get("open")
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        o = kwargs["open"]
         c = prices
-        if o is not None:
-            return (c - o) / o.replace(0, float("nan"))
-        return prices.pct_change(fill_method=None)
+        return (c - o) / o.replace(0, float("nan"))
 
 
 class CandleLengthFactor(BaseFactor):
     """KLEN: (high - low) / open. Intraday range."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open", "high", "low")
 
     @property
     def name(self) -> str:
         return "klen"
 
     def compute(self, prices, **kwargs):
-        h = kwargs.get("high")
-        l = kwargs.get("low")
-        o = kwargs.get("open")
-        if h is not None and l is not None and o is not None:
-            return (h - l) / o.replace(0, float("nan"))
-        return prices.pct_change(fill_method=None).abs()
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        h = kwargs["high"]
+        l = kwargs["low"]
+        o = kwargs["open"]
+        return (h - l) / o.replace(0, float("nan"))
 
 
 class CandleUpperShadowFactor(BaseFactor):
     """KUP: (high - max(open, close)) / open. Upper wick."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open", "high")
 
     @property
     def name(self) -> str:
         return "kup"
 
     def compute(self, prices, **kwargs):
-        h = kwargs.get("high")
-        o = kwargs.get("open")
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        h = kwargs["high"]
+        o = kwargs["open"]
         c = prices
-        if h is not None and o is not None:
-            import numpy as np
-            upper = h - np.maximum(o.values, c.values)
-            return pd.DataFrame(upper, index=prices.index, columns=prices.columns) / o.replace(0, float("nan"))
-        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        upper = h - np.maximum(o.values, c.values)
+        return pd.DataFrame(
+            upper, index=prices.index, columns=prices.columns
+        ) / o.replace(0, float("nan"))
 
 
 class CandleLowerShadowFactor(BaseFactor):
     """KLOW: (min(open, close) - low) / open. Lower wick."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open", "low")
 
     @property
     def name(self) -> str:
         return "klow"
 
     def compute(self, prices, **kwargs):
-        l = kwargs.get("low")
-        o = kwargs.get("open")
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        l = kwargs["low"]
+        o = kwargs["open"]
         c = prices
-        if l is not None and o is not None:
-            import numpy as np
-            lower = np.minimum(o.values, c.values) - l.values if hasattr(l, 'values') else (np.minimum(o, c) - l)
-            return pd.DataFrame(lower, index=prices.index, columns=prices.columns) / o.replace(0, float("nan"))
-        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        lower = np.minimum(o.values, c.values) - l.values
+        return pd.DataFrame(
+            lower, index=prices.index, columns=prices.columns
+        ) / o.replace(0, float("nan"))
 
 
 class CandleSoftnessFactor(BaseFactor):
     """KSFT: (2*close - high - low) / open. Close in range."""
     category = FactorCategory.TECHNICAL
+    required_inputs: tuple[str, ...] = ("open", "high", "low")
 
     @property
     def name(self) -> str:
         return "ksft"
 
     def compute(self, prices, **kwargs):
-        h = kwargs.get("high")
-        l = kwargs.get("low")
-        o = kwargs.get("open")
+        _require_inputs(self.name, self.required_inputs, kwargs)
+        h = kwargs["high"]
+        l = kwargs["low"]
+        o = kwargs["open"]
         c = prices
-        if h is not None and l is not None and o is not None:
-            return (2 * c - h - l) / o.replace(0, float("nan"))
-        return pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        return (2 * c - h - l) / o.replace(0, float("nan"))
 
 
 # ---------------------------------------------------------------------------
@@ -636,8 +671,10 @@ class PureVolatilityFactor(BaseFactor):
         ab = ret.mul(m, axis=0).rolling(self._window).sum()
 
         cov1 = (ab - a1.mul(b1, axis=0) / n) / (n - 1)
-        var0 = b2 / n - (b1 / n) ** 2
-        beta = cov1.div(var0.where(var0 > 1e-20), axis=0)
+        # Match the sample covariance's ddof; the old population variance
+        # overstated the OLS beta by n/(n-1).
+        var1 = (b2 - b1.pow(2) / n) / (n - 1)
+        beta = cov1.div(var1.where(var1 > 1e-20), axis=0)
 
         sum_r = a1.sub(beta.mul(b1, axis=0))
         sum_r2 = a2.sub(beta.mul(ab, axis=0) * 2.0).add(beta.pow(2).mul(b2, axis=0))

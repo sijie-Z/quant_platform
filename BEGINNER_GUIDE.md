@@ -171,7 +171,7 @@ Sharpe = 年化收益率 / 年化波动率
 ```
 原始数据 (价格/财务)
     ↓
-计算 15 个因子 (每只股票每天 15 个特征)
+计算默认 21 个因子 (16 技术 + 5 基本面；注册 27 个)
     ↓
 因子处理 (缩尾去极值 → 标准化 → 行业中性化)
     ↓
@@ -201,7 +201,7 @@ ICIR 加权合成 (预测力强的因子权重大)
 5. **ST 股票**：连续亏损被特殊处理的股票，很多机构不能买
 6. **手数限制**：最少买 100 股（1 手）
 
-这些在我们的项目中全部处理了。面试官问你"回测跟实盘有什么区别"，你就可以一条条讲。
+这些在我们的项目中大多已处理：涨跌停/停牌按执行日阻断成交（未成交顺延），ST 用公告日 PIT 掩码，T+1 与成本模型在回测/执行层生效；整手约束在执行层强制，向量化回测仍是权重层面（已明确标注）。面试官问你"回测跟实盘有什么区别"，你就可以一条条讲。
 
 ---
 
@@ -222,7 +222,7 @@ ICIR 加权合成 (预测力强的因子权重大)
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  ① Data Layer        ② Factor Engine      ③ Alpha Model     │
-│  数据获取+清洗         计算15个因子          因子合成→信号      │
+│  数据获取+清洗         计算21个因子          因子合成→信号      │
 │  - Synthetic生成器     - 动量/波动/RSI...    - 等权/IC/ICIR   │
 │  - Tushare实盘        - 缩尾/标准化/中性化   - 排名归一化      │
 │  - 停牌/ST/复权        - IC评估              - 输出: signal   │
@@ -248,7 +248,7 @@ ICIR 加权合成 (预测力强的因子权重大)
 
 ```
 quant_platform/
-├── main.py                    # CLI 入口（6个命令）
+├── main.py                    # CLI 入口（21 个命令）
 ├── config/default.yaml        # 所有参数
 │
 ├── data/                      # ① 数据层
@@ -257,7 +257,7 @@ quant_platform/
 │   └── pipeline.py            # 数据清洗流水线
 │
 ├── factors/                   # ② 因子引擎
-│   ├── technical.py           # 10个技术因子
+│   ├── technical.py           # 22个技术因子（默认启用16个）
 │   ├── fundamental.py         # 5个基本面因子
 │   ├── processing.py          # 因子处理（缩尾/标准化/中性化）
 │   └── evaluation.py          # 因子评估（IC/ICIR）
@@ -290,7 +290,7 @@ quant_platform/
 ├── notebooks/
 │   └── research_workflow.ipynb  # Jupyter 研究流程
 │
-└── tests/                     # 1077 个测试
+└── tests/                     # 193 个测试文件 / 2,662 条用例
 ```
 
 ### 数字一览
@@ -300,11 +300,11 @@ quant_platform/
 | 股票数 | 500 只（可调） |
 | 历史数据 | 5 年 (2021-2025) |
 | 交易日 | ~1300 天 |
-| 因子数 | 15 个标准 + 1 个 LLM |
+| 因子数 | 默认 21 个（16 技术 + 5 基本面；注册 27 个）+ 可选 LLM 因子 |
 | 优化器 | 3 种 |
-| 单元测试 | 1077 个 |
-| CLI 命令 | 6 个 |
-| 代码行数 | ~40,000 行 |
+| 单元测试 | 2,662 条用例（2,450 个测试函数，2026-10-20 实测） |
+| CLI 命令 | 21 个 |
+| 代码行数 | 约 75,000 行非测试 Python + 约 11,000 行 Vue |
 
 ---
 
@@ -331,7 +331,7 @@ Step 2: 因子引擎
   关键：因子处理流水线（缩尾→标准化→中性化），这是量化的标准操作
 
 Step 3: Alpha 模型
-  问题：15 个因子怎么合成一个信号
+  问题：21 个因子怎么合成一个信号
   方案：ICIR 加权——预测力强的因子权重高
   关键：横截面排名归一化到 [-0.5, 0.5]
 
@@ -350,7 +350,7 @@ Step 6: 报告
   方案：文本仪表盘 + 4 张图表 + CSV 导出
 
 Step 7: 锦上添花
-  - Numba 加速（5个计算内核 5-20x 提速）
+  - Numba 加速（6个计算内核 5-20x 提速）
   - LLM 情感因子（你的 RAG 经验直接能用！）
   - Pipeline 缓存（不重复计算）
   - 策略对比/参数搜索
@@ -362,7 +362,7 @@ Step 7: 锦上添花
 A: 事件驱动适合高频，我们做月频多因子，向量化更简单更快。一个月就调一次仓，不需要模拟每一笔订单。
 
 **Q: 为什么默认用合成数据？**
-A: 不用联网、不用注册 API、可复现。面试官让你当场跑一下，Tushare 没 token 就尴尬了。合成数据现在内置了 alpha 结构（IC~0.04），演示效果真实。
+A: 不用联网、不用注册 API、可复现。面试官让你当场跑一下，Tushare 没 token 就尴尬了。注意：默认配置开启了 `embedded_alpha`（强度 0.03，IC 约 0.02-0.03），这是演示用的人造信号；做任何策略结论前必须设为 `false`，否则测的是注入的 alpha，不是策略。
 
 **Q: 为什么要做因子中性化？**
 A: 不做中性化的话，你的"好股票"可能只是某个行业的股票——你不是在选股，是在选行业。
@@ -387,7 +387,7 @@ A: 不做中性化的话，你的"好股票"可能只是某个行业的股票—
 ```python
 # 1. 过滤 ST 股票（连续亏损的风险股）
 # 2. 过滤未上市/已退市股票（幸存者偏差！）
-# 3. 处理停牌（短期停牌前向填充，长期停牌剔除）
+# 3. 处理停牌（短期停牌前向填充；长期停牌保留缺失、不删除历史）
 # 4. 复权价格计算（close_adj = close / adj_factor）
 # 5. 日收益率计算（returns = close_adj.pct_change()）
 ```
@@ -395,14 +395,14 @@ A: 不做中性化的话，你的"好股票"可能只是某个行业的股票—
 **TushareProvider（实盘数据）**：
 ```python
 # 需要免费注册 tushare.pro 获取 token
-# 拉到 CSI 300 成分股的前复权日频数据
+# 拉到 CSI 300 成分股的后复权(hfq)日频数据
 # 存到 HDF5 本地缓存，下次秒加载
-# 没有 token 时自动回退到合成数据
+# 配置的真实数据源不可用时默认 fail closed（不会静默回退合成数据）
 ```
 
 ### 7.2 因子引擎 (`factors/`)
 
-**10 个技术因子**（从价格和成交量算出）：
+**技术因子（注册 22 个，`config/default.yaml` 默认启用 16 个）**（从价格和成交量算出）：
 
 | 因子名 | 含义 | 怎么算 |
 |--------|------|--------|
@@ -414,8 +414,11 @@ A: 不做中性化的话，你的"好股票"可能只是某个行业的股票—
 | volatility_60d | 60日波动 | 同上，更长窗口 |
 | turnover_20d | 换手率 | 20日平均换手率 |
 | rsi_14d | RSI | 相对强弱指数 (0-100) |
-| macd | MACD | 指数平滑异同移动平均线 |
+| macd | MACD | 指数平滑异同移动平均线（默认配置未启用） |
 | amplitude_20d | 振幅 | 20日平均(高-低)/收盘价 |
+
+另有 efficiency_ratio、breakout_ignition、trend_stage、ma_convergence、breakout_proximity、
+pure_volatility、mtf_resonance 及 5 个 K 线形态因子（klen/klow/kmid/ksft/kup），按配置启用。
 
 **5 个基本面因子**（从财务报表算出）：
 
@@ -448,7 +451,7 @@ A: 不做中性化的话，你的"好股票"可能只是某个行业的股票—
 
 ```python
 # 1. 等权：所有因子平均
-signal = (factor1 + factor2 + ... + factor15) / 15
+signal = (factor1 + factor2 + ... + factor21) / 21
 
 # 2. IC 加权：IC 高的因子权重高
 weight_i = IC_i / sum(所有IC)
@@ -457,7 +460,7 @@ signal = weight_1 * f1 + weight_2 * f2 + ...
 # 3. ICIR 加权：IC 稳定（ICIR 高）的因子权重高
 weight_i = ICIR_i / sum(所有ICIR)
 signal = weight_1 * f1 + weight_2 * f2 + ...
-# （这是默认方法，因为稳定性也很重要）
+# （默认配置是 equal_weight；IC/ICIR 加权可按 alpha.method 启用）
 ```
 
 最后做横截面排名归一化到 [-0.5, 0.5]：在所有股票中排名，排名最高的给 0.5，最低的给 -0.5。
@@ -531,7 +534,7 @@ LLMSentimentFactor (继承 BaseFactor)
   │
   ├── SentimentAnalyzer (Strategy 模式，可切换)
   │   ├── KeywordAnalyzer (默认，零成本，关键词打分)
-  │   └── OpenAIAnalyzer (真实 API，GPT-4o-mini)
+  │   └── OpenAIAnalyzer (真实 API，DeepSeek deepseek-chat，OpenAI 兼容 SDK)
   │
   ├── 30 条中文财经标题模板
   │   ├── 看涨：净利润同比增长50%、获得大额订单...
@@ -545,7 +548,7 @@ LLMSentimentFactor (继承 BaseFactor)
 1. 每只股票每天随机生成 0-2 条财经标题（模拟新闻流）
 2. 用情感分析器给每条标题打分（-1 = 极度看空，+1 = 极度看多）
 3. 取平均作为当天该股票的情感因子值
-4. 这个因子跟其他 15 个因子一起进入 alpha 模型
+4. 这个因子跟其他因子一起进入 alpha 模型
 
 **你怎么扩展**：
 - 接入真实的新闻 API（东财、同花顺）
@@ -565,12 +568,13 @@ LLMSentimentFactor (继承 BaseFactor)
 # 加速比: ~17x
 ```
 
-5 个被加速的计算内核：
+6 个被加速的计算内核：
 1. 滚动累计收益（动量因子核心）
 2. 最大回撤计算
 3. 横截面缩尾
 4. Spearman Rank IC
 5. Ledoit-Wolf 协方差收缩
+6. Z-Score 标准化
 
 每个都有 Pandas + Numba 双实现，Numba 不可用时自动回退。
 
@@ -582,7 +586,11 @@ LLMSentimentFactor (继承 BaseFactor)
 
 ```bash
 cd quant_platform
+python -m venv .venv
+.venv\Scripts\activate                               # Git Bash: source .venv/Scripts/activate
 pip install -r requirements.txt
+pip install -e ./packages/quant_core                 # core/store.py 依赖它
+pip install -e .                                     # 安装 quant_platform 包
 ```
 
 ### 最快体验（30 秒）
@@ -594,7 +602,7 @@ python main.py run --force
 
 你会看到：
 1. 生成 500 只股票的 5 年数据
-2. 计算 15 个因子并评估 IC
+2. 计算默认 21 个因子并评估 IC
 3. 合成 alpha 信号
 4. 优化持仓权重
 5. 回测并输出报告
@@ -642,6 +650,7 @@ python main.py cache list
 ### Jupyter Notebook
 
 ```bash
+# 可选：需要先安装 jupyter（pip install jupyter）
 jupyter notebook notebooks/research_workflow.ipynb
 ```
 
@@ -653,21 +662,21 @@ jupyter notebook notebooks/research_workflow.ipynb
 
 ### 自我介绍模板（30 秒）
 
-> "我做了一个 A 股多因子量化研究平台。端到端流水线从数据到回测，500 只股票 5 年数据，15 个因子，3 种优化器。1077 个单元测试。特色是 Numba JIT 加速、LLM 情感因子集成、10 个 A 股实盘陷阱全处理。还写了策略对比和参数搜索的 CLI 工具。"
+> "我做了一个 A 股多因子量化研究平台。端到端流水线从数据到回测，500 只股票 5 年数据，默认 21 个因子（注册 27 个），3 种优化器。2,662 条测试用例。特色是 Numba JIT 加速、LLM 情感因子集成、10 个 A 股实盘陷阱全部处理或明确标注。还写了策略对比和参数搜索的 CLI 工具。"
 
 ### 可能会被问到的问题
 
 **Q: 你的回测跟实盘有什么区别？**
-> "我处理了 10 个 A 股特有的实盘陷阱：前复权、停牌、幸存者偏差、涨跌停、ST 过滤、T+1、佣金印花税、手数限制、除权除息、行业漂移。没有做的是高频 order-book 级别的流动性建模，但对月频多因子策略这不是瓶颈。"
+> "我处理了 10 个 A 股特有的实盘陷阱：后复权、停牌、幸存者偏差、涨跌停、ST 过滤、T+1、佣金印花税、手数限制、除权除息、行业漂移。涨跌停/停牌按执行日阻断成交，整手在执行层强制、向量化回测仍是权重层面。没有做的是高频 order-book 级别的流动性建模，但对月频多因子策略这不是瓶颈。"
 
 **Q: IC 是什么意思？为什么重要？**
 > "Information Coefficient，因子值跟未来收益的秩相关系数。IC > 0.03 说明因子有预测力。为什么用 Rank IC 而不是 Pearson IC？因为 Rank IC 对异常值不敏感，更稳健。"
 
 **Q: 你怎么防止过拟合？**
-> "1) 因子只有 15 个，没有做因子挖掘（没有挖几万个因子然后挑显著的）；2) 因子经济逻辑清晰——动量、价值、波动率都有学术支撑；3) ICIR 加权——不仅看 IC 大小还看稳定性；4) 横截面中性化防止了行业和市值的虚假相关。"
+> "1) 因子只有 21 个（注册 27 个），没有做因子挖掘（没有挖几万个因子然后挑显著的）；2) 因子经济逻辑清晰——动量、价值、波动率都有学术支撑；3) 默认等权合成，IC/ICIR 加权可选——不仅看 IC 大小还看稳定性；4) 横截面中性化防止了行业和市值的虚假相关。"
 
 **Q: 你怎么做 LLM 集成的？**
-> "写了一个 LLMSentimentFactor，继承 BaseFactor。用 Strategy 模式隔离了分析器：默认用关键词打分（零成本），可以切换到 OpenAI API。有 JSON 缓存避免重复调用。这个因子跟传统 15 个因子一起进入 alpha 流水线。"
+> "写了一个 LLMSentimentFactor，继承 BaseFactor。用 Strategy 模式隔离了分析器：默认用关键词打分（零成本），可以切换到 DeepSeek（OpenAI 兼容接口，需 DEEPSEEK_API_KEY）。有 JSON 缓存避免重复调用。这个因子跟传统 21 个因子一起进入 alpha 流水线（默认因子集不包含它，需显式启用）。"
 > 
 > （这是你的强项，可以展开聊 RAG pipeline 怎么改造）
 
@@ -678,7 +687,7 @@ jupyter notebook notebooks/research_workflow.ipynb
 
 如果面试官发现你的策略 Sharpe 不高或回测有问题：
 
-> "合成数据的 IC 在 0.04 左右，这是真实可信的水平。实盘 A 股多因子策略的 Sharpe 一般在 1-2 之间。超过 3 要么是天才要么有过拟合。MVO 优化器在股票数多的时候会用等权回退——这是工程上的诚实处理，不是把崩溃藏起来。"
+> "合成数据的 IC 在 0.02-0.03 左右（alpha_strength=0.03），这是接近真实 A 股的信噪比水平；演示配置会注入 embedded_alpha，做结论前必须关掉。实盘 A 股多因子策略的 Sharpe 一般在 1-2 之间。超过 3 要么是天才要么有过拟合。MVO 现在优先用已安装的 CLARABEL 求解并把持仓纳入候选集，默认回测 0 次回退；如果求解失败会显式记录回退原因，而不是静默等权。"
 
 ---
 
@@ -689,7 +698,7 @@ jupyter notebook notebooks/research_workflow.ipynb
 | Agent/RAG 技能 | 量化对应 |
 |---------------|---------|
 | Python 数据处理 | pandas 操作股价数据 |
-| API 调用 | Tushare / OpenAI API |
+| API 调用 | Tushare / DeepSeek API |
 | 检索管道 | 因子计算流水线 |
 | 结果排序 | Alpha 信号排名 |
 | 评估指标 | IC / Sharpe / 回撤 |

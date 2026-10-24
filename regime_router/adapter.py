@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.backtest.metrics import all_metrics
+from quant_platform.data.pipeline import realized_returns
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -82,8 +83,14 @@ class ExecutionAdapter:
     # ── 信号生成 ──────────────────────────────────────────────
 
     def _compute_past_return(self, returns: pd.DataFrame) -> pd.DataFrame:
-        """过去 signal_h 日累计收益."""
-        return returns.rolling(self.signal_h, min_periods=self.signal_h).apply(
+        """过去 signal_h 日累计收益 (已实现).
+
+        ``returns`` 是 DataPipeline 的前向收益约定 (t -> t+1), 调仓日 t
+        收盘时 ``returns[t]`` 尚未发生; 先 shift(1) 再滚动, 保证 t 日信号
+        只使用已完成的收益 (无一日前视).
+        """
+        realized = realized_returns(returns)
+        return realized.rolling(self.signal_h, min_periods=self.signal_h).apply(
             lambda x: np.prod(1 + x) - 1 if len(x) == self.signal_h else np.nan,
             raw=True,
         )
@@ -169,8 +176,12 @@ class ExecutionAdapter:
             prev_date = valid_dates[i - 1]
             weights = daily_weights[prev_date]  # 使用前一天的持仓计算当日收益
 
-            # 当日收益 = sum(weight * asset_return)
-            day_ret = returns.loc[date]
+            # 当日收益 = sum(weight * asset_return).
+            # `returns` 是前向约定: returns[t] = close[t+1]/close[t]-1.
+            # 持仓从 prev_date 收盘持有到 date 收盘, 已实现收益是
+            # returns[prev_date]; 使用 returns[date] 会把 date 当天的未来
+            # 收益记进组合 (旧实现的一日前视).
+            day_ret = returns.loc[prev_date]
             valid_assets = [a for a in weights.index if a in day_ret.index and pd.notna(day_ret.get(a))]
             if not valid_assets:
                 continue

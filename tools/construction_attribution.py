@@ -19,16 +19,26 @@ import os
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, "D:/Desktop")
 import akshare as ak
 import numpy as np
 import pandas as pd
+
+# Repo dir is the `quant_platform` package; its parent must be importable when
+# this script runs without an editable install.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from quant_platform.backtest.metrics import max_drawdown
+from quant_platform.utils.research_window import compact_date, resolve_end_date
 
 DB = "data/trading.db"
 C, S, P = 0.0003, 0.001, 0.0005
 N_LONG, N_SHORT = 20, 0
 INITIAL = 1_000_000
+
+START_DATE = "2021-01-01"
+END_DATE = resolve_end_date()
 
 print("=" * 72)
 print("  CONSTRUCTION ATTRIBUTION + ENGINEERING SANITY")
@@ -51,7 +61,7 @@ frames = {}
 for i, c in enumerate(codes):
     for retry in range(3):
         try:
-            r = ak.stock_zh_a_hist_tx(symbol=txsym(c), start_date="20210101", end_date="20260523", adjust="hfq")
+            r = ak.stock_zh_a_hist_tx(symbol=txsym(c), start_date=compact_date(START_DATE), end_date=compact_date(END_DATE), adjust="hfq")
             if r is not None and not r.empty:
                 r = r.rename(columns={"date":"date","close":"close"}) if "close" in r.columns else r
                 r["date"] = pd.to_datetime(r["date"])
@@ -113,12 +123,16 @@ def backtest(factor_panel, cost_multiplier=1.0, rebalance_override=None):
     capital = INITIAL
     daily_rets = []
     turnover_log = []
+    cost_log = []
     current_w = {}
     rebal_dates = rebalance_override if rebalance_override is not None else rebals
     rebal_iter = iter(rebal_dates)
     next_rebal = next(rebal_iter, None)
 
     for date in all_dates:
+        # Decision at today's close; activated after today's return.
+        pending_w = None
+        pending_cost = 0.0
         if next_rebal is not None and date >= next_rebal:
             if date in factor_panel.index:
                 f = factor_panel.loc[date].dropna()
@@ -126,25 +140,38 @@ def backtest(factor_panel, cost_multiplier=1.0, rebalance_override=None):
                     rank = f.rank(ascending=False)
                     long_u = rank.nsmallest(N_LONG).index.tolist()
                     short_u = rank.nlargest(N_SHORT).index.tolist()
-                    if current_w:
-                        old_set = set(current_w.keys())
-                        new_set = set(long_u + short_u)
-                        sold = old_set - new_set
-                        if sold and len(current_w) > 0:
-                            to = sum(abs(current_w.get(a,0)) for a in sold)
-                            turnover_log.append(float(to))
-                            capital -= to * (C + P + S) * cost_multiplier * capital
                     total = max(len(long_u) + len(short_u), 1)
-                    current_w = {}
+                    pending_w = {}
                     for a in long_u:
-                        current_w[a] = 1.0 / total
+                        pending_w[a] = 1.0 / total
                     for a in short_u:
-                        current_w[a] = -1.0 / total
+                        pending_w[a] = -1.0 / total
+
+                    # One-way turnover = 0.5*sum|w_new - w_old|; buys pay
+                    # commission+slippage, sells also stamp tax. The old
+                    # sell-only count missed new entries and drift.
+                    old_w = current_w
+                    changed = set(old_w) | set(pending_w)
+                    buy_w = sum(
+                        max(pending_w.get(a, 0.0) - old_w.get(a, 0.0), 0.0)
+                        for a in changed
+                    )
+                    sell_w = sum(
+                        max(old_w.get(a, 0.0) - pending_w.get(a, 0.0), 0.0)
+                        for a in changed
+                    )
+                    turnover_log.append(0.5 * (buy_w + sell_w))
+                    pending_cost = (buy_w * (C + P)
+                                    + sell_w * (C + P + S)) * cost_multiplier
+                    cost_log.append(float(pending_cost))
             try:
                 next_rebal = next(rebal_iter)
             except StopIteration:
                 next_rebal = None
 
+        # Today's return belongs to the weights held since the previous
+        # close. Activating pending_w before this block was a one-day
+        # lookahead: the decision earns the t-1 -> t return it was made after.
         if current_w:
             daily = 0.0
             for a, w in current_w.items():
@@ -157,13 +184,23 @@ def backtest(factor_panel, cost_multiplier=1.0, rebalance_override=None):
         else:
             daily_rets.append(0.0)
 
+        # Trade at today's close: pay costs, then activate the new weights.
+        if pending_cost:
+            capital -= pending_cost * capital
+        if pending_w is not None:
+            current_w = pending_w
+
     dr = pd.Series(daily_rets, index=all_dates)
     cagr = (capital/INITIAL) ** (1/ny) - 1
     sharpe = float((dr.mean()/(dr.std()+1e-12)) * np.sqrt(252))
-    dd = float((dr.cumsum() + np.log(INITIAL) - (dr.cumsum() + np.log(INITIAL)).cummax()).min() / INITIAL)
+    # Compounded equity-curve drawdown, identical to
+    # backtest.metrics.max_drawdown (the old log-cumsum/INITIAL formula was
+    # dimensionally wrong and printed -0.00% for every strategy).
+    dd = float(max_drawdown(dr)[0])
     avg_to = float(np.mean(turnover_log)) if turnover_log else 0
     return {"cagr": cagr, "sharpe": sharpe, "max_dd": dd,
             "avg_turnover": avg_to, "daily_rets": dr, "turnover_log": turnover_log,
+            "cost_log": cost_log,
             "n_rebals": len(turnover_log)}
 
 
@@ -171,38 +208,28 @@ def backtest(factor_panel, cost_multiplier=1.0, rebalance_override=None):
 # 4. CONSTRUCTION ATTRIBUTION — step by step
 # ══════════════════════════════════════════════════════════════════════
 
-# 4a. UNIVERSE LOSS: what if we had ALL stocks (no CSI300 constraint)?
-# Can't test directly, but we can measure CSI300 coverage vs all A-shares.
-# For now: universe loss ≈ 0 (we use the full CSI300 we have access to)
-# This is a placeholder for future CSI500 / full-A comparison.
-universe_loss = 0.0  # no broader universe available in this data fetch
+# 4a. UNIVERSE LOSS: not measurable from a single-universe fetch. The old
+# `0.0` was a placeholder printed as if it had been measured, and the printed
+# "TOTAL: 100%" implied the decomposition was complete.
+universe_loss = None  # not measured
 
-# 4b. RANKING LOSS: equal-weight Top20 vs perfect weight = signal strength
-# Perfect weighting: weight proportional to factor z-score
-# Equal weight: 1/N for top 20, 0 for rest
-# Ranking loss = (perfect-weighted return) - (equal-weighted return)
-# We approximate by comparing equal-weight to score-weighted top20
-score_weighted = backtest(vol20)
-equal_weighted = backtest(vol20)  # identical when N_LONG=20, weights are same 1/20
-# For Long-Only equal-weight Top20: ranking_loss = 0 because there's no
-# finer weight differentiation within the top 20 bucket.
-# True ranking loss would come from NOT capturing the continuous signal
-# within the top bucket. We estimate it as the CS std of IC within top20.
-ranking_loss = 0.0  # equal-weight bucket has no within-bucket gradient
+# 4b. RANKING LOSS: not measurable here. The old code ran the same backtest
+# twice (`score_weighted = equal_weighted = backtest(vol20)`), so any value
+# derived from that comparison would have been an artifact of a duplicate
+# call, not a measurement.
+ranking_loss = None  # not measured
 
-# 4c. WEIGHT LOSS: Top20 EW vs all stocks weighted by factor score
-# The biggest gap: we discard 268 stocks entirely.
-# Estimate: the expected return of top20 vs all-stock factor-weighted
-# For now, approximate: top20 captures selection_width/mills of the total
-# But mills already accounts for this in theo_ann. Weight loss = theo - gross
-# (since ranking loss≈0, universe loss≈0 for now)
-
-# 4d. COST LOSS: already computed as annual cost drag
+# 4c. WEIGHT LOSS: Top20 EW vs all stocks weighted by factor score.
+# The residual between IC-implied alpha and the gross portfolio return. It
+# absorbs whatever the unmeasured universe/ranking steps would explain, so it
+# is labelled as the residual rather than attributed to a single cause.
+# 4d. COST LOSS: already computed as annual cost drag (buys and sells).
 base = backtest(vol20)
-gross_cagr = base["cagr"] + sum(t * (C+P+S) for t in base["turnover_log"]) / ny
-cost_loss = sum(t * (C+P+S) for t in base["turnover_log"]) / ny
-weight_loss = theo_ann - gross_cagr  # after accounting for costs
+cost_loss = sum(base["cost_log"]) / ny
+gross_cagr = base["cagr"] + cost_loss
+weight_loss = theo_ann - gross_cagr  # residual after costs
 total_construction_loss = theo_ann - base["cagr"]
+discarded = max(n_stocks - N_LONG, 0)
 
 print("")
 print("=" * 72)
@@ -212,23 +239,24 @@ print(f"  IC-implied theoretical alpha:  {theo_ann:>+8.2%}")
 print(f"  {'Step':<5} {'Component':<45} {'Annual':>10} {'Running':>10}")
 print(f"  {'-'*5} {'-'*45} {'-'*10} {'-'*10}")
 print(f"  {'[0]':<5} {'IC-implied theoretical alpha':<45} {theo_ann:>+9.2%} {theo_ann:>+9.2%}")
-print(f"  {'[1]':<5} {'- Universe Loss (CSI300 vs ALL)':<45} {-universe_loss:>+9.2%} {(theo_ann-universe_loss):>+9.2%}")
-print(f"  {'[2]':<5} {'- Ranking Loss (EW vs Score)':<45} {-ranking_loss:>+9.2%} {(theo_ann-universe_loss-ranking_loss):>+9.2%}")
-print(f"  {'[3]':<5} {'- Weight Loss (Top20 vs All)':<45} {-weight_loss:>+9.2%} {gross_cagr:>+9.2%}")
+print(f"  {'[1]':<5} {'- Universe Loss (CSI300 vs ALL)':<45} {'n/a':>10} {'n/a':>10}")
+print(f"  {'[2]':<5} {'- Ranking Loss (EW vs Score)':<45} {'n/a':>10} {'n/a':>10}")
+print(f"  {'[3]':<5} {'- Residual (Top20 vs IC-implied)':<45} {-weight_loss:>+9.2%} {gross_cagr:>+9.2%}")
 print(f"  {'[4]':<5} {'- Cost Loss (turnover+fees)':<45} {-cost_loss:>+9.2%} {base['cagr']:>+9.2%}")
 print(f"  {'':<5} {'= Net Portfolio Return':<45} {base['cagr']:>+9.2%}")
 
 leak_theo = abs(theo_ann) + 1e-8
 print("")
-print("  Attribution (% of total loss):")
-print(f"    Universe loss:      {abs(universe_loss)/leak_theo*100:.0f}%")
+print("  Attribution (% of IC-implied alpha; measured components only):")
+print("    Universe loss:      n/a (not measured)")
+print("    Ranking loss:       n/a (not measured)")
 wg_pct = abs(weight_loss)/leak_theo*100 if weight_loss > 0 else 0
-print(f"    Weight loss:        {wg_pct:.0f}%  ({-weight_loss:+.2%})")
+print(f"    Residual (weight):  {wg_pct:.0f}%  ({-weight_loss:+.2%})")
 cost_pct_attr = abs(cost_loss)/leak_theo*100
 print(f"    Cost loss:          {cost_pct_attr:.0f}%  ({-cost_loss:+.2%})")
-remain = 100 - abs(universe_loss)/leak_theo*100 - wg_pct - cost_pct_attr
-print(f"    Remaining (unexpl): {remain:.0f}%")
-print("    TOTAL:              100%")
+measured_pct = wg_pct + cost_pct_attr
+print(f"    Measured total:     {measured_pct:.0f}%  "
+      f"(universe/ranking unmeasured; no 100% claim)")
 
 # ══════════════════════════════════════════════════════════════════════
 # 5. ENGINEERING SANITY TESTS
@@ -293,7 +321,14 @@ if not test_c:
     print("    Check weight calculation and short-leg logic.")
 
 # Test D: Rebalance count matches expected
-expected_rebals = len(rebals) - 1  # first rebalance is initial buy, no prior positions
+# Test D: Rebalance count matches expected. n_rebals counts every applied
+# rebalance, including the initial buy (previously only rebalances with a
+# non-empty sell leg were counted). Warm-up rebalances without a 60-name
+# cross-section legitimately never happen, so count eligible dates only.
+expected_rebals = sum(
+    1 for d in rebals
+    if d in vol20.index and len(vol20.loc[d].dropna()) >= 60
+)
 actual_rebals = base["n_rebals"]
 test_d = abs(actual_rebals - expected_rebals) <= 2  # allow ±2 for edge cases
 print(f"  Test D (Rebal count):  expected~{expected_rebals}  actual={actual_rebals}  {'PASS' if test_d else 'FAIL'}")
@@ -312,10 +347,17 @@ print("  COMBINED VERDICT")
 print("=" * 72)
 print("")
 print("  Construction attribution:")
-print(f"    Primary alpha loss: Weight Loss ({-weight_loss:+.2%} ann)")
-print(f"    — Top20 equal-weight captures only ~{gross_cagr/theo_ann*100:.0f}% of IC-implied alpha")
-print(f"    — The remaining {(theo_ann-gross_cagr)/theo_ann*100:.0f}% sits in the 268 discarded stocks")
-print(f"    — Cost adds {-cost_loss:+.2%} ann drag ({(cost_loss/(theo_ann-gross_cagr+cost_loss))*100:.0f}% of total loss)")
+print(f"    Primary alpha loss (residual): {-weight_loss:+.2%} ann")
+if abs(theo_ann) > 1e-12:
+    print(f"    — Top20 equal-weight captures {gross_cagr/theo_ann*100:.0f}% of IC-implied alpha")
+    print(f"    — The remaining {(theo_ann-gross_cagr)/theo_ann*100:.0f}% is the residual "
+          f"across the {discarded} names outside Top20 (universe/ranking effects not separately measured)")
+else:
+    print("    — Top20 vs IC-implied alpha: n/a (IC-implied alpha is zero)")
+loss_denom = theo_ann - gross_cagr + cost_loss
+cost_share = (cost_loss / loss_denom * 100) if abs(loss_denom) > 1e-12 else float("nan")
+cost_share_txt = f"{cost_share:.0f}%" if np.isfinite(cost_share) else "n/a"
+print(f"    — Cost adds {-cost_loss:+.2%} ann drag ({cost_share_txt} of measured loss)")
 print("")
 print(f"  Engineering sanity: {'ALL PASS' if all_pass else 'FAILURES'}")
 print(f"    Pipeline infrastructure is {'verified' if all_pass else 'suspicious'}.")
@@ -327,9 +369,14 @@ ev = {
     "experiment": "construction_attribution",
     "theoretical_ann": float(theo_ann),
     "gross_cagr": float(gross_cagr), "net_cagr": float(base["cagr"]),
-    "universe_loss": float(universe_loss), "ranking_loss": float(ranking_loss),
+    # None = not measured. The old 0.0 values were placeholders that read as
+    # measured components downstream.
+    "universe_loss": None, "ranking_loss": None,
     "weight_loss": float(weight_loss), "cost_loss": float(cost_loss),
     "weight_loss_pct": float(wg_pct), "cost_loss_pct": float(cost_pct_attr),
+    "n_stocks": n_stocks, "n_discarded": discarded,
+    "data_start": str(all_dates[0].date()), "data_end": str(all_dates[-1].date()),
+    "requested_end": END_DATE,
     "engineering_sanity": {
         "cost_free_cagr": float(cost_free["cagr"]), "test_a": test_a,
         "turnover_zero_rebals": n_to, "test_b": test_b,
@@ -345,7 +392,10 @@ conn.execute(
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
     (rid, pd.Timestamp.now('UTC').isoformat()[:19], "success", "",
      "construction_attribution", "akshare",
-     json.dumps({"adjust":"hfq","provider":"akshare"}),
+     json.dumps({"adjust":"hfq","provider":"akshare",
+                 "start_date": str(all_dates[0].date()),
+                 "end_date": str(all_dates[-1].date()),
+                 "requested_end": END_DATE}),
      "CurrentConstituentUniverseProvider",
      json.dumps({"pit":False,"bias_warning":["survivorship_bias_possible"]}),
      "volatility_20d",

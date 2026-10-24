@@ -18,6 +18,14 @@ data:
   start_date: "2021-01-01"
   end_date: "2025-12-31"
   frequency: "daily"       # daily, weekly, monthly
+  # A configured REAL provider that is unavailable fails the run by default.
+  # Set true (or pass --allow-synthetic-fallback) only for development: the
+  # fallback is recorded in metrics.json/manifest as synthetic.
+  allow_synthetic_fallback: false
+  # Freshness gate (exchange sessions): a completion marker more than this
+  # many sessions behind the requested end is stale. Research runs warn;
+  # live/decisive runs fail closed. 3 sessions tolerates a weekend + T+1 lag.
+  max_staleness_days: 3
 
 # --- Factors ---
 factors:
@@ -26,7 +34,8 @@ factors:
     momentum_1m: {enabled: true, params: {period: 21}}
     momentum_3m: {enabled: true, params: {period: 63}}
     momentum_6m: {enabled: true, params: {period: 126}}
-    momentum_12m: {enabled: true, params: {period: 252}, exclude_recent: 21}
+    # Momentum12M skips the most recent 21 days by design (factor default).
+    momentum_12m: {enabled: true, params: {period: 252}}
     volatility_20d: {enabled: true, params: {period: 20}}
     volatility_60d: {enabled: true, params: {period: 60}}
     turnover_20d: {enabled: true, params: {period: 20}}
@@ -56,8 +65,9 @@ factors:
 
 # --- Alpha Model ---
 alpha:
-  method: "icir_weighted"  # equal_weight, ic_weighted, icir_weighted
-  # Ablation #001: Top 8 vs All 26 差距 1.24 Sharpe -> 等权融合所有因子会显著稀释 Alpha
+  method: "equal_weight"  # equal_weight (default, no full-sample weight fitting), ic_weighted, icir_weighted
+  # Ablation #001 found ICIR weighting over all 26 factors diluted alpha; the
+  # research baseline therefore uses equal weights and treats ICIR as opt-in.
   lookback: 252            # Days for IC/ICIR estimation
   min_icir: 0.0            # Minimum ICIR to include factor
   tradability_gate: false  # Per-stock profile-based signal filtering
@@ -72,6 +82,14 @@ portfolio:
     max_sector_exposure: 0.30  # 30% max per sector
     max_turnover: 0.30         # 30% max turnover per rebalance
     lot_size: 100              # A-share lot size
+    # R8 cost-aware MVO. All default 0 = disabled, so the default backtest
+    # (weights, objective, constraints) is unchanged.
+    transaction_cost_bps: 0.0  # one-way turnover cost in bp added to the MVO objective
+    turnover_penalty: 0.0      # quadratic penalty on (w - prev_w), smooths turnover
+    max_participation: 0.0     # ADV participation cap, e.g. 0.10 = 10% of ADV; 0 = off.
+                               # main.py run supplies both daily_volume (shares) and
+                               # raw_prices (unadjusted close) since R9; without them
+                               # the engine warns and disables the cap.
   covariance:
     method: "ledoit_wolf"      # sample, ledoit_wolf, ewma
     lookback: 252              # Days for covariance estimation
@@ -87,18 +105,21 @@ backtest:
 # --- Costs ---
 costs:
   commission: 0.0003       # 0.03% per trade
-  stamp_tax: 0.001          # 0.1% on sell only (A-share)
-  slippage: 0.001           # 0.1% slippage (baseline bps)
+  # Stamp tax (sell side only). null = statutory schedule by trade date:
+  # 0.1% before 2023-08-28, 0.05% from that date. An explicit value is a flat
+  # override of the schedule (e.g. 0.001 pins 0.1% for every date).
+  stamp_tax: null
+  slippage: 0.001           # 0.1% fixed slippage; fallback rate for impact
   # fixed, proportional, or impact.
   #
-  # This said "impact" while nothing supplied the per-asset daily_volume and
-  # volatility the impact model requires -- CostModel fell through to fixed
-  # slippage on every rebalance, so the config described a model that was not
-  # running. Set to what actually runs. Switching to "impact" needs
-  # BacktestEngine.compute_costs() callers to pass both series; CostModel now
-  # logs a warning once if a non-fixed model cannot engage.
-  slippage_model: "fixed"
-  impact_model: "composite" # composite, almgren_chriss, square_root
+  # "impact" is the default now that the pipeline actually supplies the
+  # inputs it needs: `_load_data` attaches share volume, `_run_backtest`
+  # hands the engine volume + the unadjusted close, and the engine converts
+  # shares to CNY before calling the cost model. Without those inputs the
+  # cost model warns once and falls back to fixed slippage, so the config
+  # can never silently describe a model that is not running.
+  slippage_model: "impact"
+  impact_model: "composite" # scalar single-order path; the vectorised backtest path uses the documented square-root rule
 
 # --- Risk ---
 risk:
@@ -180,3 +201,17 @@ execution:
     server: "localhost:58610"  # miniQMT TCP address
     mode: "sim"                # sim or live
     data_server: ""            # market data server (defaults to server)
+
+# --- Research ---
+# Final-evaluation holdout window. While configured, these dates are reserved
+# for the final one-shot evaluation and may not participate in any choice:
+#   * `/api/sweep` and `python main.py sweep` refuse to run when the data
+#     window (data.start_date/data.end_date) overlaps the holdout;
+#   * research validation (strategy/research_validation.py) drops holdout rows
+#     before factor screening and walk-forward.
+# Both dates are inclusive and must satisfy start_date < end_date.
+# Empty (the default) means the holdout is disabled and behaviour is unchanged.
+research:
+  holdout:
+    start_date: ""           # ISO date, e.g. "2025-01-01"
+    end_date: ""             # ISO date, e.g. "2025-12-31"

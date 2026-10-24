@@ -10,50 +10,73 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+from quant_platform.core.instrument import (
+    normalize_symbol,
+    symbol_code,
+    symbol_exchange,
+)
 from quant_platform.trading.broker import OrderSide, OrderStatus, OrderType
 
 # ── Exchange detection ──
 
 
 def classify_exchange(code: str) -> str:
-    """Return 'SH' or 'SZ' based on A-share code prefix."""
-    if "." in code:
-        code = code.split(".")[0]
-    return "SH" if code.startswith(("6", "9")) else "SZ"
+    """Return the exchange (``SH``/``SZ``/``BJ``) for an A-share symbol.
+
+    Accepts bare codes, suffix forms (``600519.SH``), prefix forms
+    (``sz300001``, ``sh.688001``) and Beijing codes (``4``/``8``/``920`` via
+    ``bj.``).  The old implementation split on ``"."`` and treated everything
+    that did not start with 6/9 as Shenzhen, so ``sh.688001`` mapped to SZ and
+    every Beijing name was routed to Shenzhen.
+    """
+    exchange = symbol_exchange(code)
+    if exchange:
+        return exchange
+    # Defensive fallback for malformed input: keep the historical default.
+    return "SH" if str(code).startswith(("6", "9")) else "SZ"
 
 
 # ── Symbol mapping ──
 
 
 def to_qmt_code(code: str) -> str:
-    """Convert internal code to QMT format.
+    """Convert an internal symbol to QMT's canonical ``CODE.EXCHANGE`` form.
 
-    '600519'  -> '600519.SH'
-    '000001'  -> '000001.SZ'
-    '600519.SH' -> '600519.SH'  (no-op)
+    Accepts bare codes, prefix styles and already-canonical symbols:
+    ``600519`` -> ``600519.SH``, ``sz300001`` -> ``300001.SZ``,
+    ``920001`` -> ``920001.BJ``.
     """
-    if "." in code:
-        return code
+    canonical = normalize_symbol(code)
+    if symbol_exchange(canonical):
+        return canonical
     exchange = classify_exchange(code)
-    return f"{code}.{exchange}"
+    digits = symbol_code(code) or str(code)
+    return f"{digits}.{exchange}"
 
 
 def from_qmt_code(code: str) -> str:
-    """Convert QMT format back to internal code.
+    """Convert a QMT symbol back to its bare six-digit internal code.
 
-    '600519.SH' -> '600519'
-    '000001.SZ' -> '000001'
+    ``600519.SH`` -> ``600519``; unknown/malformed values are returned
+    unchanged (without the suffix) so callers can still log them.
     """
+    digits = symbol_code(code)
+    if digits is not None:
+        return digits
     return code.split(".")[0] if "." in code else code
 
 
 def to_qmt_exchange(code: str) -> int:
-    """Return QMT exchange constant for a code.
+    """Return the QMT market constant for a symbol.
 
-    Import safety: returns int 1 for SH, 2 for SZ.
+    QMT/xtquant market ids: 1 = Shanghai, 2 = Shenzhen, 0 = Beijing.
     """
     exchange = classify_exchange(code)
-    return 1 if exchange == "SH" else 2  # 1=SH, 2=SZ
+    if exchange == "SH":
+        return 1
+    if exchange == "SZ":
+        return 2
+    return 0  # Beijing (bj.xxxxxx)
 
 
 # ── Order type mapping ──
@@ -81,34 +104,69 @@ def to_qmt_order_type(side: OrderSide) -> int:
     return 23 if side == OrderSide.BUY else 24
 
 
+def from_qmt_order_type(qmt_order_type: Any) -> OrderSide:
+    """Map an xtconstant order type (``XtOrder.order_type``) back to OrderSide.
+
+    23 = STOCK_BUY, 24 = STOCK_SELL. Unknown/missing values default to BUY,
+    matching the historical direction assumption used when such an order
+    could only be read back from the broker (there was no direction before).
+    """
+    try:
+        value = int(qmt_order_type)
+    except (TypeError, ValueError):
+        return OrderSide.BUY
+    return OrderSide.SELL if value == 24 else OrderSide.BUY
+
+
+def from_qmt_price_type(qmt_price_type: Any) -> OrderType:
+    """Map an xtconstant price type (``XtOrder.price_type``) back to OrderType.
+
+    5 = LATEST_PRICE (market), 11 = FIX_PRICE (limit). Anything else is
+    treated as a limit order because that is the only safe interpretation of
+    an explicit ``price`` field.
+    """
+    try:
+        value = int(qmt_price_type)
+    except (TypeError, ValueError):
+        return OrderType.LIMIT
+    return OrderType.MARKET if value == 5 else OrderType.LIMIT
+
+
 # ── Status mapping ──
 
 
 class QMTOrderStatus(IntEnum):
-    """QMT order status codes (xtconstant)."""
-    UNREPORTED = 0
-    WAIT_REPORTING = 1
-    REPORTED = 2
-    WAIT_CANCEL = 10
-    PART_CANCELED = 11
-    CANCELED = 12
-    PART_FILLED = 22
-    FILLED = 23
-    PART_CANCEL_FILLED = 24
-    WAIT_SENDING = 50
+    """QMT order status codes (xtconstant.xt_order_status).
+
+    xtquant reports ``XtOrder.order_status`` with these values. The table
+    previously used 0/1/2/10/11/12/22/23/24/50 -- codes from a different
+    API -- so every real XtOrder status fell through to PENDING.
+    """
+    UNREPORTED = 48
+    WAIT_REPORTING = 49
+    REPORTED = 50
+    REPORTED_CANCEL = 51        # reported, cancellation pending
+    PARTSUCC_CANCEL = 52        # partially filled, cancellation pending
+    PART_CANCEL = 53            # partially filled, rest cancelled
+    CANCELED = 54
+    PART_SUCC = 55
+    SUCCEEDED = 56
+    JUNK = 57                   # rejected / invalid order
+    UNKNOWN = 255
 
 
 QMT_STATUS_MAP: dict[int, OrderStatus] = {
-    0:  OrderStatus.PENDING,
-    1:  OrderStatus.PENDING,
-    2:  OrderStatus.SUBMITTED,
-    10: OrderStatus.SUBMITTED,
-    11: OrderStatus.PARTIAL,
-    12: OrderStatus.CANCELLED,
-    22: OrderStatus.PARTIAL,
-    23: OrderStatus.FILLED,
-    24: OrderStatus.PARTIAL,
-    50: OrderStatus.PENDING,
+    QMTOrderStatus.UNREPORTED: OrderStatus.PENDING,
+    QMTOrderStatus.WAIT_REPORTING: OrderStatus.PENDING,
+    QMTOrderStatus.REPORTED: OrderStatus.SUBMITTED,
+    QMTOrderStatus.REPORTED_CANCEL: OrderStatus.SUBMITTED,
+    QMTOrderStatus.PARTSUCC_CANCEL: OrderStatus.PARTIAL,
+    QMTOrderStatus.PART_CANCEL: OrderStatus.CANCELLED,
+    QMTOrderStatus.CANCELED: OrderStatus.CANCELLED,
+    QMTOrderStatus.PART_SUCC: OrderStatus.PARTIAL,
+    QMTOrderStatus.SUCCEEDED: OrderStatus.FILLED,
+    QMTOrderStatus.JUNK: OrderStatus.REJECTED,
+    QMTOrderStatus.UNKNOWN: OrderStatus.PENDING,
 }
 
 
@@ -163,17 +221,87 @@ class QMTExecution:
 def qmt_trade_to_dict(qmt_trade: Any) -> dict:
     """Convert a QMT trade object to a plain dict.
 
-    Handles both xtquant objects and mock dicts during testing.
+    Handles both xtquant objects and mock dicts during testing. Real XtTrade
+    reports carry the ``traded_*`` names (``traded_id`` / ``traded_price`` /
+    ``traded_volume`` / ``traded_amount``); the plain aliases are kept for
+    mocks and for the legacy async-response shape.
     """
     if isinstance(qmt_trade, dict):
-        return qmt_trade
+        # Normalize raw XtTrade-style keys onto the internal names the
+        # reconciliation path reads, without mutating or dropping any of the
+        # caller's keys (plain internal dicts pass through unchanged).
+        normalized = dict(qmt_trade)
+        aliases = (
+            ("traded_volume", "quantity"),
+            ("traded_price", "price"),
+            ("traded_id", "trade_id"),
+            ("traded_amount", "amount"),
+            ("stock_code", "code"),
+        )
+        for source, target in aliases:
+            if target not in normalized and source in normalized:
+                normalized[target] = normalized[source]
+        return normalized
 
     result: dict[str, Any] = {}
-    for attr in ("order_id", "trade_id", "stock_code", "price",
-                 "volume", "trade_amount", "order_type", "trade_time"):
+    for attr, key in (
+        # xtquant XtTrade fields.
+        ("traded_id", "trade_id"),
+        ("traded_price", "price"),
+        ("traded_volume", "quantity"),
+        ("traded_amount", "amount"),
+        ("order_sysid", "order_sysid"),
+        # Legacy/mock field names (applied after, so they win when present).
+        ("order_id", "order_id"),
+        ("trade_id", "trade_id"),
+        ("stock_code", "code"),
+        ("price", "price"),
+        ("volume", "quantity"),
+        ("trade_amount", "amount"),
+        ("order_type", "order_type"),
+        ("trade_time", "trade_time"),
+    ):
         val = getattr(qmt_trade, attr, None)
         if val is not None:
-            key = attr.replace("stock_code", "code").replace("volume", "quantity")
+            result[key] = val
+    return result
+
+
+def qmt_order_to_dict(qmt_order: Any) -> dict:
+    """Convert a QMT order object (``XtOrder``) to a plain dict.
+
+    Handles both xtquant objects and mock dicts. Only the fields the
+    reconciliation path needs are extracted; ``order_id`` is the broker order
+    id returned by ``order_stock``/``query_stock_orders`` and ``order_status``
+    is the raw xtconstant status code (map with ``qmt_status_to_internal``).
+    """
+    if isinstance(qmt_order, dict):
+        # Same normalization as qmt_trade_to_dict: a dict shaped like an
+        # XtOrder carries stock_code, while the reconciliation code reads
+        # code. Keep every original key.
+        normalized = dict(qmt_order)
+        if "code" not in normalized and "stock_code" in normalized:
+            normalized["code"] = normalized["stock_code"]
+        return normalized
+
+    result: dict[str, Any] = {}
+    for attr, key in (
+        ("order_id", "order_id"),
+        ("order_sysid", "order_sysid"),
+        ("stock_code", "code"),
+        ("order_type", "order_type"),
+        ("order_volume", "order_volume"),
+        ("price_type", "price_type"),
+        ("price", "price"),
+        ("traded_volume", "traded_volume"),
+        ("traded_price", "traded_price"),
+        ("order_status", "order_status"),
+        ("status_msg", "status_msg"),
+        ("order_time", "order_time"),
+        ("strategy_name", "strategy_name"),
+    ):
+        val = getattr(qmt_order, attr, None)
+        if val is not None:
             result[key] = val
     return result
 

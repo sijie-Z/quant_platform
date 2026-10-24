@@ -23,6 +23,11 @@ from quant_platform.factors.technical import register_all as register_technical 
 from quant_platform.lab.registry import DEFAULT_DB, RunStore  # noqa: E402
 from quant_platform.lab.reports import generate_report  # noqa: E402
 
+#: A factor that produced fewer cross-sectional IC observations than this has
+#: not been evaluated in any meaningful sense. Recording it as a success is
+#: what produced a live registry row with n_ic_obs=0 and ic_mean=None.
+MIN_IC_OBS = 20
+
 
 def available_factors() -> list[str]:
     register_technical()
@@ -88,22 +93,58 @@ def run_synthetic_factor(
     store = RunStore(str(db_path))
     run_id = store.begin_run(f"synthetic_{factor_name}", {
         "data_source": "synthetic",
+        "data_meta": {
+            "provider": "synthetic",
+            "adjust": "none",
+            "seed": seed,
+            "n_stocks": n_stocks,
+            "n_days": n_days,
+            "panel_start": str(dates[0].date()),
+            "panel_end": str(dates[-1].date()),
+            "description": "Offline synthetic price panel; not market data",
+        },
+        "universe_provider": "SyntheticDataProvider",
+        "universe_meta": {
+            "provider": "SyntheticDataProvider",
+            "kind": "synthetic",
+            "pit": False,
+            "bias_warning": ["synthetic_data_not_market_data"],
+            "description": "Simulated universe; trust applies to the code path, not to market claims",
+        },
         "factor": factor_name,
         "factor_params": getattr(cls(), "params", {}),
         "warnings": [],
     })
+    n_ic_obs = int(len(ic_series))
+    warnings: list[str] = []
+    if n_ic_obs < MIN_IC_OBS:
+        status = "failed"
+        reason = (
+            f"insufficient_ic_observations: n_ic_obs={n_ic_obs} "
+            f"< MIN_IC_OBS={MIN_IC_OBS}"
+        )
+        warnings.append(reason)
+    else:
+        status = "success"
+        reason = None
     evaluation = {
-        "n_ic_obs": int(len(ic_series)),
+        "n_ic_obs": n_ic_obs,
         "ic_mean": round(float(stats.get("mean_ic", float("nan"))), 4) if stats else None,
         "icir": round(float(stats.get("icir", float("nan"))), 4) if stats else None,
         "ic_positive_ratio": round(float(stats.get("ic_positive_ratio", float("nan"))), 4) if stats else None,
+        "data_start": str(dates[0].date()),
+        "data_end": str(dates[-1].date()),
+        "status_reason": reason or "ok",
     }
-    store.finish_run(run_id, status="success", evaluation=evaluation, report_path=None, warnings=[])
+    store.finish_run(run_id, status=status, evaluation=evaluation,
+                     report_path=None, reason=reason, warnings=warnings)
     report_path = generate_report(store.get_run(run_id), out_dir=str(out_dir))
-    store.finish_run(run_id, status="success", evaluation=evaluation, report_path=report_path, warnings=[])
+    store.finish_run(run_id, status=status, evaluation=evaluation,
+                     report_path=report_path, reason=reason, warnings=warnings)
 
     print(f"[synthetic_factor_run] {factor_name}: IC={evaluation['ic_mean']} "
-          f"ICIR={evaluation['icir']} run={run_id} report={report_path}")
+          f"ICIR={evaluation['icir']} n_ic_obs={n_ic_obs} status={status} "
+          f"run={run_id} report={report_path}")
     return run_id
 
 
