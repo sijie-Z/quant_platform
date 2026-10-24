@@ -1,4 +1,5 @@
 {
+  "annualization_periods_per_year": 252,
   "as_of": "2025-06-30",
   "benchmark": {
     "annualized_return": 0.26442826889242177,

@@ -39,6 +39,12 @@ Execution and accounting contract
 * **Benchmark.** Equal-weight, daily-rebalanced mean of the cached universe's
   close-to-close returns over the same window (the ``daily_ew`` convention in
   ``tools/real_data_research.py``). The execution row is 0.0.
+* **Scope.** One target per ledger: this version builds the book once and
+  then lets it drift -- there is no scheduled rebalancing after the build.
+  To track a different target, use a different ``--out-dir``; an existing
+  ledger refuses to mix targets, capital, cost mode, or stale policy.
+  Positions are weight-level (the platform backtest does not round to
+  100-share lots either).
 
 Idempotent accumulation
 -----------------------
@@ -707,6 +713,7 @@ def build_summary(
         "stale_policy": STALE_POLICY,
         "benchmark_definition": BENCHMARK_DEFINITION,
         "risk_free_rate": RISK_FREE_ANNUAL,
+        "annualization_periods_per_year": PERIODS_PER_YEAR,
         "target_file": target_file,
         "target_sha256": target_sha256,
         "n_target_assets": simulation.n_target_assets,
