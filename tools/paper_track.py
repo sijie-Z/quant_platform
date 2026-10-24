@@ -14,6 +14,17 @@ Execution and accounting contract
   session *strictly after* the target's ``as_of`` date -- the same
   "next session at the close" convention as the backtest engine. The target's
   ``as_of`` row itself is never traded on.
+* **Returns (ex-rights).** Asset and benchmark returns are Baostock
+  ``pct_chg / 100``, whose ``preclose`` is adjusted for ex-rights events, so a
+  dividend or split is not booked as a loss (raw close ratios would be). Raw
+  ``close`` is used only to convert share volume into CNY traded value for the
+  cost model, and as the reference price a stale position is liquidated at.
+* **Tradability gate (R9/R19a).** A target asset is bought on the execution
+  close only when it has ``close > 0``, a finite ``pct_chg``, ``volume > 0``
+  (the R9 ``tradable_mask``), and did not close limit-up
+  (``pct_chg > 9.8%``, the platform's limit-up approximation). Blocked or
+  untradable weight stays in cash and a warning is recorded -- the tool never
+  assumes a fill that could not have happened.
 * **Costs (R9 basis).** On the execution day the tool buys the target book
   from cash and charges :class:`~quant_platform.backtest.cost_model.CostModel`
   exactly the way the engine does: CNY buy notionals
@@ -23,22 +34,30 @@ Execution and accounting contract
   tax (no sells on a build, so the stamp tax is zero), the per-order CNY 5
   commission floor, the both-sides transfer fee, and -- with
   ``--cost-mode impact`` -- the square-root impact rule on participation.
-  Volatility is the causal ``rolling(20).std().shift(1).fillna(0.02)``
-  estimate used by the engine.
-* **Drift.** Between executions weights drift with the assets' close-to-close
-  returns; cash earns nothing. NAV is close-to-close: the execution row's only
-  return is the build cost, and each later row's return is the drifted book's
-  return from the previous close.
-* **Stale prices.** A held asset with no valid close on a session is held at
-  its last valid close (return 0) and counted in ``stale_assets`` -- it is
-  never silently marked to zero. After ``--max-stale-sessions`` consecutive
-  missing closes (default 20; 0 disables) the position is liquidated at its
-  last valid close, the proceeds become cash, and a warning is recorded. A
-  target asset without a valid close *on the execution date* is not bought at
-  all; its weight stays in cash (warning).
+  Volatility is the causal ``rolling(20).std()`` estimate on the same
+  ``pct_chg`` returns (backward-looking rows make the unshifted window at
+  the execution close identical to the engine's forward-panel
+  ``shift(1)`` window). If the modelled build cost would
+  exhaust the capital the run aborts before writing anything.
+* **Drift.** Between executions weights drift with the assets' returns; cash
+  earns nothing. NAV is close-to-close: the execution row's only return is
+  the build cost, and each later row's return is the drifted book's return
+  from the previous close.
+* **Stale prices.** A session is *stale* for a held asset when its ``pct_chg``
+  or ``volume`` is missing/NaN or the volume is zero (the cache encodes
+  intra-series suspensions as a repeated close with NaN/zero volume and
+  ``pct_chg``, not as a NaN close). A stale session is held at the last valid
+  close with return 0 and counted in ``stale_assets``; it is never silently
+  marked to zero. When the price returns, the resume-day ``pct_chg`` carries
+  the whole gap return. After ``--max-stale-sessions`` consecutive stale
+  sessions (default 20; 0 disables) the position is liquidated at its last
+  valid close and the proceeds become cash, with a warning. Liquidation is a
+  valuation convention and books no trade cost: there is no tradable price to
+  charge it against.
 * **Benchmark.** Equal-weight, daily-rebalanced mean of the cached universe's
-  close-to-close returns over the same window (the ``daily_ew`` convention in
-  ``tools/real_data_research.py``). The execution row is 0.0.
+  ``pct_chg`` returns over the same window (the ``daily_ew`` convention in
+  ``tools/real_data_research.py``); an asset is excluded from a session when
+  its observation is stale by the same rule. The execution row is 0.0.
 * **Scope.** One target per ledger: this version builds the book once and
   then lets it drift -- there is no scheduled rebalancing after the build.
   To track a different target, use a different ``--out-dir``; an existing
@@ -52,14 +71,16 @@ Idempotent accumulation
 leaves ``nav.csv`` byte-for-byte untouched, and rewrites ``summary.json`` with
 identical content (it contains no timestamps). When the cache grows, only
 dates after the last ledger row are appended; existing rows are preserved
-verbatim. Mixing a different target, capital, cost mode, or stale policy into
-an existing out-dir is refused. If a revised cache would change already-written
-NAV values, the tool keeps the ledger rows but records the discrepancy in
+verbatim. Mixing a different target, capital, cost mode, stale policy, or
+ledger version into an existing out-dir is refused, and a ``nav.csv`` without
+its ``summary.json`` is treated as an unverifiable orphan and refused rather
+than appended to. If a revised cache would change already-written NAV values,
+the tool keeps the ledger rows but records the discrepancy in
 ``summary.json`` warnings.
 
 Errors (target beyond the cache, no session after ``as_of``, malformed target
-or panel) exit non-zero before anything is written, so a failed run never
-leaves a half-built ledger.
+or panel, a build cost that would exhaust capital) exit non-zero before
+anything is written, so a failed run never leaves a half-built ledger.
 
 Outputs (in ``--out-dir``)
 --------------------------
@@ -69,8 +90,8 @@ n_positions, stale_assets, costs_paid``.
 
 ``summary.json`` carries since-inception return / annualized / Sharpe / max
 drawdown, the benchmark on the same window, tracking difference and tracking
-error, the execution date, total costs, warnings, and the mandatory
-``disclaimer``.
+error, the execution date, total costs, the return/tradability bases,
+warnings, and the mandatory ``disclaimer``.
 
 Usage::
 
@@ -84,6 +105,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import math
@@ -109,12 +131,12 @@ from quant_platform.backtest.cost_model import CostModel
 from quant_platform.backtest.metrics import (
     annualized_return,
     annualized_volatility,
-    max_drawdown,
     sharpe_ratio,
     tracking_error,
 )
 
 DISCLAIMER = "paper tracking only; style-tilt demo, not validated alpha"
+LEDGER_VERSION = 2
 NAV_COLUMNS = (
     "date",
     "nav",
@@ -135,14 +157,27 @@ DEFAULT_MAX_STALE_SESSIONS = 20
 VOL_LOOKBACK = 20
 VOL_MIN_PERIODS = 5
 VOL_FALLBACK = 0.02
+LIMIT_UP_PCT = 9.8
+RETURN_BASIS = (
+    "pct_chg/100 (Baostock ex-rights preclose); raw close is used only for "
+    "volume x price cost conversion and the stale liquidation reference"
+)
+TRADABLE_GATE = (
+    "execution buys require close > 0, finite pct_chg, volume > 0 (R9 "
+    "tradable_mask) and pct_chg <= 9.8% (R19a limit-up approximation); "
+    "blocked weight stays in cash with a warning"
+)
 BENCHMARK_DEFINITION = (
-    "equal-weight daily-rebalanced mean of the cached universe's "
-    "close-to-close returns"
+    "equal-weight daily-rebalanced mean of the cached universe's pct_chg "
+    "close-to-close returns over the same window; stale observations are "
+    "excluded from that session"
 )
 STALE_POLICY = (
-    "hold at the last valid close (return 0, flagged stale); after "
-    "max_stale_sessions consecutive missing closes, liquidate at the last "
-    "close and hold the proceeds as cash"
+    "a session is stale when pct_chg or volume is missing/zero; hold at the "
+    "last valid close (return 0, flagged stale); when the price returns the "
+    "resume-day pct_chg carries the gap return; after max_stale_sessions "
+    "consecutive stale sessions, liquidate at the last valid close with no "
+    "extra trade cost (no tradable price exists) and hold the proceeds as cash"
 )
 REVISION_NAV_TOLERANCE = 1e-6
 
@@ -163,6 +198,24 @@ def _normalize_code(value: Any) -> str:
     return text
 
 
+def _parse_target_date(value: Any) -> pd.Timestamp:
+    """Parse the target ``as_of``; integers are YYYYMMDD, never epoch ns."""
+    if isinstance(value, bool) or not isinstance(
+        value, (str, int, np.integer, dt.date, pd.Timestamp),
+    ):
+        raise PaperTrackError(
+            f"target 'as_of' must be a date string or YYYYMMDD integer; "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        parsed = pd.to_datetime(str(int(value)), format="%Y%m%d", errors="coerce")
+    else:
+        parsed = pd.to_datetime(value, errors="coerce")
+    if not isinstance(parsed, pd.Timestamp) or pd.isna(parsed):
+        raise PaperTrackError(f"target 'as_of' is not a parseable date: {value!r}")
+    return parsed.normalize()
+
+
 def load_target(path: Path) -> tuple[pd.Timestamp, pd.Series]:
     """Read ``{as_of, weights}`` and return (as_of, normalised weights)."""
     path = Path(path)
@@ -178,12 +231,7 @@ def load_target(path: Path) -> tuple[pd.Timestamp, pd.Series]:
         )
     if "as_of" not in payload:
         raise PaperTrackError("target file is missing 'as_of'")
-    as_of = pd.to_datetime(payload["as_of"], errors="coerce")
-    if pd.isna(as_of):
-        raise PaperTrackError(
-            f"target 'as_of' is not a parseable date: {payload['as_of']!r}"
-        )
-    as_of = pd.Timestamp(as_of).normalize()
+    as_of = _parse_target_date(payload["as_of"])
 
     raw = payload["weights"]
     if not isinstance(raw, dict) or not raw:
@@ -234,8 +282,29 @@ def _parse_date_level(dates: pd.Index) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(parsed)
 
 
-def load_cache(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load the cached daily panel and return (close, volume) wide panels."""
+@dataclass
+class Panels:
+    """Wide (date x asset) panels needed for execution and accounting."""
+
+    close: pd.DataFrame
+    volume: pd.DataFrame
+    pct_chg: pd.DataFrame  # percent, Baostock ex-rights basis
+
+    def observation_mask(self) -> pd.DataFrame:
+        """Sessions with a usable, traded observation (the stale complement)."""
+        return (
+            self.pct_chg.notna()
+            & self.volume.notna()
+            & (self.volume > 0)
+        )
+
+    def returns(self) -> pd.DataFrame:
+        """``pct_chg/100`` where the session observation is usable, else NaN."""
+        return (self.pct_chg / 100.0).where(self.observation_mask())
+
+
+def load_cache(path: Path) -> Panels:
+    """Load the cached daily panel into close / volume / pct_chg panels."""
     path = Path(path)
     if not path.is_file():
         raise PaperTrackError(f"cache panel not found: {path}")
@@ -255,7 +324,7 @@ def load_cache(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         )
     if names != ["date", "asset"]:
         frame = frame.reorder_levels(["date", "asset"]).sort_index()
-    for column in ("close", "volume"):
+    for column in ("close", "volume", "pct_chg"):
         if column not in frame.columns:
             raise PaperTrackError(
                 f"cache panel is missing required column: {column!r}"
@@ -274,10 +343,9 @@ def load_cache(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             f"cache panel has {duplicated} duplicated (date, asset) rows"
         )
     close = frame["close"].unstack("asset").sort_index().astype(float)
-    volume = (
-        frame["volume"].unstack("asset").reindex_like(close).astype(float)
-    )
-    return close, volume
+    volume = frame["volume"].unstack("asset").reindex_like(close).astype(float)
+    pct_chg = frame["pct_chg"].unstack("asset").reindex_like(close).astype(float)
+    return Panels(close=close, volume=volume, pct_chg=pct_chg)
 
 
 # ---------------------------------------------------------------------------
@@ -311,31 +379,57 @@ def _build_cost_model(cost_mode: str) -> CostModel:
     )
 
 
-def _vol_panel(close: pd.DataFrame) -> pd.DataFrame:
-    """Causal daily volatility, exactly the engine's fallback estimate.
+def _vol_panel(returns: pd.DataFrame) -> pd.DataFrame:
+    """Causal daily volatility on the same basis as the engine.
 
-    At close(d) only returns before d are observable, so the rolling window is
-    shifted one session; short histories fall back to 2% daily.
+    ``returns`` here is already backward-looking: row d is the ``pct_chg``
+    return realized *into* close d. The engine's forward-return panel uses
+    ``rolling(20).std().shift(1)``, which at the execution close e covers
+    ``pct_chg`` dates up to and including e; on this backward panel the same
+    observation set is the unshifted rolling std at e. Short histories fall
+    back to 2% daily.
     """
-    returns = close.pct_change(fill_method=None)
     return (
         returns.rolling(VOL_LOOKBACK, min_periods=VOL_MIN_PERIODS)
         .std()
-        .shift(1)
         .fillna(VOL_FALLBACK)
     )
+
+
+def _execution_block_reason(close, volume, pct_chg, asset) -> str | None:
+    """Why a target asset cannot be bought at the execution close (or None)."""
+    if asset not in close.index:
+        return "is not present in the cached panel"
+    price = close.get(asset, np.nan)
+    shares = volume.get(asset, np.nan)
+    change = pct_chg.get(asset, np.nan)
+    if not (np.isfinite(price) and price > 0):
+        return "has no valid close on the execution date"
+    if not (np.isfinite(change) and np.isfinite(shares) and shares > 0):
+        return (
+            "is not tradable on the execution date (missing pct_chg or "
+            "zero/NaN volume)"
+        )
+    if change > LIMIT_UP_PCT:
+        return (
+            f"closed limit-up on the execution date (pct_chg {change:.4f}% > "
+            f"{LIMIT_UP_PCT}%); the buy is blocked"
+        )
+    return None
 
 
 def simulate(
     weights: pd.Series,
     as_of: pd.Timestamp,
-    close: pd.DataFrame,
-    volume: pd.DataFrame,
+    panels: Panels,
     capital: float,
     cost_mode: str,
     max_stale_sessions: int,
 ) -> Simulation:
     """Run the close-to-close paper book; raise on insufficient data."""
+    close = panels.close
+    volume = panels.volume
+    pct_chg = panels.pct_chg
     dates = close.index
     if len(dates) == 0:
         raise PaperTrackError("cache panel contains no sessions")
@@ -354,27 +448,31 @@ def simulate(
     execution = pd.Timestamp(dates[position])
 
     warnings: list[str] = []
-    exec_prices = close.loc[execution]
+    if position == len(dates) - 1:
+        warnings.append(
+            f"{execution.date()}: the execution day is the last cached "
+            "session; the ledger has no tracking sessions yet (build row only)"
+        )
+
+    exec_close = close.loc[execution]
+    exec_volume = volume.loc[execution]
+    exec_pct = pct_chg.loc[execution]
     target = weights.copy()
 
-    # Assets without a valid close on the execution date cannot be bought at
-    # that close; their weight stays in cash for the whole run.
-    valid = pd.Series(False, index=target.index)
+    buyable = pd.Series(False, index=target.index)
     for asset in target.index:
-        if asset not in close.columns:
-            continue
-        price = exec_prices.get(asset, np.nan)
-        valid.loc[asset] = bool(np.isfinite(price) and price > 0)
-    unpurchased = sorted(target.index[~valid])
-    for asset in unpurchased:
-        warnings.append(
-            f"{execution.date()}: target asset {asset} has no valid close on "
-            "the execution date; its weight is held as cash and never bought"
-        )
-    buy_weights = target[valid].astype(float)
+        reason = _execution_block_reason(exec_close, exec_volume, exec_pct, asset)
+        if reason is None:
+            buyable.loc[asset] = True
+        else:
+            warnings.append(
+                f"{execution.date()}: target asset {asset} {reason}; its "
+                "weight is held as cash and not bought"
+            )
+    buy_weights = target[buyable].astype(float)
     if buy_weights.empty:
         raise PaperTrackError(
-            f"no target asset has a valid close on the execution date "
+            f"no target asset is tradable on the execution date "
             f"{execution.date()}; nothing to buy"
         )
     gross = float(buy_weights.sum())
@@ -382,21 +480,22 @@ def simulate(
     cash_at_build = cash_weight
 
     # --- Build cost: CostModel on CNY notional, volume in CNY (R9 basis) ---
+    # Buyability required a positive share volume and a positive raw close, so
+    # the CNY traded value below is finite and positive by construction.
     notional = buy_weights * capital
     volume_cny: pd.Series | None = None
     vol_row: pd.Series | None = None
     if cost_mode == "impact":
-        # Engine parity: missing volume cells use the cross-sectional median.
-        shares = volume.loc[execution].reindex(buy_weights.index)
-        traded_cny = shares * exec_prices.reindex(buy_weights.index)
-        if traded_cny.notna().any():
-            volume_cny = traded_cny.fillna(float(traded_cny.median())).astype(float)
-        else:
-            warnings.append(
-                f"{execution.date()}: no volume data for the bought assets; "
-                "CostModel falls back to fixed slippage"
+        shares = exec_volume.reindex(buy_weights.index).astype(float)
+        volume_cny = shares * exec_close.reindex(buy_weights.index).astype(float)
+        if not np.isfinite(volume_cny.to_numpy()).all() or (volume_cny <= 0).any():
+            raise PaperTrackError(
+                f"{execution.date()}: non-positive CNY volume for a bought "
+                "asset despite the tradability gate; refusing to price costs"
             )
-        vol_row = _vol_panel(close).loc[execution].reindex(buy_weights.index)
+        vol_row = _vol_panel(panels.returns()).loc[execution].reindex(
+            buy_weights.index
+        )
     cost_model = _build_cost_model(cost_mode)
     costs = cost_model.compute_costs(
         float(notional.sum()),
@@ -412,11 +511,18 @@ def simulate(
         raise PaperTrackError(
             f"cost model produced an invalid cost fraction {cost_fraction!r}"
         )
+    if cost_fraction >= 1.0:
+        raise PaperTrackError(
+            f"build cost {cost_fraction:.6f} of capital would exhaust the "
+            f"{capital:.2f} CNY book; increase --capital or reduce the book"
+        )
     cost_cny = cost_fraction * capital
     nav_prev = capital * (1.0 - cost_fraction)
+    if not math.isfinite(nav_prev) or nav_prev <= 0:
+        raise PaperTrackError("build produced a non-positive NAV; refusing to write")
 
     held = buy_weights.astype(float).copy()
-    last_price = {asset: float(exec_prices[asset]) for asset in held.index}
+    last_price = {asset: float(exec_close[asset]) for asset in held.index}
     stale_streak = {asset: 0 for asset in held.index}
 
     rows: list[dict[str, Any]] = [
@@ -433,18 +539,20 @@ def simulate(
         }
     ]
     peak = capital
-    benchmark = close.pct_change(fill_method=None).mean(axis=1, skipna=True)
+    benchmark = panels.returns().mean(axis=1, skipna=True)
 
     for date in dates[position + 1:]:
         date = pd.Timestamp(date)
         asset_returns: dict[str, float] = {}
         stale_today: list[str] = []
         for asset in held.index:
-            price = close.at[date, asset]
-            if np.isfinite(price) and price > 0:
-                base = last_price[asset]
-                asset_returns[asset] = float(price) / base - 1.0
-                last_price[asset] = float(price)
+            change = pct_chg.at[date, asset]
+            shares = volume.at[date, asset]
+            if np.isfinite(change) and np.isfinite(shares) and shares > 0:
+                asset_returns[asset] = float(change) / 100.0
+                price = close.at[date, asset]
+                if np.isfinite(price) and price > 0:
+                    last_price[asset] = float(price)
                 stale_streak[asset] = 0
             else:
                 # Held at the last valid close: zero return, explicitly stale.
@@ -460,6 +568,11 @@ def simulate(
                 "not a valid long-only daily return"
             )
         nav = nav_prev * (1.0 + portfolio_return)
+        if not math.isfinite(nav) or nav <= 0:
+            raise PaperTrackError(
+                f"{date.date()}: NAV would be non-positive ({nav!r}); "
+                "refusing to write"
+            )
         held = (held * (1.0 + r)) / (1.0 + portfolio_return)
         cash_weight /= 1.0 + portfolio_return
 
@@ -473,10 +586,10 @@ def simulate(
                     stale_streak.pop(asset, None)
                     liquidated.append(asset)
                     warnings.append(
-                        f"{date.date()}: {asset} had no valid close for "
+                        f"{date.date()}: {asset} had no valid price for "
                         f"{max_stale_sessions} consecutive sessions; "
                         f"liquidated at its last close {frozen:.6f} and held "
-                        "as cash"
+                        "as cash (no trade cost: no tradable price exists)"
                     )
 
         bench_return = benchmark.get(date, 0.0)
@@ -578,6 +691,7 @@ def _check_existing_summary(
             f"{summary_path} exists but is not valid JSON; refusing to append"
         ) from exc
     checks = (
+        ("ledger_version", LEDGER_VERSION, "ledger version (return basis)"),
         ("target_sha256", target_sha256, "target file"),
         ("capital", float(capital), "capital"),
         ("cost_mode", cost_mode, "cost mode"),
@@ -619,11 +733,12 @@ def _merged_series(lines: list[str]) -> dict[str, Any]:
         bench.append(float(parts[3]))
         stale.append(int(parts[7]))
         costs.append(float(parts[8]))
+    index = pd.DatetimeIndex(dates)
     return {
-        "dates": pd.DatetimeIndex(dates),
+        "dates": index,
         "nav": np.asarray(nav, dtype=float),
-        "daily": pd.Series(daily, index=pd.DatetimeIndex(dates)),
-        "bench": pd.Series(bench, index=pd.DatetimeIndex(dates)),
+        "daily": pd.Series(daily, index=index),
+        "bench": pd.Series(bench, index=index),
         "costs": np.asarray(costs, dtype=float),
         "stale": np.asarray(stale, dtype=int),
     }
@@ -638,41 +753,55 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _metrics(series: pd.Series) -> dict[str, Any]:
-    """Annualized return / vol / Sharpe / max drawdown on an explicit 252-day year."""
-    n = len(series)
-    if n == 0:
-        return {"annualized_return": None, "annualized_volatility": None,
-                "sharpe_ratio": None, "max_drawdown": None,
-                "max_drawdown_peak": None, "max_drawdown_trough": None}
-    mdd, peak_date, trough_date = max_drawdown(series)
-    if n < 2:
-        return {
-            "annualized_return": None,
-            "annualized_volatility": None,
-            "sharpe_ratio": None,
-            "max_drawdown": _finite(mdd),
-            "max_drawdown_peak": (
-                str(peak_date.date()) if pd.notna(peak_date) else None
-            ),
-            "max_drawdown_trough": (
-                str(trough_date.date()) if pd.notna(trough_date) else None
-            ),
-        }
-    return {
-        "annualized_return": _finite(annualized_return(series, PERIODS_PER_YEAR)),
-        "annualized_volatility": _finite(
-            annualized_volatility(series, PERIODS_PER_YEAR)
-        ),
-        "sharpe_ratio": _finite(
-            sharpe_ratio(series, RISK_FREE_ANNUAL, PERIODS_PER_YEAR)
-        ),
+def _drawdown_stats(
+    nav: np.ndarray, dates: pd.DatetimeIndex, initial: float,
+) -> tuple[float, str | None, str | None]:
+    """Max drawdown on the NAV path itself (dates are close-of-day labels).
+
+    The platform's ``max_drawdown`` helper treats a return series as labelled
+    by period *start*; a ledger row is labelled by its close, so the peak and
+    trough dates are derived directly from the wealth path here.
+    """
+    wealth = np.concatenate(([float(initial)], np.asarray(nav, dtype=float)))
+    peaks = np.maximum.accumulate(wealth)
+    drawdowns = wealth / peaks - 1.0
+    trough_idx = int(np.argmin(drawdowns))
+    worst = float(drawdowns[trough_idx])
+    if trough_idx == 0:
+        return 0.0, None, None
+    peak_idx = int(np.argmax(peaks[: trough_idx + 1]))
+    peak_date = dates[peak_idx - 1] if peak_idx >= 1 else None
+    trough_date = dates[trough_idx - 1]
+    return (
+        worst,
+        peak_date.strftime("%Y-%m-%d") if peak_date is not None else None,
+        trough_date.strftime("%Y-%m-%d"),
+    )
+
+
+def _metrics(
+    daily: pd.Series, nav: np.ndarray, dates: pd.DatetimeIndex, initial: float,
+) -> dict[str, Any]:
+    """Annualized return / vol / Sharpe and NAV-path max drawdown."""
+    mdd, peak_date, trough_date = _drawdown_stats(nav, dates, initial)
+    metrics: dict[str, Any] = {
         "max_drawdown": _finite(mdd),
-        "max_drawdown_peak": str(peak_date.date()) if pd.notna(peak_date) else None,
-        "max_drawdown_trough": (
-            str(trough_date.date()) if pd.notna(trough_date) else None
-        ),
+        "max_drawdown_peak": peak_date,
+        "max_drawdown_trough": trough_date,
     }
+    if len(daily) < 2:
+        metrics.update(
+            annualized_return=None, annualized_volatility=None, sharpe_ratio=None,
+        )
+        return metrics
+    metrics.update(
+        annualized_return=_finite(annualized_return(daily, PERIODS_PER_YEAR)),
+        annualized_volatility=_finite(
+            annualized_volatility(daily, PERIODS_PER_YEAR)
+        ),
+        sharpe_ratio=_finite(sharpe_ratio(daily, RISK_FREE_ANNUAL, PERIODS_PER_YEAR)),
+    )
+    return metrics
 
 
 def build_summary(
@@ -688,10 +817,12 @@ def build_summary(
     daily = series["daily"]
     bench = series["bench"]
     nav = series["nav"]
+    dates = series["dates"]
     total_return = float(nav[-1] / capital - 1.0)
-    benchmark_total = float((1.0 + bench).prod() - 1.0)
-    strategy_metrics = _metrics(daily)
-    benchmark_metrics = _metrics(bench)
+    bench_nav = np.cumprod(1.0 + bench.to_numpy(dtype=float))
+    benchmark_total = float(bench_nav[-1] - 1.0)
+    strategy_metrics = _metrics(daily, nav, dates, capital)
+    benchmark_metrics = _metrics(bench, bench_nav, dates, 1.0)
     if len(daily) >= 2:
         tracking_error_value = _finite(
             tracking_error(daily, bench, PERIODS_PER_YEAR)
@@ -701,16 +832,19 @@ def build_summary(
     total_costs = float(series["costs"].sum())
     stale_days = int((series["stale"] > 0).sum())
     return {
+        "ledger_version": LEDGER_VERSION,
         "as_of": simulation.as_of.strftime("%Y-%m-%d"),
         "execution_date": simulation.execution_date.strftime("%Y-%m-%d"),
-        "first_ledger_date": series["dates"][0].strftime("%Y-%m-%d"),
-        "last_ledger_date": series["dates"][-1].strftime("%Y-%m-%d"),
+        "first_ledger_date": dates[0].strftime("%Y-%m-%d"),
+        "last_ledger_date": dates[-1].strftime("%Y-%m-%d"),
         "cache_last_date": simulation.last_cache_date.strftime("%Y-%m-%d"),
         "n_sessions": int(len(daily)),
         "capital": float(capital),
         "cost_mode": simulation.cost_mode,
         "max_stale_sessions": int(simulation.max_stale_sessions),
         "stale_policy": STALE_POLICY,
+        "return_basis": RETURN_BASIS,
+        "tradable_gate": TRADABLE_GATE,
         "benchmark_definition": BENCHMARK_DEFINITION,
         "risk_free_rate": RISK_FREE_ANNUAL,
         "annualization_periods_per_year": PERIODS_PER_YEAR,
@@ -769,14 +903,22 @@ def run(
     out_dir = Path(out_dir)
 
     as_of, weights = load_target(target_path)
-    close, volume = load_cache(cache_path)
+    panels = load_cache(cache_path)
     target_sha256 = hashlib.sha256(target_path.read_bytes()).hexdigest()
     simulation = simulate(
-        weights, as_of, close, volume, capital, cost_mode, max_stale_sessions,
+        weights, as_of, panels, capital, cost_mode, max_stale_sessions,
     )
 
     nav_path = out_dir / "nav.csv"
     summary_path = out_dir / "summary.json"
+    if nav_path.is_file() and not summary_path.is_file():
+        # The writer always emits summary.json immediately after nav.csv, so
+        # this is a broken/partial ledger with unknown provenance.
+        raise PaperTrackError(
+            f"{nav_path} exists without {summary_path}; cannot verify which "
+            "target/config produced it -- refusing to append. Move the orphan "
+            "ledger aside or use a new --out-dir"
+        )
     existing_lines: list[str] = []
     warnings = list(simulation.warnings)
     if summary_path.is_file():
@@ -785,11 +927,6 @@ def run(
         )
     if nav_path.is_file():
         existing_lines = _read_existing_nav(nav_path)
-        if not summary_path.is_file():
-            warnings.append(
-                "existing nav.csv has no summary.json; appended without a "
-                "provenance check"
-            )
 
     existing_dates = [
         pd.Timestamp(line.split(",", 1)[0]) for line in existing_lines
@@ -871,7 +1008,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-stale-sessions", type=int, default=DEFAULT_MAX_STALE_SESSIONS,
         help=(
-            "consecutive missing closes before a held asset is liquidated to "
+            "consecutive stale sessions before a held asset is liquidated to "
             f"cash (default {DEFAULT_MAX_STALE_SESSIONS}; 0 disables)"
         ),
     )
