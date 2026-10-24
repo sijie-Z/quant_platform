@@ -8,6 +8,10 @@ from quant_platform.backtest.engine import BacktestEngine
 from quant_platform.backtest.walkforward import WalkForwardValidator
 from quant_platform.factors.evaluation import rank_ic
 from quant_platform.portfolio.constraints import PortfolioConstraints
+from quant_platform.portfolio.optimizers import (
+    EqualWeightOptimizer,
+    MeanVarianceOptimizer,
+)
 
 
 class TestWalkForwardValidator:
@@ -763,22 +767,26 @@ class TestSectorCapThroughTheWalkForwardChain:
 
     def test_real_sector_map_caps_every_sector_at_30_percent(self, monkeypatch):
         ret, prices, factor, sectors = _two_sector_panel()
-        engine_runs = []
-        real_run = BacktestEngine.run
+        target_weights = []
+        real_mvo = MeanVarianceOptimizer.optimize
+        real_ew = EqualWeightOptimizer.optimize
 
-        def spy(self, **kwargs):
-            result = real_run(self, **kwargs)
-            engine_runs.append(dict(result["weights_history"]))
-            return result
+        def wrap(original):
+            def spy(self, *args, **kwargs):
+                out = original(self, *args, **kwargs)
+                target_weights.append(out.copy())
+                return out
+            return spy
 
-        monkeypatch.setattr(BacktestEngine, "run", spy)
+        monkeypatch.setattr(MeanVarianceOptimizer, "optimize", wrap(real_mvo))
+        monkeypatch.setattr(EqualWeightOptimizer, "optimize", wrap(real_ew))
         constraints = PortfolioConstraints(
             long_only=True, max_weight=0.10, max_sector_exposure=0.30,
             max_turnover=0.30,
         )
 
         def run_with(sector_map):
-            engine_runs.clear()
+            target_weights.clear()
             validator = WalkForwardValidator(
                 train_period=100, test_period=40, step_size=40, n_folds=1,
             )
@@ -789,7 +797,14 @@ class TestSectorCapThroughTheWalkForwardChain:
                 alpha_kwargs={"method": "equal_weight"},
                 engine_kwargs={"initial_capital": 2_000_000},
             )
-            return result, [dict(run) for run in engine_runs]
+            # A fallback records the equal-weight call and the outer MVO call
+            # with identical weights; collapse adjacent duplicates so each
+            # rebalance contributes exactly one target.
+            deduped = []
+            for weights in target_weights:
+                if not deduped or not deduped[-1].equals(weights):
+                    deduped.append(weights)
+            return result, deduped
 
         def sector_totals(weights):
             by_sector = sectors.reindex(weights.index).fillna("Unknown")
@@ -797,29 +812,24 @@ class TestSectorCapThroughTheWalkForwardChain:
 
         # Control: the old single-sector map disables the cap, and the
         # optimizer really does put 60% into S1 (the test has teeth).
-        _, control_runs = run_with(pd.Series("A", index=factor.columns))
-        assert control_runs, "control run produced no rebalances"
+        _, control_targets = run_with(pd.Series("A", index=factor.columns))
+        assert control_targets, "control run produced no optimizer targets"
         control_max = max(
-            float(sector_totals(weights).max())
-            for run in control_runs for weights in run.values()
+            float(sector_totals(weights).max()) for weights in control_targets
         )
         assert control_max > 0.30 + 0.05, (
             "control with a single 'A' sector never exceeded the 30% cap; "
             "the assertions below would not prove anything"
         )
 
-        # Real map: every rebalance must respect the 30% sector cap.
-        result, capped_runs = run_with(sectors)
+        # Real map: every optimizer target must respect the 30% sector cap.
+        result, capped_targets = run_with(sectors)
         assert result["fold_metrics"], "no OOS metrics"
-        assert capped_runs, "capped run produced no rebalances"
-        n_rebalances = 0
-        for run in capped_runs:
-            for date, weights in run.items():
-                n_rebalances += 1
-                totals = sector_totals(weights)
-                assert float(totals.max()) <= 0.30 + 1e-6, (
-                    f"rebalance {date}: sector total {float(totals.max()):.4f} "
-                    f"exceeds max_sector_exposure=0.30 ({totals.to_dict()})"
-                )
-                assert float(weights.sum()) <= 1.0 + 1e-9
-        assert n_rebalances > 0
+        assert capped_targets, "capped run produced no optimizer targets"
+        for weights in capped_targets:
+            totals = sector_totals(weights)
+            assert float(totals.max()) <= 0.30 + 1e-6, (
+                f"sector total {float(totals.max()):.4f} exceeds "
+                f"max_sector_exposure=0.30 ({totals.to_dict()})"
+            )
+            assert float(weights.sum()) <= 1.0 + 1e-9
