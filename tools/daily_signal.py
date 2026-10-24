@@ -455,6 +455,12 @@ def build_simple_book(
     fallback_count = 0
     fallback_reason: str | None = None
     optimizer_name = construction
+    if len(selected_index) * constraints.max_weight < 1.0 - 1e-12:
+        warnings.append(
+            f"construction {construction}: {len(selected_index)} names x "
+            f"max-weight {constraints.max_weight:.4f} < 1; the book cannot be "
+            "fully funded and the residual stays cash"
+        )
 
     if construction == "risk_parity":
         # Restrict the optimiser's candidate set to the selected top-N by
@@ -471,6 +477,12 @@ def build_simple_book(
         if enforced_sector:
             weights = project_sector_cap(
                 weights, sector_map, constraints.max_sector_exposure,
+            )
+        gross = float(weights.sum())
+        if gross < 1.0 - 1e-6:
+            warnings.append(
+                f"construction {construction}: gross {gross:.4f} < 1 after "
+                "caps; the residual stays cash"
             )
         # RiskParityOptimizer already applied the platform turnover blend.
         return weights, {
@@ -506,6 +518,12 @@ def build_simple_book(
     if enforced_sector:
         weights = project_sector_cap(
             weights, sector_map, constraints.max_sector_exposure,
+        )
+    gross = float(weights.sum())
+    if gross < 1.0 - 1e-6:
+        warnings.append(
+            f"construction {construction}: gross {gross:.4f} < 1 after caps; "
+            "the residual stays cash"
         )
     return weights, {
         "selected": int(len(selected_index)),
