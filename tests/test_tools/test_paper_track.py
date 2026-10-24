@@ -85,25 +85,69 @@ def make_panel(
 
 
 def write_cache(
-    path: Path, close: pd.DataFrame, volume: pd.DataFrame, pct_chg: pd.DataFrame,
+    path: Path,
+    close: pd.DataFrame,
+    volume: pd.DataFrame,
+    pct_chg: pd.DataFrame,
+    amount: pd.DataFrame | None = None,
 ) -> Path:
-    """Write a (date, asset) MultiIndex parquet with the required columns."""
+    """Write a (date, asset) MultiIndex parquet with the required columns.
+
+    ``amount`` is optional (R32): when given, the cache carries the raw CNY
+    traded value needed by ``--raw-price-mode amount_over_volume``.
+    """
     close = close.sort_index()
     volume = volume.reindex_like(close)
     pct_chg = pct_chg.reindex_like(close)
     index = pd.MultiIndex.from_product(
         [close.index, close.columns], names=["date", "asset"],
     )
-    frame = pd.DataFrame(
-        {
-            "close": close.to_numpy(dtype=float).reshape(-1),
-            "volume": volume.to_numpy(dtype=float).reshape(-1),
-            "pct_chg": pct_chg.to_numpy(dtype=float).reshape(-1),
-        },
-        index=index,
-    )
+    columns = {
+        "close": close.to_numpy(dtype=float).reshape(-1),
+        "volume": volume.to_numpy(dtype=float).reshape(-1),
+        "pct_chg": pct_chg.to_numpy(dtype=float).reshape(-1),
+    }
+    if amount is not None:
+        columns["amount"] = (
+            amount.reindex_like(close).to_numpy(dtype=float).reshape(-1)
+        )
+    frame = pd.DataFrame(columns, index=index)
     frame.to_parquet(path)
     return path
+
+
+def make_hfq_panel(
+    raw_prices: dict[str, list[float]],
+    factor: float = 2.0,
+    volume_shares: float = 1_000_000.0,
+    pct_chg: dict[str, list[float]] | None = None,
+    volume: dict[str, list[float]] | None = None,
+    amount: dict[str, list[float]] | None = None,
+    start: str = "2024-01-02",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """A Sina-style hfq panel: close = raw * factor, amount = raw * volume.
+
+    Returns ``(close, volume, pct_chg, amount)``. ``pct_chg`` defaults to the
+    hfq close change (the ex-rights return basis); pass ``amount`` to model
+    missing traded value on specific cells.
+    """
+    close, volume_panel, pct = make_panel(
+        {
+            asset: [price * factor for price in prices]
+            for asset, prices in raw_prices.items()
+        },
+        pct_chg=pct_chg,
+        volume=volume,
+        volume_shares=volume_shares,
+        start=start,
+    )
+    raw = pd.DataFrame(raw_prices, index=close.index, dtype=float)
+    amount_panel = (
+        raw * volume_panel
+        if amount is None
+        else pd.DataFrame(amount, index=close.index, dtype=float)
+    )
+    return close, volume_panel, pct, amount_panel
 
 
 def write_target(path: Path, as_of, weights: dict[str, float]) -> Path:
@@ -124,6 +168,8 @@ def run_tool(tool, target: Path, cache: Path, out_dir: Path, **kwargs) -> int:
     ]
     if "max_stale_sessions" in kwargs:
         argv += ["--max-stale-sessions", str(kwargs.pop("max_stale_sessions"))]
+    if "raw_price_mode" in kwargs:
+        argv += ["--raw-price-mode", kwargs.pop("raw_price_mode")]
     assert not kwargs, f"unexpected kwargs: {kwargs}"
     return tool.main(argv)
 
@@ -836,6 +882,8 @@ def run_roll_tool(
         argv += ["--targets", ",".join(str(path) for path in targets)]
     if "max_stale_sessions" in kwargs:
         argv += ["--max-stale-sessions", str(kwargs.pop("max_stale_sessions"))]
+    if "raw_price_mode" in kwargs:
+        argv += ["--raw-price-mode", kwargs.pop("raw_price_mode")]
     assert not kwargs, f"unexpected kwargs: {kwargs}"
     return tool.main(argv)
 
@@ -1363,3 +1411,363 @@ def test_single_target_mode_matches_pre_rolling_golden_bytes(tool, tmp_path):
     assert summary["since_inception"]["final_nav"] == pytest.approx(
         1_036_640.22, abs=1e-6,
     )
+
+
+# ---------------------------------------------------------------------------
+# R32: raw-price mode (adjusted close vs amount / volume)
+# ---------------------------------------------------------------------------
+
+def _impact_expected(notional: float, volume_cny: float) -> float:
+    """The vector-path CostModel charge for one buy (zero-vol clip 10bp)."""
+    commission_cost = max(notional * 0.0003, 5.0)
+    transfer = notional * 0.00001
+    impact = notional * math.sqrt(notional / volume_cny) * 0.001
+    return commission_cost + transfer + impact
+
+
+def test_auto_selects_amount_over_volume_and_prices_costs_on_raw(
+    tool, tmp_path, capsys,
+):
+    # Sina-style hfq cache: close = raw * 2, amount = raw * volume. The impact
+    # model's CNY daily volume must be shares * raw (== amount), not
+    # shares * hfq close (which would understate participation and impact).
+    close, volume, pct, amount = make_hfq_panel(
+        {"A": [10.0] * 8, "B": [10.0] * 8},
+    )
+    dates = close.index
+    cache = write_cache(
+        tmp_path / "cache.parquet", close, volume, pct, amount=amount,
+    )
+    target = write_target(
+        tmp_path / "target.json", dates[5].strftime("%Y-%m-%d"),
+        {"A": 0.5, "B": 0.5},
+    )
+    capital = 1_000_000.0
+    notional = 500_000.0
+    expected = 2 * _impact_expected(notional, volume_cny=10_000_000.0)
+
+    out_auto = tmp_path / "out-auto"
+    assert run_tool(
+        tool, target, cache, out_auto, capital=capital, cost_mode="impact",
+    ) == 0
+    nav = read_nav(out_auto)
+    summary = read_summary(out_auto)
+    assert nav.loc[0, "costs_paid"] == pytest.approx(expected, abs=1e-6)
+    assert nav.loc[0, "nav"] == pytest.approx(capital - expected, abs=1e-6)
+    assert summary["raw_price_mode"] == "amount_over_volume"
+    assert "amount/volume" in summary["return_basis"]
+    assert "amount/volume" in summary["tradable_gate"]
+    stdout = capsys.readouterr().out
+    assert "raw-price mode auto -> amount_over_volume" in stdout
+
+    # Explicit close reproduces the pre-R32 basis: shares * hfq close is 2x
+    # the true CNY volume, so the impact charge is visibly smaller.
+    out_close = tmp_path / "out-close"
+    assert run_tool(
+        tool, target, cache, out_close, capital=capital, cost_mode="impact",
+        raw_price_mode="close",
+    ) == 0
+    close_nav = read_nav(out_close)
+    close_expected = 2 * _impact_expected(notional, volume_cny=20_000_000.0)
+    assert close_nav.loc[0, "costs_paid"] == pytest.approx(
+        close_expected, abs=1e-6,
+    )
+    assert close_expected < expected
+    close_summary = read_summary(out_close)
+    assert "raw_price_mode" not in close_summary
+    assert "amount/volume" not in close_summary["return_basis"]
+
+
+def test_auto_keeps_close_on_raw_panel_and_matches_pre_r32_golden(
+    tool, tmp_path, capsys,
+):
+    # Baostock-style panel: close is the raw CNY price and amount == close *
+    # volume. auto must keep close and produce the same ledger bytes as the
+    # pre-R32 implementation (the golden pinned by the pre-rolling test).
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, 11.0, 10.5], "B": [10.0, 10.0, 10.0, 10.2]},
+    )
+    dates = close.index
+    cache = write_cache(
+        tmp_path / "cache.parquet", close, volume, pct, amount=close * volume,
+    )
+    target = write_target(
+        tmp_path / "target.json", dates[0].strftime("%Y-%m-%d"),
+        {"A": 0.6, "B": 0.4},
+    )
+    golden = (
+        "date,nav,daily_return,benchmark_daily_return,cum_return,drawdown,"
+        "n_positions,stale_assets,costs_paid\n"
+        "2024-01-03,998690.000000,-0.0013100000,0.0000000000,"
+        "-0.0013100000,-0.0013100000,2,0,1310.000000\n"
+        "2024-01-04,1058611.400000,0.0600000000,0.0500000000,"
+        "0.0586114000,0.0000000000,2,0,0.000000\n"
+        "2024-01-05,1036640.220000,-0.0207547170,-0.0127272727,"
+        "0.0366402200,-0.0207547170,2,0,0.000000\n"
+    )
+    out_auto = tmp_path / "out-auto"
+    assert run_tool(tool, target, cache, out_auto) == 0
+    assert (out_auto / "nav.csv").read_text(encoding="utf-8") == golden
+    summary_auto = read_summary(out_auto)
+    assert "raw_price_mode" not in summary_auto
+    stdout = capsys.readouterr().out
+    assert "raw-price mode auto -> close" in stdout
+
+    out_close = tmp_path / "out-close"
+    assert run_tool(
+        tool, target, cache, out_close, raw_price_mode="close",
+    ) == 0
+    assert (out_close / "nav.csv").read_bytes() == (
+        out_auto / "nav.csv"
+    ).read_bytes()
+    assert (out_close / "summary.json").read_bytes() == (
+        out_auto / "summary.json"
+    ).read_bytes()
+
+
+def test_auto_threshold_sits_at_one_percent(tool, tmp_path, capsys):
+    # A 0.5% amount/close*volume deviation keeps close; a 2% deviation
+    # switches to amount/volume. The decision is the sampled median.
+    for delta, expected_mode in (
+        (0.005, "close"), (0.02, "amount_over_volume"),
+    ):
+        close, volume, pct = make_panel(
+            {"A": [10.0] * 6, "B": [10.0] * 6}, volume_shares=1_000_000.0,
+        )
+        amount = close * volume * (1.0 + delta)
+        cache = write_cache(
+            tmp_path / f"cache_{delta}.parquet", close, volume, pct,
+            amount=amount,
+        )
+        target = write_target(
+            tmp_path / f"target_{delta}.json",
+            close.index[0].strftime("%Y-%m-%d"), {"A": 0.5, "B": 0.5},
+        )
+        out_dir = tmp_path / f"out_{delta}"
+        assert run_tool(tool, target, cache, out_dir) == 0
+        summary = read_summary(out_dir)
+        expected_key = (
+            "amount_over_volume" if expected_mode == "amount_over_volume"
+            else None
+        )
+        assert summary.get("raw_price_mode") == expected_key
+        captured = capsys.readouterr().out
+        assert f"raw-price mode auto -> {expected_mode}" in captured
+
+
+def test_amount_mode_requires_amount_column_and_auto_falls_back(
+    tool, tmp_path, capsys,
+):
+    close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0]})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target = write_target(
+        tmp_path / "target.json", dates[0].strftime("%Y-%m-%d"), {"A": 0.5},
+    )
+    out_missing = tmp_path / "out-missing"
+    assert run_tool(
+        tool, target, cache, out_missing, raw_price_mode="amount_over_volume",
+    ) == 2
+    assert not out_missing.exists()
+    stderr = capsys.readouterr().err
+    assert "amount" in stderr
+    assert "amount_over_volume" in stderr
+
+    out_auto = tmp_path / "out-auto"
+    assert run_tool(tool, target, cache, out_auto) == 0
+    summary = read_summary(out_auto)
+    assert "raw_price_mode" not in summary
+    stdout = capsys.readouterr().out
+    assert "no 'amount' column" in stdout
+
+
+def test_zero_volume_and_missing_amount_are_stale_without_crashing(
+    tool, tmp_path,
+):
+    # B: suspension encoding on d2 (volume 0, NaN pct), missing amount on d3
+    # (close/volume/pct all present). Under amount_over_volume both sessions
+    # have a NaN raw price and are held stale; under close the d3 session is
+    # live. Neither path may crash or zero the position.
+    close, volume, pct, amount = make_hfq_panel(
+        {"A": [10.0, 10.0, 10.0, 11.0], "B": [10.0, 10.0, 10.0, 10.0]},
+        pct_chg={
+            "A": [np.nan, 0.0, 0.0, 10.0],
+            "B": [np.nan, 0.0, 0.0, 0.0],
+        },
+        volume={
+            "A": [1_000_000.0] * 4,
+            "B": [1_000_000.0] * 4,
+        },
+        amount={
+            "A": [10_000_000.0, 10_000_000.0, 10_000_000.0, 11_000_000.0],
+            "B": [10_000_000.0, 10_000_000.0, 0.0, np.nan],
+        },
+    )
+    # Encode B's d2 suspension: zero volume and NaN pct_chg / amount.
+    volume.loc[volume.index[2], "B"] = 0.0
+    pct.loc[pct.index[2], "B"] = np.nan
+    amount.loc[amount.index[2], "B"] = 0.0
+    dates = close.index
+    cache = write_cache(
+        tmp_path / "cache.parquet", close, volume, pct, amount=amount,
+    )
+    target = write_target(
+        tmp_path / "target.json", dates[0].strftime("%Y-%m-%d"),
+        {"A": 0.5, "B": 0.5},
+    )
+    out_auto = tmp_path / "out-auto"
+    assert run_tool(tool, target, cache, out_auto) == 0
+    nav = read_nav(out_auto)
+    assert read_summary(out_auto)["raw_price_mode"] == "amount_over_volume"
+    assert nav["stale_assets"].tolist() == [0, 1, 1]
+    assert nav["n_positions"].tolist() == [2, 2, 2]
+    assert nav.loc[2, "daily_return"] == pytest.approx(0.05, abs=1e-9)
+    assert (nav["nav"] > 0).all()
+
+    out_close = tmp_path / "out-close"
+    assert run_tool(
+        tool, target, cache, out_close, raw_price_mode="close",
+    ) == 0
+    close_nav = read_nav(out_close)
+    # d3 has a valid close/volume/pct_chg, so the legacy basis books it live.
+    assert close_nav["stale_assets"].tolist() == [0, 1, 0]
+    pd.testing.assert_series_equal(
+        nav["nav"], close_nav["nav"], check_exact=False, rtol=0, atol=1e-9,
+    )
+
+
+def test_stale_liquidation_uses_the_raw_price_reference(tool, tmp_path):
+    # B has no valid raw price after the build, so it is liquidated after two
+    # stale sessions. The warning must name the raw price (10), not the hfq
+    # close (20); the close-basis run names 20.
+    close, volume, pct, amount = make_hfq_panel(
+        {"A": [10.0] * 6, "B": [10.0] * 6},
+        pct_chg={
+            "A": [np.nan, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "B": [np.nan, 0.0, np.nan, np.nan, np.nan, np.nan],
+        },
+        volume={
+            "A": [1_000_000.0] * 6,
+            "B": [1_000_000.0, 1_000_000.0, 0.0, 0.0, 0.0, 0.0],
+        },
+        amount={
+            "A": [10_000_000.0] * 6,
+            "B": [10_000_000.0, 10_000_000.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    )
+    dates = close.index
+    cache = write_cache(
+        tmp_path / "cache.parquet", close, volume, pct, amount=amount,
+    )
+    target = write_target(
+        tmp_path / "target.json", dates[0].strftime("%Y-%m-%d"),
+        {"A": 0.5, "B": 0.5},
+    )
+    out_auto = tmp_path / "out-auto"
+    assert run_tool(
+        tool, target, cache, out_auto, max_stale_sessions=2,
+    ) == 0
+    nav = read_nav(out_auto)
+    warnings = read_summary(out_auto)["warnings"]
+    liquidation = [w for w in warnings if "liquidated" in w]
+    assert len(liquidation) == 1
+    assert "10.000000" in liquidation[0]
+    assert "20.000000" not in liquidation[0]
+    assert nav["n_positions"].tolist() == [2, 2, 1, 1, 1]
+
+    out_close = tmp_path / "out-close"
+    assert run_tool(
+        tool, target, cache, out_close, max_stale_sessions=2,
+        raw_price_mode="close",
+    ) == 0
+    close_warnings = read_summary(out_close)["warnings"]
+    close_liquidation = [w for w in close_warnings if "liquidated" in w]
+    assert len(close_liquidation) == 1
+    assert "20.000000" in close_liquidation[0]
+
+
+def test_roll_auto_uses_amount_over_volume_for_impact_costs(
+    tool, tmp_path, capsys,
+):
+    close, volume, pct, amount = make_hfq_panel(
+        {"A": [10.0] * 8, "B": [10.0] * 8},
+    )
+    dates = close.index
+    cache = write_cache(
+        tmp_path / "cache.parquet", close, volume, pct, amount=amount,
+    )
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[5].strftime("%Y-%m-%d"), {"A": 0.4, "B": 0.4}),
+    ])
+    out_auto = tmp_path / "out-auto"
+    assert run_roll_tool(
+        tool, cache, out_auto, targets_dir=target_dir, cost_mode="impact",
+    ) == 0
+    nav = read_nav(out_auto)
+    expected = 2 * _impact_expected(400_000.0, volume_cny=10_000_000.0)
+    assert nav.loc[0, "costs_paid"] == pytest.approx(expected, abs=1e-6)
+    summary = read_summary(out_auto)
+    assert summary["raw_price_mode"] == "amount_over_volume"
+    assert "amount/volume" in summary["tradable_gate"]
+    stdout = capsys.readouterr().out
+    assert "raw-price mode auto -> amount_over_volume" in stdout
+
+    out_close = tmp_path / "out-close"
+    assert run_roll_tool(
+        tool, cache, out_close, targets_dir=target_dir, cost_mode="impact",
+        raw_price_mode="close",
+    ) == 0
+    close_expected = 2 * _impact_expected(400_000.0, volume_cny=20_000_000.0)
+    assert read_nav(out_close).loc[0, "costs_paid"] == pytest.approx(
+        close_expected, abs=1e-6,
+    )
+
+
+def test_existing_ledger_refuses_a_different_raw_price_mode(
+    tool, tmp_path, capsys,
+):
+    close, volume, pct, amount = make_hfq_panel(
+        {"A": [10.0] * 4, "B": [10.0] * 4},
+    )
+    dates = close.index
+    cache = write_cache(
+        tmp_path / "cache.parquet", close, volume, pct, amount=amount,
+    )
+    target = write_target(
+        tmp_path / "target.json", dates[0].strftime("%Y-%m-%d"),
+        {"A": 0.5, "B": 0.5},
+    )
+    out_dir = tmp_path / "out"
+    assert run_tool(
+        tool, target, cache, out_dir, raw_price_mode="close",
+    ) == 0
+    nav_bytes = (out_dir / "nav.csv").read_bytes()
+    # auto now resolves to amount_over_volume (hfq close), which must not be
+    # appended to a ledger built on the legacy close basis.
+    assert run_tool(tool, target, cache, out_dir) == 2
+    stderr = capsys.readouterr().err
+    assert "raw price mode" in stderr
+    assert (out_dir / "nav.csv").read_bytes() == nav_bytes
+
+    out_reverse = tmp_path / "out-reverse"
+    assert run_tool(tool, target, cache, out_reverse) == 0
+    assert run_tool(
+        tool, target, cache, out_reverse, raw_price_mode="close",
+    ) == 2
+    stderr = capsys.readouterr().err
+    assert "raw price mode" in stderr
+
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5, "B": 0.5}),
+    ])
+    out_roll = tmp_path / "out-roll"
+    assert run_roll_tool(
+        tool, cache, out_roll, targets_dir=target_dir, raw_price_mode="close",
+    ) == 0
+    assert run_roll_tool(
+        tool, cache, out_roll, targets_dir=target_dir,
+    ) == 2
+    stderr = capsys.readouterr().err
+    assert "raw price mode" in stderr
