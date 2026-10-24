@@ -289,6 +289,29 @@ def test_fallback_counter_counts_one_per_event(tool):
         optimizer_logger.removeHandler(counter)
 
 
+def test_excess_sharpe_does_not_double_subtract_risk_free(tool):
+    """An excess series' Sharpe is an information ratio: rf must be zero.
+
+    ``all_metrics`` defaults to a 3% risk-free rate. Applying that default to
+    ``strategy - benchmark`` subtracts the risk-free rate twice and reports a
+    Sharpe near zero even when the excess stream is strong.
+    """
+    rng = np.random.default_rng(5)
+    excess = pd.Series(
+        rng.normal(0.0004, 0.005, size=600),
+        index=pd.bdate_range("2022-01-03", periods=600),
+    )
+
+    with_rf = tool._series_metrics(excess)["sharpe"]
+    information_ratio = tool._series_metrics(excess, risk_free=0.0)["sharpe"]
+
+    assert with_rf is not None and information_ratio is not None
+    assert information_ratio > with_rf
+    assert information_ratio == pytest.approx(
+        tool.all_metrics(excess, risk_free=0.0)["sharpe_ratio"]
+    )
+
+
 def test_num_trials_override_and_deterministic_json(tool, tmp_path):
     """--num-trials overrides the default, and identical inputs give identical JSON."""
     cache = tmp_path / "panel.parquet"
@@ -311,6 +334,9 @@ def test_num_trials_override_and_deterministic_json(tool, tmp_path):
     summary = json.loads(payloads[0])
     assert summary["dsr"]["num_trials"] == 48
     assert summary["dsr"]["num_trials_source"] == "cli"
+    # Wall-clock runtime is deliberately absent from the JSON artifact.
+    assert "runtime_seconds" not in summary
+    assert summary["excess_vs_daily_ew"]["sharpe"] is not None
 
 
 def test_industry_map_loading(tool, tmp_path):

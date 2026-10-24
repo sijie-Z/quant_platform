@@ -101,7 +101,7 @@ MIN_FACTOR_COVERAGE = 0.20
 
 ENGINE_LOGGER_NAME = "quant_platform.backtest.engine"
 OPTIMIZER_LOGGER_NAME = "quant_platform.portfolio.optimizers"
-LIMIT_MOVE_THRESHOLD = 0.098
+LIMIT_MOVE_THRESHOLD = 0.098  # 10% board approximation (cache is all 000xxx)
 RISK_FREE_ANNUAL = 0.03
 TRADING_DAYS_PER_YEAR = 252.0
 INDUSTRY_MAP_NOTE = (
@@ -222,7 +222,11 @@ def build_execution_gates(
     that day's own limit state (``pct_chg/100`` on the same row), never the
     forward return panel: the engine trades at day d's close and must decide
     with information available then. This mirrors ``data/pipeline.py``'s
-    ``is_limit_up`` (``close.pct_change()`` on the same date).
+    ``is_limit_up`` (``close.pct_change()`` on the same date) for 10%-limit
+    boards. The 9.8% threshold is deliberately the taskbook's flat
+    approximation: the current cache is entirely 000xxx main-board names. A
+    cache with ChiNext/STAR (20%) or Beijing (30%) names would need the
+    board-specific thresholds from ``shared/symbols.py``.
     """
     return {
         "tradable_mask": close.notna() & (volume.fillna(0) > 0),
@@ -455,22 +459,23 @@ def compute_benchmark_returns(
     return {"daily_ew": daily_ew, "buyhold": buyhold}
 
 
-def _series_metrics(series: pd.Series) -> dict[str, float | None]:
-    """Sharpe / total annual / max drawdown for a daily return series."""
-    metrics = all_metrics(series.dropna())
+def _series_metrics(
+    series: pd.Series, risk_free: float = RISK_FREE_ANNUAL,
+) -> dict[str, float | None]:
+    """Sharpe / total annual / max drawdown for a daily return series.
+
+    ``risk_free`` is passed straight to ``all_metrics``. Benchmark Sharpe
+    uses the platform's 3% convention like the strategy; an *excess* series
+    already subtracts the benchmark, so its Sharpe is an information ratio
+    and must be computed with ``risk_free=0`` (otherwise the risk-free rate
+    is subtracted a second time).
+    """
+    metrics = all_metrics(series.dropna(), risk_free=risk_free)
     return {
         "sharpe": _finite(metrics.get("sharpe_ratio")),
         "annual": _finite(metrics.get("annual_return")),
         "mdd": _finite(metrics.get("max_drawdown")),
     }
-
-
-def excess_metrics(strategy: pd.Series, benchmark: pd.Series) -> dict[str, float | None]:
-    """Metrics of the aligned daily excess return (strategy - benchmark)."""
-    aligned = pd.concat(
-        [strategy.rename("strategy"), benchmark.rename("benchmark")], axis=1,
-    ).dropna()
-    return _series_metrics(aligned["strategy"] - aligned["benchmark"])
 
 
 def deflated_sharpe_excess(
@@ -607,10 +612,24 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
     dsr = deflated_sharpe_excess(oos, num_trials)
 
     benchmark_series = compute_benchmark_returns(returns, adj, oos.index)
+    # Align strategy and both benchmarks on the common valid dates so all
+    # three rows cover the same observations (the buy&hold leg is undefined
+    # on the last sliced session when --end is used).
+    aligned = pd.concat(
+        [
+            oos.rename("strategy"),
+            *(series.rename(name) for name, series in benchmark_series.items()),
+        ],
+        axis=1,
+    ).dropna()
     benchmark = {
-        name: _series_metrics(values) for name, values in benchmark_series.items()
+        name: _series_metrics(aligned[name]) for name in benchmark_series
     }
-    excess_vs_daily_ew = excess_metrics(oos, benchmark_series["daily_ew"])
+    # An excess series is already over the benchmark: its Sharpe is an
+    # information ratio and must NOT subtract the risk-free rate again.
+    excess_vs_daily_ew = _series_metrics(
+        aligned["strategy"] - aligned["daily_ew"], risk_free=0.0,
+    )
 
     skipped_folds = [
         detail for detail in result.get("fold_details", []) if "error" in detail
