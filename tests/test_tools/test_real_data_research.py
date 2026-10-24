@@ -204,3 +204,26 @@ def test_string_date_index_is_coerced(tool, tmp_path):
     assert isinstance(loaded.index.get_level_values("date"), pd.DatetimeIndex)
     assert loaded.index.get_level_values("date")[0] == pd.Timestamp("2024-01-02")
 
+
+def test_integer_date_index_read_as_yyyymmdd(tool, tmp_path):
+    """Integer YYYYMMDD dates parse as calendar dates, not epoch nanoseconds."""
+    index = pd.MultiIndex.from_product(
+        [[20240102, 20240103], ["000001"]], names=["date", "asset"],
+    )
+    path = tmp_path / "int_dates.parquet"
+    pd.DataFrame(
+        {
+            "close": [10.0, 10.1],
+            "volume": [1000.0, 1100.0],
+            "turnover": [0.01, 0.01],
+            "pct_chg": [0.0, 1.0],
+        },
+        index=index,
+    ).to_parquet(path)
+
+    loaded = tool.load_panel_frame(path)
+
+    assert loaded.index.get_level_values("date")[0] == pd.Timestamp("2024-01-02")
+    assert loaded.index.get_level_values("date")[1] == pd.Timestamp("2024-01-03")
+
+

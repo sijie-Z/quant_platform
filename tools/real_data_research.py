@@ -122,12 +122,21 @@ def load_panel_frame(path: Path) -> pd.DataFrame:
         frame = frame.reorder_levels(["date", "asset"]).sort_index()
     # Some parquet writers store the date level as strings; coerce it here so a
     # string-indexed cache fails nowhere deep inside the engine (whose fold and
-    # metric code calls .year on the index).
+    # metric code calls .year on the index). Integer levels are read as
+    # YYYYMMDD, never as epoch nanoseconds: pd.to_datetime would otherwise
+    # silently turn 20240102 into 1970-01-01T00:00:00.020240102.
     dates = frame.index.get_level_values("date")
     if not isinstance(dates, pd.DatetimeIndex):
-        parsed = pd.to_datetime(pd.Index(dates), errors="coerce")
+        values = pd.Index(dates)
+        if pd.api.types.is_integer_dtype(values.dtype):
+            parsed = pd.to_datetime(values.astype(str), format="%Y%m%d", errors="coerce")
+        else:
+            parsed = pd.to_datetime(values, errors="coerce")
         if pd.isna(parsed).any():
-            raise ResearchError("cache panel has unparseable values in the 'date' level")
+            raise ResearchError(
+                "cache panel has unparseable values in the 'date' level "
+                "(expected datetime, YYYY-MM-DD strings, or YYYYMMDD integers)"
+            )
         frame = frame.set_axis(
             pd.MultiIndex.from_arrays(
                 [parsed, frame.index.get_level_values("asset")],
