@@ -1,0 +1,1210 @@
+{
+  "annualization_periods_per_year": 252,
+  "benchmark": {
+    "annualized_return": 0.10610846022300113,
+    "annualized_volatility": 0.2085152241109593,
+    "definition": "equal-weight daily-rebalanced mean of the cached universe's pct_chg close-to-close returns over the same window; stale observations are excluded from that session",
+    "max_drawdown": -0.2570603213552566,
+    "sharpe_ratio": 0.36500193473883125,
+    "total_return": 0.778684217565458
+  },
+  "benchmark_definition": "equal-weight daily-rebalanced mean of the cached universe's pct_chg close-to-close returns over the same window; stale observations are excluded from that session",
+  "cache_last_date": "2025-12-31",
+  "capital": 2000000.0,
+  "cost_mode": "impact",
+  "costs": {
+    "pct_of_capital": 0.02263892867,
+    "total_cny": 45277.857339999995
+  },
+  "disclaimer": "paper tracking only; style-tilt demo, not validated alpha",
+  "first_ledger_date": "2020-02-03",
+  "last_ledger_date": "2025-12-31",
+  "max_stale_sessions": 20,
+  "mode": "rolling",
+  "n_pending_targets": 1,
+  "n_rebalances": 71,
+  "n_sessions": 1439,
+  "n_targets": 72,
+  "pending_targets": [
+    {
+      "as_of": "2025-12-31",
+      "file": ".scratch/orchestrate/roll_targets/targets_2025-12-31.json",
+      "reason": "no cached session after as_of yet"
+    }
+  ],
+  "rebalances": [
+    {
+      "as_of": "2020-01-23",
+      "blocked_buys": [
+        "000029"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 1899999.8058000002,
+      "buy_scale": 1.0,
+      "costs_cny": 4161.252112698515,
+      "execution_date": "2020-02-03",
+      "n_buys": 25,
+      "n_sells": 0,
+      "sell_cny": 0.0,
+      "turnover": 0.47499995145000007
+    },
+    {
+      "as_of": "2020-02-28",
+      "blocked_buys": [
+        "000029"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 123931.70162669633,
+      "buy_scale": 1.0,
+      "costs_cny": 455.80866878747736,
+      "execution_date": "2020-03-02",
+      "n_buys": 13,
+      "n_sells": 13,
+      "sell_cny": 136899.46236991425,
+      "turnover": 0.059930003819990404
+    },
+    {
+      "as_of": "2020-03-31",
+      "blocked_buys": [
+        "000029"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 118516.42788248551,
+      "buy_scale": 1.0,
+      "costs_cny": 406.05310667227343,
+      "execution_date": "2020-04-01",
+      "n_buys": 16,
+      "n_sells": 13,
+      "sell_cny": 112329.27537589586,
+      "turnover": 0.0564893601475492
+    },
+    {
+      "as_of": "2020-04-30",
+      "blocked_buys": [
+        "000029"
+      ],
+      "blocked_sells": [
+        "000403"
+      ],
+      "buy_cny": 110436.68861691747,
+      "buy_scale": 1.0,
+      "costs_cny": 328.332080933877,
+      "execution_date": "2020-05-06",
+      "n_buys": 16,
+      "n_sells": 11,
+      "sell_cny": 106482.86307960787,
+      "turnover": 0.050227897523205355
+    },
+    {
+      "as_of": "2020-05-29",
+      "blocked_buys": [
+        "000029"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 189467.16410908662,
+      "buy_scale": 1.0,
+      "costs_cny": 589.39600907861,
+      "execution_date": "2020-06-01",
+      "n_buys": 20,
+      "n_sells": 8,
+      "sell_cny": 204945.24720616773,
+      "turnover": 0.08729522080550653
+    },
+    {
+      "as_of": "2020-06-30",
+      "blocked_buys": [
+        "000029"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 127804.28816274677,
+      "buy_scale": 1.0,
+      "costs_cny": 418.75254735685485,
+      "execution_date": "2020-07-01",
+      "n_buys": 18,
+      "n_sells": 11,
+      "sell_cny": 132112.35410753952,
+      "turnover": 0.055737273018248996
+    },
+    {
+      "as_of": "2020-07-31",
+      "blocked_buys": [
+        "000029"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 280822.27695015376,
+      "buy_scale": 1.0,
+      "costs_cny": 841.0093125873668,
+      "execution_date": "2020-08-03",
+      "n_buys": 16,
+      "n_sells": 13,
+      "sell_cny": 302047.3391940404,
+      "turnover": 0.10605178493129422
+    },
+    {
+      "as_of": "2020-08-31",
+      "blocked_buys": [
+        "000029"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 179137.7401042316,
+      "buy_scale": 1.0,
+      "costs_cny": 494.78261906689505,
+      "execution_date": "2020-09-01",
+      "n_buys": 14,
+      "n_sells": 13,
+      "sell_cny": 181458.3399297001,
+      "turnover": 0.06487501458617828
+    },
+    {
+      "as_of": "2020-09-30",
+      "blocked_buys": [
+        "000010",
+        "000029"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 81153.8548905407,
+      "buy_scale": 1.0,
+      "costs_cny": 252.5227836391795,
+      "execution_date": "2020-10-09",
+      "n_buys": 12,
+      "n_sells": 14,
+      "sell_cny": 83669.13438397502,
+      "turnover": 0.030921942516140923
+    },
+    {
+      "as_of": "2020-10-30",
+      "blocked_buys": [
+        "000029"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 113826.74878084454,
+      "buy_scale": 1.0,
+      "costs_cny": 331.6134707275305,
+      "execution_date": "2020-11-02",
+      "n_buys": 17,
+      "n_sells": 12,
+      "sell_cny": 103138.92959259935,
+      "turnover": 0.0417118796023738
+    },
+    {
+      "as_of": "2020-11-30",
+      "blocked_buys": [
+        "000048"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 331941.91643416334,
+      "buy_scale": 1.0,
+      "costs_cny": 847.7556342424926,
+      "execution_date": "2020-12-01",
+      "n_buys": 22,
+      "n_sells": 9,
+      "sell_cny": 217524.8087367815,
+      "turnover": 0.09792837361708046
+    },
+    {
+      "as_of": "2020-12-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 191519.4126578731,
+      "buy_scale": 0.9966890843740714,
+      "costs_cny": 636.2129188209665,
+      "execution_date": "2021-01-04",
+      "n_buys": 18,
+      "n_sells": 14,
+      "sell_cny": 177713.76330166604,
+      "turnover": 0.06950967800574874
+    },
+    {
+      "as_of": "2021-01-29",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 173115.51224700452,
+      "buy_scale": 0.997024394567758,
+      "costs_cny": 516.7919715817368,
+      "execution_date": "2021-02-01",
+      "n_buys": 15,
+      "n_sells": 15,
+      "sell_cny": 173632.3042162946,
+      "turnover": 0.07033754220856392
+    },
+    {
+      "as_of": "2021-02-26",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 215394.55851331836,
+      "buy_scale": 0.9970153324217871,
+      "costs_cny": 645.220587738264,
+      "execution_date": "2021-03-01",
+      "n_buys": 19,
+      "n_sells": 15,
+      "sell_cny": 216039.77909855868,
+      "turnover": 0.07949677267471532
+    },
+    {
+      "as_of": "2021-03-31",
+      "blocked_buys": [
+        "000065"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 235981.12359774153,
+      "buy_scale": 1.0,
+      "costs_cny": 695.5668817046142,
+      "execution_date": "2021-04-01",
+      "n_buys": 23,
+      "n_sells": 14,
+      "sell_cny": 240697.98184090428,
+      "turnover": 0.08131436850294647
+    },
+    {
+      "as_of": "2021-04-30",
+      "blocked_buys": [
+        "000062"
+      ],
+      "blocked_sells": [
+        "000301"
+      ],
+      "buy_cny": 217595.66940010394,
+      "buy_scale": 0.915564793984977,
+      "costs_cny": 652.7244228291614,
+      "execution_date": "2021-05-06",
+      "n_buys": 19,
+      "n_sells": 17,
+      "sell_cny": 214227.1024588847,
+      "turnover": 0.0768919411754219
+    },
+    {
+      "as_of": "2021-05-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 262539.7175692666,
+      "buy_scale": 0.9974284687685394,
+      "costs_cny": 692.2892219495919,
+      "execution_date": "2021-06-01",
+      "n_buys": 25,
+      "n_sells": 13,
+      "sell_cny": 263232.0067885441,
+      "turnover": 0.08957819041832392
+    },
+    {
+      "as_of": "2021-06-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 281905.6688580103,
+      "buy_scale": 0.9971697870309286,
+      "costs_cny": 800.3145048858465,
+      "execution_date": "2021-07-01",
+      "n_buys": 25,
+      "n_sells": 14,
+      "sell_cny": 282705.98336020816,
+      "turnover": 0.09504861463781221
+    },
+    {
+      "as_of": "2021-07-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 261766.67958306894,
+      "buy_scale": 0.9972955870075203,
+      "costs_cny": 710.139384506193,
+      "execution_date": "2021-08-02",
+      "n_buys": 24,
+      "n_sells": 21,
+      "sell_cny": 262476.81896495866,
+      "turnover": 0.09106555986855612
+    },
+    {
+      "as_of": "2021-08-31",
+      "blocked_buys": [],
+      "blocked_sells": [
+        "000016",
+        "000422"
+      ],
+      "buy_cny": 162341.74294635924,
+      "buy_scale": 0.4237258057917664,
+      "costs_cny": 498.68330673033626,
+      "execution_date": "2021-09-01",
+      "n_buys": 34,
+      "n_sells": 11,
+      "sell_cny": 162840.42625010113,
+      "turnover": 0.05160277377300777
+    },
+    {
+      "as_of": "2021-09-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 437724.0095769433,
+      "buy_scale": 0.9969782160366029,
+      "costs_cny": 1329.34841781652,
+      "execution_date": "2021-10-08",
+      "n_buys": 30,
+      "n_sells": 16,
+      "sell_cny": 439053.3579920428,
+      "turnover": 0.1389467011259772
+    },
+    {
+      "as_of": "2021-10-29",
+      "blocked_buys": [
+        "000062"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 274505.8597744428,
+      "buy_scale": 1.0,
+      "costs_cny": 816.4270516035788,
+      "execution_date": "2021-11-01",
+      "n_buys": 27,
+      "n_sells": 20,
+      "sell_cny": 286961.08169135335,
+      "turnover": 0.09152172033309139
+    },
+    {
+      "as_of": "2021-11-30",
+      "blocked_buys": [
+        "000032",
+        "000068"
+      ],
+      "blocked_sells": [
+        "000401"
+      ],
+      "buy_cny": 218499.09805084707,
+      "buy_scale": 0.9794649416853052,
+      "costs_cny": 551.8708721612016,
+      "execution_date": "2021-12-01",
+      "n_buys": 23,
+      "n_sells": 19,
+      "sell_cny": 207412.17405484026,
+      "turnover": 0.06914930353817081
+    },
+    {
+      "as_of": "2021-12-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 316289.2608526754,
+      "buy_scale": 0.9973367884034319,
+      "costs_cny": 883.4280013197927,
+      "execution_date": "2022-01-04",
+      "n_buys": 26,
+      "n_sells": 16,
+      "sell_cny": 317172.68885100755,
+      "turnover": 0.09585749023599634
+    },
+    {
+      "as_of": "2022-01-28",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 355630.6722270163,
+      "buy_scale": 0.9977608693049649,
+      "costs_cny": 1082.24376020048,
+      "execution_date": "2022-02-07",
+      "n_buys": 29,
+      "n_sells": 14,
+      "sell_cny": 356712.9159843201,
+      "turnover": 0.10950314630090126
+    },
+    {
+      "as_of": "2022-02-28",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 251938.81352945283,
+      "buy_scale": 0.9978387838701388,
+      "costs_cny": 774.481767299751,
+      "execution_date": "2022-03-01",
+      "n_buys": 20,
+      "n_sells": 22,
+      "sell_cny": 252713.2952937765,
+      "turnover": 0.07816323840452072
+    },
+    {
+      "as_of": "2022-03-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 363856.3736117995,
+      "buy_scale": 0.997381794381205,
+      "costs_cny": 955.16652202718,
+      "execution_date": "2022-04-01",
+      "n_buys": 21,
+      "n_sells": 22,
+      "sell_cny": 364811.5401310134,
+      "turnover": 0.11466139518022071
+    },
+    {
+      "as_of": "2022-04-29",
+      "blocked_buys": [
+        "000038"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 242383.39836413637,
+      "buy_scale": 1.0,
+      "costs_cny": 1019.4714742553066,
+      "execution_date": "2022-05-05",
+      "n_buys": 16,
+      "n_sells": 23,
+      "sell_cny": 336681.75118080626,
+      "turnover": 0.10150319892526512
+    },
+    {
+      "as_of": "2022-05-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 418334.48792108847,
+      "buy_scale": 0.996776445331033,
+      "costs_cny": 1352.9759534652244,
+      "execution_date": "2022-06-01",
+      "n_buys": 25,
+      "n_sells": 13,
+      "sell_cny": 326408.5825295125,
+      "turnover": 0.12226425705504196
+    },
+    {
+      "as_of": "2022-06-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 214180.0404900018,
+      "buy_scale": 0.9973280346167405,
+      "costs_cny": 573.8702494668303,
+      "execution_date": "2022-07-01",
+      "n_buys": 15,
+      "n_sells": 21,
+      "sell_cny": 214753.91073651845,
+      "turnover": 0.06777238014201374
+    },
+    {
+      "as_of": "2022-07-29",
+      "blocked_buys": [
+        "000425"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 209417.2907562555,
+      "buy_scale": 1.0,
+      "costs_cny": 564.7528933003373,
+      "execution_date": "2022-08-01",
+      "n_buys": 23,
+      "n_sells": 13,
+      "sell_cny": 212184.51151944892,
+      "turnover": 0.06767920210947806
+    },
+    {
+      "as_of": "2022-08-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 168137.0351076124,
+      "buy_scale": 0.9973824769067093,
+      "costs_cny": 441.29161121543336,
+      "execution_date": "2022-09-01",
+      "n_buys": 19,
+      "n_sells": 18,
+      "sell_cny": 166375.8588459806,
+      "turnover": 0.0535666631134808
+    },
+    {
+      "as_of": "2022-09-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 159780.74536643806,
+      "buy_scale": 0.9971393140031073,
+      "costs_cny": 458.53996161003994,
+      "execution_date": "2022-10-10",
+      "n_buys": 18,
+      "n_sells": 19,
+      "sell_cny": 160239.28532535446,
+      "turnover": 0.05607577920585001
+    },
+    {
+      "as_of": "2022-10-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 215226.4683091286,
+      "buy_scale": 0.9978040623404362,
+      "costs_cny": 552.5110296526025,
+      "execution_date": "2022-11-01",
+      "n_buys": 20,
+      "n_sells": 16,
+      "sell_cny": 215778.97933609792,
+      "turnover": 0.07434622805664298
+    },
+    {
+      "as_of": "2022-11-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 158872.6019312141,
+      "buy_scale": 0.9974805978486718,
+      "costs_cny": 401.3360965752373,
+      "execution_date": "2022-12-01",
+      "n_buys": 17,
+      "n_sells": 16,
+      "sell_cny": 159273.93802478013,
+      "turnover": 0.050209971480584224
+    },
+    {
+      "as_of": "2022-12-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 194795.68819854187,
+      "buy_scale": 0.99720224136423,
+      "costs_cny": 546.5241042890702,
+      "execution_date": "2023-01-03",
+      "n_buys": 18,
+      "n_sells": 14,
+      "sell_cny": 195342.21229990054,
+      "turnover": 0.062414420641855525
+    },
+    {
+      "as_of": "2023-01-31",
+      "blocked_buys": [
+        "000026"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 86524.18801181208,
+      "buy_scale": 1.0,
+      "costs_cny": 287.44425915450125,
+      "execution_date": "2023-02-01",
+      "n_buys": 13,
+      "n_sells": 17,
+      "sell_cny": 98717.1916836334,
+      "turnover": 0.02878955085696615
+    },
+    {
+      "as_of": "2023-02-28",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 116343.94607756115,
+      "buy_scale": 0.9973727128552516,
+      "costs_cny": 306.5413610633916,
+      "execution_date": "2023-03-01",
+      "n_buys": 20,
+      "n_sells": 10,
+      "sell_cny": 104744.92802279565,
+      "turnover": 0.03371841389814177
+    },
+    {
+      "as_of": "2023-03-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 168897.55939077592,
+      "buy_scale": 0.9968115897620468,
+      "costs_cny": 540.4688815032168,
+      "execution_date": "2023-04-03",
+      "n_buys": 21,
+      "n_sells": 12,
+      "sell_cny": 169438.02826915268,
+      "turnover": 0.05133310834345248
+    },
+    {
+      "as_of": "2023-04-28",
+      "blocked_buys": [
+        "000007"
+      ],
+      "blocked_sells": [
+        "000038"
+      ],
+      "buy_cny": 216610.05871247023,
+      "buy_scale": 1.0,
+      "costs_cny": 596.799006186484,
+      "execution_date": "2023-05-04",
+      "n_buys": 19,
+      "n_sells": 10,
+      "sell_cny": 243882.576530574,
+      "turnover": 0.07003330011578417
+    },
+    {
+      "as_of": "2023-05-31",
+      "blocked_buys": [
+        "000038"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 315259.14810152614,
+      "buy_scale": 1.0,
+      "costs_cny": 845.9073727500046,
+      "execution_date": "2023-06-01",
+      "n_buys": 19,
+      "n_sells": 12,
+      "sell_cny": 241653.25210164706,
+      "turnover": 0.08923837068905292
+    },
+    {
+      "as_of": "2023-06-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 247906.74440101374,
+      "buy_scale": 0.9979615753293597,
+      "costs_cny": 744.9976388831432,
+      "execution_date": "2023-07-03",
+      "n_buys": 19,
+      "n_sells": 12,
+      "sell_cny": 204523.91565535,
+      "turnover": 0.06917086930970714
+    },
+    {
+      "as_of": "2023-07-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 227464.18235144884,
+      "buy_scale": 0.9984635765356005,
+      "costs_cny": 639.3858028599371,
+      "execution_date": "2023-08-01",
+      "n_buys": 20,
+      "n_sells": 12,
+      "sell_cny": 228103.56815113797,
+      "turnover": 0.06702756538558582
+    },
+    {
+      "as_of": "2023-08-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 194640.70466184843,
+      "buy_scale": 0.999152425615461,
+      "costs_cny": 406.1930599386942,
+      "execution_date": "2023-09-01",
+      "n_buys": 19,
+      "n_sells": 16,
+      "sell_cny": 195046.89771871734,
+      "turnover": 0.05968599136870146
+    },
+    {
+      "as_of": "2023-09-28",
+      "blocked_buys": [
+        "000410"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 120528.98442337959,
+      "buy_scale": 1.0,
+      "costs_cny": 287.27843859849025,
+      "execution_date": "2023-10-09",
+      "n_buys": 19,
+      "n_sells": 16,
+      "sell_cny": 120876.68195803465,
+      "turnover": 0.03746578488853955
+    },
+    {
+      "as_of": "2023-10-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 214332.97196756012,
+      "buy_scale": 0.9973889295787398,
+      "costs_cny": 561.1115517155996,
+      "execution_date": "2023-11-01",
+      "n_buys": 23,
+      "n_sells": 15,
+      "sell_cny": 214833.66442023977,
+      "turnover": 0.0671882152023036
+    },
+    {
+      "as_of": "2023-11-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 291071.58654686925,
+      "buy_scale": 0.9979680199274412,
+      "costs_cny": 594.0937427502049,
+      "execution_date": "2023-12-01",
+      "n_buys": 23,
+      "n_sells": 14,
+      "sell_cny": 291665.68028657086,
+      "turnover": 0.08723969058379147
+    },
+    {
+      "as_of": "2023-12-29",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 237741.05289974302,
+      "buy_scale": 0.997778776982903,
+      "costs_cny": 531.5545608791269,
+      "execution_date": "2024-01-02",
+      "n_buys": 20,
+      "n_sells": 19,
+      "sell_cny": 238272.60745759177,
+      "turnover": 0.07282590682401405
+    },
+    {
+      "as_of": "2024-01-31",
+      "blocked_buys": [],
+      "blocked_sells": [
+        "000020",
+        "000025",
+        "000068"
+      ],
+      "buy_cny": 178594.95950562673,
+      "buy_scale": 0.5811362037429225,
+      "costs_cny": 402.3504359845679,
+      "execution_date": "2024-02-01",
+      "n_buys": 22,
+      "n_sells": 16,
+      "sell_cny": 178997.30993878568,
+      "turnover": 0.0595125574704906
+    },
+    {
+      "as_of": "2024-02-29",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 282860.3573748487,
+      "buy_scale": 0.9973591718749608,
+      "costs_cny": 748.96926283483,
+      "execution_date": "2024-03-01",
+      "n_buys": 19,
+      "n_sells": 18,
+      "sell_cny": 283609.3266347506,
+      "turnover": 0.08806918403912721
+    },
+    {
+      "as_of": "2024-03-29",
+      "blocked_buys": [
+        "000005",
+        "000100"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 152315.80256807173,
+      "buy_scale": 1.0,
+      "costs_cny": 367.8663298368766,
+      "execution_date": "2024-04-01",
+      "n_buys": 18,
+      "n_sells": 15,
+      "sell_cny": 190127.81361665844,
+      "turnover": 0.05230719206026589
+    },
+    {
+      "as_of": "2024-04-30",
+      "blocked_buys": [
+        "000005",
+        "000017"
+      ],
+      "blocked_sells": [
+        "000413"
+      ],
+      "buy_cny": 231819.96263939133,
+      "buy_scale": 1.0,
+      "costs_cny": 435.16513108232533,
+      "execution_date": "2024-05-06",
+      "n_buys": 14,
+      "n_sells": 16,
+      "sell_cny": 222901.67371578456,
+      "turnover": 0.06919400567323339
+    },
+    {
+      "as_of": "2024-05-31",
+      "blocked_buys": [
+        "000005"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 209264.96868762153,
+      "buy_scale": 1.0,
+      "costs_cny": 387.53813577228317,
+      "execution_date": "2024-06-03",
+      "n_buys": 16,
+      "n_sells": 14,
+      "sell_cny": 183478.21657110058,
+      "turnover": 0.06213072441976507
+    },
+    {
+      "as_of": "2024-06-28",
+      "blocked_buys": [
+        "000005"
+      ],
+      "blocked_sells": [
+        "000007"
+      ],
+      "buy_cny": 122472.49846137068,
+      "buy_scale": 1.0,
+      "costs_cny": 288.01617702861654,
+      "execution_date": "2024-07-01",
+      "n_buys": 14,
+      "n_sells": 14,
+      "sell_cny": 128086.61328840238,
+      "turnover": 0.04104462642989311
+    },
+    {
+      "as_of": "2024-07-31",
+      "blocked_buys": [
+        "000005"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 212951.49171636777,
+      "buy_scale": 1.0,
+      "costs_cny": 495.26336971661294,
+      "execution_date": "2024-08-01",
+      "n_buys": 16,
+      "n_sells": 16,
+      "sell_cny": 230546.72388596696,
+      "turnover": 0.07424988151199967
+    },
+    {
+      "as_of": "2024-08-30",
+      "blocked_buys": [
+        "000005"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 208753.6780147227,
+      "buy_scale": 1.0,
+      "costs_cny": 403.190815640393,
+      "execution_date": "2024-09-02",
+      "n_buys": 16,
+      "n_sells": 16,
+      "sell_cny": 208444.2287490334,
+      "turnover": 0.0712240786898697
+    },
+    {
+      "as_of": "2024-09-30",
+      "blocked_buys": [
+        "000063"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 243250.08282742658,
+      "buy_scale": 1.0,
+      "costs_cny": 396.6537052822515,
+      "execution_date": "2024-10-08",
+      "n_buys": 21,
+      "n_sells": 10,
+      "sell_cny": 192032.4502580602,
+      "turnover": 0.05931540921308028
+    },
+    {
+      "as_of": "2024-10-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 246452.4415257539,
+      "buy_scale": 0.9979776480966746,
+      "costs_cny": 499.7168447600383,
+      "execution_date": "2024-11-01",
+      "n_buys": 17,
+      "n_sells": 14,
+      "sell_cny": 242097.68135139535,
+      "turnover": 0.06821813156701619
+    },
+    {
+      "as_of": "2024-11-29",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 227706.50846906402,
+      "buy_scale": 0.9979369831207722,
+      "costs_cny": 471.2564147115545,
+      "execution_date": "2024-12-02",
+      "n_buys": 22,
+      "n_sells": 13,
+      "sell_cny": 228177.7648802763,
+      "turnover": 0.061158340827302315
+    },
+    {
+      "as_of": "2024-12-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 267987.8456217928,
+      "buy_scale": 0.9981703069786252,
+      "costs_cny": 491.4475385949421,
+      "execution_date": "2025-01-02",
+      "n_buys": 25,
+      "n_sells": 12,
+      "sell_cny": 268479.29315710196,
+      "turnover": 0.07547498787421891
+    },
+    {
+      "as_of": "2025-01-27",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 274662.37527252594,
+      "buy_scale": 0.9989583013813778,
+      "costs_cny": 617.7939889342437,
+      "execution_date": "2025-02-05",
+      "n_buys": 22,
+      "n_sells": 15,
+      "sell_cny": 275280.16925821494,
+      "turnover": 0.07811276810810773
+    },
+    {
+      "as_of": "2025-02-28",
+      "blocked_buys": [
+        "000409"
+      ],
+      "blocked_sells": [
+        "000096"
+      ],
+      "buy_cny": 309467.6869548281,
+      "buy_scale": 0.73246121593759,
+      "costs_cny": 539.9098386156166,
+      "execution_date": "2025-03-03",
+      "n_buys": 24,
+      "n_sells": 13,
+      "sell_cny": 310007.59679007746,
+      "turnover": 0.08426372460950549
+    },
+    {
+      "as_of": "2025-03-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 379567.1009690192,
+      "buy_scale": 0.9980615659375675,
+      "costs_cny": 737.2018623264479,
+      "execution_date": "2025-04-01",
+      "n_buys": 21,
+      "n_sells": 16,
+      "sell_cny": 380304.3028280107,
+      "turnover": 0.10227823103594189
+    },
+    {
+      "as_of": "2025-04-30",
+      "blocked_buys": [
+        "000158"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 259094.41571335087,
+      "buy_scale": 1.0,
+      "costs_cny": 695.9415081919099,
+      "execution_date": "2025-05-06",
+      "n_buys": 17,
+      "n_sells": 15,
+      "sell_cny": 279347.4633213064,
+      "turnover": 0.07353803888160597
+    },
+    {
+      "as_of": "2025-05-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 306502.29302101553,
+      "buy_scale": 0.9979245133302587,
+      "costs_cny": 637.8081530397549,
+      "execution_date": "2025-06-03",
+      "n_buys": 18,
+      "n_sells": 17,
+      "sell_cny": 287582.9950708505,
+      "turnover": 0.07925696726755806
+    },
+    {
+      "as_of": "2025-06-30",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 220568.7178148809,
+      "buy_scale": 0.9981557476895959,
+      "costs_cny": 407.8291571720821,
+      "execution_date": "2025-07-01",
+      "n_buys": 19,
+      "n_sells": 15,
+      "sell_cny": 220976.5469684461,
+      "turnover": 0.05768054021453752
+    },
+    {
+      "as_of": "2025-07-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 164676.1629654539,
+      "buy_scale": 0.9979716969260557,
+      "costs_cny": 334.8512769655492,
+      "execution_date": "2025-08-01",
+      "n_buys": 17,
+      "n_sells": 17,
+      "sell_cny": 165011.01423869058,
+      "turnover": 0.04233690709518195
+    },
+    {
+      "as_of": "2025-08-29",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 345181.1328394178,
+      "buy_scale": 0.9983364025702118,
+      "costs_cny": 575.2654910092942,
+      "execution_date": "2025-09-01",
+      "n_buys": 20,
+      "n_sells": 14,
+      "sell_cny": 345756.39832655946,
+      "turnover": 0.08200377369861937
+    },
+    {
+      "as_of": "2025-09-30",
+      "blocked_buys": [],
+      "blocked_sells": [
+        "000029"
+      ],
+      "buy_cny": 239394.98933755214,
+      "buy_scale": 0.9942175687069819,
+      "costs_cny": 433.9510675812222,
+      "execution_date": "2025-10-09",
+      "n_buys": 19,
+      "n_sells": 12,
+      "sell_cny": 239828.94040121255,
+      "turnover": 0.05759445471871547
+    },
+    {
+      "as_of": "2025-10-31",
+      "blocked_buys": [],
+      "blocked_sells": [],
+      "buy_cny": 374544.96851519565,
+      "buy_scale": 0.9983772522013403,
+      "costs_cny": 656.655382643534,
+      "execution_date": "2025-11-03",
+      "n_buys": 21,
+      "n_sells": 18,
+      "sell_cny": 375201.6238940422,
+      "turnover": 0.08985988828327045
+    },
+    {
+      "as_of": "2025-11-28",
+      "blocked_buys": [
+        "000063"
+      ],
+      "blocked_sells": [],
+      "buy_cny": 367837.4195381189,
+      "buy_scale": 1.0,
+      "costs_cny": 631.9784572895511,
+      "execution_date": "2025-12-01",
+      "n_buys": 21,
+      "n_sells": 17,
+      "sell_cny": 378316.9571324046,
+      "turnover": 0.08732568032297908
+    }
+  ],
+  "return_basis": "pct_chg/100 (Baostock ex-rights preclose); raw close is used only for volume x price cost conversion and the stale liquidation reference",
+  "risk_free_rate": 0.03,
+  "roll_ledger_version": 1,
+  "since_inception": {
+    "annualized_return": 0.1466377737804898,
+    "annualized_volatility": 0.17252003887292433,
+    "final_nav": 4368906.179415,
+    "max_drawdown": -0.21594553134038474,
+    "max_drawdown_peak": "2021-09-13",
+    "max_drawdown_trough": "2022-04-26",
+    "n_stale_days": 154,
+    "sharpe_ratio": 0.6760824686945697,
+    "total_return": 1.1844530897074996
+  },
+  "stale_policy": "a session is stale when close, pct_chg or volume is missing/invalid or the volume is zero; hold at the last valid close (return 0, flagged stale); when the price returns the resume-day pct_chg carries the gap return; after max_stale_sessions consecutive stale sessions, liquidate at the last valid close with no extra trade cost (no tradable price exists) and hold the proceeds as cash",
+  "target_files": [
+    ".scratch/orchestrate/roll_targets/targets_2020-01-23.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-02-28.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-03-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-04-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-05-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-06-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-07-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-08-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-09-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-10-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-11-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2020-12-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-01-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-02-26.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-03-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-04-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-05-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-06-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-07-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-08-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-09-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-10-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-11-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2021-12-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-01-28.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-02-28.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-03-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-04-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-05-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-06-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-07-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-08-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-09-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-10-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-11-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2022-12-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-01-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-02-28.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-03-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-04-28.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-05-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-06-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-07-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-08-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-09-28.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-10-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-11-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2023-12-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-01-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-02-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-03-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-04-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-05-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-06-28.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-07-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-08-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-09-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-10-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-11-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2024-12-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-01-27.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-02-28.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-03-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-04-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-05-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-06-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-07-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-08-29.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-09-30.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-10-31.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-11-28.json",
+    ".scratch/orchestrate/roll_targets/targets_2025-12-31.json"
+  ],
+  "targets_sha256": "64629bae4e411e86ee7040052802d17f5eaff90590cf0667da6c691044da0b67",
+  "tracking": {
+    "difference": 0.4057688721420416,
+    "tracking_error": 0.08988158969366515
+  },
+  "tradable_gate": "execution buys require close > 0, finite pct_chg, volume > 0 (R9 tradable_mask) and pct_chg <= 9.8% (R19a limit-up approximation); blocked weight stays in cash with a warning; at a rebalance, limit-down blocks the sell and limit-up blocks the buy",
+  "turnover": {
+    "definition": "realised one-sided turnover = 0.5 * (buys + sells) / pre-cost portfolio value, per executed rebalance",
+    "mean_per_rebalance": 0.07795093099450819,
+    "total": 5.534516100610081
+  },
+  "volatility_basis": "rolling(20, min_periods=5).std() of pct_chg/100 through the execution close, masking suspension and resume-day gap returns as data/pipeline.py does; short histories fall back to 2% daily",
+  "warnings": [
+    "pending target(s) with no cached session after as_of: targets_2025-12-31.json (2025-12-31)",
+    "2020-02-03: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-03-02: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-04-01: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-05-06: rebalance sell of 000403 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); the position is held at its current weight",
+    "2020-05-06: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-06-01: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-07-01: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-08-03: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-09-01: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-10-09: rebalance buy of 000010 closed limit-up on the rebalance date (pct_chg 9.9744% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2020-10-09: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-11-02: rebalance buy of 000029 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2020-12-01: rebalance buy of 000048 closed limit-up on the rebalance date (pct_chg 10.0219% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2021-04-01: rebalance buy of 000065 closed limit-up on the rebalance date (pct_chg 10.0423% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2021-05-06: rebalance sell of 000301 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); the position is held at its current weight",
+    "2021-05-06: rebalance buy of 000062 closed limit-up on the rebalance date (pct_chg 10.0000% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2021-05-06: cash constraint scaled rebalance buys to 91.5565% of the intended notional",
+    "2021-09-01: rebalance sell of 000016 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); the position is held at its current weight",
+    "2021-09-01: rebalance sell of 000422 closed limit-down on the rebalance date (pct_chg -10.0048% < -9.8%); the sell is blocked; the position is held at its current weight",
+    "2021-09-01: cash constraint scaled rebalance buys to 42.3726% of the intended notional",
+    "2021-11-01: rebalance buy of 000062 closed limit-up on the rebalance date (pct_chg 10.0000% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2021-12-01: rebalance sell of 000401 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); the position is held at its current weight",
+    "2021-12-01: rebalance buy of 000032 closed limit-up on the rebalance date (pct_chg 10.0216% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2021-12-01: rebalance buy of 000068 closed limit-up on the rebalance date (pct_chg 10.0000% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2021-12-01: cash constraint scaled rebalance buys to 97.9465% of the intended notional",
+    "2022-05-05: rebalance buy of 000038 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2022-08-01: rebalance buy of 000425 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2023-02-01: rebalance buy of 000026 closed limit-up on the rebalance date (pct_chg 9.9832% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2023-05-04: rebalance sell of 000038 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); the position is held at its current weight",
+    "2023-05-04: rebalance buy of 000007 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2023-05-31: 000038 had no valid price for 20 consecutive sessions; liquidated at its last close 3.430000 and held as cash (no trade cost: no tradable price exists)",
+    "2023-06-01: rebalance buy of 000038 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2023-10-09: rebalance buy of 000410 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2024-02-01: rebalance sell of 000020 closed limit-down on the rebalance date (pct_chg -10.0066% < -9.8%); the sell is blocked; the position is held at its current weight",
+    "2024-02-01: rebalance sell of 000025 closed limit-down on the rebalance date (pct_chg -10.0000% < -9.8%); the sell is blocked; the position is held at its current weight",
+    "2024-02-01: rebalance sell of 000068 closed limit-down on the rebalance date (pct_chg -9.9796% < -9.8%); the sell is blocked; the position is held at its current weight",
+    "2024-02-01: cash constraint scaled rebalance buys to 58.1136% of the intended notional",
+    "2024-04-01: rebalance buy of 000005 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); its weight stays in cash",
+    "2024-04-01: rebalance buy of 000100 closed limit-up on the rebalance date (pct_chg 10.0642% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2024-04-02: 000005 had no valid price for 20 consecutive sessions; liquidated at its last close 0.830000 and held as cash (no trade cost: no tradable price exists)",
+    "2024-05-06: rebalance sell of 000413 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); the position is held at its current weight",
+    "2024-05-06: rebalance buy of 000005 has no valid close on the rebalance date; its weight stays in cash",
+    "2024-05-06: rebalance buy of 000017 closed limit-up on the rebalance date (pct_chg 9.9719% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2024-05-31: 000413 had no valid price for 20 consecutive sessions; liquidated at its last close 1.430000 and held as cash (no trade cost: no tradable price exists)",
+    "2024-06-03: rebalance buy of 000005 has no valid close on the rebalance date; its weight stays in cash",
+    "2024-07-01: rebalance sell of 000007 is not tradable on the rebalance date (missing pct_chg or zero/NaN volume); the position is held at its current weight",
+    "2024-07-01: rebalance buy of 000005 has no valid close on the rebalance date; its weight stays in cash",
+    "2024-08-01: rebalance buy of 000005 has no valid close on the rebalance date; its weight stays in cash",
+    "2024-09-02: rebalance buy of 000005 has no valid close on the rebalance date; its weight stays in cash",
+    "2024-10-08: rebalance buy of 000063 closed limit-up on the rebalance date (pct_chg 10.0161% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2025-03-03: rebalance sell of 000096 closed limit-down on the rebalance date (pct_chg -10.0000% < -9.8%); the sell is blocked; the position is held at its current weight",
+    "2025-03-03: rebalance buy of 000409 closed limit-up on the rebalance date (pct_chg 9.9692% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2025-03-03: cash constraint scaled rebalance buys to 73.2461% of the intended notional",
+    "2025-05-06: rebalance buy of 000158 closed limit-up on the rebalance date (pct_chg 10.0177% > 9.8%); the buy is blocked; its weight stays in cash",
+    "2025-10-09: rebalance sell of 000029 closed limit-down on the rebalance date (pct_chg -10.0060% < -9.8%); the sell is blocked; the position is held at its current weight",
+    "2025-10-09: cash constraint scaled rebalance buys to 99.4218% of the intended notional",
+    "2025-12-01: rebalance buy of 000063 closed limit-up on the rebalance date (pct_chg 10.0024% > 9.8%); the buy is blocked; its weight stays in cash"
+  ]
+}
