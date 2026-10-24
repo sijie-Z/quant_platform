@@ -48,7 +48,7 @@
 
 ## 4. 仓库状态
 
-- 分支 `feature/system-hardening`，远端 head `8b91531`；PR #84 已更新（Update 4）。
+- 分支 `feature/system-hardening`，远端 head `a92d999`；PR #84 已更新（Update 4）。
 - 研究报告：`docs/research/REAL_DATA_EVIDENCE_2026-10-24.md`（新增 §17 宽池价值、§18 2026 holdout、overlay 负结果）。
 - 决策备忘：`docs/research/DEPLOYMENT_DECISION_2026-10-25.md`（补充 2026 holdout）。
 - 全部临时脚本与原始结果：`.scratch/orchestrate/`、`.scratch/holdout_2026/`、`.scratch/wide_sina_2026/`、`.scratch/valuation_baidu/`。
