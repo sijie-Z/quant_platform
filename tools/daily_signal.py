@@ -404,10 +404,16 @@ def build_signal(
     weights: dict[str, float],
     signal_date: pd.Timestamp,
 ) -> pd.Series:
-    """Composite ``sum(w_f * z_f)`` per asset, NaN when every factor is NaN.
+    """Composite ``sum(w_f * z_f) / sum(|w_f|)`` per asset.
 
-    Assets are renormalised by the absolute weight of the factors that have a
-    value, so a partially missing asset is not systematically shrunk.
+    Missing factor values are filled with 0 -- the cross-sectional mean of a
+    z-scored factor -- and the denominator is the *fixed* sum of |weight|, not
+    the weight of the factors that happen to be present for each asset. This
+    mirrors ``alpha.combination._build_row`` and the taskbook's
+    ``signal = sum(w_f * z_f)``: a missing value must be neutral, not a
+    promotion (renormalising per asset would hand an asset that lacks the
+    dominant factor the full weight of the remaining factors). Only assets
+    whose values are NaN for *every* weighted factor get no weight (NaN).
     """
     rows: dict[str, pd.Series] = {}
     for name, panel in factors.items():
@@ -418,18 +424,24 @@ def build_signal(
             )
         rows[name] = panel.loc[signal_date]
     cross_section = pd.DataFrame(rows)
+    total_abs = sum(
+        abs(float(weight)) for weight in weights.values()
+        if abs(float(weight)) > 0.0
+    )
+    if total_abs < 1e-12:
+        raise SignalError("all factor IC weights are zero; cannot build a signal")
     numerator = pd.Series(0.0, index=cross_section.index)
-    denominator = pd.Series(0.0, index=cross_section.index)
+    present_any = pd.Series(False, index=cross_section.index)
     for name in factors:
         weight = float(weights.get(name, 0.0))
-        if weight == 0.0:
+        if abs(weight) < 1e-12:
             continue
         values = cross_section[name]
         present = values.notna()
         numerator.loc[present] += weight * values.loc[present]
-        denominator.loc[present] += abs(weight)
-    composite = (numerator / denominator.where(denominator > 0)).astype(float)
-    composite[denominator <= 0] = np.nan
+        present_any |= present
+    composite = (numerator / total_abs).astype(float)
+    composite[~present_any] = np.nan
     if not np.isfinite(composite.to_numpy()).any():
         raise SignalError(
             f"insufficient factor coverage on signal date "
@@ -507,7 +519,12 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
 
     all_dates = frame.index.get_level_values("date")
     if args.as_of:
-        as_of = pd.Timestamp(args.as_of)
+        try:
+            as_of = pd.Timestamp(args.as_of)
+        except (ValueError, TypeError) as exc:
+            raise SignalError(
+                f"could not parse --as-of {args.as_of!r}: {exc}"
+            ) from exc
         if pd.isna(as_of):
             raise SignalError(f"could not parse --as-of {args.as_of!r}")
     else:
@@ -551,6 +568,15 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
 
     panels = build_panels(sliced)
     signal_date = pd.Timestamp(panels.close.index[-1])
+    data_lag_days = int(
+        (as_of.normalize() - signal_date.normalize()).days
+    )
+    if data_lag_days > 7:
+        warnings.append(
+            f"stale cache: --as-of {as_of.date()} but the last cached session "
+            f"is {signal_date.date()} ({data_lag_days} calendar days earlier); "
+            "the signal is computed from older data"
+        )
 
     # The signal date's forward label (next session's return) must never be
     # used. It is already NaN after slicing, and we drop the row explicitly.
@@ -661,6 +687,25 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
         )
     max_actual = float(targets.max())
     if max_actual > constraints.max_weight + 1e-6:
+        over_cap_prev = None
+        if prev_weights is not None:
+            over_cap_prev = prev_weights[
+                prev_weights > constraints.max_weight + 1e-6
+            ]
+        if over_cap_prev is not None and len(over_cap_prev):
+            top = ", ".join(
+                f"{code}={weight:.4f}"
+                for code, weight in over_cap_prev.sort_values(
+                    ascending=False,
+                ).head(5).items()
+            )
+            raise SignalError(
+                "prev weights exceed --max-weight "
+                f"{constraints.max_weight:.4f} ({top}); with the "
+                f"{constraints.max_turnover:.2f} one-sided turnover cap the "
+                "book cannot be brought back under the cap in one rebalance "
+                "(the optimiser falls back and keeps the over-cap holdings)"
+            )
         raise SignalError(
             "internal consistency check failed: max weight "
             f"{max_actual:.8f} exceeds --max-weight "
@@ -668,6 +713,14 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     turnover = one_sided_turnover(targets, prev_weights)
+    if first_build and turnover > constraints.max_turnover + 1e-6:
+        warnings.append(
+            f"first build: one-sided turnover {turnover:.4f} against a zero "
+            f"book exceeds the {constraints.max_turnover:.4f} cap; the cap is "
+            "not applied to a first build (nothing to trade from; the "
+            "platform engine also passes prev_weights=None on its first "
+            "rebalance)"
+        )
     if not first_build and turnover > constraints.max_turnover + 1e-6:
         warnings.append(
             f"turnover {turnover:.4f} exceeds the cap "
@@ -713,6 +766,7 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
         },
         "diagnostics": {
             "history_sessions": n_sessions,
+            "data_lag_days": data_lag_days,
             "universe_assets": int(alpha.size),
             "candidates": int(alpha.notna().sum()),
             "n_holdings": int(len(targets)),
@@ -737,7 +791,8 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             },
             "covariance_assets": int(cov_matrix.shape[0]),
-            "covariance_sessions": int(len(cov_input)),
+            "covariance_sessions": int(min(len(cov_input), IC_LOOKBACK)),
+            "covariance_input_sessions": int(len(cov_input)),
             "optimizer": {
                 "name": "MeanVarianceOptimizer",
                 "fallback_count": int(optimizer.fallback_count),
@@ -877,8 +932,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--max-weight must be in (0, 1]")
     if not 0.0 < float(args.max_turnover) <= 1.0:
         parser.error("--max-turnover must be in (0, 1]")
-    if float(args.capital) <= 0.0:
-        parser.error("--capital must be > 0")
+    if not math.isfinite(float(args.capital)) or float(args.capital) <= 0.0:
+        parser.error("--capital must be a finite number > 0")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -220,6 +220,29 @@ def test_ep_and_turnover_formulas(tool):
     assert turnover20d.loc[dates[-1], "000002"] == pytest.approx(10.0)
 
 
+def test_build_signal_missing_factor_is_neutral(tool):
+    """A missing factor value is a zero, never a per-asset renormalisation."""
+    date = pd.Timestamp("2023-03-01")
+    assets = ["000001", "000002", "000003", "000004"]
+    ep = pd.DataFrame(
+        [[np.nan, 0.0, 2.5, np.nan]], index=[date], columns=assets,
+    )
+    turnover = pd.DataFrame(
+        [[-2.0, -2.0, 0.0, np.nan]], index=[date], columns=assets,
+    )
+    composite = tool.build_signal(
+        {"ep": ep, "turnover20d": turnover},
+        {"ep": 0.5, "turnover20d": -0.5},
+        date,
+    )
+    # EP missing (000001) must score exactly like EP = 0 (000002).
+    assert composite["000001"] == pytest.approx(composite["000002"])
+    assert composite["000001"] == pytest.approx(1.0)
+    assert composite["000003"] == pytest.approx(1.25)
+    # Only an asset that is NaN for every weighted factor gets no weight.
+    assert math.isnan(composite["000004"])
+
+
 def test_industry_neutralization_on_off(tool, panels_dir, tmp_path):
     """Acceptance (c): both modes give finite long-only weights within caps."""
     directory, as_of = panels_dir
@@ -249,6 +272,8 @@ def test_industry_neutralization_on_off(tool, panels_dir, tmp_path):
         total = values.sum()
         assert 0.999 <= total <= 1.0 + 1e-6
         assert abs(payload["diagnostics"]["gross_weight"] - total) < 1e-9
+        assert payload["diagnostics"]["covariance_sessions"] == 252
+        assert payload["diagnostics"]["covariance_input_sessions"] == 299
     assert not any(
         "industry map" in warning for warning in on["diagnostics"]["warnings"]
     )
@@ -338,6 +363,11 @@ def test_prev_weights_and_turnover_cap(tool, panels_dir, tmp_path):
     assert first["diagnostics"]["turnover"] == pytest.approx(
         0.5 * first["diagnostics"]["gross_weight"], abs=1e-6,
     )
+    # The turnover cap cannot apply against a zero book; that must be loud.
+    assert any(
+        "first build" in warning and "turnover" in warning
+        for warning in first["diagnostics"]["warnings"]
+    )
 
     # Chain the previous targets.json into the next run.
     code_chain, json_chain, _ = run_tool(
@@ -383,3 +413,86 @@ def test_prev_weights_and_turnover_cap(tool, panels_dir, tmp_path):
     assert (values >= 0.0).all()
     assert values.max() <= 0.05 + 1e-9
     assert values.sum() <= 1.0 + 1e-6
+
+
+def test_stale_cache_warns(tool, panels_dir, tmp_path):
+    """A cache that ends long before --as-of must not pass silently."""
+    directory, _ = panels_dir
+    code, json_path, _ = run_tool(
+        tool, directory / "panel.parquet", tmp_path / "stale",
+        as_of="2023-06-30",
+    )
+    assert code == 0
+    payload = load_targets(json_path)
+    assert payload["signal_date"] == "2023-02-24"
+    assert payload["data_end"] == "2023-02-24"
+    assert payload["diagnostics"]["data_lag_days"] > 7
+    assert any(
+        "stale cache" in warning for warning in payload["diagnostics"]["warnings"]
+    )
+
+
+def test_invalid_cli_inputs_fail_cleanly(tool, panels_dir, tmp_path, capsys):
+    """Bad --as-of / --capital exit 2 without tracebacks or half-written files."""
+    directory, as_of = panels_dir
+    cache = directory / "panel.parquet"
+    json_path = tmp_path / "bad.json"
+    csv_path = tmp_path / "bad.csv"
+
+    code = tool.main([
+        "--cache", str(cache),
+        "--as-of", "not-a-date",
+        "--out-json", str(json_path),
+        "--out-csv", str(csv_path),
+    ])
+    assert code == 2
+    assert "could not parse --as-of" in capsys.readouterr().err
+    assert not json_path.exists()
+
+    with pytest.raises(SystemExit) as excinfo:
+        tool.main([
+            "--cache", str(cache),
+            "--as-of", as_of.date().isoformat(),
+            "--capital", "nan",
+            "--out-json", str(json_path),
+            "--out-csv", str(csv_path),
+        ])
+    assert excinfo.value.code == 2
+    assert not json_path.exists()
+
+
+def test_prev_over_cap_is_a_clear_input_error(
+    tool, panels_dir, tmp_path, capsys,
+):
+    """An over-cap prior book that the turnover cap cannot repair fails loudly."""
+    directory, as_of = panels_dir
+    as_of_text = as_of.date().isoformat()
+    industry = str(directory / "industry.parquet")
+    cache = directory / "panel.parquet"
+
+    code_first, json_first, _ = run_tool(
+        tool, cache, tmp_path / "first",
+        "--industry-map", industry, as_of=as_of_text,
+    )
+    assert code_first == 0
+    codes = sorted(load_targets(json_first)["weights"])[:20]
+    prev = {codes[0]: 0.5}
+    prev.update({code: 0.025 for code in codes[1:]})
+    prev_path = tmp_path / "over_cap_prev.json"
+    prev_path.write_text(json.dumps(prev), encoding="utf-8")
+
+    json_path = tmp_path / "targets.json"
+    csv_path = tmp_path / "targets.csv"
+    code = tool.main([
+        "--cache", str(cache),
+        "--as-of", as_of_text,
+        "--factors", "ep,turnover20d",
+        "--industry-map", industry,
+        "--prev-weights", str(prev_path),
+        "--out-json", str(json_path),
+        "--out-csv", str(csv_path),
+    ])
+    assert code == 2
+    assert "prev weights exceed --max-weight" in capsys.readouterr().err
+    assert not json_path.exists()
+    assert not csv_path.exists()
