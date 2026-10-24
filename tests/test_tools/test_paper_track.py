@@ -907,6 +907,69 @@ def test_roll_execution_and_rebalance_match_hand_computed_ledger(tool, tmp_path)
     assert summary["disclaimer"] == DISCLAIMER
 
 
+def test_roll_impact_cost_matches_square_root_rule(tool, tmp_path):
+    # Constant prices -> zero vol, clipped to 0.1% by the impact rule; daily
+    # CNY volume = 1e6 shares * 10 CNY = 1e7; 400k notional per asset.
+    close, volume, pct = make_panel(
+        {"A": [10.0] * 8, "B": [10.0] * 8}, volume_shares=1_000_000.0,
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    # The execution day is d6, so rolling(20, min_periods=5).std() at d6 has
+    # five returns and the fixed-cost fallback is not used.
+    write_target_files(target_dir, [
+        (dates[5].strftime("%Y-%m-%d"), {"A": 0.4, "B": 0.4}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(
+        tool, cache, out_dir, targets_dir=target_dir, cost_mode="impact",
+    ) == 0
+    nav = read_nav(out_dir)
+    summary = read_summary(out_dir)
+    notional = 400_000.0
+    volume_cny = 1_000_000.0 * 10.0
+    commission = max(notional * 0.0003, 5.0)
+    transfer = notional * 0.00001
+    impact = notional * math.sqrt(notional / volume_cny) * 0.001
+    expected = 2 * (commission + transfer + impact)
+    assert nav.loc[0, "date"] == dates[6]
+    assert nav.loc[0, "costs_paid"] == pytest.approx(expected, abs=1e-6)
+    assert nav.loc[0, "nav"] == pytest.approx(1_000_000.0 - expected, abs=1e-6)
+    assert summary["cost_mode"] == "impact"
+
+
+def test_roll_first_ledger_row_has_zero_benchmark(tool, tmp_path):
+    # A -10% move (limit-down, so buying is allowed) on the execution session
+    # happened before the book existed: the build row must not book a drift
+    # return, and its benchmark must start flat (the same convention as the
+    # single-target execution row). Without the fix the row would show -5%.
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, 10.0, 10.0], "B": [10.0, 9.0, 9.0, 9.0]},
+        pct_chg={"A": [np.nan, 0.0, 0.0, 0.0],
+                 "B": [np.nan, -10.0, 0.0, 0.0]},
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5, "B": 0.5}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    nav = read_nav(out_dir)
+    summary = read_summary(out_dir)
+    cost_rate = 0.0003 + 0.00001 + 0.001
+    expected_cost = 1_000_000.0 * cost_rate / (1.0 + cost_rate)
+    assert nav.loc[0, "daily_return"] == pytest.approx(
+        -expected_cost / 1_000_000.0, abs=1e-9,
+    )
+    assert nav.loc[0, "benchmark_daily_return"] == 0.0
+    # The next session's benchmark is the panel's own EW return (0 here).
+    assert nav.loc[1, "benchmark_daily_return"] == pytest.approx(0.0, abs=1e-12)
+    assert summary["benchmark"]["total_return"] == pytest.approx(0.0, abs=1e-12)
+
+
 def test_roll_second_target_half_turnover_cost_is_hand_computed(tool, tmp_path):
     # Constant prices: the only P&L is costs. Target 1 buys A at 50%; target
     # 2 sells all of A and buys B at 50% -> one-sided turnover ~50%.

@@ -1568,8 +1568,11 @@ def simulate_roll(
         costs_paid = 0.0
         target = execution_map.get(date)
         if target is not None:
+            date_vol_row = (
+                vol_panel.loc[date] if vol_panel is not None else None
+            )
             cash, record = _rebalance_to_target(
-                date, target, holdings, cash, panels, cost_model, vol_panel,
+                date, target, holdings, cash, panels, cost_model, date_vol_row,
                 warnings,
             )
             rebalances.append(record)
@@ -1591,7 +1594,10 @@ def simulate_roll(
                 "refusing to write"
             )
         daily_return = nav / nav_prev_row - 1.0
-        bench_return = benchmark.get(date, 0.0)
+        # The first ledger row is the build/execution close: there is no
+        # tracked session before it, so the benchmark starts flat exactly like
+        # the strategy (the single-target mode's execution row is 0.0 too).
+        bench_return = 0.0 if not rows else benchmark.get(date, 0.0)
         if not math.isfinite(bench_return):
             bench_return = 0.0
         peak = max(peak, nav)
