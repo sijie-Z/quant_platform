@@ -541,7 +541,7 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 - **为什么 EP 在宽池无效**：EP 的全样本 rank IC 虽为正（plain +0.0197、ICIR 0.128；行业中性 +0.0145、0.152）且 8/8 年为正，但量级只有 turnover20（−0.0435、ICIR −0.210）的约一半；在 5% 单票/30% 行业约束下，EP 多头组合的收益被风格（R² 0.85–0.86）解释，残余 alpha 为负。B/C 的 IR vs EW 分别 −0.138/−0.218，CAGR 差 −0.35pp/−1.56pp——Sharpe 优势仍主要来自降波动（16.3–16.5% vs 等权 23.2%），不是增收益，与 §16 的宽池结论一致。
 - **fallback（真实计数）**：4 次 walk-forward 引擎 optimizer fallback **0**、selector fallback **0**、协方差失败 0；R18 现金约束 `n_funding_scaled_days` 3,107–3,443；优化器目标最大行业权重 17.6%–20.1%（30% cap 未顶到），0 违规。OOS 年化单边换手 0.91–1.05。
 - DSR 家族敏感性：按 R30 家族 58 + 本轮 4 = N=62 复算，四组 p 为 0.849/0.744/0.787/0.650，判定不变。本轮按任务书统一报告 N=60。
-- **复现前提与确定性**：官方 CLI 在 import numpy 前把 OMP/MKL/OPENBLAS/NUMEXPR 线程固定为 1。外部驱动若先 import numpy 再以默认线程直接调用，B 会得到 Sharpe 0.667、DSR p 0.745、alpha t −0.66（官方 0.674/0.740/−0.62），结论不变。确定性：A–D 四个变体各做两次独立 pinned 运行（第一次 JSON 备份后 `--research --force` 重跑），全部字段（含 per-fold weights/cost/daily returns，每变体 ≥26 万数值单元）0 差异；`runtime_s` 与运行名 excluded。
+- **复现前提与确定性**：官方 CLI 在 import numpy 前把 OMP/MKL/OPENBLAS/NUMEXPR 线程固定为 1。外部驱动若先 import numpy 再以默认线程直接调用，B 会得到 Sharpe 0.667、DSR p 0.745、alpha t −0.66（官方 0.674/0.740/−0.62），结论不变。确定性：A–D 四个变体各做两次独立 pinned 运行（第一次 JSON 备份后 `--research --force` 重跑），全部字段（含 per-fold weights/cost/daily returns，A–C ≈25.9 万、D ≈26.2 万数值单元）0 差异；`runtime_s` 与运行名 excluded。
 
 ### 与 101 池 EP 结果并列
 

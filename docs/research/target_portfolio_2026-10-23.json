@@ -183,7 +183,8 @@
         "n_same_day": 12,
         "last_source_date_overall": "2026-10-24"
       },
-      "note": "Baidu publishes valuation points sparsely (per-asset median gap ~8 days). The book therefore uses the last observation at or before as_of; a later source point (2026-10-24) exists in the vendor file and is excluded by construction."
+      "n_assets_with_close_on_signal_date": 299,
+      "note": "Baidu publishes valuation points sparsely (per-asset median gap ~8 days). The book therefore uses the last observation at or before as_of; a later source point (2026-10-24) exists in the vendor file and is excluded by construction. The per-field n counts all 300 panel names with a prior observation (002717 is suspended on as_of but has one); the tradable signal-date universe is 299."
     },
     "research_caveat": "R31 wide-pool EP variants found no statistically significant incremental alpha; this book is a style-tilt demo, not validated alpha",
     "cap_checks": {
@@ -237,7 +238,8 @@
           "n_same_day": 12,
           "last_source_date_overall": "2026-10-24"
         },
-        "note": "Baidu publishes valuation points sparsely (per-asset median gap ~8 days). The book therefore uses the last observation at or before as_of; a later source point (2026-10-24) exists in the vendor file and is excluded by construction."
+        "n_assets_with_close_on_signal_date": 299,
+        "note": "Baidu publishes valuation points sparsely (per-asset median gap ~8 days). The book therefore uses the last observation at or before as_of; a later source point (2026-10-24) exists in the vendor file and is excluded by construction. The per-field n counts all 300 panel names with a prior observation (002717 is suspended on as_of but has one); the tradable signal-date universe is 299."
       },
       "coverage_on_signal_date": {
         "date": "2026-10-23",
