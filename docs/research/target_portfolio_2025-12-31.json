@@ -1,0 +1,118 @@
+{
+  "as_of": "2025-12-31",
+  "data_end": "2025-12-31",
+  "factors": [
+    "ep",
+    "turnover20d"
+  ],
+  "weights": {
+    "000001": 0.0499999962,
+    "000019": 0.0499999988,
+    "000026": 0.0198765965,
+    "000027": 0.0499999992,
+    "000028": 0.0499999991,
+    "000029": 0.0186344869,
+    "000039": 0.0450073257,
+    "000042": 0.0125339445,
+    "000050": 0.0427530663,
+    "000061": 0.04310464,
+    "000065": 0.033730559,
+    "000066": 0.0499998567,
+    "000089": 0.0499999983,
+    "000096": 0.0120982559,
+    "000100": 0.0499999978,
+    "000151": 0.0001897618,
+    "000301": 0.0266975934,
+    "000333": 0.0499999992,
+    "000338": 0.0436971615,
+    "000403": 0.0499999991,
+    "000404": 0.0499999992,
+    "000409": 0.0016768351,
+    "000421": 0.0499995829,
+    "000423": 0.0499999993,
+    "000429": 0.0499999993,
+    "000498": 0.0499999992
+  },
+  "signal_date": "2025-12-31",
+  "provenance": {
+    "tool": "tools/daily_signal.py",
+    "cache": ".cache\\baostock\\daily_2018-01-01_2025-12-31_500.parquet",
+    "industry_map": ".cache\\baostock\\industry_map.parquet",
+    "industry_neutralization": true,
+    "prev_weights": null,
+    "capital_cny": 2000000.0,
+    "max_weight": 0.05,
+    "max_turnover": 0.3,
+    "risk_aversion": 1.0,
+    "transaction_cost_bps": 20.0,
+    "turnover_penalty": 0.5,
+    "covariance": "ledoit_wolf",
+    "covariance_lookback": 252,
+    "ic_lookback": 252,
+    "ic_min_obs": 20,
+    "winsorize": [
+      0.01,
+      0.99
+    ],
+    "standardize": "zscore",
+    "returns_convention": "pct_chg/100 shift(-1) computed within the panel sliced to date <= as_of; the signal date's forward label is NaN and excluded from IC and covariance"
+  },
+  "diagnostics": {
+    "history_sessions": 1942,
+    "data_lag_days": 0,
+    "universe_assets": 101,
+    "candidates": 88,
+    "n_holdings": 26,
+    "max_weight_actual": 0.0499999993,
+    "gross_weight": 0.9999996509,
+    "cash_weight": 3.491000000188649e-07,
+    "turnover": 0.49999982545,
+    "turnover_definition": "one_sided = 0.5 * sum(|w - w_prev|)",
+    "first_build": true,
+    "min_reported_weight": 0.0001,
+    "pruned_weight": 3.491e-07,
+    "factor_skipped": [],
+    "factor_ic": {
+      "lookback": 252,
+      "min_obs": 20,
+      "window": {
+        "start": "2024-12-18",
+        "end": "2025-12-30",
+        "n": 252
+      },
+      "per_factor": {
+        "ep": {
+          "mean_ic": 0.029124007005621528,
+          "n_obs": 252,
+          "window_start": "2024-12-18",
+          "window_end": "2025-12-30",
+          "weight": 0.44205885197761696
+        },
+        "turnover20d": {
+          "mean_ic": -0.036758639332826144,
+          "n_obs": 252,
+          "window_start": "2024-12-18",
+          "window_end": "2025-12-30",
+          "weight": -0.557941148022383
+        }
+      }
+    },
+    "signal": {
+      "composite_min": -2.291305362751381,
+      "composite_max": 1.5807903688398242,
+      "composite_mean": 4.718447854656915e-16,
+      "alpha_convention": "cross-sectional percentile rank - 0.5 (MeanVarianceOptimizer input; composite z is the delivered signal)"
+    },
+    "covariance_assets": 89,
+    "covariance_sessions": 252,
+    "covariance_input_sessions": 1941,
+    "optimizer": {
+      "name": "MeanVarianceOptimizer",
+      "fallback_count": 0,
+      "fallback_reason": null
+    },
+    "warnings": [
+      "first build: one-sided turnover 0.5000 against a zero book exceeds the 0.3000 cap; the cap is not applied to a first build (nothing to trade from; the platform engine also passes prev_weights=None on its first rebalance)"
+    ]
+  }
+}
