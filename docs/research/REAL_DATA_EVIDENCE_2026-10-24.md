@@ -294,10 +294,38 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 
 产物：`.scratch/orchestrate/r22_results/r22_voltarget_2026-10-24.{json,md}`、每组 `r22_<variant>_vt<target>_2026-10-24.{json,csv}`、`cc_report_R22_voltarget.md`、`review_R22.md`。
 
-## 12. 下一步（按优先级）
+## 12. 正交 alpha 筛选（预注册，R23，零结果）
+
+**问题**：已有研究证明现有组合主要是市场 + 低换手/低波/价值/规模风格暴露（§5、§9）；那么**与这些风格正交**的残余信息能否赚钱？R23 预注册 5 个候选因子（任务书 §1，只有这 5 个、不许加），全部用**同日已实现数据**构造（`pct` 同日收益，不用 `returns = pct.shift(-1)` 前向面板），缩尾 1/99 → zscore → 静态行业中性：
+
+| 因子 | 定义 | 方向 |
+|---|---|---|
+| `lottery` | −max(pct, 20 日) | 预注册为负（彩票效应） |
+| `ivol` | −60 日对 EW 市场回归的残差波动 | 预注册为负 |
+| `amihud` | mean(\|pct\| / amount, 20 日) | 预注册为正（非流动性） |
+| `overnight` | mean(close/open − 1, 20 日) | 不翻转，WF 内 train-only IC 定符号 |
+| `abn_volume` | mean(volume / 前 120 日均量, 20 日) | 不翻转，WF 内 train-only IC 定符号 |
+
+评估口径与 §3/§11 完全一致（expanding 504/126/126、purge 5、embargo 5、月度、5% 单票、30% 行业、rank 归一化、R18 现金约束、impact、2M）；DSR excess **N=49**（家族 44 + 本轮 5）；风格残差检验为对 MKT + LOW_TURN + LOW_VOL + HIGH_EP + SMALL 的 OLS 回归（经典标准误为主，Newey-West(5) 作稳健性）。判定先写死：**alpha t > 2 且 DSR p < 0.1 才算候选，否则未通过；零结果合法**。
+
+| 因子 | mean IC | Sharpe | 年化 | 最大回撤 | DSR p (N=49) | alpha 年化 | t(alpha) OLS [NW5] | corr EP+换手 | corr 换手60 | 判定 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| lottery | +0.032 | 0.559 | 11.82% | −19.48% | 0.7936 | +1.43% | 0.60 [0.61] | 0.981 | 0.978 | 未通过 |
+| ivol | +0.034 | 0.546 | 11.82% | −19.90% | 0.8007 | +1.24% | 0.51 [0.50] | 0.982 | 0.981 | 未通过 |
+| amihud | +0.013 | 0.511 | 11.38% | −20.06% | 0.8211 | +0.98% | 0.36 [0.36] | 0.943 | 0.949 | 未通过 |
+| overnight | −0.031 | 0.582 | 12.24% | −22.51% | 0.7793 | +2.45% | 1.03 [1.00] | 0.975 | 0.971 | 未通过 |
+| abn_volume | −0.021 | 0.434 | 9.57% | −20.11% | 0.8634 | +0.14% | 0.06 [0.06] | 0.967 | 0.963 | 未通过 |
+
+**判定：0/5 通过 → 零结果。** 全部 12 折、1433 个 OOS 日、优化器回退 0。五个单因子策略的风格回归 R² = 0.85–0.88，MKT beta 0.76–0.81；残余 alpha 在 −0.1% ~ +2.5%/年、|t| ≤ 1.03，没有一个显著；DSR p 0.78–0.86。它们与现有 `ep_turn_sector` 的日收益相关 **0.943–0.982**（与 `turnover60_sector` 0.949–0.981）——在这个 101 只 000xxx 池 + 5% 单票 + MVO 约束下，不同单因子收敛到几乎同一个多头风格篮子，**“正交”在组合层面没有发生**。`overnight` 是全场最强（alpha +2.45%/年、t=1.03），但仍远低于双重门槛；`abn_volume` 的残余 alpha 几乎精确为零。
+
+**验证**：因子因果性毒化测试（t=2023-12-29，未来数据毒化后 t 日及以前逐位不变；毒化确实改变未来值）5/5 PASS；OLS 手算样例 + scipy + statsmodels 三路交叉核验一致；5 个因子各两次独立运行的 JSON（去 runtime）逐位一致 5/5；`pytest tests/test_backtest/test_walkforward.py` 33 passed；`ruff` 通过。**明确声明**：这是探索性预注册筛选，零结果不改变任何平台默认行为，也不构成投资建议；5 个因子都未通过，因此没有“候选”可进入 forward 验证。
+
+产物：`.scratch/orchestrate/r23_orthogonal.py`、`r23_orthogonal_2026-10-24.{json,md}`、`r23_results/`、`r23_capture/`、`r23_checks_2026-10-24.json`、`r23_determinism_2026-10-24.json`、`cc_report_R23_orthogonal.md`、`review_R23.md`。
+
+## 13. 下一步（按优先级）
 
 1. **Forward paper 跟踪（不动钱）**：用真实行情按本组合/流程跑 3–6 个月，记录成交、滑点与风格暴露漂移；这是把“回测候选”变成“可观察假设”的最低成本方式。
-2. **正交 alpha 研究**：先把候选信号对市场+低换手+低波+EP+规模做横截面残差化，再在残差上做 IC/回归；只有残差上的增量信息才可能是新 alpha。当前证据表明残差 alpha≈0。
+2. **正交 alpha 研究**：R23 已按预注册完成第一轮（5 个候选，§12），**零结果**——风格残差 alpha 全部不显著。下一轮若继续，应把“宽池 + 真实市值 + 新数据源”作为前置条件，而不是在同一个 101 只池里继续挖因子；任何新候选仍须预注册并计入 DSR 的 N。
 3. **宽池与真实市值**：拉取全市场（含创业板/科创板）与连续总市值字段，做严格 size 中性化与 PIT 行业；现有 000xxx 池的外部有效性太弱。
 4. **容量估计器修正**：修掉 capital 重复扣费、统一 WF 口径、把“封顶资产-日”改成交易日，并用 paper TCA 校准冲击系数，再谈容量阈值。
 5. **纪律**：任何新变体都登记进试验台账并计入 DSR 的 N；在真正 holdout（未参与本轮搜索的数据段）上做一次性评估。
@@ -305,4 +333,4 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 
 ---
 
-_生成于 2026-10-24（R19b 重写；R20 口径对齐；R22 新增 §11）。作者：Claude（监督—执行环）。R22 产物：`.scratch/orchestrate/r22_results/r22_voltarget_2026-10-24.{json,md}`、每组 `r22_<variant>_vt<target>_2026-10-24.{json,csv}`、`cc_report_R22_voltarget.md`、`review_R22.md`。R20 产物：`.scratch/orchestrate/real_variants2_r20_2026-10-24.{json,md}`（四变体重跑）、`real_variants2_r20_results/`、`r20_capture/`、`r20_style_attr_2026-10-24.{json,md}`、`r20_benchmark_2026-10-24.{json,md}`、`r20_cap_probe_2026-10-24.json`（15% 行业上限剂量探针）、`r20_old_vs_new_2026-10-24.json`、`r20_golden_check.py`（默认路径逐位对比 c5c919c）。R19b 产物：`.scratch/orchestrate/r19b_headline_2026-10-24.{json,md}`、`r19b_benchmark_2026-10-24.{json,md}`、`r19b_style_attr_2026-10-24.{json,md}`、`r19b_size_split_2026-10-24.{json,md}`、`r19b_ic_scan_2026-10-24.{json,md}`、`r19b_old_vs_new_2026-10-24.json`、`capacity_curve_ep_turn_oos_2026-10-24.{json,md}`。旧数字来源：`real_variants{4,5,7,9}_2026-10-24.json`（旧口径，仅用于对照）；旧基准行 0.222/4.50%/−25.71% 取自 R19b 之前的报告文本（git 历史），旧容量 1M 0.565/5 亿 0.420 取自被本轮覆盖前的 `capacity_ep_turn_oos_out.txt`（数值已固化在 `r19b_old_vs_new_2026-10-24.json`）。注意 `capacity_curve_ep_turn_2026-10-24.json` 是另一套**全期**容量配置，勿与本报告的 OOS 容量表混用。_
+_生成于 2026-10-24（R19b 重写；R20 口径对齐；R22 新增 §11；R23 新增 §12「正交 alpha 筛选（预注册）」，零结果）。作者：Claude（监督—执行环）。R23 产物：`.scratch/orchestrate/r23_orthogonal_2026-10-24.{json,md}`、`r23_orthogonal.py`、`r23_results/`、`r23_capture/`、`r23_checks_2026-10-24.json`、`r23_determinism_2026-10-24.json`、`cc_report_R23_orthogonal.md`、`review_R23.md`。R22 产物：`.scratch/orchestrate/r22_results/r22_voltarget_2026-10-24.{json,md}`、每组 `r22_<variant>_vt<target>_2026-10-24.{json,csv}`、`cc_report_R22_voltarget.md`、`review_R22.md`。R20 产物：`.scratch/orchestrate/real_variants2_r20_2026-10-24.{json,md}`（四变体重跑）、`real_variants2_r20_results/`、`r20_capture/`、`r20_style_attr_2026-10-24.{json,md}`、`r20_benchmark_2026-10-24.{json,md}`、`r20_cap_probe_2026-10-24.json`（15% 行业上限剂量探针）、`r20_old_vs_new_2026-10-24.json`、`r20_golden_check.py`（默认路径逐位对比 c5c919c）。R19b 产物：`.scratch/orchestrate/r19b_headline_2026-10-24.{json,md}`、`r19b_benchmark_2026-10-24.{json,md}`、`r19b_style_attr_2026-10-24.{json,md}`、`r19b_size_split_2026-10-24.{json,md}`、`r19b_ic_scan_2026-10-24.{json,md}`、`r19b_old_vs_new_2026-10-24.json`、`capacity_curve_ep_turn_oos_2026-10-24.{json,md}`。旧数字来源：`real_variants{4,5,7,9}_2026-10-24.json`（旧口径，仅用于对照）；旧基准行 0.222/4.50%/−25.71% 取自 R19b 之前的报告文本（git 历史），旧容量 1M 0.565/5 亿 0.420 取自被本轮覆盖前的 `capacity_ep_turn_oos_out.txt`（数值已固化在 `r19b_old_vs_new_2026-10-24.json`）。注意 `capacity_curve_ep_turn_2026-10-24.json` 是另一套**全期**容量配置，勿与本报告的 OOS 容量表混用。_
