@@ -26,6 +26,16 @@ from quant_platform.risk.healthcheck import SystemBlockError
 from quant_platform.trading.broker import Order, OrderSide, OrderStatus, SimulatedBroker
 from quant_platform.trading.engine import LiveTradingEngine, TradeSignal
 
+# Fixed exchange session for the T+1 rollover tests: Monday 2026-10-26,
+# 15:00 Asia/Shanghai. Pinning the exchange clock removes the run-date
+# dependency: `_execute_cycle_body` only advances the trading day when the
+# exchange calendar says today is a session, so running the suite on a
+# weekend/holiday used to leave T+1 locked. 2026-10-23 is the previous
+# exchange session (Friday).
+_FIXED_SESSION = real_datetime(2026, 10, 26, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+_FIXED_SESSION_DAY = "2026-10-26"
+_PREVIOUS_SESSION_DAY = "2026-10-23"
+
 
 def _buy(broker: SimulatedBroker, quantity: int = 2000, price: float = 10.0):
     return broker.place_order(
@@ -147,11 +157,13 @@ def test_same_day_restart_does_not_unlock_todays_buys(tmp_path, monkeypatch):
     engine1 = LiveTradingEngine(
         broker=broker1, store=store1, risk_monitor=RiskMonitor(),
     )
-    engine1._trading_day = engine1._exchange_trading_date()
+    monkeypatch.setattr(engine1, "_exchange_now", lambda: _FIXED_SESSION)
+    engine1._trading_day = _FIXED_SESSION_DAY
     engine1._persist_engine_state()
 
     broker2 = SimulatedBroker(initial_cash=1_000_000)
     engine2 = _engine(broker2, Store(db), monkeypatch)
+    monkeypatch.setattr(engine2, "_exchange_now", lambda: _FIXED_SESSION)
     engine2.start()
     try:
         _wait_for_cycle(engine2)
@@ -216,11 +228,13 @@ def test_next_day_restart_releases_t1(tmp_path, monkeypatch):
     engine1 = LiveTradingEngine(
         broker=broker1, store=store1, risk_monitor=RiskMonitor(),
     )
-    engine1._trading_day = "2020-01-02"  # an earlier exchange session
+    monkeypatch.setattr(engine1, "_exchange_now", lambda: _FIXED_SESSION)
+    engine1._trading_day = _PREVIOUS_SESSION_DAY  # the prior exchange session
     engine1._persist_engine_state()
 
     broker2 = SimulatedBroker(initial_cash=1_000_000)
     engine2 = _engine(broker2, Store(db), monkeypatch)
+    monkeypatch.setattr(engine2, "_exchange_now", lambda: _FIXED_SESSION)
     engine2.start()
     try:
         _wait_for_cycle(engine2)
