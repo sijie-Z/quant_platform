@@ -29,6 +29,20 @@ days and at limit-down but *not* on non-membership -- a name that leaves the
 index must remain sellable. Blocked trades are carried to the next tradable
 day; no cost or turnover is booked for them. Without the panels the engine
 behaves exactly as before.
+
+Cash constraint (R18)
+---------------------
+Execution is sell-first: the allowed sells settle, and buys are then funded
+from real cash only, ``available_cash = max(0, 1 - sum(weights after sells))``.
+When a sell is blocked (limit-down / suspension) while the target still buys,
+the buys that would execute can exceed that cash; the engine scales every
+buy down by one common factor instead of turning the blocked sell into
+cost-free leverage. After execution ``sum(weights) <= 1 + 1e-9`` holds on
+every day, and the unfilled buy deltas stay in the deferred queue. The
+optimizer's ``max_weight`` remains a target-level constraint: it bounds the
+rebalance target, not the held book, so price drift (or a blocked sell) can
+still leave a single name above it between rebalances -- the engine does not
+force an extra sell to clip it.
 """
 
 from __future__ import annotations
@@ -53,6 +67,12 @@ logger = get_logger(__name__)
 # value would silently fall through to "use the caller's series", which is how
 # `market_cap_weight` used to be accepted-but-not-implemented (B6).
 _SUPPORTED_BENCHMARKS = ("equal_weight", "market_cap_weight")
+
+# Tolerance on the cash-funded buy budget. The post-execution gross-exposure
+# invariant the engine promises is ``sum(weights) <= 1 + 1e-9``; anything
+# inside this tolerance is left untouched so the default (no blocked sells)
+# path stays bit-identical to the pre-R18 engine.
+_FUNDING_TOL = 1e-12
 
 
 class BacktestEngine:
@@ -123,6 +143,8 @@ class BacktestEngine:
         # Sum of per-rebalance costs in return units. Reported in the summary
         # so the strategy gates can evaluate the configured cost-drag limit.
         self.total_cost_drag = 0.0
+        # Execution days on which the cash constraint scaled buys down (R18).
+        self.n_funding_scaled_days = 0
 
     @staticmethod
     def _compute_equal_weight_benchmark(returns: pd.DataFrame) -> pd.Series:
@@ -537,6 +559,9 @@ class BacktestEngine:
         summary["n_skipped_rebalances"] = self.skipped_rebalances
         summary["n_covariance_failures"] = self.covariance_failures
         summary["n_identity_covariance_fallbacks"] = self.identity_covariance_fallbacks
+        # R18: execution days on which the cash constraint scaled buys down
+        # (only possible when a sell was blocked or the book carried no cash).
+        summary["n_funding_scaled_days"] = int(self.n_funding_scaled_days)
         if self.optimizer_fallback_count > 0:
             summary["effective_optimizer"] = (
                 f"{self.optimizer_name}+equal_weight_fallback"
@@ -718,6 +743,14 @@ class BacktestEngine:
         traps a held position. Blocked deltas are retried on following days
         until they fill or a newer rebalance supersedes them; no cost or
         turnover is booked for a blocked trade.
+
+        R18: sells settle before buys and buys are capped by the cash they
+        release. If a blocked sell (or a cash-less book) would make the
+        requested buys exceed ``max(0, 1 - sum(weights after sells))``, all
+        buys are scaled by one common factor, the unfilled remainder stays
+        deferred, and the day is counted in ``n_funding_scaled_days``. The
+        executed book therefore never carries cost-free leverage
+        (``sum(weights) <= 1 + 1e-9``).
         """
         all_dates = returns.index.sort_values()
         columns = returns.columns
@@ -785,6 +818,7 @@ class BacktestEngine:
             )
 
         self.total_cost_drag = 0.0
+        self.n_funding_scaled_days = 0
         self._executed_signal_dates = set()
         capital = self.initial_capital
         current_weights = pd.Series(0.0, index=columns)
@@ -798,6 +832,8 @@ class BacktestEngine:
 
         for date in all_dates:
             rebalance_cost = 0.0
+            # At most one funding-scale warning per execution day (R18).
+            funding_scaled_today = False
 
             # A scheduled rebalance starts on its execution date. If a previous
             # rebalance still has blocked deltas outstanding, the newer signal
@@ -865,6 +901,51 @@ class BacktestEngine:
                     scale = self.constraints.max_turnover / turnover
                     executable_delta = executable_delta * scale
                     turnover = float(executable_delta.abs().sum()) / 2.0
+
+                # R18: sells settle first; buys are then funded from real cash
+                # only. `available_cash` is what the allowed sells leave
+                # uninvested. When a sell is blocked (limit-down/suspension)
+                # while the target still buys, the requested buys can exceed
+                # it; scaling every buy by one common factor preserves the
+                # target's relative ordering and never lifts a weight (so the
+                # optimizer's max_weight still bounds the rebalance target).
+                # The old code applied the buys unconditionally and clipped
+                # negative cash to zero in the drift step, i.e. it ran
+                # cost-free hidden leverage. The unfilled buy remainder is
+                # returned to the deferred queue below.
+                funding_scale = 1.0
+                total_buys = 0.0
+                available_cash = 0.0
+                if len(candidates):
+                    sell_delta = executable_delta.clip(upper=0.0)
+                    buy_delta = executable_delta.clip(lower=0.0)
+                    total_buys = float(buy_delta.sum())
+                    if total_buys > 0.0:
+                        available_cash = max(
+                            0.0,
+                            1.0 - (
+                                float(current_weights.sum())
+                                + float(sell_delta.sum())
+                            ),
+                        )
+                        if total_buys > available_cash + _FUNDING_TOL:
+                            funding_scale = available_cash / total_buys
+                            executable_delta = (
+                                sell_delta + buy_delta * funding_scale
+                            )
+                            turnover = (
+                                float(executable_delta.abs().sum()) / 2.0
+                            )
+                            if not funding_scaled_today:
+                                funding_scaled_today = True
+                                self.n_funding_scaled_days += 1
+                                logger.warning(
+                                    "Rebalance %s: buy orders at %s scaled to "
+                                    "%.4f of the requested amount by available "
+                                    "cash (%.4f available vs %.4f requested)",
+                                    str(pending_rdate)[:10], str(date)[:10],
+                                    funding_scale, available_cash, total_buys,
+                                )
 
                 if turnover > 0 and capital > 0:
                     # `turnover` is one-sided (the convention documented in
@@ -937,6 +1018,16 @@ class BacktestEngine:
                     blocked = allowed[~allowed & (delta.abs() > 1e-12)].index
                 else:
                     blocked = pd.Index([])
+                if funding_scale < 1.0:
+                    # Buys the cash constraint could not fund stay deferred
+                    # and are retried like gate-blocked trades, instead of
+                    # being dropped (which would silently abandon the target).
+                    residual = (target - current_weights).reindex(
+                        candidates, fill_value=0.0,
+                    )
+                    funding_blocked = residual[residual > 1e-12].index
+                    if len(funding_blocked):
+                        blocked = blocked.union(funding_blocked)
                 pending_assets = blocked
                 if len(pending_assets) == 0:
                     if (
@@ -960,6 +1051,10 @@ class BacktestEngine:
             # and every reported backtest was a daily-rebalanced portfolio.
             if current_weights.sum() > 1e-12:
                 growth = current_weights * (1.0 + daily_ret_assets.fillna(0.0))
+                # Real cash, not a forgotten negative balance: the R18 cash
+                # constraint keeps sum(weights) <= 1 after every execution, so
+                # this is non-negative by construction; max() stays as a
+                # floating-point guard only.
                 cash_weight = max(0.0, 1.0 - float(current_weights.sum()))
                 total_value = float(growth.sum()) + cash_weight
                 if total_value > 1e-12:
