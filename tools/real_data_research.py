@@ -238,7 +238,13 @@ def build_execution_gates(
 # ---------------------------------------------------------------------------
 
 def load_industry_map(path: Path, assets: pd.Index) -> pd.Series:
-    """Static asset -> industry map ("6-digit code" index, ``industry`` column)."""
+    """Static asset -> industry map ("6-digit code" index, ``industry`` column).
+
+    The map has no historical effective dates: it is the latest classification
+    applied to every backtest date, which is a mild look-ahead when used for
+    neutralization. Disclosed in the report (``INDUSTRY_MAP_NOTE``); the
+    platform has no historical sector data to do better offline.
+    """
     if not Path(path).is_file():
         raise ResearchError(f"industry map not found: {path}")
     frame = pd.read_parquet(path)
@@ -717,9 +723,9 @@ def format_console(summary: dict[str, Any]) -> str:
         f"OOS annual return (total): {_pct(metrics['annual_return'])}",
         f"OOS max drawdown: {_pct(metrics['max_drawdown'])}",
         f"Benchmark daily EW (same window): Sharpe "
-        f"{_num(summary['benchmark']['daily_ew']['sharpe'])}, annual "
+        f"{_num(summary['benchmark']['daily_ew']['sharpe'])}, annual (total) "
         f"{_pct(summary['benchmark']['daily_ew']['annual'])}; buy & hold: Sharpe "
-        f"{_num(summary['benchmark']['buyhold']['sharpe'])}, annual "
+        f"{_num(summary['benchmark']['buyhold']['sharpe'])}, annual (total) "
         f"{_pct(summary['benchmark']['buyhold']['annual'])}",
         f"Strategy excess vs daily EW (annualized, aligned daily): "
         f"{_pct(summary['excess_vs_daily_ew']['annual'])}",
