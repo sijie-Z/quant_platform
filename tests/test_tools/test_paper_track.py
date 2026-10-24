@@ -1581,6 +1581,37 @@ def test_amount_mode_requires_amount_column_and_auto_falls_back(
     assert "no 'amount' column" in stdout
 
 
+def test_volume_column_is_required_in_every_mode(tool, tmp_path, capsys):
+    # volume backs the R9 tradability gate and the shares -> CNY conversion,
+    # so a cache without it cannot produce a ledger in any mode. The failure
+    # is a clean non-zero exit that writes nothing.
+    close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0]})
+    dates = close.index
+    index = pd.MultiIndex.from_product(
+        [close.index, close.columns], names=["date", "asset"],
+    )
+    frame = pd.DataFrame(
+        {
+            "close": close.to_numpy(dtype=float).reshape(-1),
+            "pct_chg": pct.to_numpy(dtype=float).reshape(-1),
+        },
+        index=index,
+    )
+    cache = tmp_path / "cache_no_volume.parquet"
+    frame.to_parquet(cache)
+    target = write_target(
+        tmp_path / "target.json", dates[0].strftime("%Y-%m-%d"), {"A": 0.5},
+    )
+    for mode in ("auto", "close", "amount_over_volume"):
+        out_dir = tmp_path / f"out-{mode}"
+        assert run_tool(
+            tool, target, cache, out_dir, raw_price_mode=mode,
+        ) == 2
+        assert not out_dir.exists()
+        stderr = capsys.readouterr().err
+        assert "volume" in stderr
+
+
 def test_zero_volume_and_missing_amount_are_stale_without_crashing(
     tool, tmp_path,
 ):

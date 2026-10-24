@@ -34,7 +34,9 @@ Execution and accounting contract
   ``close`` when the cache has no ``amount`` column, while an explicit
   ``amount_over_volume`` against such a cache exits non-zero. ``volume``
   remains a required column in every mode (the R9 tradability gate and the
-  CNY traded-value conversion depend on it). ``summary.json`` records
+  CNY traded-value conversion depend on it). The basis is panel-level: a
+  single cache must use one adjustment convention (a mixed panel would let
+  the majority dilute the detection). ``summary.json`` records
   ``raw_price_mode`` only for the ``amount_over_volume`` basis so that
   legacy/raw-close runs keep their pre-R32 bytes. Returns never use the raw
   price: they stay ``pct_chg / 100``.
@@ -623,13 +625,18 @@ def load_cache(
         raise PaperTrackError(
             f"cache panel has {duplicated} duplicated (date, asset) rows"
         )
-    close = frame["close"].unstack("asset").sort_index().astype(float)
-    volume = frame["volume"].unstack("asset").reindex_like(close).astype(float)
-    pct_chg = frame["pct_chg"].unstack("asset").reindex_like(close).astype(float)
-    amount = (
-        frame["amount"].unstack("asset").reindex_like(close).astype(float)
-        if has_amount else None
-    )
+    try:
+        close = frame["close"].unstack("asset").sort_index().astype(float)
+        volume = frame["volume"].unstack("asset").reindex_like(close).astype(float)
+        pct_chg = frame["pct_chg"].unstack("asset").reindex_like(close).astype(float)
+        amount = (
+            frame["amount"].unstack("asset").reindex_like(close).astype(float)
+            if has_amount else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise PaperTrackError(
+            f"cache panel has non-numeric price/volume values: {exc}"
+        ) from exc
     detection: dict[str, Any] | None = None
     if raw_price_mode == RAW_PRICE_MODE_CLOSE:
         resolved_mode = RAW_PRICE_MODE_CLOSE
@@ -709,7 +716,9 @@ def _vol_panel(returns: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _execution_block_reason(close, volume, pct_chg, asset) -> str | None:
+def _execution_block_reason(
+    close, volume, pct_chg, asset, price_label: str = "close",
+) -> str | None:
     """Why a target asset cannot be bought at the execution close (or None)."""
     if asset not in close.index:
         return "is not present in the cached panel"
@@ -717,7 +726,7 @@ def _execution_block_reason(close, volume, pct_chg, asset) -> str | None:
     shares = volume.get(asset, np.nan)
     change = pct_chg.get(asset, np.nan)
     if not (np.isfinite(price) and price > 0):
-        return "has no valid close on the execution date"
+        return f"has no valid {price_label} on the execution date"
     if not (np.isfinite(change) and np.isfinite(shares) and shares > 0):
         return (
             "is not tradable on the execution date (missing pct_chg or "
@@ -743,6 +752,10 @@ def simulate(
     close = panels.close
     volume = panels.volume
     pct_chg = panels.pct_chg
+    price_label = (
+        "close" if panels.raw_price_mode == RAW_PRICE_MODE_CLOSE
+        else "raw price"
+    )
     dates = close.index
     if len(dates) == 0:
         raise PaperTrackError("cache panel contains no sessions")
@@ -774,7 +787,9 @@ def simulate(
 
     buyable = pd.Series(False, index=target.index)
     for asset in target.index:
-        reason = _execution_block_reason(exec_close, exec_volume, exec_pct, asset)
+        reason = _execution_block_reason(
+            exec_close, exec_volume, exec_pct, asset, price_label,
+        )
         if reason is None:
             buyable.loc[asset] = True
         else:
@@ -904,8 +919,9 @@ def simulate(
                     warnings.append(
                         f"{date.date()}: {asset} had no valid price for "
                         f"{max_stale_sessions} consecutive sessions; "
-                        f"liquidated at its last close {frozen:.6f} and held "
-                        "as cash (no trade cost: no tradable price exists)"
+                        f"liquidated at its last {price_label} {frozen:.6f} "
+                        "and held as cash (no trade cost: no tradable price "
+                        "exists)"
                     )
 
         bench_return = benchmark.get(date, 0.0)
@@ -1027,9 +1043,14 @@ def _check_existing_summary(
         else:
             existing_value = existing[key]
         if existing_value != expected:
+            hint = (
+                " or pass the matching --raw-price-mode"
+                if key == "raw_price_mode" else ""
+            )
             raise PaperTrackError(
                 f"{summary_path} belongs to a different {label} "
                 f"({existing_value!r} != {expected!r}); use a new --out-dir"
+                f"{hint}"
             )
 
 
@@ -1434,13 +1455,14 @@ def _trade_block_reason(
     date: pd.Timestamp,
     asset: str,
     side: str,
+    price_label: str = "close",
 ) -> str | None:
     """Why a rebalance trade cannot be executed at this close (or None)."""
     price = close.at[date, asset]
     shares = volume.at[date, asset]
     change = pct_chg.at[date, asset]
     if not (np.isfinite(price) and price > 0):
-        return "has no valid close on the rebalance date"
+        return f"has no valid {price_label} on the rebalance date"
     if not (np.isfinite(change) and np.isfinite(shares) and shares > 0):
         return (
             "is not tradable on the rebalance date (missing pct_chg or "
@@ -1521,6 +1543,7 @@ def _rebalance_to_target(
     cost_model: CostModel,
     vol_row: pd.Series | None,
     warnings: list[str],
+    price_label: str = "close",
 ) -> tuple[float, Rebalance]:
     """Trade ``holdings`` toward ``target`` at the close of ``date``.
 
@@ -1550,7 +1573,9 @@ def _rebalance_to_target(
         want = desired.get(asset, 0.0)
         if held <= want + ROLL_REBALANCE_EPS:
             continue
-        reason = _trade_block_reason(close, volume, pct_chg, date, asset, "sell")
+        reason = _trade_block_reason(
+            close, volume, pct_chg, date, asset, "sell", price_label,
+        )
         if reason is None:
             sells[asset] = held - want
             if want > ROLL_REBALANCE_EPS:
@@ -1573,7 +1598,9 @@ def _rebalance_to_target(
         held = holdings.get(asset, 0.0)
         if want <= held + ROLL_REBALANCE_EPS:
             continue
-        reason = _trade_block_reason(close, volume, pct_chg, date, asset, "buy")
+        reason = _trade_block_reason(
+            close, volume, pct_chg, date, asset, "buy", price_label,
+        )
         if reason is None:
             buys[asset] = want - held
         else:
@@ -1685,6 +1712,10 @@ def simulate_roll(
     close = panels.close
     volume = panels.volume
     pct_chg = panels.pct_chg
+    price_label = (
+        "close" if panels.raw_price_mode == RAW_PRICE_MODE_CLOSE
+        else "raw price"
+    )
     dates = close.index
     if len(dates) == 0:
         raise PaperTrackError("cache panel contains no sessions")
@@ -1779,8 +1810,8 @@ def simulate_roll(
                 warnings.append(
                     f"{date.date()}: {asset} had no valid price for "
                     f"{max_stale_sessions} consecutive sessions; liquidated at "
-                    f"its last close {frozen:.6f} and held as cash (no trade "
-                    "cost: no tradable price exists)"
+                    f"its last {price_label} {frozen:.6f} and held as cash "
+                    "(no trade cost: no tradable price exists)"
                 )
         turnover = 0.0
         costs_paid = 0.0
@@ -1791,7 +1822,7 @@ def simulate_roll(
             )
             cash, record = _rebalance_to_target(
                 date, target, holdings, cash, panels, cost_model, date_vol_row,
-                warnings,
+                warnings, price_label,
             )
             rebalances.append(record)
             turnover = record.turnover
@@ -2098,7 +2129,8 @@ def run_roll(
             raise PaperTrackError(
                 f"{summary_path} belongs to a rolling ledger with a different "
                 f"raw price mode ({existing_mode!r} != "
-                f"{panels.raw_price_mode!r}); use a new --out-dir"
+                f"{panels.raw_price_mode!r}); use a new --out-dir or pass the "
+                "matching --raw-price-mode"
             )
     out_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(
