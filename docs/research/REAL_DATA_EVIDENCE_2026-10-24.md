@@ -448,7 +448,70 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 
 产物：`docs/research/target_portfolio_2025-12-31.{json,csv}`（重生成）、`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`（重生成）、`.scratch/orchestrate/r26_target_compare_2026-10-24.{json,md}`、`r26_checks_2026-10-24.json`、`r26_compare_roll_wf_2026-10-24.json`、`cc_report_R26_prod_constraints.md`、`review_R26.md`。
 
-## 16. 下一步（按优先级）
+## 16. 宽池外部有效性验证（R30，297 只 · 60/00/30 · 新浪）
+
+**问题**：§3–§15 的全部结论建立在 101 只全 `000xxx` 深市池上。低换手/低波 tilt 是否只是这个同质池的特征？本轮用新浪源抓取的 297 只跨板块后复权日线（60:106 / 00:99 / 30:92，2018-01-02..2025-12-31，字段 open/high/low/close/volume/amount/turnover/pct_chg）按**预注册**五组复跑，口径与 R20/R22/R23 完全一致：同日涨跌停门禁（执行日 `pct_chg`）、因果波动率（同日 pct 滚动，绝不用前向 `returns`）、R18 现金约束引擎、impact 成本（佣金 0.03% + 法定印花税）、月度调仓、5% 单票、30% 行业上限、rank 归一 MVO、静态 `industry_map.parquet`、expanding WF（504/126/126，purge/embargo 5）、2M 资金。五组：**A** `turnover_20d`（top1）；**B** `turnover_60d`（top1）；**C** `volatility_20d+60d+amplitude_20d`（top2）；**D** 十因子动物园 momentum_1m/3m/6m、vol20/60、turnover20、rsi、amplitude、efficiency_ratio、macd（top2）；**E** A + 行业中性化（top1）。同一脚本对 101 池原样复跑，作为**同代码、同口径**对照（与 R20/R23 发布数字并列时注明因子处理差异）。
+
+### 数据与质量
+
+- 面板 1,942 交易日 × 297 只；close/turnover 缺失 12.21%（上市前/停牌；100 只存在区间内缺口共 2,198 行，零成交行 3 行）。横截面 2018 年中位 207→228 只，2025 年 291–297 只；OOS 期（2020+）最小 233 只。
+- `pct_chg == close.pct_change()*100` **逐位一致**（max abs diff = 0，N=506,347）；turnover 为百分数（p1/中位/p99 = 0.14/1.52/22.77）。
+- 与 101 池 Baostock 缓存重叠仅 6 只（宽池 00 段是另一批抽样）：`pct_chg` 相关 **0.999419–0.999999**、turnover **0.99997–1.0**、volume/amount **1.0**。Baostock 缓存 `close` 为原始价（非后复权），故 close 水平相关低（0.42–0.97）属预期；两条链路的研究价格路径都由 `pct_chg` 复利构建，收益口径可比。
+- **幸存者偏差（未校正）**：新浪只返回当前上市股票，297 只全部有 2025-12-31 数据，**退市样本 0 只**；抓取失败 3 只（001312/301655/301686，空序列）。宽池绝对收益是“活到今天的股票”的上界；同池等权基准同样受影响，策略-基准差受污染相对小，但两池的绝对收益不可直接外推。
+- 其它限制：30xxxx 2020-08 后涨跌幅为 20%，门禁仍用 ±9.8%（**保守**，会阻止部分本可成交的 +10%–20% 日买入）；无 ST 标记/过滤；行业映射静态最新分类（同前轮）。
+
+### 结果（净成本，OOS 2020-02-11..2025-12-31，1,433 天）
+
+宽池（297 只，新浪）：
+
+| 变体 | Sharpe | 年化 | 年化波动 | 最大回撤 | DSR p (N=58) | 基准 Sharpe | Sharpe 差 | IR vs EW | CAGR 差 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| A turnover20_plain | 0.807 | 15.51% | 15.49% | −20.22% | 0.6394 | 0.493 | **+0.314** | −0.042 | +1.08pp |
+| B turnover60_plain | 0.790 | 15.32% | 15.59% | −20.46% | 0.6525 | 0.493 | +0.297 | −0.053 | +0.89pp |
+| C lowvol3_plain | 0.736 | 14.46% | 15.56% | −19.48% | 0.6922 | 0.493 | **+0.243** | −0.110 | +0.03pp |
+| D zoo10_plain | 0.567 | 12.00% | 15.86% | −21.85% | 0.8037 | 0.493 | +0.074 | −0.277 | −2.43pp |
+| E turnover20_sector | 0.717 | 14.86% | 16.54% | −24.90% | 0.7039 | 0.493 | +0.224 | −0.081 | +0.43pp |
+| 同池日频等权 | 0.493 | 14.44% | 23.19% | −32.28% | — | — | — | — | — |
+
+101 池同代码、同口径复跑（对照）：
+
+| 变体 | Sharpe | 年化 | 最大回撤 | DSR p (N=58) | 基准 Sharpe | Sharpe 差 | IR vs EW | CAGR 差 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| A turnover20_plain | 0.632 | 13.07% | −18.17% | 0.7665 | 0.294 | +0.338 | +0.302 | +4.08pp |
+| B turnover60_plain | 0.628 | 13.05% | −17.48% | 0.7684 | 0.294 | +0.335 | +0.300 | +4.06pp |
+| C lowvol3_plain | 0.493 | 10.68% | −17.43% | 0.8470 | 0.294 | +0.199 | +0.069 | +1.69pp |
+| D zoo10_plain | 0.445 | 9.93% | −17.24% | 0.8704 | 0.294 | +0.151 | −0.002 | +0.94pp |
+| E turnover20_sector | 0.504 | 10.76% | −19.27% | 0.8423 | 0.294 | +0.211 | +0.078 | +1.77pp |
+| 同池日频等权 | 0.294 | 9.00% | −25.71% | — | — | — | — | — |
+
+（发布对照：R20 `turnover60_sector` 0.429 / `lowvol_sector` 0.577（两者为**行业中性**因子、N=48）；R19b `turnover20_plain` 0.663、`turnover60_plain` 0.682（均为 60% 行业上限、单行业映射、无 rank 归一，口径不同，仅参考）。本轮 B 的 0.628 与 R19b `turnover60_plain` 的 0.682 量级一致；而 R20 的**行业中性** `turnover60_sector` 只有 0.429——可见发布数字与本轮同口径结果的差异主要来自**因子中性化**，不是池子。本轮 B/C 为 **plain** 因子，故不可与 R20 的中性化版本逐位对齐；同表 A–E 的 101 列才是同口径对照。）
+
+- **方向复现**：宽池上 A/B/C/E 的 Sharpe 差 +0.22~+0.31、C 的 +0.243，均超过 0.1；D 仅 +0.074（101 池 +0.151），两池都弱于单因子 tilt。
+- **但宽池的 Sharpe 优势主要来自降波动**：策略年化波动 15.5–16.5% vs 同池等权 **23.19%**；IR（日均超额 mean/std）为 **−0.04~−0.11**，CAGR 仅高 0.03–1.08pp。101 池则同时有 IR +0.30 与 CAGR +4.1pp——宽池的等权基准本身极强（2025 年 +37.1%，受小盘/幸存者推动），策略在算术日均收益上并未跑赢。
+- 全样本 rank IC（处理前 plain 因子 vs 前向收益）：宽池 turnover20 **−0.0435**（ICIR −0.210）、vol20 **−0.0504**（−0.261）、amplitude **−0.0497**（−0.247），且 **8/8 年全为负**；101 池对应 −0.0468/−0.0533/−0.0522。**因子方向与量级在宽池复现**。
+- **fallback（真实计数）**：12 次运行（2 池 × 5 组 + PIT 2）引擎 optimizer fallback **0**、selector fallback **0**；R18 现金约束 `n_funding_scaled_days` 每 run 3,107–3,631。确定性：wide A 用同一脚本独立重跑（第一次未限 BLAS 线程、重跑限 1 线程），Sharpe/年化/MDD/DSR/年度收益一致到浮点末位（指标最大差 ≤4e-14；除 runtime 外最大绝对差 2.0e-7 CNY，出现在组合净值约为 3.4M 的 path 上，相对 ~6e-14），每折选择与 fallback 完全相同；差异来自 BLAS 线程数，非随机性。
+
+### PIT 大小盘拆分（2018–2019 平均成交额，2020+ OOS）
+
+2018-01-01..2019-12-31 平均 `amount` 中位数（74,567,871 CNY）分半：117 小 / 118 大；62 只 2020 后上市股票无 PIT 成交额，**不参与**拆分（避免用未来上市信息分类）。
+
+| half | n | Sharpe | 基准 Sharpe | 年化 | 最大回撤 | DSR p | IR vs EW | CAGR 差 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 大（PIT 成交额高半） | 118 | 0.790 | 0.473 | 16.28% | −24.21% | 0.6456 | +0.057 | +2.32pp |
+| 小（PIT 成交额低半） | 117 | 0.660 | 0.576 | 14.80% | −28.23% | 0.7465 | −0.225 | −1.56pp |
+
+低换手 tilt 的 Sharpe 优势集中在 **PIT 大 half**（+0.317）；小 half 的同 half 等权本身很强（Sharpe 0.576），策略 +0.084 未过 0.1 门线、IR 为负。
+
+### 判定（预注册规则，先写死再看结果）
+
+规则：宽池低换手（A）/低波（C）若 **Sharpe 差 >0.1 且 DSR p<0.2**，方向性结论可保留；否则说明原结论只适用于原池。
+
+- A：Sharpe 差 +0.314（通过），DSR p **0.639**（不通过）→ **不通过**。C：+0.243（通过），DSR p **0.692**（不通过）→ **不通过**。
+- **按字面预注册规则，宽池未通过验证门槛。** 但必须如实指出：同一 DSR 门槛在原 101 池**同样不通过**（本轮同口径 A 0.767 / C 0.847；R20 发布 lowvol_sector 0.7805、turnover60_sector 0.8637，N=48）。因此不能把“未通过”解释为“原结论只适用于原池”——两池证据都只是**方向性风格 tilt**，都未达到多重检验显著。
+- 可以保留的表述：低换手/低波的**方向**（IC 符号/量级、Sharpe 差）在跨板块宽池复现，且因子 IC 量级与 101 池几乎相同；但宽池证据强度弱于 101 池（IR 为负、PIT 小 half 失灵、zoo 失效），且宽池 Sharpe 优势主要是降波动而非增收益。**不可表述为“已验证的 alpha”，也不支持据此投入真金白银。**
+- 本轮新增 5 个变体已计入 DSR 全家族 N=53+5=58。
+
+## 17. 下一步（按优先级）
 
 1. **Forward paper 跟踪（不动钱）**：用真实行情按本组合/流程跑 3–6 个月，记录成交、滑点与风格暴露漂移；这是把“回测候选”变成“可观察假设”的最低成本方式。
 2. **正交 alpha 研究**：R23 已按预注册完成第一轮（5 个候选，§12），**零结果**——风格残差 alpha 全部不显著。下一轮若继续，应把“宽池 + 真实市值 + 新数据源”作为前置条件，而不是在同一个 101 只池里继续挖因子；任何新候选仍须预注册并计入 DSR 的 N。
@@ -459,4 +522,4 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 
 ---
 
-_生成于 2026-10-24（R19b 重写；R20 口径对齐；R22 新增 §11；R23 新增 §12「正交 alpha 筛选（预注册）」，零结果；R24 新增 §13「生产链路交叉验证」；R25 新增 §14「组合构建方式对比（预注册）」，保留 MVO；R26 新增 §15「生产工具组合层约束」，原下一步顺延为 §16）。作者：Claude（监督—执行环）。R26 产物：`docs/research/target_portfolio_2025-12-31.{json,csv}`（重生成）、`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`（重生成）、`.scratch/orchestrate/{gen_roll_targets.py,roll_targets/（72 个目标，不入 git）,r26_compare_targets.py,r26_target_compare_2026-10-24.{json,md},r26_checks.py,r26_checks_2026-10-24.json,r26_compare_roll_wf.py,r26_compare_roll_wf_2026-10-24.json,cc_report_R26_prod_constraints.md,review_R26.md}`。R25 产物：`.scratch/orchestrate/r25_construct.py`、`r25_construct_2026-10-24.{json,md}`、`r25_results/`、`r25_capture/`、`r25_checks_2026-10-24.json`、`r25_determinism_2026-10-24.json`、`cc_report_R25_construct.md`、`review_R25.md`。R24 产物：`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`、`.scratch/orchestrate/gen_roll_targets.py`、`roll_targets/`（72 个目标，不入 git）、`compare_roll_wf.py`、`r24_compare_2026-10-24.json`、`cc_report_R24_roll_track.md`、`review_R24.md`。R23 产物：`.scratch/orchestrate/r23_orthogonal_2026-10-24.{json,md}`、`r23_orthogonal.py`、`r23_results/`、`r23_capture/`、`r23_checks_2026-10-24.json`、`r23_determinism_2026-10-24.json`、`cc_report_R23_orthogonal.md`、`review_R23.md`。R22 产物：`.scratch/orchestrate/r22_results/r22_voltarget_2026-10-24.{json,md}`、每组 `r22_<variant>_vt<target>_2026-10-24.{json,csv}`、`cc_report_R22_voltarget.md`、`review_R22.md`。R20 产物：`.scratch/orchestrate/real_variants2_r20_2026-10-24.{json,md}`（四变体重跑）、`real_variants2_r20_results/`、`r20_capture/`、`r20_style_attr_2026-10-24.{json,md}`、`r20_benchmark_2026-10-24.{json,md}`、`r20_cap_probe_2026-10-24.json`（15% 行业上限剂量探针）、`r20_old_vs_new_2026-10-24.json`、`r20_golden_check.py`（默认路径逐位对比 c5c919c）。R19b 产物：`.scratch/orchestrate/r19b_headline_2026-10-24.{json,md}`、`r19b_benchmark_2026-10-24.{json,md}`、`r19b_style_attr_2026-10-24.{json,md}`、`r19b_size_split_2026-10-24.{json,md}`、`r19b_ic_scan_2026-10-24.{json,md}`、`r19b_old_vs_new_2026-10-24.json`、`capacity_curve_ep_turn_oos_2026-10-24.{json,md}`。旧数字来源：`real_variants{4,5,7,9}_2026-10-24.json`（旧口径，仅用于对照）；旧基准行 0.222/4.50%/−25.71% 取自 R19b 之前的报告文本（git 历史），旧容量 1M 0.565/5 亿 0.420 取自被本轮覆盖前的 `capacity_ep_turn_oos_out.txt`（数值已固化在 `r19b_old_vs_new_2026-10-24.json`）。注意 `capacity_curve_ep_turn_2026-10-24.json` 是另一套**全期**容量配置，勿与本报告的 OOS 容量表混用。_
+_生成于 2026-10-24（R19b 重写；R20 口径对齐；R22 新增 §11；R23 新增 §12「正交 alpha 筛选（预注册）」，零结果；R24 新增 §13「生产链路交叉验证」；R25 新增 §14「组合构建方式对比（预注册）」，保留 MVO；R26 新增 §15「生产工具组合层约束」，原下一步顺延为 §16）。作者：Claude（监督—执行环）。R30 产物：`.scratch/orchestrate/{r30_wide.py,r30_wide_2026-10-25.json,r30_wide_2026-10-25.md,r30_quality_2026-10-25.json,r30_ic_2026-10-25.json,r30_results/（12 个 run JSON）,r30_logs/,progress_R30.md,cc_report_R30_wide.md,review_R30.md}`（R30 新增 §16「宽池外部有效性验证」，下一步顺延为 §17）。R26 产物：`docs/research/target_portfolio_2025-12-31.{json,csv}`（重生成）、`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`（重生成）、`.scratch/orchestrate/{gen_roll_targets.py,roll_targets/（72 个目标，不入 git）,r26_compare_targets.py,r26_target_compare_2026-10-24.{json,md},r26_checks.py,r26_checks_2026-10-24.json,r26_compare_roll_wf.py,r26_compare_roll_wf_2026-10-24.json,cc_report_R26_prod_constraints.md,review_R26.md}`。R25 产物：`.scratch/orchestrate/r25_construct.py`、`r25_construct_2026-10-24.{json,md}`、`r25_results/`、`r25_capture/`、`r25_checks_2026-10-24.json`、`r25_determinism_2026-10-24.json`、`cc_report_R25_construct.md`、`review_R25.md`。R24 产物：`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`、`.scratch/orchestrate/gen_roll_targets.py`、`roll_targets/`（72 个目标，不入 git）、`compare_roll_wf.py`、`r24_compare_2026-10-24.json`、`cc_report_R24_roll_track.md`、`review_R24.md`。R23 产物：`.scratch/orchestrate/r23_orthogonal_2026-10-24.{json,md}`、`r23_orthogonal.py`、`r23_results/`、`r23_capture/`、`r23_checks_2026-10-24.json`、`r23_determinism_2026-10-24.json`、`cc_report_R23_orthogonal.md`、`review_R23.md`。R22 产物：`.scratch/orchestrate/r22_results/r22_voltarget_2026-10-24.{json,md}`、每组 `r22_<variant>_vt<target>_2026-10-24.{json,csv}`、`cc_report_R22_voltarget.md`、`review_R22.md`。R20 产物：`.scratch/orchestrate/real_variants2_r20_2026-10-24.{json,md}`（四变体重跑）、`real_variants2_r20_results/`、`r20_capture/`、`r20_style_attr_2026-10-24.{json,md}`、`r20_benchmark_2026-10-24.{json,md}`、`r20_cap_probe_2026-10-24.json`（15% 行业上限剂量探针）、`r20_old_vs_new_2026-10-24.json`、`r20_golden_check.py`（默认路径逐位对比 c5c919c）。R19b 产物：`.scratch/orchestrate/r19b_headline_2026-10-24.{json,md}`、`r19b_benchmark_2026-10-24.{json,md}`、`r19b_style_attr_2026-10-24.{json,md}`、`r19b_size_split_2026-10-24.{json,md}`、`r19b_ic_scan_2026-10-24.{json,md}`、`r19b_old_vs_new_2026-10-24.json`、`capacity_curve_ep_turn_oos_2026-10-24.{json,md}`。旧数字来源：`real_variants{4,5,7,9}_2026-10-24.json`（旧口径，仅用于对照）；旧基准行 0.222/4.50%/−25.71% 取自 R19b 之前的报告文本（git 历史），旧容量 1M 0.565/5 亿 0.420 取自被本轮覆盖前的 `capacity_ep_turn_oos_out.txt`（数值已固化在 `r19b_old_vs_new_2026-10-24.json`）。注意 `capacity_curve_ep_turn_2026-10-24.json` 是另一套**全期**容量配置，勿与本报告的 OOS 容量表混用。_
