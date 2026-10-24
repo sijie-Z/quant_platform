@@ -159,7 +159,7 @@ def load_listed_codes(path: str | Path) -> list[str]:
             listed_mask = delisted.isna().to_numpy()
         else:
             text = delisted.astype(str).str.strip().str.lower()
-            listed_mask = delisted.isna().to_numpy() | text.isin(["", "nan", "nat", "none", "null", "-"]).to_numpy()
+            listed_mask = delisted.isna().to_numpy() | text.isin(["", "nan", "nat", "none", "null", "n/a", "na", "-"]).to_numpy()
     else:
         listed_mask = np.ones(len(frame), dtype=bool)
     return sorted({code for code, keep in zip(codes, listed_mask, strict=True) if keep})
@@ -314,8 +314,12 @@ def write_stock(frame: pd.DataFrame, code: str, stocks_dir: Path) -> None:
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def aggregate_stocks(
@@ -333,6 +337,18 @@ def aggregate_stocks(
     for path in files:
         try:
             frame = pd.read_parquet(path)
+            if "date" not in frame.columns:
+                frame = frame.reset_index()
+            if "asset" not in frame.columns:
+                frame["asset"] = path.stem
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+            frame = frame.dropna(subset=["date"])
+            if frame.empty:
+                continue
+            for column in OUTPUT_COLUMNS:
+                if column not in frame.columns:
+                    frame[column] = np.nan
+            frames.append(frame.loc[:, OUTPUT_COLUMNS])
         except Exception as exc:
             if errors is None:
                 raise
@@ -341,19 +357,6 @@ def aggregate_stocks(
                 message = message[:297] + "..."
             errors.append({"code": path.stem, "error_type": "ReadError", "reason": message, "attempts": 0})
             print(f"WARN: cannot read {path}: {message}", file=sys.stderr)
-            continue
-        if "date" not in frame.columns:
-            frame = frame.reset_index()
-        if "asset" not in frame.columns:
-            frame["asset"] = path.stem
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-        frame = frame.dropna(subset=["date"])
-        if frame.empty:
-            continue
-        for column in OUTPUT_COLUMNS:
-            if column not in frame.columns:
-                frame[column] = np.nan
-        frames.append(frame.loc[:, OUTPUT_COLUMNS])
     if not frames:
         return None
     panel = pd.concat(frames, ignore_index=True)
@@ -363,8 +366,12 @@ def aggregate_stocks(
     panel = panel.loc[:, VALUE_COLUMNS]
     out_path = Path(out_path)
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    panel.to_parquet(tmp)
-    os.replace(tmp, out_path)
+    try:
+        panel.to_parquet(tmp)
+        os.replace(tmp, out_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return panel
 
 
@@ -393,15 +400,16 @@ def run(
     if not codes:
         print("WARN: universe selection produced 0 codes", file=sys.stderr)
 
-    out_dir = Path(args.out_dir)
-    stocks_dir = out_dir / "stocks"
-    stocks_dir.mkdir(parents=True, exist_ok=True)
-    existing = {path.stem for path in stocks_dir.glob("*.parquet")}
     try:
         refresh = {_require_code(normalize_code(code)) for code in (args.refresh or [])}
     except ValueError as exc:
         print(f"ERROR: invalid --refresh code: {exc}", file=sys.stderr)
         return 2
+
+    out_dir = Path(args.out_dir)
+    stocks_dir = out_dir / "stocks"
+    stocks_dir.mkdir(parents=True, exist_ok=True)
+    existing = {path.stem for path in stocks_dir.glob("*.parquet")}
     selected = set(codes)
     to_fetch = [code for code in codes if code in refresh or code not in existing]
     for code in sorted(refresh - selected):
@@ -457,13 +465,15 @@ def run(
             except Exception:  # pragma: no cover - logout errors must not mask fetch results
                 pass
 
+    failures_path = out_dir / "failures.json"
+    write_json_atomic(failures_path, {"generated_at": _utc_now(), "count": len(failures), "failures": failures})
+
     out_path = out_dir / "daily_wide.parquet"
     read_errors: list[dict[str, Any]] = []
     panel = aggregate_stocks(stocks_dir, out_path, errors=read_errors)
-    failures.extend(read_errors)
-
-    failures_path = out_dir / "failures.json"
-    write_json_atomic(failures_path, {"generated_at": _utc_now(), "count": len(failures), "failures": failures})
+    if read_errors:  # a pre-aggregation file survives a panel-write failure
+        failures.extend(read_errors)
+        write_json_atomic(failures_path, {"generated_at": _utc_now(), "count": len(failures), "failures": failures})
     if panel is None and out_path.exists():
         print(f"WARN: {out_path} was not rebuilt this run and may be stale", file=sys.stderr)
     success_codes = sorted(panel.index.get_level_values("asset").unique()) if panel is not None else []

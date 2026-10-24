@@ -491,16 +491,18 @@ def test_read_error_is_reported_and_skipped(tool, tmp_path, monkeypatch):
     stocks_dir = out / "stocks"
     write_seed_stock(tool, stocks_dir, "600002")
     (stocks_dir / "600001.parquet").write_bytes(b"definitely not parquet")
+    # Readable parquet without a usable date column: same ReadError path (review MIN-8).
+    pd.DataFrame({"close": [1.0]}).to_parquet(stocks_dir / "600003.parquet", index=False)
 
     fake = FakeAK(responses={"600000": ConnectionError("down")})
     install(tool, monkeypatch, ak=fake)
     rc = run_cli(tool, out, codes="600000", retries=0)
-    assert rc == 0  # 600002 still provides data; the run does not crash on the bad file
+    assert rc == 0  # 600002 still provides data; the run does not crash on the bad files
 
     payload = json.loads((out / "failures.json").read_text(encoding="utf-8"))
-    assert {entry["code"] for entry in payload["failures"]} == {"600000", "600001"}
-    read_error = next(entry for entry in payload["failures"] if entry["code"] == "600001")
-    assert read_error["error_type"] == "ReadError"
+    assert {entry["code"] for entry in payload["failures"]} == {"600000", "600001", "600003"}
+    read_errors = [entry for entry in payload["failures"] if entry["error_type"] == "ReadError"]
+    assert {entry["code"] for entry in read_errors} == {"600001", "600003"}
     wide = pd.read_parquet(out / "daily_wide.parquet")
     assert sorted(wide.index.get_level_values("asset").unique()) == ["600002"]
 
@@ -525,22 +527,24 @@ def test_codes_and_refresh_must_be_six_digits(tool, tmp_path, monkeypatch):
     assert rc == 2
     assert fake.calls == []
     assert not (tmp_path / "EVIL.parquet").exists()
+    assert not (tmp_path / "out_traversal").exists()
 
     rc = run_cli(tool, tmp_path / "out_refresh", codes="600000", extra=["--refresh", "../x"])
     assert rc == 2
     assert fake.calls == []
+    assert not (tmp_path / "out_refresh").exists()
 
 
 def test_text_delisting_date_sentinels(tool, tmp_path):
-    codes = ["000001", "000002", "000003", "000004", "000005", "000006"]
+    codes = ["000001", "000002", "000003", "000004", "000005", "000006", "000007"]
     frame = pd.DataFrame(
-        {"delisting_date": [None, "", "null", "NaN", "-", "2020-01-01"]},
+        {"delisting_date": [None, "", "null", "NaN", "-", "n/a", "2020-01-01"]},
         index=pd.Index(codes, name="asset"),
     )
     frame["delisting_date"] = frame["delisting_date"].astype(object)
     path = tmp_path / "metadata_text.parquet"
     frame.to_parquet(path)
-    assert tool.load_listed_codes(path) == codes[:5]
+    assert tool.load_listed_codes(path) == codes[:6]
 
 
 def test_backoff_waits_are_capped(tool):
