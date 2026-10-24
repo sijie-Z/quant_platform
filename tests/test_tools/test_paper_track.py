@@ -792,3 +792,414 @@ def test_cost_exceeding_capital_is_rejected(tool, tmp_path):
     out_dir = tmp_path / "out"
     assert run_tool(tool, target, cache, out_dir, capital=10.0) == 2
     assert not out_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Rolling mode (R24): a schedule of monthly targets -> one ledger
+# ---------------------------------------------------------------------------
+
+def write_target_files(
+    directory: Path, targets: list[tuple[str, dict[str, float]]],
+) -> list[Path]:
+    """Write one JSON target per (as_of, weights) entry."""
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for index, (as_of, weights) in enumerate(targets):
+        path = directory / f"target_{index:02d}.json"
+        path.write_text(
+            json.dumps({"as_of": as_of, "weights": weights}, indent=2),
+            encoding="utf-8",
+        )
+        paths.append(path)
+    return paths
+
+
+def run_roll_tool(
+    tool,
+    cache: Path,
+    out_dir: Path,
+    *,
+    targets: list[Path] | None = None,
+    targets_dir: Path | None = None,
+    **kwargs,
+) -> int:
+    argv = [
+        "--cache", str(cache),
+        "--out-dir", str(out_dir),
+        "--capital", str(kwargs.pop("capital", 1_000_000.0)),
+        "--cost-mode", kwargs.pop("cost_mode", "fixed"),
+    ]
+    if targets_dir is not None:
+        argv += ["--targets-dir", str(targets_dir)]
+    else:
+        assert targets is not None
+        argv += ["--targets", ",".join(str(path) for path in targets)]
+    if "max_stale_sessions" in kwargs:
+        argv += ["--max-stale-sessions", str(kwargs.pop("max_stale_sessions"))]
+    assert not kwargs, f"unexpected kwargs: {kwargs}"
+    return tool.main(argv)
+
+
+def test_roll_execution_and_rebalance_match_hand_computed_ledger(tool, tmp_path):
+    # d0 = first target as_of; d1 = build. A jumps +10% on d2 and stays.
+    # The second target is as_of d4, so it rebalances at the d5 close.
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, 11.0, 11.0, 11.0, 11.0, 11.0, 11.0, 11.0, 11.0],
+         "B": [10.0] * 10},
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.4, "B": 0.4}),
+        (dates[4].strftime("%Y-%m-%d"), {"A": 0.2, "B": 0.5}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+
+    nav = read_nav(out_dir)
+    summary = read_summary(out_dir)
+
+    # Execution is the first cached session strictly after each as_of.
+    assert list(nav["date"]) == list(dates[1:])
+    assert summary["mode"] == "rolling"
+    assert summary["n_targets"] == 2
+    assert summary["n_rebalances"] == 2
+    assert summary["n_pending_targets"] == 0
+    assert [record["execution_date"] for record in summary["rebalances"]] == [
+        dates[1].strftime("%Y-%m-%d"), dates[5].strftime("%Y-%m-%d"),
+    ]
+
+    # Build at d1: 400k per asset; 0.03% + 0.001% + 10bp fixed per side.
+    build_cost_per_asset = 400_000.0 * (0.0003 + 0.00001 + 0.001)
+    build_cost = 2 * build_cost_per_asset
+    assert nav.loc[0, "costs_paid"] == pytest.approx(build_cost, abs=1e-6)
+    assert nav.loc[0, "nav"] == pytest.approx(1_000_000.0 - build_cost, abs=1e-6)
+    assert nav.loc[0, "turnover"] == pytest.approx(0.4, abs=1e-9)
+
+    # d2 drift: A +10% on the 400,000 CNY position held against the post-cost
+    # NAV (targets are sized off the pre-cost value, so the realised weight is
+    # 400,000 / 998,952); the benchmark is the EW mean (+5%).
+    assert nav.loc[1, "daily_return"] == pytest.approx(
+        40_000.0 / (1_000_000.0 - build_cost), abs=1e-9,
+    )
+    assert nav.loc[1, "benchmark_daily_return"] == pytest.approx(0.05, abs=1e-9)
+    assert nav.loc[1, "nav"] == pytest.approx(1_038_952.0, abs=1e-6)
+
+    # d5 rebalance at P = 1,038,952: sell A down to 20%, buy B up to 50%.
+    pre = 1_038_952.0
+    sell_a = 440_000.0 - 0.2 * pre
+    buy_b = 0.5 * pre - 400_000.0
+    sell_cost = sell_a * (0.0003 + 0.0005 + 0.00001 + 0.001)
+    buy_cost = buy_b * (0.0003 + 0.00001 + 0.001)
+    total_cost = sell_cost + buy_cost
+    assert nav.loc[4, "costs_paid"] == pytest.approx(total_cost, abs=1e-6)
+    assert nav.loc[4, "nav"] == pytest.approx(pre - total_cost, abs=1e-6)
+    assert nav.loc[4, "daily_return"] == pytest.approx(-total_cost / pre, abs=1e-9)
+    assert nav.loc[4, "turnover"] == pytest.approx(
+        0.5 * (sell_a + buy_b) / pre, abs=1e-9,
+    )
+    # No drift after d5, no rebalance on the remaining sessions.
+    assert nav.loc[5:, "daily_return"].eq(0.0).all()
+    assert nav.loc[5:, "costs_paid"].eq(0.0).all()
+    assert nav.loc[5:, "turnover"].eq(0.0).all()
+    assert nav["n_positions"].tolist() == [2] * 9
+    assert summary["disclaimer"] == DISCLAIMER
+
+
+def test_roll_second_target_half_turnover_cost_is_hand_computed(tool, tmp_path):
+    # Constant prices: the only P&L is costs. Target 1 buys A at 50%; target
+    # 2 sells all of A and buys B at 50% -> one-sided turnover ~50%.
+    close, volume, pct = make_panel(
+        {"A": [10.0] * 6, "B": [10.0] * 6, "C": [10.0] * 6},
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+        (dates[2].strftime("%Y-%m-%d"), {"B": 0.5}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+
+    nav = read_nav(out_dir)
+    summary = read_summary(out_dir)
+    build_cost = 500_000.0 * (0.0003 + 0.00001 + 0.001)
+    pre = 1_000_000.0 - build_cost
+    sell_a = 500_000.0
+    buy_b = 0.5 * pre
+    sell_cost = sell_a * (0.0003 + 0.0005 + 0.00001 + 0.001)
+    buy_cost = buy_b * (0.0003 + 0.00001 + 0.001)
+    total_cost = sell_cost + buy_cost
+
+    assert nav.loc[0, "costs_paid"] == pytest.approx(build_cost, abs=1e-6)
+    assert nav.loc[2, "costs_paid"] == pytest.approx(total_cost, abs=1e-6)
+    assert nav.loc[2, "nav"] == pytest.approx(pre - total_cost, abs=1e-6)
+    assert nav.loc[2, "turnover"] == pytest.approx(
+        0.5 * (sell_a + buy_b) / pre, abs=1e-9,
+    )
+    assert summary["rebalances"][1]["sell_cny"] == pytest.approx(sell_a, abs=1e-6)
+    assert summary["rebalances"][1]["buy_cny"] == pytest.approx(buy_b, abs=1e-6)
+    # Stamp tax is charged on the sell side only: its 0.05% is inside sell_cost.
+    assert summary["rebalances"][1]["costs_cny"] == pytest.approx(
+        total_cost, abs=1e-6,
+    )
+
+
+def test_roll_idempotent_rebuild_is_byte_identical(tool, tmp_path):
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.1, 10.3, 10.2, 10.4, 10.3, 10.5, 10.4],
+         "B": [10.0, 9.9, 10.0, 10.2, 10.1, 10.3, 10.2, 10.2]},
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5, "B": 0.3}),
+        (dates[2].strftime("%Y-%m-%d"), {"A": 0.3, "B": 0.5}),
+        (dates[4].strftime("%Y-%m-%d"), {"A": 0.6, "B": 0.1}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    nav_bytes = (out_dir / "nav.csv").read_bytes()
+    summary_bytes = (out_dir / "summary.json").read_bytes()
+
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    assert (out_dir / "nav.csv").read_bytes() == nav_bytes
+    assert (out_dir / "summary.json").read_bytes() == summary_bytes
+
+    # The explicit --targets list is sorted by as_of, so it must produce the
+    # same bytes as --targets-dir even when passed in reverse order.
+    out_list = tmp_path / "out-list"
+    files = sorted(target_dir.glob("*.json"), reverse=True)
+    assert run_roll_tool(tool, cache, out_list, targets=files) == 0
+    assert (out_list / "nav.csv").read_bytes() == nav_bytes
+    assert (out_list / "summary.json").read_bytes() == summary_bytes
+
+
+def test_roll_duplicate_as_of_names_both_files(tool, tmp_path, capsys):
+    close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0]})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    paths = write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.6}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 2
+    stderr = capsys.readouterr().err
+    assert paths[0].name in stderr and paths[1].name in stderr
+    assert "duplicate target as_of" in stderr
+    assert not out_dir.exists()
+
+
+def test_roll_invalid_targets_are_rejected_with_the_file_name(tool, tmp_path, capsys):
+    close, volume, pct = make_panel({"A": [10.0, 10.0], "B": [10.0, 10.0]})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    as_of = dates[0].strftime("%Y-%m-%d")
+
+    cases = {
+        "leverage": {"A": 0.7, "B": 0.7},
+        "negative": {"A": -0.1, "B": 0.5},
+        "unknown": {"A": 0.5, "ZZZZZZ": 0.5},
+    }
+    for name, weights in cases.items():
+        target_dir = tmp_path / name
+        (path,) = write_target_files(target_dir, [(as_of, weights)])
+        out_dir = tmp_path / f"out-{name}"
+        assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 2
+        stderr = capsys.readouterr().err
+        assert path.name in stderr, (name, stderr)
+        assert not out_dir.exists()
+        if name == "unknown":
+            assert "not present in the cached panel" in stderr
+        if name == "negative":
+            assert "negative" in stderr
+        if name == "leverage":
+            assert "sum to" in stderr
+
+
+def test_roll_target_beyond_cache_is_rejected(tool, tmp_path, capsys):
+    close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0]})
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    (path,) = write_target_files(target_dir, [("2030-01-01", {"A": 0.5})])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 2
+    stderr = capsys.readouterr().err
+    assert path.name in stderr
+    assert "beyond the cache end" in stderr
+    assert not out_dir.exists()
+
+
+def test_roll_pending_tail_target_is_reported_not_executed(tool, tmp_path):
+    close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0, 10.0, 10.0]})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+        # as_of == last cached session: no session after it yet.
+        (dates[-1].strftime("%Y-%m-%d"), {"A": 0.4}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    summary = read_summary(out_dir)
+    assert summary["n_targets"] == 2
+    assert summary["n_rebalances"] == 1
+    assert summary["n_pending_targets"] == 1
+    assert summary["pending_targets"][0]["as_of"] == dates[-1].strftime("%Y-%m-%d")
+    assert any("pending target" in warning for warning in summary["warnings"])
+    nav = read_nav(out_dir)
+    assert list(nav["date"]) == list(dates[1:])
+
+
+def test_roll_duplicate_execution_session_is_rejected(tool, tmp_path, capsys):
+    # Start on a Friday: as_of Friday and Saturday both execute on Monday.
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, 10.0]}, start="2024-01-05",
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    paths = write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+        ("2024-01-06", {"A": 0.6}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 2
+    stderr = capsys.readouterr().err
+    assert "duplicate execution sessions" in stderr
+    assert paths[0].name in stderr and paths[1].name in stderr
+    assert not out_dir.exists()
+
+
+def test_roll_gross_one_build_scales_buys_to_fund_costs(tool, tmp_path):
+    # A 100%-gross book cannot spend all the cash and still pay its costs:
+    # buys are scaled by 1/(1+cost_rate) and cash ends at exactly zero.
+    close, volume, pct = make_panel({"A": [10.0] * 4, "B": [10.0] * 4})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5, "B": 0.5}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+
+    nav = read_nav(out_dir)
+    summary = read_summary(out_dir)
+    record = summary["rebalances"][0]
+    # All-linear fixed costs: 30bp commission + 1bp transfer + 10bp slippage.
+    cost_rate = 0.0003 + 0.00001 + 0.001
+    expected_scale = 1.0 / (1.0 + cost_rate)
+    assert record["buy_scale"] == pytest.approx(expected_scale, abs=1e-9)
+    expected_cost = 1_000_000.0 * cost_rate / (1.0 + cost_rate)
+    assert record["costs_cny"] == pytest.approx(expected_cost, abs=1e-4)
+    # The cash-budget tolerance (1e-12 relative) leaves a micro-yuan sliver;
+    # everything above it must match the closed-form scale exactly.
+    assert record["buy_cny"] == pytest.approx(1_000_000.0 - expected_cost, abs=1e-5)
+    assert nav.loc[0, "nav"] == pytest.approx(
+        1_000_000.0 - expected_cost, abs=1e-5,
+    )
+    assert nav.loc[0, "turnover"] == pytest.approx(
+        0.5 * (1_000_000.0 - expected_cost) / 1_000_000.0, abs=1e-9,
+    )
+    assert nav.loc[0, "n_positions"] == 2
+
+
+def test_roll_blocked_sell_and_limit_up_buy_stay_cash_constrained(tool, tmp_path):
+    # Target 2 wants 90% B and 10% C while A is limit-down (cannot sell) and
+    # C is limit-up (cannot buy): buys for B are scaled to the available cash.
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, 10.0, 9.0, 9.0, 9.0],
+         "B": [10.0] * 6,
+         "C": [10.0, 10.0, 10.0, 11.0, 11.0, 11.0]},
+        pct_chg={
+            "A": [np.nan, 0.0, 0.0, -10.0, 0.0, 0.0],
+            "B": [np.nan, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "C": [np.nan, 0.0, 0.0, 10.0, 0.0, 0.0],
+        },
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+        (dates[2].strftime("%Y-%m-%d"), {"B": 0.9, "C": 0.1}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+
+    summary = read_summary(out_dir)
+    record = summary["rebalances"][1]
+    assert record["blocked_sells"] == ["A"]
+    assert record["blocked_buys"] == ["C"]
+    assert record["buy_scale"] < 0.6
+    # A dropped 10% before the rebalance: P = 450,000 (A) + 499,345 (cash).
+    pre = 450_000.0 + (1_000_000.0 - 500_000.0 * (0.0003 + 0.00001 + 0.001))
+    desired_b = 0.9 * pre
+    assert record["buy_cny"] + record["costs_cny"] <= 499_345.0 + 2e-3
+    assert record["buy_cny"] < desired_b
+    assert any("cash constraint scaled" in w for w in summary["warnings"])
+    assert any("limit-down" in w for w in summary["warnings"])
+    assert any("limit-up" in w for w in summary["warnings"])
+    nav = read_nav(out_dir)
+    assert nav.loc[3, "n_positions"] == 2  # A (stuck) + B
+    assert summary["since_inception"]["final_nav"] == pytest.approx(
+        float(nav["nav"].iloc[-1]), abs=1e-6,
+    )
+
+
+def test_roll_refuses_to_mix_with_a_single_target_ledger(tool, tmp_path, capsys):
+    close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0, 10.0]})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    out_dir = tmp_path / "out"
+    single = write_target(
+        tmp_path / "single.json", dates[0].strftime("%Y-%m-%d"), {"A": 0.5},
+    )
+    assert run_tool(tool, single, cache, out_dir) == 0
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [(dates[0].strftime("%Y-%m-%d"), {"A": 0.5})])
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 2
+    stderr = capsys.readouterr().err
+    assert "not a rolling ledger" in stderr
+
+
+# ---------------------------------------------------------------------------
+# e. Single-target mode is byte-identical to the pre-rolling behavior
+# ---------------------------------------------------------------------------
+
+def test_single_target_mode_matches_pre_rolling_golden_bytes(tool, tmp_path):
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, 11.0, 10.5], "B": [10.0, 10.0, 10.0, 10.2]},
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target = write_target(
+        tmp_path / "target.json", dates[0].strftime("%Y-%m-%d"),
+        {"A": 0.6, "B": 0.4},
+    )
+    out_dir = tmp_path / "out"
+    assert run_tool(tool, target, cache, out_dir) == 0
+    golden = (
+        "date,nav,daily_return,benchmark_daily_return,cum_return,drawdown,"
+        "n_positions,stale_assets,costs_paid\n"
+        "2024-01-03,998690.000000,-0.0013100000,0.0000000000,"
+        "-0.0013100000,-0.0013100000,2,0,1310.000000\n"
+        "2024-01-04,1058611.400000,0.0600000000,0.0500000000,"
+        "0.0586114000,0.0000000000,2,0,0.000000\n"
+        "2024-01-05,1036640.220000,-0.0207547170,-0.0127272727,"
+        "0.0366402200,-0.0207547170,2,0,0.000000\n"
+    )
+    assert (out_dir / "nav.csv").read_text(encoding="utf-8") == golden
+    summary = read_summary(out_dir)
+    assert summary["ledger_version"] == 2
+    assert "mode" not in summary
+    assert summary["since_inception"]["final_nav"] == pytest.approx(
+        1_036_640.22, abs=1e-6,
+    )

@@ -60,12 +60,64 @@ Execution and accounting contract
   ``pct_chg`` returns over the same window (the ``daily_ew`` convention in
   ``tools/real_data_research.py``); an asset is excluded from a session when
   its observation is stale by the same rule. The execution row is 0.0.
-* **Scope.** One target per ledger: this version builds the book once and
-  then lets it drift -- there is no scheduled rebalancing after the build.
-  To track a different target, use a different ``--out-dir``; an existing
-  ledger refuses to mix targets, capital, cost mode, or stale policy.
+* **Scope (single-target mode).** With ``--target`` the tool builds the book
+  once and then lets it drift -- there is no scheduled rebalancing after the
+  build. To track a different target, use a different ``--out-dir``; an
+  existing ledger refuses to mix targets, capital, cost mode, or stale policy.
   Positions are weight-level (the platform backtest does not round to
   100-share lots either).
+
+Rolling mode (``--targets-dir`` / ``--targets``)
+------------------------------------------------
+Multiple ``daily_signal`` outputs are applied as a rebalance schedule:
+targets are sorted by ``as_of``; the first one builds the book at the close
+of the first cached session strictly after its ``as_of``, and every later
+target rebalances the book at the close of the first session strictly after
+*its* ``as_of``. On a rebalance session the tool marks the old book to that
+close first, then trades **sells first, buys second** at the same close.
+
+Trading is cash-constrained: buys can spend only the cash left after the
+sells plus the existing cash, *and* they must leave enough to pay the
+transaction costs. A gross-100% target therefore executes with buys scaled
+down by the cost fraction; the book still ends fully invested (cash 0) and
+each weight is a hair above target. If the constraint binds harder -- for
+example a limit-down position that cannot be sold -- buys are scaled
+proportionally and a warning records the realised scale.
+
+Tradability at a rebalance uses the R9/R19a gates on the execution close:
+an asset is sellable when it has a positive raw close, finite ``pct_chg``,
+positive volume and did not close limit-down (``pct_chg < -9.8%``); buyable
+when the same observation exists and it did not close limit-up
+(``pct_chg > 9.8%``). A blocked buy leaves that weight in cash; a blocked
+sell keeps the existing position (the reduction is superseded), with a
+warning naming the asset. Held assets with no valid observation are carried
+stale under the same policy as the single-target mode (last close, zero
+return, optional liquidation after ``--max-stale-sessions``).
+
+Costs are charged once per rebalance on the executed CNY notionals, using
+the same CostModel configuration as the single-target mode: per-order
+commission with the CNY 5 floor, both-sides transfer fee, the date-dependent
+sell-side stamp tax, and -- with ``--cost-mode impact`` -- the square-root
+impact rule whose daily volume is ``shares * raw_close`` (the R9 basis).
+Costs are deducted from cash at the rebalance close; the row's return is
+the drifted book return minus that cost fraction.
+
+A trailing target with no cached session after its ``as_of`` (only possible
+when ``as_of`` equals the cache's last date) is *pending*: it is listed in
+``summary.json`` and left for the next run once the cache extends, while the
+ledger ends at the last executed rebalance. A target whose ``as_of`` is
+beyond the cache end is an error, as are duplicate ``as_of`` values,
+duplicate execution sessions, unknown target assets, negative weights and
+weight sums above 1.
+
+Rolling ``nav.csv`` columns:
+``date, nav, daily_return, benchmark_daily_return, cum_return, drawdown,
+n_positions, turnover, costs_paid, stale_assets`` (``turnover`` is the
+realised one-sided turnover of an executed rebalance -- half of buys plus
+sells over the pre-cost portfolio value -- and 0 on non-rebalance sessions).
+The rolling ledger is rebuilt from scratch on every run, so the same targets
+and cache produce byte-identical files; an existing non-rolling ledger in
+the out-dir is refused rather than mixed.
 
 Idempotent accumulation
 -----------------------
@@ -101,6 +153,12 @@ Usage::
       --target docs/research/target_portfolio_2025-12-31.json \
       --cache .cache/baostock/daily_2018-01-01_2025-12-31_500.parquet \
       --out-dir docs/research/paper_track \
+      --capital 2000000 --cost-mode impact
+
+    python tools/paper_track.py \
+      --targets-dir .scratch/orchestrate/roll_targets \
+      --cache .cache/baostock/daily_2018-01-01_2025-12-31_500.parquet \
+      --out-dir docs/research/paper_track/roll_2020_2025 \
       --capital 2000000 --cost-mode impact
 """
 
@@ -150,6 +208,21 @@ NAV_COLUMNS = (
     "stale_assets",
     "costs_paid",
 )
+ROLL_MODE = "rolling"
+ROLL_LEDGER_VERSION = 1
+ROLL_NAV_COLUMNS = (
+    "date",
+    "nav",
+    "daily_return",
+    "benchmark_daily_return",
+    "cum_return",
+    "drawdown",
+    "n_positions",
+    "turnover",
+    "costs_paid",
+    "stale_assets",
+)
+ROLL_REBALANCE_EPS = 1e-9
 PERIODS_PER_YEAR = 252
 RISK_FREE_ANNUAL = 0.03
 COMMISSION = 0.0003
@@ -1028,17 +1101,788 @@ def run(
 
 
 # ---------------------------------------------------------------------------
+# Rolling mode: a schedule of targets -> one continuous ledger
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Target:
+    """One parsed target file with its provenance path."""
+
+    path: Path
+    as_of: pd.Timestamp
+    weights: pd.Series
+
+
+@dataclass
+class Rebalance:
+    """One executed rebalance (the first one is the build)."""
+
+    as_of: pd.Timestamp
+    execution_date: pd.Timestamp
+    turnover: float
+    costs_cny: float
+    buy_cny: float
+    sell_cny: float
+    buy_scale: float
+    n_buys: int
+    n_sells: int
+    blocked_buys: list[str]
+    blocked_sells: list[str]
+
+
+@dataclass
+class RollSimulation:
+    """Everything the rolling writer needs from one in-memory simulation."""
+
+    rows: list[dict[str, Any]]
+    warnings: list[str]
+    rebalances: list[Rebalance]
+    pending: list[tuple[Path, pd.Timestamp]]
+    targets: list[Target]
+    last_cache_date: pd.Timestamp
+    cost_mode: str
+    max_stale_sessions: int
+
+
+def load_targets(paths: list[Path]) -> list[Target]:
+    """Load and validate a target schedule, sorted by ``as_of``."""
+    if not paths:
+        raise PaperTrackError("no target files supplied")
+    targets: list[Target] = []
+    seen: dict[pd.Timestamp, Path] = {}
+    for raw_path in paths:
+        path = Path(raw_path)
+        try:
+            as_of, weights = load_target(path)
+        except PaperTrackError as exc:
+            # Name the offending file: load_target validates structure/weights
+            # but does not know the caller's provenance.
+            raise PaperTrackError(f"{path}: {exc}") from exc
+        if as_of in seen:
+            raise PaperTrackError(
+                f"duplicate target as_of {as_of.date()} in {seen[as_of]} and "
+                f"{path}; one rebalance per as_of"
+            )
+        seen[as_of] = path
+        targets.append(Target(path=path, as_of=as_of, weights=weights))
+    targets.sort(key=lambda target: target.as_of)
+    return targets
+
+
+def target_paths_from_dir(directory: Path) -> list[Path]:
+    """All ``*.json`` files directly inside ``directory`` (sorted by name)."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise PaperTrackError(f"targets directory not found: {directory}")
+    paths = sorted(path for path in directory.glob("*.json") if path.is_file())
+    if not paths:
+        raise PaperTrackError(f"no *.json target files in {directory}")
+    return paths
+
+
+def target_paths_from_list(raw: str) -> list[Path]:
+    """Comma-separated target files -> list of existing paths."""
+    paths = [Path(piece.strip()) for piece in str(raw).split(",") if piece.strip()]
+    if not paths:
+        raise PaperTrackError("--targets produced an empty file list")
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise PaperTrackError(f"target file(s) not found: {', '.join(missing)}")
+    return paths
+
+
+def _observation_ok(
+    close: pd.DataFrame,
+    volume: pd.DataFrame,
+    pct_chg: pd.DataFrame,
+    date: pd.Timestamp,
+    asset: str,
+) -> bool:
+    """A usable traded observation on ``date`` (the R9 ``tradable_mask``)."""
+    price = close.at[date, asset]
+    shares = volume.at[date, asset]
+    change = pct_chg.at[date, asset]
+    return bool(
+        np.isfinite(price) and price > 0
+        and np.isfinite(shares) and shares > 0
+        and np.isfinite(change)
+    )
+
+
+def _trade_block_reason(
+    close: pd.DataFrame,
+    volume: pd.DataFrame,
+    pct_chg: pd.DataFrame,
+    date: pd.Timestamp,
+    asset: str,
+    side: str,
+) -> str | None:
+    """Why a rebalance trade cannot be executed at this close (or None)."""
+    price = close.at[date, asset]
+    shares = volume.at[date, asset]
+    change = pct_chg.at[date, asset]
+    if not (np.isfinite(price) and price > 0):
+        return "has no valid close on the rebalance date"
+    if not (np.isfinite(change) and np.isfinite(shares) and shares > 0):
+        return (
+            "is not tradable on the rebalance date (missing pct_chg or "
+            "zero/NaN volume)"
+        )
+    if side == "buy" and change > LIMIT_UP_PCT:
+        return (
+            f"closed limit-up on the rebalance date (pct_chg {change:.4f}% > "
+            f"{LIMIT_UP_PCT}%); the buy is blocked"
+        )
+    if side == "sell" and change < -LIMIT_UP_PCT:
+        return (
+            f"closed limit-down on the rebalance date (pct_chg {change:.4f}% < "
+            f"-{LIMIT_UP_PCT}%); the sell is blocked"
+        )
+    return None
+
+
+def _rebalance_cost_fraction(
+    cost_model: CostModel,
+    buy_cny: pd.Series,
+    sell_cny: pd.Series,
+    date: pd.Timestamp,
+    portfolio_value: float,
+    panels: Panels,
+    vol_row: pd.Series | None,
+) -> float:
+    """CostModel charge on executed buy/sell notionals, as a fraction of P."""
+    index = buy_cny.index.union(sell_cny.index)
+    if len(index) == 0:
+        return 0.0
+    # pandas would align the two Series by label and leave NaN on the
+    # asset only present on one side; CostModel expects a dense buy/sell
+    # split, so reindex both onto the union with explicit zeros.
+    buy = buy_cny.reindex(index, fill_value=0.0).astype(float)
+    sell = sell_cny.reindex(index, fill_value=0.0).astype(float)
+    daily_volume: pd.Series | None = None
+    volatility: pd.Series | None = None
+    if vol_row is not None:
+        # R9 basis: daily traded value in CNY = shares * raw close.
+        daily_volume = (
+            panels.volume.loc[date].reindex(index).astype(float)
+            * panels.close.loc[date].reindex(index).astype(float)
+        )
+        volatility = vol_row.reindex(index).astype(float)
+        if (
+            not np.isfinite(daily_volume.to_numpy()).all()
+            or (daily_volume <= 0).any()
+        ):
+            raise PaperTrackError(
+                f"{date.date()}: non-positive CNY volume for a traded asset "
+                "despite the tradability gate; refusing to price costs"
+            )
+    costs = cost_model.compute_costs(
+        0.0,
+        buy_turnover=buy,
+        sell_turnover=sell,
+        daily_volume=daily_volume,
+        volatility=volatility,
+        date=date,
+        portfolio_value=portfolio_value,
+    )
+    total = float(np.sum(np.asarray(costs, dtype=float)))
+    if not math.isfinite(total) or total < 0:
+        raise PaperTrackError(
+            f"{date.date()}: cost model produced an invalid cost fraction "
+            f"{total!r}"
+        )
+    return total
+
+
+def _rebalance_to_target(
+    date: pd.Timestamp,
+    target: Target,
+    holdings: dict[str, float],
+    cash: float,
+    panels: Panels,
+    cost_model: CostModel,
+    vol_row: pd.Series | None,
+    warnings: list[str],
+) -> tuple[float, Rebalance]:
+    """Trade ``holdings`` toward ``target`` at the close of ``date``.
+
+    Mutates ``holdings`` in place and returns ``(cash_after, record)``.
+    Sells execute first and their proceeds (plus existing cash) fund the
+    buys; buys are scaled down when they would leave less cash than the
+    transaction costs.
+    """
+    close = panels.close
+    volume = panels.volume
+    pct_chg = panels.pct_chg
+    pre_value = float(sum(holdings.values()) + cash)
+    if not math.isfinite(pre_value) or pre_value <= 0:
+        raise PaperTrackError(
+            f"{date.date()}: non-positive portfolio value at rebalance"
+        )
+    desired = {
+        asset: float(weight) * pre_value
+        for asset, weight in target.weights.items()
+    }
+    blocked_buys: list[str] = []
+    blocked_sells: list[str] = []
+
+    sells: dict[str, float] = {}
+    for asset in sorted(holdings):
+        held = holdings[asset]
+        want = desired.get(asset, 0.0)
+        if held <= want + ROLL_REBALANCE_EPS:
+            continue
+        reason = _trade_block_reason(close, volume, pct_chg, date, asset, "sell")
+        if reason is None:
+            sells[asset] = held - want
+            if want > ROLL_REBALANCE_EPS:
+                holdings[asset] = want
+            else:
+                holdings.pop(asset)
+        else:
+            desired[asset] = held
+            blocked_sells.append(asset)
+            warnings.append(
+                f"{date.date()}: rebalance sell of {asset} {reason}; the "
+                "position is held at its current weight"
+            )
+    sell_cny = float(sum(sells.values()))
+    cash += sell_cny
+
+    buys: dict[str, float] = {}
+    for asset in sorted(desired):
+        want = desired[asset]
+        held = holdings.get(asset, 0.0)
+        if want <= held + ROLL_REBALANCE_EPS:
+            continue
+        reason = _trade_block_reason(close, volume, pct_chg, date, asset, "buy")
+        if reason is None:
+            buys[asset] = want - held
+        else:
+            blocked_buys.append(asset)
+            warnings.append(
+                f"{date.date()}: rebalance buy of {asset} {reason}; its "
+                "weight stays in cash"
+            )
+
+    buy_series = pd.Series(buys, dtype=float).sort_index()
+    sell_series = pd.Series(sells, dtype=float).sort_index()
+    available = cash
+    # Numerical tolerance for the cash budget: 1e-12 relative (a micro-yuan
+    # on a CNY 1M book), large enough to absorb float summation noise but
+    # not a real overdraft.
+    tolerance = max(1e-9, 1e-12 * max(1.0, pre_value))
+
+    def feasible(scale: float) -> bool:
+        scaled = buy_series * scale
+        cost_fraction = _rebalance_cost_fraction(
+            cost_model, scaled, sell_series, date, pre_value, panels, vol_row,
+        )
+        return (
+            float(scaled.sum()) + cost_fraction * pre_value
+            <= available + tolerance
+        )
+
+    buy_scale = 1.0
+    if len(buy_series):
+        if feasible(1.0):
+            buy_scale = 1.0
+        elif not feasible(0.0):
+            raise PaperTrackError(
+                f"{date.date()}: expected sell proceeds ({sell_cny:.2f} CNY) "
+                "cannot fund the rebalance transaction costs; refusing to "
+                "write a negative-cash ledger"
+            )
+        else:
+            # Feasibility is monotone in the buy scale (notionals and their
+            # costs both grow with it), so bisection finds the largest
+            # affordable scale deterministically.
+            low, high = 0.0, 1.0
+            for _ in range(64):
+                middle = 0.5 * (low + high)
+                if feasible(middle):
+                    low = middle
+                else:
+                    high = middle
+            buy_scale = low
+            # A hair below the bisection point so that re-evaluating the
+            # costs at the final notionals cannot land a floating-point ulp
+            # above the cash budget.
+            buy_scale = max(0.0, buy_scale * (1.0 - 1e-12))
+            if buy_scale < 0.995:
+                warnings.append(
+                    f"{date.date()}: cash constraint scaled rebalance buys to "
+                    f"{buy_scale:.4%} of the intended notional"
+                )
+    executed_buys = buy_series * buy_scale
+    cost_fraction = _rebalance_cost_fraction(
+        cost_model, executed_buys, sell_series, date, pre_value, panels, vol_row,
+    )
+    cost_cny = cost_fraction * pre_value
+    buy_cny = float(executed_buys.sum())
+    if buy_cny + cost_cny > available + tolerance:
+        raise PaperTrackError(
+            f"{date.date()}: internal cash-feasibility check failed after "
+            f"scaling (buys {buy_cny:.2f} + costs {cost_cny:.2f} > cash "
+            f"{available:.2f})"
+        )
+    for asset, amount in executed_buys.items():
+        holdings[asset] = holdings.get(asset, 0.0) + float(amount)
+    cash = available - buy_cny - cost_cny
+    if cash < -tolerance:
+        raise PaperTrackError(
+            f"{date.date()}: rebalance left negative cash ({cash:.6f} CNY)"
+        )
+    if cash < 0:
+        cash = 0.0
+    turnover = 0.5 * (buy_cny + sell_cny) / pre_value
+    record = Rebalance(
+        as_of=target.as_of,
+        execution_date=date,
+        turnover=float(turnover),
+        costs_cny=float(cost_cny),
+        buy_cny=buy_cny,
+        sell_cny=sell_cny,
+        buy_scale=float(buy_scale),
+        n_buys=int(len(executed_buys)),
+        n_sells=int(len(sell_series)),
+        blocked_buys=blocked_buys,
+        blocked_sells=blocked_sells,
+    )
+    return cash, record
+
+
+def simulate_roll(
+    targets: list[Target],
+    panels: Panels,
+    capital: float,
+    cost_mode: str,
+    max_stale_sessions: int,
+) -> RollSimulation:
+    """Run the multi-target paper book; raise on insufficient/invalid data."""
+    if not math.isfinite(capital) or capital <= 0:
+        raise PaperTrackError(f"capital must be a positive number; got {capital!r}")
+    if max_stale_sessions < 0:
+        raise PaperTrackError("--max-stale-sessions must be >= 0 (0 disables)")
+    close = panels.close
+    volume = panels.volume
+    pct_chg = panels.pct_chg
+    dates = close.index
+    if len(dates) == 0:
+        raise PaperTrackError("cache panel contains no sessions")
+    last_cache_date = pd.Timestamp(dates[-1])
+
+    available_assets = set(close.columns)
+    for target in targets:
+        unknown = sorted(set(target.weights.index) - available_assets)
+        if unknown:
+            shown = ", ".join(unknown[:10])
+            more = "" if len(unknown) <= 10 else f" (+{len(unknown) - 10} more)"
+            raise PaperTrackError(
+                f"{target.path}: target asset(s) not present in the cached "
+                f"panel: {shown}{more}"
+            )
+
+    warnings: list[str] = []
+    schedule: list[tuple[Target, pd.Timestamp]] = []
+    pending: list[tuple[Path, pd.Timestamp]] = []
+    for target in targets:
+        if target.as_of > last_cache_date:
+            raise PaperTrackError(
+                f"{target.path}: target as_of {target.as_of.date()} is beyond "
+                f"the cache end ({last_cache_date.date()}); no data to track"
+            )
+        position = int(dates.searchsorted(target.as_of, side="right"))
+        if position >= len(dates):
+            pending.append((target.path, target.as_of))
+            continue
+        schedule.append((target, pd.Timestamp(dates[position])))
+    if not schedule:
+        raise PaperTrackError(
+            "no target has an execution session after its as_of in the "
+            "cache; nothing to track"
+        )
+    execution_seen: dict[pd.Timestamp, Path] = {}
+    for target, execution in schedule:
+        previous = execution_seen.get(execution)
+        if previous is not None:
+            raise PaperTrackError(
+                f"targets {previous} and {target.path} both execute on "
+                f"{execution.date()}; duplicate execution sessions are not "
+                "supported"
+            )
+        execution_seen[execution] = target.path
+    if pending:
+        warnings.append(
+            "pending target(s) with no cached session after as_of: "
+            + ", ".join(
+                f"{path.name} ({as_of.date()})" for path, as_of in pending
+            )
+        )
+
+    cost_model = _build_cost_model(cost_mode)
+    vol_panel = (
+        _vol_panel(panels.volatility_returns())
+        if cost_mode == "impact" else None
+    )
+    benchmark = panels.returns().mean(axis=1, skipna=True)
+    execution_map = {execution: target for target, execution in schedule}
+
+    first_execution = schedule[0][1]
+    start = int(dates.searchsorted(first_execution))
+    holdings: dict[str, float] = {}
+    cash = float(capital)
+    last_price: dict[str, float] = {}
+    stale_streak: dict[str, int] = {}
+    rows: list[dict[str, Any]] = []
+    rebalances: list[Rebalance] = []
+    nav_prev_row = float(capital)
+    peak = float(capital)
+
+    for date in dates[start:]:
+        date = pd.Timestamp(date)
+        stale_today: list[str] = []
+        for asset in sorted(holdings):
+            if _observation_ok(close, volume, pct_chg, date, asset):
+                change = float(pct_chg.at[date, asset]) / 100.0
+                holdings[asset] *= 1.0 + change
+                last_price[asset] = float(close.at[date, asset])
+                stale_streak[asset] = 0
+            else:
+                stale_streak[asset] = stale_streak.get(asset, 0) + 1
+                stale_today.append(asset)
+        if max_stale_sessions > 0:
+            for asset in sorted(holdings):
+                if stale_streak.get(asset, 0) < max_stale_sessions:
+                    continue
+                frozen = last_price.pop(asset, np.nan)
+                cash += holdings.pop(asset)
+                stale_streak.pop(asset, None)
+                warnings.append(
+                    f"{date.date()}: {asset} had no valid price for "
+                    f"{max_stale_sessions} consecutive sessions; liquidated at "
+                    f"its last close {frozen:.6f} and held as cash (no trade "
+                    "cost: no tradable price exists)"
+                )
+        turnover = 0.0
+        costs_paid = 0.0
+        target = execution_map.get(date)
+        if target is not None:
+            cash, record = _rebalance_to_target(
+                date, target, holdings, cash, panels, cost_model, vol_panel,
+                warnings,
+            )
+            rebalances.append(record)
+            turnover = record.turnover
+            costs_paid = record.costs_cny
+            for asset in holdings:
+                if _observation_ok(close, volume, pct_chg, date, asset):
+                    last_price[asset] = float(close.at[date, asset])
+            for asset in list(last_price):
+                if asset not in holdings:
+                    last_price.pop(asset)
+            for asset in list(stale_streak):
+                if asset not in holdings:
+                    stale_streak.pop(asset)
+        nav = float(sum(holdings.values()) + cash)
+        if not math.isfinite(nav) or nav <= 0:
+            raise PaperTrackError(
+                f"{date.date()}: NAV would be non-positive ({nav!r}); "
+                "refusing to write"
+            )
+        daily_return = nav / nav_prev_row - 1.0
+        bench_return = benchmark.get(date, 0.0)
+        if not math.isfinite(bench_return):
+            bench_return = 0.0
+        peak = max(peak, nav)
+        rows.append(
+            {
+                "date": date,
+                "nav": nav,
+                "daily_return": float(daily_return),
+                "benchmark_daily_return": float(bench_return),
+                "cum_return": nav / capital - 1.0,
+                "drawdown": nav / peak - 1.0,
+                "n_positions": int(len(holdings)),
+                "turnover": float(turnover),
+                "costs_paid": float(costs_paid),
+                "stale_assets": int(len(stale_today)),
+            }
+        )
+        nav_prev_row = nav
+
+    return RollSimulation(
+        rows=rows,
+        warnings=warnings,
+        rebalances=rebalances,
+        pending=pending,
+        targets=targets,
+        last_cache_date=last_cache_date,
+        cost_mode=cost_mode,
+        max_stale_sessions=max_stale_sessions,
+    )
+
+
+def _format_roll_row(row: dict[str, Any]) -> str:
+    """Format one rolling ledger row with fixed precision."""
+    return ",".join(
+        (
+            pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
+            f"{row['nav']:.6f}",
+            f"{row['daily_return']:.10f}",
+            f"{row['benchmark_daily_return']:.10f}",
+            f"{row['cum_return']:.10f}",
+            f"{row['drawdown']:.10f}",
+            str(int(row["n_positions"])),
+            f"{row['turnover']:.10f}",
+            f"{row['costs_paid']:.6f}",
+            str(int(row["stale_assets"])),
+        )
+    )
+
+
+def _roll_merged_series(lines: list[str]) -> dict[str, Any]:
+    """Parse rolling ledger lines into per-column arrays for the summary."""
+    dates: list[pd.Timestamp] = []
+    nav: list[float] = []
+    daily: list[float] = []
+    bench: list[float] = []
+    costs: list[float] = []
+    stale: list[int] = []
+    for line in lines:
+        parts = line.split(",")
+        if len(parts) != len(ROLL_NAV_COLUMNS):
+            raise PaperTrackError(
+                f"internal error: malformed rolling ledger row: {line!r}"
+            )
+        dates.append(pd.Timestamp(parts[0]))
+        nav.append(float(parts[1]))
+        daily.append(float(parts[2]))
+        bench.append(float(parts[3]))
+        costs.append(float(parts[8]))
+        stale.append(int(parts[9]))
+    index = pd.DatetimeIndex(dates)
+    return {
+        "dates": index,
+        "nav": np.asarray(nav, dtype=float),
+        "daily": pd.Series(daily, index=index),
+        "bench": pd.Series(bench, index=index),
+        "costs": np.asarray(costs, dtype=float),
+        "stale": np.asarray(stale, dtype=int),
+    }
+
+
+def build_roll_summary(
+    simulation: RollSimulation,
+    lines: list[str],
+    capital: float,
+    target_files: list[str],
+    targets_sha256: str,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Deterministic summary of a rolling ledger (no timestamps inside)."""
+    series = _roll_merged_series(lines)
+    daily = series["daily"]
+    bench = series["bench"]
+    nav = series["nav"]
+    dates = series["dates"]
+    total_return = float(nav[-1] / capital - 1.0)
+    bench_nav = np.cumprod(1.0 + bench.to_numpy(dtype=float))
+    benchmark_total = float(bench_nav[-1] - 1.0)
+    strategy_metrics = _metrics(daily, nav, dates, capital)
+    benchmark_metrics = _metrics(bench, bench_nav, dates, 1.0)
+    tracking_error_value = (
+        _finite(tracking_error(daily, bench, PERIODS_PER_YEAR))
+        if len(daily) >= 2 else None
+    )
+    total_costs = float(series["costs"].sum())
+    turnovers = [record.turnover for record in simulation.rebalances]
+    return {
+        "mode": ROLL_MODE,
+        "roll_ledger_version": ROLL_LEDGER_VERSION,
+        "capital": float(capital),
+        "cost_mode": simulation.cost_mode,
+        "max_stale_sessions": int(simulation.max_stale_sessions),
+        "n_targets": int(len(simulation.targets)),
+        "n_rebalances": int(len(simulation.rebalances)),
+        "n_pending_targets": int(len(simulation.pending)),
+        "targets_sha256": targets_sha256,
+        "target_files": list(target_files),
+        "first_ledger_date": dates[0].strftime("%Y-%m-%d"),
+        "last_ledger_date": dates[-1].strftime("%Y-%m-%d"),
+        "cache_last_date": simulation.last_cache_date.strftime("%Y-%m-%d"),
+        "n_sessions": int(len(daily)),
+        "stale_policy": STALE_POLICY,
+        "return_basis": RETURN_BASIS,
+        "volatility_basis": VOLATILITY_BASIS,
+        "tradable_gate": TRADABLE_GATE + (
+            "; at a rebalance, limit-down blocks the sell and limit-up blocks "
+            "the buy"
+        ),
+        "benchmark_definition": BENCHMARK_DEFINITION,
+        "risk_free_rate": RISK_FREE_ANNUAL,
+        "annualization_periods_per_year": PERIODS_PER_YEAR,
+        "since_inception": {
+            "final_nav": float(nav[-1]),
+            "total_return": total_return,
+            "annualized_return": strategy_metrics["annualized_return"],
+            "annualized_volatility": strategy_metrics["annualized_volatility"],
+            "sharpe_ratio": strategy_metrics["sharpe_ratio"],
+            "max_drawdown": strategy_metrics["max_drawdown"],
+            "max_drawdown_peak": strategy_metrics["max_drawdown_peak"],
+            "max_drawdown_trough": strategy_metrics["max_drawdown_trough"],
+            "n_stale_days": int((series["stale"] > 0).sum()),
+        },
+        "benchmark": {
+            "definition": BENCHMARK_DEFINITION,
+            "total_return": benchmark_total,
+            "annualized_return": benchmark_metrics["annualized_return"],
+            "annualized_volatility": benchmark_metrics["annualized_volatility"],
+            "sharpe_ratio": benchmark_metrics["sharpe_ratio"],
+            "max_drawdown": benchmark_metrics["max_drawdown"],
+        },
+        "tracking": {
+            "difference": total_return - benchmark_total,
+            "tracking_error": tracking_error_value,
+        },
+        "costs": {
+            "total_cny": total_costs,
+            "pct_of_capital": total_costs / capital if capital else None,
+        },
+        "turnover": {
+            "definition": (
+                "realised one-sided turnover = 0.5 * (buys + sells) / "
+                "pre-cost portfolio value, per executed rebalance"
+            ),
+            "total": float(sum(turnovers)),
+            "mean_per_rebalance": (
+                float(np.mean(turnovers)) if turnovers else None
+            ),
+        },
+        "rebalances": [
+            {
+                "as_of": record.as_of.strftime("%Y-%m-%d"),
+                "execution_date": record.execution_date.strftime("%Y-%m-%d"),
+                "turnover": record.turnover,
+                "costs_cny": record.costs_cny,
+                "buy_cny": record.buy_cny,
+                "sell_cny": record.sell_cny,
+                "buy_scale": record.buy_scale,
+                "n_buys": record.n_buys,
+                "n_sells": record.n_sells,
+                "blocked_buys": record.blocked_buys,
+                "blocked_sells": record.blocked_sells,
+            }
+            for record in simulation.rebalances
+        ],
+        "pending_targets": [
+            {
+                "file": path.as_posix(),
+                "as_of": as_of.strftime("%Y-%m-%d"),
+                "reason": "no cached session after as_of yet",
+            }
+            for path, as_of in simulation.pending
+        ],
+        "warnings": list(warnings),
+        "disclaimer": DISCLAIMER,
+    }
+
+
+def run_roll(
+    target_paths: list[Path],
+    cache_path: Path,
+    out_dir: Path,
+    capital: float = DEFAULT_CAPITAL,
+    cost_mode: str = "impact",
+    max_stale_sessions: int = DEFAULT_MAX_STALE_SESSIONS,
+) -> tuple[dict[str, Any], Path]:
+    """Rebuild one rolling paper ledger; returns (summary, nav_path)."""
+    if not math.isfinite(capital) or capital <= 0:
+        raise PaperTrackError(f"capital must be a positive number; got {capital!r}")
+    if max_stale_sessions < 0:
+        raise PaperTrackError("--max-stale-sessions must be >= 0 (0 disables)")
+    targets = load_targets([Path(path) for path in target_paths])
+    panels = load_cache(Path(cache_path))
+    simulation = simulate_roll(
+        targets, panels, float(capital), cost_mode, int(max_stale_sessions),
+    )
+    lines = [_format_roll_row(row) for row in simulation.rows]
+    if not lines:
+        raise PaperTrackError("internal error: empty rolling ledger after simulation")
+
+    digest = hashlib.sha256()
+    for target in targets:
+        digest.update(hashlib.sha256(target.path.read_bytes()).digest())
+    target_files = [target.path.as_posix() for target in targets]
+    summary = build_roll_summary(
+        simulation, lines, float(capital), target_files, digest.hexdigest(),
+        list(simulation.warnings),
+    )
+
+    out_dir = Path(out_dir)
+    nav_path = out_dir / "nav.csv"
+    summary_path = out_dir / "summary.json"
+    if nav_path.is_file():
+        existing_lines = nav_path.read_text(encoding="utf-8").splitlines()
+        header = existing_lines[0].strip() if existing_lines else ""
+        if header != ",".join(ROLL_NAV_COLUMNS):
+            raise PaperTrackError(
+                f"{nav_path} exists but is not a rolling ledger (header "
+                f"{header!r}); use a new --out-dir"
+            )
+    if summary_path.is_file():
+        try:
+            existing = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise PaperTrackError(
+                f"{summary_path} exists but is not valid JSON; refusing to "
+                "overwrite"
+            ) from exc
+        if existing.get("mode") != ROLL_MODE:
+            raise PaperTrackError(
+                f"{summary_path} belongs to a non-rolling paper_track "
+                "ledger; use a new --out-dir"
+            )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(
+        nav_path,
+        ",".join(ROLL_NAV_COLUMNS) + "\n" + "\n".join(lines) + "\n",
+    )
+    summary_text = json.dumps(
+        summary, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False,
+    ) + "\n"
+    _atomic_write_text(summary_path, summary_text)
+    return summary, nav_path
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Forward paper tracking: fixed target book -> idempotent daily "
-            "NAV ledger + benchmark (read-only; no broker)."
+            "Forward paper tracking: fixed target book (or a rolling target "
+            "schedule) -> idempotent daily NAV ledger + benchmark (read-only; "
+            "no broker)."
         )
     )
-    parser.add_argument("--target", required=True, help="target weights JSON")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--target",
+        help="target weights JSON (single-target mode: build once, then drift)",
+    )
+    mode.add_argument(
+        "--targets-dir",
+        help=(
+            "directory of daily_signal JSON targets (rolling mode; the files "
+            "are sorted by as_of)"
+        ),
+    )
+    mode.add_argument(
+        "--targets",
+        help="comma-separated target JSON paths (rolling mode)",
+    )
     parser.add_argument("--cache", required=True, help="cached daily parquet")
     parser.add_argument("--out-dir", required=True, help="ledger output directory")
     parser.add_argument(
@@ -1062,14 +1906,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        summary, n_new, nav_path = run(
-            Path(args.target),
-            Path(args.cache),
-            Path(args.out_dir),
-            capital=float(args.capital),
-            cost_mode=args.cost_mode,
-            max_stale_sessions=int(args.max_stale_sessions),
-        )
+        if args.target is not None:
+            summary, n_new, nav_path = run(
+                Path(args.target),
+                Path(args.cache),
+                Path(args.out_dir),
+                capital=float(args.capital),
+                cost_mode=args.cost_mode,
+                max_stale_sessions=int(args.max_stale_sessions),
+            )
+        else:
+            if args.targets_dir is not None:
+                target_paths = target_paths_from_dir(Path(args.targets_dir))
+            else:
+                target_paths = target_paths_from_list(args.targets)
+            summary, nav_path = run_roll(
+                target_paths,
+                Path(args.cache),
+                Path(args.out_dir),
+                capital=float(args.capital),
+                cost_mode=args.cost_mode,
+                max_stale_sessions=int(args.max_stale_sessions),
+            )
     except PaperTrackError as exc:
         print(f"paper_track: error: {exc}", file=sys.stderr)
         return 2
@@ -1078,21 +1936,40 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     since = summary["since_inception"]
-    print(
-        "paper_track: executed {execution} on {as_of} target; ledger "
-        "{first}..{last} ({sessions} sessions, +{new} new rows); "
-        "final NAV {nav:.2f} ({ret:+.2%}); costs {costs:.2f} CNY".format(
-            execution=summary["execution_date"],
-            as_of=summary["as_of"],
-            first=summary["first_ledger_date"],
-            last=summary["last_ledger_date"],
-            sessions=summary["n_sessions"],
-            new=n_new,
-            nav=since["final_nav"],
-            ret=since["total_return"],
-            costs=summary["costs"]["total_cny"],
+    if args.target is not None:
+        print(
+            "paper_track: executed {execution} on {as_of} target; ledger "
+            "{first}..{last} ({sessions} sessions, +{new} new rows); "
+            "final NAV {nav:.2f} ({ret:+.2%}); costs {costs:.2f} CNY".format(
+                execution=summary["execution_date"],
+                as_of=summary["as_of"],
+                first=summary["first_ledger_date"],
+                last=summary["last_ledger_date"],
+                sessions=summary["n_sessions"],
+                new=n_new,
+                nav=since["final_nav"],
+                ret=since["total_return"],
+                costs=summary["costs"]["total_cny"],
+            )
         )
-    )
+    else:
+        print(
+            "paper_track: rolling ledger {first}..{last} ({sessions} sessions, "
+            "{rebalances} rebalances, {pending} pending target(s)); final NAV "
+            "{nav:.2f} ({ret:+.2%}) vs benchmark {bench:+.2%} (diff "
+            "{diff:+.2%}); costs {costs:.2f} CNY".format(
+                first=summary["first_ledger_date"],
+                last=summary["last_ledger_date"],
+                sessions=summary["n_sessions"],
+                rebalances=summary["n_rebalances"],
+                pending=summary["n_pending_targets"],
+                nav=since["final_nav"],
+                ret=since["total_return"],
+                bench=summary["benchmark"]["total_return"],
+                diff=summary["tracking"]["difference"],
+                costs=summary["costs"]["total_cny"],
+            )
+        )
     print(f"paper_track: wrote {nav_path} and {nav_path.parent / 'summary.json'}")
     if summary["warnings"]:
         print(
