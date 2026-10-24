@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import math
 import sys
 import time
@@ -103,7 +104,16 @@ def test_end_to_end_smoke(tool, tmp_path):
         assert math.isfinite(value)
     # No --industry-map: neutralization is skipped, not crashed on.
     assert summary["config"]["industry_neutralization"] is False
+    assert summary["config"]["industry_map_note"].startswith("static latest")
     assert summary["dsr"]["num_trials"] == summary["n_folds"] * 1
+    assert summary["dsr"]["num_trials_source"] == "fold_x_factors"
+    assert summary["dsr"]["return_basis"] == "excess"
+    # Both benchmarks exist on the same OOS window and are finite.
+    for name in ("daily_ew", "buyhold"):
+        for key in ("sharpe", "annual", "mdd"):
+            value = summary["benchmark"][name][key]
+            assert value is not None, f"benchmark {name}.{key} should be finite"
+            assert math.isfinite(value)
     assert md_out.is_file()
     assert elapsed < 30.0, f"smoke run took {elapsed:.1f}s (budget 30s)"
 
@@ -150,7 +160,7 @@ def test_returns_are_next_session_pct_chg(tool):
         index=index,
     )
 
-    _close, _volume, _turnover, returns, adj = tool.build_panels(frame)
+    _close, _volume, _turnover, returns, adj, pct = tool.build_panels(frame)
 
     expected = np.array([
         [0.10, 0.05],
@@ -162,9 +172,145 @@ def test_returns_are_next_session_pct_chg(tool):
     # Row t is the *next* session's return; the final row has no successor.
     assert returns.iloc[0].tolist() == [pytest.approx(0.10), pytest.approx(0.05)]
     assert returns.iloc[-1].isna().all()
+    # ``pct`` is the same-day move, unshifted.
+    np.testing.assert_allclose(pct.to_numpy(dtype=float), pct_chg / 100.0)
     # Adjusted path compounds pct_chg; blanked wherever close is missing.
     expected_adj = 100.0 * np.cumprod(1.0 + pct_chg / 100.0, axis=0)
     np.testing.assert_allclose(adj.to_numpy(dtype=float), expected_adj, rtol=1e-12)
+
+
+def test_limit_gates_use_same_day_pct(tool):
+    """Gates on day d must reflect day d's own move, not the forward return.
+
+    Asset A: normal on day 0, limit-up on day 1. Asset B: limit-up on day 0.
+    Asset C: normal on day 0, limit-down on day 1. The old gate panel was the
+    forward return panel (``returns[t] = pct_chg[t+1]``), so day 0's gate read
+    day 1's move -- a one-day look-ahead.
+    """
+    dates = pd.bdate_range("2024-01-02", periods=3)
+    assets = ["A", "B", "C"]
+    pct_chg = np.array([
+        [1.0, 10.0, -1.0],
+        [10.0, 1.0, -10.0],
+        [0.0, 0.0, 0.0],
+    ])
+    close = 10.0 * np.cumprod(1.0 + pct_chg / 100.0, axis=0)
+    index = pd.MultiIndex.from_product([dates, assets], names=["date", "asset"])
+    frame = pd.DataFrame(
+        {
+            "close": close.reshape(-1),
+            "volume": np.ones(9),
+            "turnover": np.ones(9) * 0.01,
+            "pct_chg": pct_chg.reshape(-1),
+        },
+        index=index,
+    )
+    close_p, volume_p, _turnover, returns, _adj, pct = tool.build_panels(frame)
+    gates = tool.build_execution_gates(close_p, volume_p, pct)
+    day0, day1 = dates[0], dates[1]
+
+    # The forward panel *would* have blocked A on day 0 ...
+    assert returns.loc[day0, "A"] == pytest.approx(0.10)
+    # ... but the same-day gate must not: A was normal on day 0.
+    assert gates["limit_up"].loc[day0].tolist() == [False, True, False]
+    assert gates["limit_up"].loc[day1].tolist() == [True, False, False]
+    assert gates["limit_down"].loc[day0].tolist() == [False, False, False]
+    assert gates["limit_down"].loc[day1].tolist() == [False, False, True]
+
+
+def test_benchmark_returns_same_oos_window_hand_computed(tool):
+    """Daily-EW and buy&hold benchmarks, hand-computed on a tiny panel."""
+    dates = pd.bdate_range("2024-01-02", periods=4)
+    assets = ["A", "B"]
+    pct = pd.DataFrame(
+        [
+            [0.00, 0.00],
+            [0.10, -0.02],
+            [-0.05, 0.04],
+            [0.02, 0.10],
+        ],
+        index=dates, columns=assets,
+    )
+    adj = (1.0 + pct).cumprod() * 100.0
+    returns = pct.shift(-1)
+    oos = pd.DatetimeIndex(dates[1:])
+
+    series = tool.compute_benchmark_returns(returns, adj, oos)
+
+    # daily EW: row d = mean of the next session's moves.
+    expected_ew = pd.Series([-0.005, 0.06, np.nan], index=dates[1:])
+    np.testing.assert_allclose(
+        series["daily_ew"].to_numpy(dtype=float),
+        expected_ew.to_numpy(dtype=float), equal_nan=True,
+    )
+    # buy & hold: basket formed at day 1, weights drift; day 2's return is
+    # 1.0565 / 0.995 - 1, not the daily-EW 0.06.
+    expected_bh = pd.Series([-0.005, 1.0565 / 0.995 - 1.0, np.nan], index=dates[1:])
+    np.testing.assert_allclose(
+        series["buyhold"].to_numpy(dtype=float),
+        expected_bh.to_numpy(dtype=float), equal_nan=True,
+    )
+    # Same clock as the strategy series.
+    assert series["daily_ew"].index.equals(series["buyhold"].index)
+
+
+def test_dsr_uses_excess_returns(tool):
+    """DSR input is ``oos - rf/252``; the excess p is strictly larger."""
+    rng = np.random.default_rng(3)
+    oos = pd.Series(
+        rng.normal(0.0005, 0.01, size=300),
+        index=pd.bdate_range("2023-01-02", periods=300),
+    )
+
+    gross = tool.FactorValidator().deflated_sharpe_test(oos.to_numpy(), num_trials=10)
+    excess = tool.deflated_sharpe_excess(oos, num_trials=10)
+
+    assert excess.observed_sharpe < gross.observed_sharpe
+    assert excess.deflated_p_value > gross.deflated_p_value
+
+
+def test_fallback_counter_counts_one_per_event(tool):
+    """One fallback emits one line per logger; the count must stay 1."""
+    counter = tool._OptimizerFallbackCounter()
+    engine_logger = logging.getLogger(tool.ENGINE_LOGGER_NAME)
+    optimizer_logger = logging.getLogger(tool.OPTIMIZER_LOGGER_NAME)
+    engine_logger.addHandler(counter)
+    optimizer_logger.addHandler(counter)
+    try:
+        engine_logger.warning(
+            "Rebalance 2020-01-31: optimizer fallback #1 - solver error",
+        )
+        assert counter.count == 1
+        optimizer_logger.warning("Optimizer fallback to equal weight: solver error")
+        # Same event seen by the second logger: not double-counted.
+        assert counter.count == 1
+    finally:
+        engine_logger.removeHandler(counter)
+        optimizer_logger.removeHandler(counter)
+
+
+def test_num_trials_override_and_deterministic_json(tool, tmp_path):
+    """--num-trials overrides the default, and identical inputs give identical JSON."""
+    cache = tmp_path / "panel.parquet"
+    write_panel(cache, n_days=300, n_assets=12, seed=11)
+    payloads = []
+    for run in range(2):
+        json_out = tmp_path / f"run{run}.json"
+        md_out = tmp_path / f"run{run}.md"
+        exit_code = tool.main([
+            "--cache", str(cache),
+            "--train", "100", "--test", "50", "--step", "50",
+            "--factors", "turnover_20d", "--top-k", "1",
+            "--num-trials", "48",
+            "--json-out", str(json_out), "--md-out", str(md_out),
+        ])
+        assert exit_code == 0
+        payloads.append(json_out.read_bytes())
+
+    assert payloads[0] == payloads[1]
+    summary = json.loads(payloads[0])
+    assert summary["dsr"]["num_trials"] == 48
+    assert summary["dsr"]["num_trials_source"] == "cli"
 
 
 def test_industry_map_loading(tool, tmp_path):

@@ -23,12 +23,27 @@ Pipeline semantics (deliberately identical to the validated scratch runs):
   tax follows the statutory date schedule (``stamp_tax=None``).
 * Portfolio: MVO with max-weight, turnover cap and cost-aware penalty
   (R8/R9 wiring); monthly rebalance.
-* Gates (R9): ``tradable_mask`` = close present and volume > 0, limit moves
-  approximated by ``|pct_chg| > 9.8%``; ``daily_volume``/``raw_prices`` travel
-  through the gates adapter to the engine.
+* Gates (R9, fixed in R19a): ``tradable_mask`` = close present and volume > 0;
+  limit moves use the *same-day* ``pct_chg`` (``|pct_chg| > 9.8%``), i.e. the
+  move already realized when the engine trades at that close, matching
+  ``data/pipeline.py`` ``is_limit_up``. Using the forward return panel here
+  (``returns[t] = pct_chg[t+1]``) let day t+1's limit move decide day t's
+  fill -- a one-day look-ahead. ``daily_volume``/``raw_prices`` travel through
+  the gates adapter to the engine.
+* Benchmarks (R19a): daily equal-weight (rebalanced every session) and
+  equal-weight buy & hold, both computed over the *same* OOS window as the
+  strategy. Benchmark annual figures are total returns; excess is reported
+  separately and never substituted for a total.
+* DSR (R19a): deflated Sharpe is computed on excess daily returns
+  (``oos - risk_free/252``, 3%/yr); ``--num-trials`` overrides the default
+  fold x factor trial count.
+* Industry map (when supplied): a *static latest* classification with no
+  historical effective dates -- mild look-ahead, disclosed in the report.
 
 Outputs: console table plus JSON and Markdown reports. By default they are
 written to ``real_data_research_<date>.{json,md}`` in the current directory.
+The JSON excludes wall-clock runtime so identical inputs produce byte-identical
+reports (the runtime is still printed and written to the Markdown).
 """
 
 from __future__ import annotations
@@ -56,6 +71,7 @@ for _path in (
         sys.path.insert(0, _path)
 
 from quant_platform.backtest.cost_model import CostModel
+from quant_platform.backtest.metrics import all_metrics
 from quant_platform.backtest.walkforward import WalkForwardValidator
 from quant_platform.factors.evaluation import ic_summary, rank_ic
 from quant_platform.factors.processing import process_factor
@@ -84,6 +100,14 @@ DEFAULT_MAX_SECTOR_EXPOSURE = 0.60  # R8/R9 parity with the scratch runs
 MIN_FACTOR_COVERAGE = 0.20
 
 ENGINE_LOGGER_NAME = "quant_platform.backtest.engine"
+OPTIMIZER_LOGGER_NAME = "quant_platform.portfolio.optimizers"
+LIMIT_MOVE_THRESHOLD = 0.098
+RISK_FREE_ANNUAL = 0.03
+TRADING_DAYS_PER_YEAR = 252.0
+INDUSTRY_MAP_NOTE = (
+    "static latest industry classification (no historical effective dates); "
+    "mild look-ahead when used for neutralization"
+)
 
 
 class ResearchError(RuntimeError):
@@ -151,12 +175,15 @@ def load_panel_frame(path: Path) -> pd.DataFrame:
 
 
 def build_panels(frame: pd.DataFrame) -> tuple[pd.DataFrame, ...]:
-    """(date x asset) close / volume / turnover / returns / adjusted prices.
+    """(date x asset) close / volume / turnover / returns / adjusted prices / pct.
 
     ``returns`` is the *next-session* return (``pct_chg/100`` shifted by -1),
     matching the platform's forward-return convention used by IC and the
-    backtest. ``adj`` compounds the same ``pct_chg`` into a dividend-jump-free
-    price path and is blanked wherever the raw close is missing.
+    backtest. ``pct`` is the same-day move (``pct_chg/100`` on the row's own
+    date) and is what execution gates must use: the engine trades at day d's
+    close and may only look at the move already realized on day d. ``adj``
+    compounds the same ``pct_chg`` into a dividend-jump-free price path and is
+    blanked wherever the raw close is missing.
     """
     close = frame["close"].unstack("asset").sort_index()
     volume = frame["volume"].unstack("asset").reindex_like(close).astype(float)
@@ -165,7 +192,7 @@ def build_panels(frame: pd.DataFrame) -> tuple[pd.DataFrame, ...]:
     returns = pct.shift(-1)
     adj = (1.0 + pct.fillna(0.0)).cumprod() * 100.0
     adj = adj.where(close.notna())
-    return close, volume, turnover, returns, adj
+    return close, volume, turnover, returns, adj, pct
 
 
 def slice_panels(
@@ -184,6 +211,26 @@ def slice_panels(
             f"no sessions in requested range {start or 'start'} .. {end or 'end'}"
         )
     return tuple(panel.loc[mask] for panel in panels)
+
+
+def build_execution_gates(
+    close: pd.DataFrame, volume: pd.DataFrame, pct: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    """Execution-day gate panels for the engine.
+
+    ``limit_up``/``limit_down`` are indexed by the *execution* day and hold
+    that day's own limit state (``pct_chg/100`` on the same row), never the
+    forward return panel: the engine trades at day d's close and must decide
+    with information available then. This mirrors ``data/pipeline.py``'s
+    ``is_limit_up`` (``close.pct_change()`` on the same date).
+    """
+    return {
+        "tradable_mask": close.notna() & (volume.fillna(0) > 0),
+        "limit_up": pct > LIMIT_MOVE_THRESHOLD,
+        "limit_down": pct < -LIMIT_MOVE_THRESHOLD,
+        "daily_volume": volume,
+        "raw_prices": close,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -273,19 +320,42 @@ def build_factors(
 # ---------------------------------------------------------------------------
 
 class _OptimizerFallbackCounter(logging.Handler):
-    """Count engine optimizer-fallback warnings across all folds."""
+    """Count engine optimizer fallbacks across all folds.
+
+    The engine logs ``Rebalance ...: optimizer fallback #N - reason`` on
+    ``quant_platform.backtest.engine``; the optimizer logs
+    ``Optimizer fallback to equal weight: reason`` on the *sibling* logger
+    ``quant_platform.portfolio.optimizers``. The old handler listened only on
+    the engine logger, so a fallback seen only through the optimizer logger
+    was invisible. Both loggers are attached now. One fallback emits one line
+    per logger, so the engine tally (the line carrying ``#N``) and the
+    optimizer tally are kept separately and ``count`` reports the larger --
+    never the sum, which would double-count, and never zero when either
+    logger is filtered.
+    """
 
     def __init__(self) -> None:
         super().__init__(level=logging.WARNING)
-        self.count = 0
+        self.engine_count = 0
+        self.optimizer_count = 0
+
+    @property
+    def count(self) -> int:
+        return max(self.engine_count, self.optimizer_count)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             message = record.getMessage()
         except Exception:  # noqa: BLE001 - a broken record must not break the run
             return
-        if "optimizer fallback" in message.lower():
-            self.count += 1
+        lowered = message.lower()
+        if "optimizer fallback #" in lowered:
+            self.engine_count += 1
+        elif (
+            record.name == OPTIMIZER_LOGGER_NAME
+            and "optimizer fallback" in lowered
+        ):
+            self.optimizer_count += 1
 
 
 def make_factor_selector(state: dict[str, dict], max_factors: int):
@@ -353,12 +423,74 @@ def _build_constraints(args: argparse.Namespace) -> PortfolioConstraints:
     )
 
 
+def compute_benchmark_returns(
+    returns: pd.DataFrame, adj: pd.DataFrame, oos_index: pd.DatetimeIndex,
+) -> dict[str, pd.Series]:
+    """Both benchmark return series on the strategy's exact OOS clock.
+
+    Row ``t`` is the return realized from session ``t`` to the next session,
+    matching ``oos_returns``. ``daily_ew`` is the cross-sectional mean of the
+    forward returns (equal weight, rebalanced every session). ``buyhold`` is an
+    equal-weight basket formed at the first OOS session and never rebalanced:
+    its value is the cross-sectional mean of ``adj(t)/adj(t0)`` and row ``t``
+    is ``V(t+1)/V(t) - 1``. The old report mixed a full-sample benchmark with
+    the OOS window and quoted an excess as the benchmark's total annual.
+    """
+    oos_index = pd.DatetimeIndex(oos_index)
+    daily_ew = returns.reindex(index=oos_index).mean(axis=1)
+    if len(oos_index) == 0:
+        buyhold = pd.Series(dtype=float, index=oos_index)
+    else:
+        window = adj.loc[oos_index[0]:]
+        base = window.iloc[0]
+        rel = window.divide(base.where(base > 0), axis=1)
+        level = rel.mean(axis=1, skipna=True)
+        buyhold = (level.shift(-1) / level - 1.0).reindex(oos_index)
+    return {"daily_ew": daily_ew, "buyhold": buyhold}
+
+
+def _series_metrics(series: pd.Series) -> dict[str, float | None]:
+    """Sharpe / total annual / max drawdown for a daily return series."""
+    metrics = all_metrics(series.dropna())
+    return {
+        "sharpe": _finite(metrics.get("sharpe_ratio")),
+        "annual": _finite(metrics.get("annual_return")),
+        "mdd": _finite(metrics.get("max_drawdown")),
+    }
+
+
+def excess_metrics(strategy: pd.Series, benchmark: pd.Series) -> dict[str, float | None]:
+    """Metrics of the aligned daily excess return (strategy - benchmark)."""
+    aligned = pd.concat(
+        [strategy.rename("strategy"), benchmark.rename("benchmark")], axis=1,
+    ).dropna()
+    return _series_metrics(aligned["strategy"] - aligned["benchmark"])
+
+
+def deflated_sharpe_excess(
+    oos_returns: pd.Series,
+    num_trials: int,
+    risk_free_annual: float = RISK_FREE_ANNUAL,
+):
+    """Deflated Sharpe on **excess** daily returns (``oos - rf/252``).
+
+    Bailey & Lopez de Prado's SR is defined on excess returns; feeding gross
+    returns understates the multiple-testing burden and overstated
+    significance. The risk-free rate is converted with the same 252-day basis
+    the validator uses.
+    """
+    excess = np.asarray(oos_returns.to_numpy(), dtype=float) - (
+        risk_free_annual / TRADING_DAYS_PER_YEAR
+    )
+    return FactorValidator().deflated_sharpe_test(excess, num_trials=num_trials)
+
+
 def run_research(args: argparse.Namespace) -> dict[str, Any]:
     """Execute the full pipeline and return the JSON-ready summary."""
     started = time.time()
     frame = load_panel_frame(Path(args.cache))
     panels = build_panels(frame)
-    close, volume, _turnover, returns, adj = slice_panels(
+    close, volume, _turnover, returns, adj, pct = slice_panels(
         panels, args.start, args.end,
     )
     n_sessions = len(close)
@@ -391,18 +523,13 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
             f"({factors_skipped}); refusing to fabricate a result"
         )
 
-    # R9 gates: the engine reads daily_volume/raw_prices at run() time. The
-    # limit panels are built from the *forward* return panel (returns[t] is
-    # session t+1's move), exactly as the validated scratch runs and the
-    # taskbook's R9 wiring specify; do not "fix" this here without changing
-    # the reference semantics and re-validating R9.
-    gates = {
-        "tradable_mask": close.notna() & (volume.fillna(0) > 0),
-        "limit_up": returns > 0.098,
-        "limit_down": returns < -0.098,
-        "daily_volume": volume,
-        "raw_prices": close,
-    }
+    # R9/R19a gates: the engine reads daily_volume/raw_prices at run() time.
+    # The limit panels are keyed by the execution day and hold that day's own
+    # move (``pct``), because the engine trades at day d's close. Building them
+    # from the forward panel (``returns[t] = pct_chg[t+1]``) let tomorrow's
+    # limit move decide today's fill -- a one-day look-ahead. The same-day
+    # convention matches data/pipeline.py's ``is_limit_up``.
+    gates = build_execution_gates(close, volume, pct)
     cost_model = _build_cost_model(args.cost_mode)
     constraints = _build_constraints(args)
 
@@ -417,7 +544,9 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
     )
     fallback_counter = _OptimizerFallbackCounter()
     engine_logger = logging.getLogger(ENGINE_LOGGER_NAME)
+    optimizer_logger = logging.getLogger(OPTIMIZER_LOGGER_NAME)
     engine_logger.addHandler(fallback_counter)
+    optimizer_logger.addHandler(fallback_counter)
     try:
         result = validator.run(
             signal=returns,
@@ -440,6 +569,7 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
         raise ResearchError(f"walk-forward run failed: {exc}") from exc
     finally:
         engine_logger.removeHandler(fallback_counter)
+        optimizer_logger.removeHandler(fallback_counter)
 
     oos = result["oos_returns"]
     aggregate = result.get("aggregate_metrics", {}) or {}
@@ -459,10 +589,22 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
             yearly_returns[str(int(year))] = float(np.prod(1.0 + values) - 1.0)
 
     n_folds = int(result.get("n_folds", 0))
-    num_trials = max(1, n_folds * max(1, len(factors)))
-    dsr = FactorValidator().deflated_sharpe_test(
-        np.asarray(oos.to_numpy(), dtype=float), num_trials=num_trials,
+    default_trials = max(1, n_folds * max(1, len(factors)))
+    num_trials = (
+        int(args.num_trials)
+        if getattr(args, "num_trials", None)
+        else default_trials
     )
+    num_trials_source = "cli" if getattr(args, "num_trials", None) else "fold_x_factors"
+    # DSR theory defines SR on excess returns; the old gross-input p-value
+    # overstated significance.
+    dsr = deflated_sharpe_excess(oos, num_trials)
+
+    benchmark_series = compute_benchmark_returns(returns, adj, oos.index)
+    benchmark = {
+        name: _series_metrics(values) for name, values in benchmark_series.items()
+    }
+    excess_vs_daily_ew = excess_metrics(oos, benchmark_series["daily_ew"])
 
     skipped_folds = [
         detail for detail in result.get("fold_details", []) if "error" in detail
@@ -495,6 +637,10 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
             "max_participation": float(args.max_participation),
             "capital": float(args.capital),
             "industry_neutralization": sector_map is not None,
+            "industry_map": str(Path(args.industry_map)) if args.industry_map else None,
+            "industry_map_note": INDUSTRY_MAP_NOTE,
+            "num_trials": int(num_trials),
+            "num_trials_source": num_trials_source,
         },
         "factors_used": sorted(factors),
         "factors_skipped": factors_skipped,
@@ -506,8 +652,13 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
         "per_fold_selection": {str(k): v for k, v in sorted(state["per_fold"].items())},
         "selection_fallback_count": int(selection_fallbacks),
         "optimizer_fallback_count": int(fallback_counter.count),
+        "benchmark": benchmark,
+        "excess_vs_daily_ew": excess_vs_daily_ew,
         "dsr": {
             "num_trials": int(num_trials),
+            "num_trials_source": num_trials_source,
+            "return_basis": "excess",
+            "risk_free_annual": RISK_FREE_ANNUAL,
             "observed_sharpe": _finite(dsr.observed_sharpe),
             "expected_max_sharpe": _finite(dsr.expected_max_sharpe),
             "deflated_p_value": _finite(dsr.deflated_p_value),
@@ -524,6 +675,10 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
 
 def _pct(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}%}"
+
+
+def _num(value: float | None, digits: int = 3) -> str:
+    return "n/a" if value is None else f"{value:.{digits}f}"
 
 
 def format_console(summary: dict[str, Any]) -> str:
@@ -559,11 +714,18 @@ def format_console(summary: dict[str, Any]) -> str:
         f"(skipped folds: {len(summary['skipped_folds'])})",
         f"OOS Sharpe: {metrics['sharpe_ratio']:.3f}"
         if metrics["sharpe_ratio"] is not None else "OOS Sharpe: n/a",
-        f"OOS annual return: {_pct(metrics['annual_return'])}",
+        f"OOS annual return (total): {_pct(metrics['annual_return'])}",
         f"OOS max drawdown: {_pct(metrics['max_drawdown'])}",
+        f"Benchmark daily EW (same window): Sharpe "
+        f"{_num(summary['benchmark']['daily_ew']['sharpe'])}, annual "
+        f"{_pct(summary['benchmark']['daily_ew']['annual'])}; buy & hold: Sharpe "
+        f"{_num(summary['benchmark']['buyhold']['sharpe'])}, annual "
+        f"{_pct(summary['benchmark']['buyhold']['annual'])}",
+        f"Strategy excess vs daily EW (annualized, aligned daily): "
+        f"{_pct(summary['excess_vs_daily_ew']['annual'])}",
         f"Yearly returns: "
         f"{', '.join(f'{year}:{value:+.1%}' for year, value in summary['yearly_returns'].items())}",
-        f"Deflated Sharpe: p={summary['dsr']['deflated_p_value']} over "
+        f"Deflated Sharpe (excess returns): p={summary['dsr']['deflated_p_value']} over "
         f"{summary['dsr']['num_trials']} trials "
         f"(significant={summary['dsr']['significant']})",
         f"Fallbacks: selection={summary['selection_fallback_count']}, "
@@ -590,7 +752,11 @@ def format_markdown(summary: dict[str, Any]) -> str:
         f"- Costs: {config['cost_mode']} model, stamp tax by date, commission 0.03%; "
         f"cost-aware MVO (max weight {config['max_weight']:.0%}, "
         f"{config['cost_bps']:.0f}bp, turnover penalty {config['turnover_penalty']})",
-        f"- Industry neutralization: {'on' if config['industry_neutralization'] else 'off'}",
+        f"- Industry neutralization: {'on' if config['industry_neutralization'] else 'off'}"
+        + (
+            f" (industry map: {config['industry_map_note']})"
+            if config["industry_neutralization"] else ""
+        ),
         "",
         "## Out-of-sample result (net of costs)",
         "",
@@ -598,13 +764,34 @@ def format_markdown(summary: dict[str, Any]) -> str:
         f"(skipped folds: {len(summary['skipped_folds'])})",
         f"- OOS Sharpe: {metrics['sharpe_ratio']:.3f}"
         if metrics["sharpe_ratio"] is not None else "- OOS Sharpe: n/a",
-        f"- OOS annualized return: {_pct(metrics['annual_return'])}",
+        f"- OOS annualized return (total): {_pct(metrics['annual_return'])}",
         f"- OOS max drawdown: {_pct(metrics['max_drawdown'])}",
-        f"- Deflated Sharpe: p={summary['dsr']['deflated_p_value']:.4f} "
+        f"- Deflated Sharpe (excess returns, rf "
+        f"{summary['dsr']['risk_free_annual']:.0%}): p="
+        f"{summary['dsr']['deflated_p_value']:.4f} "
         f"over {summary['dsr']['num_trials']} trials "
         f"(significant={summary['dsr']['significant']})",
         f"- Fallbacks: selection={summary['selection_fallback_count']}, "
         f"optimizer={summary['optimizer_fallback_count']}",
+        "",
+        "## Benchmarks (same OOS window)",
+        "",
+        "| benchmark | Sharpe | annual (total) | max DD |",
+        "|---|---:|---:|---:|",
+        f"| daily equal-weight (rebalanced daily) | "
+        f"{_num(summary['benchmark']['daily_ew']['sharpe'])} | "
+        f"{_pct(summary['benchmark']['daily_ew']['annual'])} | "
+        f"{_pct(summary['benchmark']['daily_ew']['mdd'])} |",
+        f"| equal-weight buy & hold | "
+        f"{_num(summary['benchmark']['buyhold']['sharpe'])} | "
+        f"{_pct(summary['benchmark']['buyhold']['annual'])} | "
+        f"{_pct(summary['benchmark']['buyhold']['mdd'])} |",
+        "",
+        f"- Strategy annualized excess vs daily EW (aligned daily): "
+        f"{_pct(summary['excess_vs_daily_ew']['annual'])} "
+        f"(Sharpe {_num(summary['excess_vs_daily_ew']['sharpe'])}, "
+        f"max DD {_pct(summary['excess_vs_daily_ew']['mdd'])}). "
+        "This is an excess figure; the benchmark rows above are total returns.",
         "",
         "## Yearly OOS returns",
         "",
@@ -649,8 +836,13 @@ def _write_outputs(summary: dict[str, Any], json_out: Path | None, md_out: Path 
         md_out = Path.cwd() / f"real_data_research_{_date.today().isoformat()}.md"
     json_out.parent.mkdir(parents=True, exist_ok=True)
     md_out.parent.mkdir(parents=True, exist_ok=True)
+    # Wall-clock runtime is the one non-reproducible field; dropping it from
+    # the JSON keeps identical inputs byte-identical (it remains in the MD).
+    json_payload = {
+        key: value for key, value in summary.items() if key != "runtime_seconds"
+    }
     json_out.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False),
+        json.dumps(json_payload, ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8",
     )
     md_out.write_text(format_markdown(summary), encoding="utf-8")
@@ -713,6 +905,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="ADV participation cap (0 disables)")
     parser.add_argument("--capital", type=float, default=2_000_000.0,
                         help="initial capital in CNY")
+    parser.add_argument("--num-trials", type=int, default=None,
+                        help="multiple-testing trial count for the deflated Sharpe; "
+                             "default: n_folds x n_factors. Pass the real search count "
+                             "when the run is one of many variants")
     parser.add_argument("--industry-map", default=None,
                         help="optional industry map parquet (6-digit code index, 'industry' column)")
     parser.add_argument("--json-out", default=None,
@@ -742,6 +938,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--max-participation must be 0 or in (0, 1]")
     if args.capital <= 0:
         parser.error("--capital must be > 0")
+    if args.num_trials is not None and args.num_trials < 1:
+        parser.error("--num-trials must be >= 1")
 
 
 def main(argv: list[str] | None = None) -> int:
