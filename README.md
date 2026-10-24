@@ -330,7 +330,7 @@ worker** 运行：不要给 `uvicorn` / `main.py web` 加 `--workers N` 或 `--r
 | `data/ASHARE_PITFALLS.md` | 10 大 A 股实盘陷阱及处理 |
 | `docs/OPS_RUNBOOK.md` | 运维手册（启停、故障、备份/恢复、升级迁移） |
 | `docs/research/` | 系统研究报告（Alpha Discovery / 市场结构 / Regime） |
-| `tools/real_data_research.py` | 真实数据研究一键复跑：缓存面板 → 技术因子 → walk-forward 选因子 → 成本感知 MVO → JSON/Markdown 报告 |
+| `tools/real_data_research.py` | 真实数据研究一键复跑：缓存面板 → 技术因子 → walk-forward 选因子 → 成本感知 MVO → JSON/Markdown 报告（同日涨跌停门禁、同窗口日频/买入持有双基准、超额收益 DSR） |
 | `tools/daily_signal.py` | 每日信号：缓存面板 → PIT 因子/Rank IC → 成本感知 MVO → 目标权重 JSON/CSV（不接 broker） |
 
 ---
