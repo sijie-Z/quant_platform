@@ -40,6 +40,18 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def default_volatility(returns: pd.DataFrame) -> pd.DataFrame:
+    """Causal daily volatility from the platform's forward-return panel.
+
+    ``returns[t]`` is the close(t)->close(t+1) return, so at execution day t
+    only rows up to t-1 are realized. The rolling window is therefore shifted
+    by one session before use; without the shift the impact model at day t
+    read a volatility that included day t's own (future) return. Missing
+    warm-up values fall back to the 2%/day default the estimator always used.
+    """
+    return returns.rolling(20, min_periods=5).std().shift(1).fillna(0.02)
+
+
 @dataclass
 class CapacityResult:
     """Capacity estimation result for a single AUM level."""
@@ -144,7 +156,10 @@ class CapacityEstimator:
             returns: (date x asset) daily returns.
             benchmark_returns: Benchmark daily returns for Sharpe calculation.
             aum_range: List of AUM levels to test. Default: [1M, 5M, 10M, 50M, 100M, 500M, 1B].
-            volatility: (date x asset) daily volatility. If None, estimated from returns.
+            volatility: (date x asset) daily volatility. If None, estimated
+                causally from ``returns`` (``rolling(20).std().shift(1)``:
+                row t uses only returns up to t-1). A caller-supplied panel
+                must already be causal -- the estimator does not shift it.
 
         Returns:
             CapacityCurve with results for each AUM level.
@@ -153,7 +168,7 @@ class CapacityEstimator:
             aum_range = [1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9]
 
         if volatility is None:
-            volatility = returns.rolling(20, min_periods=5).std().fillna(0.02)
+            volatility = default_volatility(returns)
 
         rebalance_dates = sorted(weights_history.keys())
         all_dates = returns.index.sort_values()
