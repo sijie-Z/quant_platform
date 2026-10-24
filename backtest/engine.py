@@ -561,6 +561,8 @@ class BacktestEngine:
         summary["n_identity_covariance_fallbacks"] = self.identity_covariance_fallbacks
         # R18: execution days on which the cash constraint scaled buys down
         # (only possible when a sell was blocked or the book carried no cash).
+        # Counted per execution/retry day, not per rebalance: one pending
+        # rebalance whose sell stays blocked retries (and is counted) daily.
         summary["n_funding_scaled_days"] = int(self.n_funding_scaled_days)
         if self.optimizer_fallback_count > 0:
             summary["effective_optimizer"] = (
@@ -929,6 +931,13 @@ class BacktestEngine:
                             ),
                         )
                         if total_buys > available_cash + _FUNDING_TOL:
+                            # Cash below the tolerance is zero. Without this,
+                            # a fully-invested book whose drifted sum is
+                            # 0.9999999999999999 leaves ~1e-16 of "cash" and
+                            # the scaled buys become dust orders, each paying
+                            # the cost model's per-order minimum commission.
+                            if available_cash <= _FUNDING_TOL:
+                                available_cash = 0.0
                             funding_scale = available_cash / total_buys
                             executable_delta = (
                                 sell_delta + buy_delta * funding_scale

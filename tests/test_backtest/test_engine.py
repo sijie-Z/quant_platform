@@ -714,7 +714,7 @@ class TestCashConstrainedBuys:
         )
         return dates, returns
 
-    def test_blocked_sell_scales_buys_to_the_cash_the_other_sell_released(self):
+    def test_blocked_sell_scales_buys_to_the_cash_the_other_sell_released(self, caplog):
         """Test (a)/(d): A's sell is blocked at limit-down while D's fills.
 
         The buys must fit D's proceeds: B and C are scaled by one common
@@ -730,8 +730,12 @@ class TestCashConstrainedBuys:
         limit_down = pd.DataFrame(False, index=dates, columns=returns.columns)
         limit_down.loc[dates[3], "A"] = True
 
-        engine._simulate_pnl(returns, limit_down=limit_down)
+        with caplog.at_level("WARNING"):
+            engine._simulate_pnl(returns, limit_down=limit_down)
 
+        assert any(
+            "scaled to" in record.getMessage() for record in caplog.records
+        ), "the funding constraint must warn when it scales buys"
         held = engine.weights_history[dates[2]]
         assert float(held.sum()) <= 1.0 + 1e-9
         assert engine.n_funding_scaled_days == 1
@@ -769,6 +773,33 @@ class TestCashConstrainedBuys:
             returns.loc[dates[3], "A"]
         )
         assert dates[2] not in engine._executed_signal_dates
+
+    def test_zero_cash_retries_do_not_book_dust_orders(self):
+        """Drifted weights leave ~1e-16 of "cash"; that must mean zero.
+
+        A fully invested book can sum to 0.9999999999999999 after drift. If
+        each retry day scales the buys by that residue, every asset becomes a
+        dust order and the cost model charges its per-order minimum commission
+        (5 CNY) for a trade worth ~1e-10 CNY. Cash below the tolerance must
+        therefore be treated as exactly zero: no turnover record, no cost.
+        """
+        dates, returns = self._setup(n_days=30)
+        engine = self._engine()
+        engine.weights_history = {
+            dates[0]: pd.Series({"A": 0.6, "B": 0.0, "C": 0.0, "D": 0.4}),
+            dates[2]: pd.Series({"A": 0.0, "B": 0.5, "C": 0.5, "D": 0.0}),
+        }
+        # Both sells are blocked for the rest of the sample.
+        limit_down = pd.DataFrame(False, index=dates, columns=returns.columns)
+        limit_down.loc[dates[3]:, ["A", "D"]] = True
+
+        engine._simulate_pnl(returns, limit_down=limit_down)
+
+        # Only the initial build traded; every retry leaves the book alone.
+        assert list(engine.turnover_history.index) == [dates[1]]
+        assert engine.total_cost_drag == 0.0
+        # 27 retry days (index 3..29), each counted once.
+        assert engine.n_funding_scaled_days == 27
 
     def test_partial_fills_are_deferred_and_completed_when_the_sell_unblocks(self):
         """The unfilled buy remainder is retried, not dropped.
@@ -855,6 +886,8 @@ class TestCashConstrainedBuys:
 
         engine = self._engine()
         engine._get_optimizer = lambda: TwoStageOptimizer()
+        # A reused engine must not carry the counter into the next run.
+        engine.n_funding_scaled_days = 7
 
         rdates = engine._get_rebalance_dates(signal.index)
         assert len(rdates) >= 2
@@ -870,8 +903,9 @@ class TestCashConstrainedBuys:
 
         summary = result["summary"]
         assert isinstance(summary["n_funding_scaled_days"], int)
+        # `run()` reset the 7 planted on the reused engine; the counter is
+        # per execution/retry day, and this scenario has one scaled day.
         assert summary["n_funding_scaled_days"] == 1
-        assert summary["n_funding_scaled_days"] <= summary["n_rebalances"]
         # Every executed rebalance leaves an unlevered book.
         for weights in result["weights_history"].values():
             assert float(weights.sum()) <= 1.0 + 1e-9
