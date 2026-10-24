@@ -16,11 +16,31 @@ Execution and accounting contract
   ``as_of`` row itself is never traded on.
 * **Returns (ex-rights).** Asset and benchmark returns are Baostock
   ``pct_chg / 100``, whose ``preclose`` is adjusted for ex-rights events, so a
-  dividend or split is not booked as a loss (raw close ratios would be). Raw
-  ``close`` is used only to convert share volume into CNY traded value for the
-  cost model, and as the reference price a stale position is liquidated at.
+  dividend or split is not booked as a loss (raw close ratios would be).
+* **Raw price basis (R32).** Price-level decisions -- the CNY traded value
+  fed to the cost model (``volume_shares * raw_price``), the stale/tradability
+  gate, and the stale-liquidation reference -- use a *raw CNY* price, never an
+  adjusted one. ``--raw-price-mode close`` keeps the legacy assumption that
+  the cached ``close`` is already the raw CNY close. ``--raw-price-mode
+  amount_over_volume`` uses ``amount / volume`` (NaN when ``amount`` is
+  missing or ``volume`` is not positive), the day's CNY VWAP proxy (the
+  convention ``.scratch/orchestrate/cc_report_R30_wide.md`` validated:
+  ``volume * amount/volume == amount`` exactly). ``--raw-price-mode auto``
+  (the default) samples up to 60 of the most recent sessions with usable
+  cells and selects ``amount_over_volume`` when the sample's median
+  ``|close*volume - amount| / amount`` exceeds 1% -- an adjusted close breaks
+  ``amount == close * volume`` -- otherwise it keeps ``close``; the selected
+  mode and the sampled statistic are printed. ``auto`` falls back to
+  ``close`` when the cache has no ``amount`` column, while an explicit
+  ``amount_over_volume`` against such a cache exits non-zero. ``volume``
+  remains a required column in every mode (the R9 tradability gate and the
+  CNY traded-value conversion depend on it). ``summary.json`` records
+  ``raw_price_mode`` only for the ``amount_over_volume`` basis so that
+  legacy/raw-close runs keep their pre-R32 bytes. Returns never use the raw
+  price: they stay ``pct_chg / 100``.
 * **Tradability gate (R9/R19a).** A target asset is bought on the execution
-  close only when it has ``close > 0``, a finite ``pct_chg``, ``volume > 0``
+  close only when its raw price is ``> 0``, ``pct_chg`` is finite,
+  ``volume > 0``
   (the R9 ``tradable_mask``), and did not close limit-up
   (``pct_chg > 9.8%``, the platform's limit-up approximation). Blocked or
   untradable weight stays in cash and a warning is recorded -- the tool never
@@ -29,9 +49,9 @@ Execution and accounting contract
   from cash and charges :class:`~quant_platform.backtest.cost_model.CostModel`
   exactly the way the engine does: CNY buy notionals
   (``weight * capital``), ``daily_volume`` in CNY as
-  ``volume_shares * raw_close`` (the cached ``close`` is the raw CNY close --
-  ``amount`` matches ``close * volume``), the date-dependent statutory stamp
-  tax (no sells on a build, so the stamp tax is zero), the per-order CNY 5
+  ``volume_shares * raw_price`` (the resolved raw price basis above; on a
+  raw-close cache ``amount`` matches ``close * volume``), the date-dependent
+  statutory stamp tax (no sells on a build, so the stamp tax is zero), the per-order CNY 5
   commission floor, the both-sides transfer fee, and -- with
   ``--cost-mode impact`` -- the square-root impact rule on participation.
   Volatility is the causal ``rolling(20).std()`` estimate on the same
@@ -44,7 +64,7 @@ Execution and accounting contract
   earns nothing. NAV is close-to-close: the execution row's only return is
   the build cost, and each later row's return is the drifted book's return
   from the previous close.
-* **Stale prices.** A session is *stale* for a held asset when its ``close``
+* **Stale prices.** A session is *stale* for a held asset when its raw price
   is missing/non-positive, or its ``pct_chg`` or ``volume`` is missing/NaN, or
   the volume is zero (the cache encodes
   intra-series suspensions as a repeated close with NaN/zero volume and
@@ -87,20 +107,21 @@ binds harder -- for example a limit-down position that cannot be sold --
 buys are scaled proportionally and a warning records the realised scale.
 
 Tradability at a rebalance uses the R9/R19a gates on the execution close:
-an asset is sellable when it has a positive raw close, finite ``pct_chg``,
+an asset is sellable when it has a positive raw price, finite ``pct_chg``,
 positive volume and did not close limit-down (``pct_chg < -9.8%``); buyable
 when the same observation exists and it did not close limit-up
 (``pct_chg > 9.8%``). A blocked buy leaves that weight in cash; a blocked
 sell keeps the existing position (the reduction is superseded), with a
 warning naming the asset. Held assets with no valid observation are carried
-stale under the same policy as the single-target mode (last close, zero
+stale under the same policy as the single-target mode (last raw price, zero
 return, optional liquidation after ``--max-stale-sessions``).
 
 Costs are charged once per rebalance on the executed CNY notionals, using
 the same CostModel configuration as the single-target mode: per-order
 commission with the CNY 5 floor, both-sides transfer fee, the date-dependent
 sell-side stamp tax, and -- with ``--cost-mode impact`` -- the square-root
-impact rule whose daily volume is ``shares * raw_close`` (the R9 basis).
+impact rule whose daily volume is ``shares * raw_price`` (the R9 basis, on
+the raw-price basis selected above).
 Costs are deducted from cash at the rebalance close; the row's return is
 the drifted book return minus that cost fraction.
 
@@ -238,14 +259,33 @@ VOL_LOOKBACK = 20
 VOL_MIN_PERIODS = 5
 VOL_FALLBACK = 0.02
 LIMIT_UP_PCT = 9.8
+RAW_PRICE_MODE_AUTO = "auto"
+RAW_PRICE_MODE_CLOSE = "close"
+RAW_PRICE_MODE_AMOUNT = "amount_over_volume"
+RAW_PRICE_MODES = (
+    RAW_PRICE_MODE_AUTO, RAW_PRICE_MODE_CLOSE, RAW_PRICE_MODE_AMOUNT,
+)
+RAW_PRICE_RELATIVE_TOLERANCE = 0.01
+RAW_PRICE_SAMPLE_SESSIONS = 60
+RAW_PRICE_SAMPLE_MAX_CELLS = 20_000
 RETURN_BASIS = (
     "pct_chg/100 (Baostock ex-rights preclose); raw close is used only for "
     "volume x price cost conversion and the stale liquidation reference"
+)
+RETURN_BASIS_AMOUNT = (
+    "pct_chg/100 (Baostock ex-rights preclose); raw price = amount/volume "
+    "(CNY VWAP proxy, volume > 0) is used only for volume x price cost "
+    "conversion and the stale liquidation reference"
 )
 TRADABLE_GATE = (
     "execution buys require close > 0, finite pct_chg, volume > 0 (R9 "
     "tradable_mask) and pct_chg <= 9.8% (R19a limit-up approximation); "
     "blocked weight stays in cash with a warning"
+)
+TRADABLE_GATE_AMOUNT = (
+    "execution buys require raw price amount/volume > 0, finite pct_chg, "
+    "volume > 0 (R9 tradable_mask) and pct_chg <= 9.8% (R19a limit-up "
+    "approximation); blocked weight stays in cash with a warning"
 )
 BENCHMARK_DEFINITION = (
     "equal-weight daily-rebalanced mean of the cached universe's pct_chg "
@@ -259,6 +299,14 @@ STALE_POLICY = (
     "return; after max_stale_sessions consecutive stale sessions, liquidate "
     "at the last valid close with no extra trade cost (no tradable price "
     "exists) and hold the proceeds as cash"
+)
+STALE_POLICY_AMOUNT = (
+    "a session is stale when the raw price amount/volume, pct_chg or volume "
+    "is missing/invalid or the volume is zero; hold at the last valid raw "
+    "price (return 0, flagged stale); when the price returns the resume-day "
+    "pct_chg carries the gap return; after max_stale_sessions consecutive "
+    "stale sessions, liquidate at the last valid raw price with no extra "
+    "trade cost (no tradable price exists) and hold the proceeds as cash"
 )
 VOLATILITY_BASIS = (
     "rolling(20, min_periods=5).std() of pct_chg/100 through the execution "
@@ -381,18 +429,27 @@ def _parse_date_level(dates: pd.Index) -> pd.DatetimeIndex:
 
 @dataclass
 class Panels:
-    """Wide (date x asset) panels needed for execution and accounting."""
+    """Wide (date x asset) panels needed for execution and accounting.
+
+    ``close`` holds the *resolved raw price*: the cached ``close`` on a
+    raw-close cache (``--raw-price-mode close``) or ``amount / volume`` on an
+    adjusted cache (``--raw-price-mode amount_over_volume``). Every
+    price-level decision (CNY cost conversion, tradability, stale marking,
+    the liquidation reference) reads it; returns are always ``pct_chg / 100``.
+    """
 
     close: pd.DataFrame
     volume: pd.DataFrame
     pct_chg: pd.DataFrame  # percent, Baostock ex-rights basis
+    raw_price_mode: str = RAW_PRICE_MODE_CLOSE
+    raw_price_detection: dict[str, Any] | None = None
 
     def observation_mask(self) -> pd.DataFrame:
         """Sessions with a usable, traded observation (the stale complement).
 
-        Requires a positive raw close (the stale/liquidation reference price),
-        a finite ``pct_chg`` and a positive share volume -- the R9
-        ``tradable_mask``. A NaN close with a valid ``pct_chg`` is still
+        Requires a positive raw price (the stale/liquidation reference), a
+        finite ``pct_chg`` and a positive share volume -- the R9
+        ``tradable_mask``. A NaN raw price with a valid ``pct_chg`` is still
         treated as stale: there is no price to mark or to liquidate at.
         """
         return (
@@ -421,8 +478,108 @@ class Panels:
         return (self.pct_chg / 100.0).where(both)
 
 
-def load_cache(path: Path) -> Panels:
-    """Load the cached daily panel into close / volume / pct_chg panels."""
+def _amount_over_volume_price(
+    amount: pd.DataFrame, volume: pd.DataFrame,
+) -> pd.DataFrame:
+    """Raw CNY price proxy ``amount / volume`` (NaN when volume <= 0).
+
+    ``amount`` is the day's traded value in CNY and ``volume`` the share
+    count, so the ratio is the day's VWAP in CNY -- a raw-price estimate that
+    does not depend on the cache's adjustment convention. Zero, missing or
+    non-finite volume and missing/non-finite amount yield NaN; callers treat
+    a NaN raw price as a stale session.
+    """
+    sane_volume = volume.where(np.isfinite(volume) & (volume > 0))
+    price = amount / sane_volume
+    return price.where(np.isfinite(price))
+
+
+def _detect_raw_price_basis(
+    close: pd.DataFrame, volume: pd.DataFrame, amount: pd.DataFrame,
+) -> tuple[str, dict[str, Any]]:
+    """Choose between the cached ``close`` and ``amount/volume`` (auto mode).
+
+    Samples up to ``RAW_PRICE_SAMPLE_SESSIONS`` of the most recent sessions
+    that contain usable cells (walking backward from the cache end), capped
+    at ``RAW_PRICE_SAMPLE_MAX_CELLS`` cells. A cell is usable when ``close``,
+    ``volume`` and ``amount`` are finite and positive. The statistic is the
+    sample median of ``|close*volume - amount| / amount``.
+
+    Above ``RAW_PRICE_RELATIVE_TOLERANCE`` (1%) the cached close cannot be
+    the raw CNY close -- an adjusted (hfq) close is a multiple of the raw
+    price, so ``amount == close * volume`` breaks -- and
+    ``amount_over_volume`` is selected. Otherwise (including when no usable
+    cell exists) the legacy ``close`` basis is kept.
+    """
+    valid = (
+        close.notna() & np.isfinite(close) & (close > 0)
+        & volume.notna() & np.isfinite(volume) & (volume > 0)
+        & amount.notna() & np.isfinite(amount) & (amount > 0)
+    )
+    counts = valid.sum(axis=1)
+    selected: list[pd.Timestamp] = []
+    n_cells = 0
+    for date in reversed(counts.index):
+        n = int(counts.loc[date])
+        if n == 0:
+            continue
+        if selected and n_cells + n > RAW_PRICE_SAMPLE_MAX_CELLS:
+            break
+        selected.append(pd.Timestamp(date))
+        n_cells += n
+        if len(selected) >= RAW_PRICE_SAMPLE_SESSIONS:
+            break
+    detection: dict[str, Any] = {
+        "n_cells": int(n_cells),
+        "n_sessions": int(len(selected)),
+        "median_relative_error": None,
+    }
+    if not selected:
+        return RAW_PRICE_MODE_CLOSE, detection
+    relative = ((close * volume - amount).abs() / amount).loc[selected]
+    values = relative.to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return RAW_PRICE_MODE_CLOSE, detection
+    median = float(np.median(values))
+    detection["median_relative_error"] = median
+    if median > RAW_PRICE_RELATIVE_TOLERANCE:
+        return RAW_PRICE_MODE_AMOUNT, detection
+    return RAW_PRICE_MODE_CLOSE, detection
+
+
+def _detection_note(detection: dict[str, Any]) -> str:
+    """Human-readable auto-detection evidence for the stdout log line."""
+    median = detection.get("median_relative_error")
+    if median is None:
+        return (
+            f"(no usable amount/close*volume cells in the last "
+            f"{detection['n_sessions']} session(s); falling back to close)"
+        )
+    return (
+        f"(median |close*volume - amount| / amount = {median:.4%} over "
+        f"{detection['n_cells']} cells in {detection['n_sessions']} sessions; "
+        f"switch threshold {RAW_PRICE_RELATIVE_TOLERANCE:.2%})"
+    )
+
+
+def load_cache(
+    path: Path, raw_price_mode: str = RAW_PRICE_MODE_AUTO,
+) -> Panels:
+    """Load the cached daily panel and resolve its raw-price basis.
+
+    ``raw_price_mode`` is ``auto`` (sample and decide), ``close`` (legacy:
+    the cached close is already the raw CNY price) or ``amount_over_volume``
+    (raw price = ``amount / volume``; a cache without an ``amount`` column is
+    a non-zero-exit error). ``auto`` falls back to ``close`` when ``amount``
+    is absent. ``volume`` is required in every mode: the R9 tradability gate
+    and the CNY traded-value conversion depend on it.
+    """
+    if raw_price_mode not in RAW_PRICE_MODES:
+        raise PaperTrackError(
+            f"unknown raw price mode {raw_price_mode!r}; expected one of "
+            f"{', '.join(RAW_PRICE_MODES)}"
+        )
     path = Path(path)
     if not path.is_file():
         raise PaperTrackError(f"cache panel not found: {path}")
@@ -447,6 +604,12 @@ def load_cache(path: Path) -> Panels:
             raise PaperTrackError(
                 f"cache panel is missing required column: {column!r}"
             )
+    has_amount = "amount" in frame.columns
+    if raw_price_mode == RAW_PRICE_MODE_AMOUNT and not has_amount:
+        raise PaperTrackError(
+            "cache panel is missing required column: 'amount' (required by "
+            "--raw-price-mode amount_over_volume)"
+        )
     dates = _parse_date_level(frame.index.get_level_values("date"))
     assets = pd.Index(
         [_normalize_code(asset) for asset in frame.index.get_level_values("asset")],
@@ -463,7 +626,38 @@ def load_cache(path: Path) -> Panels:
     close = frame["close"].unstack("asset").sort_index().astype(float)
     volume = frame["volume"].unstack("asset").reindex_like(close).astype(float)
     pct_chg = frame["pct_chg"].unstack("asset").reindex_like(close).astype(float)
-    return Panels(close=close, volume=volume, pct_chg=pct_chg)
+    amount = (
+        frame["amount"].unstack("asset").reindex_like(close).astype(float)
+        if has_amount else None
+    )
+    detection: dict[str, Any] | None = None
+    if raw_price_mode == RAW_PRICE_MODE_CLOSE:
+        resolved_mode = RAW_PRICE_MODE_CLOSE
+    elif raw_price_mode == RAW_PRICE_MODE_AMOUNT:
+        resolved_mode = RAW_PRICE_MODE_AMOUNT
+    elif amount is None:
+        resolved_mode = RAW_PRICE_MODE_CLOSE
+        print(
+            "paper_track: raw-price mode auto -> close (the cache has no "
+            "'amount' column; assuming close is the raw CNY price)",
+        )
+    else:
+        resolved_mode, detection = _detect_raw_price_basis(close, volume, amount)
+        print(
+            f"paper_track: raw-price mode auto -> {resolved_mode} "
+            f"{_detection_note(detection)}"
+        )
+    price = (
+        _amount_over_volume_price(amount, volume)
+        if resolved_mode == RAW_PRICE_MODE_AMOUNT else close
+    )
+    return Panels(
+        close=price,
+        volume=volume,
+        pct_chg=pct_chg,
+        raw_price_mode=resolved_mode,
+        raw_price_detection=detection,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +678,7 @@ class Simulation:
     cash_weight_at_build: float
     cost_mode: str
     max_stale_sessions: int
+    raw_price_mode: str = RAW_PRICE_MODE_CLOSE
 
 
 def _build_cost_model(cost_mode: str) -> CostModel:
@@ -598,7 +793,7 @@ def simulate(
     cash_at_build = cash_weight
 
     # --- Build cost: CostModel on CNY notional, volume in CNY (R9 basis) ---
-    # Buyability required a positive share volume and a positive raw close, so
+    # Buyability required a positive share volume and a positive raw price, so
     # the CNY traded value below is finite and positive by construction.
     notional = buy_weights * capital
     volume_cny: pd.Series | None = None
@@ -743,6 +938,7 @@ def simulate(
         cash_weight_at_build=float(cash_at_build),
         cost_mode=cost_mode,
         max_stale_sessions=max_stale_sessions,
+        raw_price_mode=panels.raw_price_mode,
     )
 
 
@@ -800,7 +996,7 @@ def _read_existing_nav(nav_path: Path) -> list[str]:
 
 def _check_existing_summary(
     summary_path: Path, target_sha256: str, capital: float, cost_mode: str,
-    max_stale_sessions: int,
+    max_stale_sessions: int, raw_price_mode: str = RAW_PRICE_MODE_CLOSE,
 ) -> None:
     """Refuse to append to a ledger produced by a different configuration."""
     if not summary_path.is_file():
@@ -817,17 +1013,23 @@ def _check_existing_summary(
         ("capital", float(capital), "capital"),
         ("cost_mode", cost_mode, "cost mode"),
         ("max_stale_sessions", int(max_stale_sessions), "stale policy"),
+        # Pre-R32 ledgers have no key and were all on the legacy close basis.
+        ("raw_price_mode", raw_price_mode, "raw price mode"),
     )
     for key, expected, label in checks:
-        if key not in existing:
+        if key == "raw_price_mode":
+            existing_value = existing.get(key, RAW_PRICE_MODE_CLOSE)
+        elif key not in existing:
             raise PaperTrackError(
                 f"{summary_path} has no {key!r}; cannot verify it is the same "
                 f"{label}; refusing to append"
             )
-        if existing[key] != expected:
+        else:
+            existing_value = existing[key]
+        if existing_value != expected:
             raise PaperTrackError(
                 f"{summary_path} belongs to a different {label} "
-                f"({existing[key]!r} != {expected!r}); use a new --out-dir"
+                f"({existing_value!r} != {expected!r}); use a new --out-dir"
             )
 
 
@@ -952,7 +1154,8 @@ def build_summary(
         tracking_error_value = None
     total_costs = float(series["costs"].sum())
     stale_days = int((series["stale"] > 0).sum())
-    return {
+    amount_basis = simulation.raw_price_mode == RAW_PRICE_MODE_AMOUNT
+    summary: dict[str, Any] = {
         "ledger_version": LEDGER_VERSION,
         "as_of": simulation.as_of.strftime("%Y-%m-%d"),
         "execution_date": simulation.execution_date.strftime("%Y-%m-%d"),
@@ -963,10 +1166,12 @@ def build_summary(
         "capital": float(capital),
         "cost_mode": simulation.cost_mode,
         "max_stale_sessions": int(simulation.max_stale_sessions),
-        "stale_policy": STALE_POLICY,
-        "return_basis": RETURN_BASIS,
+        "stale_policy": STALE_POLICY_AMOUNT if amount_basis else STALE_POLICY,
+        "return_basis": RETURN_BASIS_AMOUNT if amount_basis else RETURN_BASIS,
         "volatility_basis": VOLATILITY_BASIS,
-        "tradable_gate": TRADABLE_GATE,
+        "tradable_gate": (
+            TRADABLE_GATE_AMOUNT if amount_basis else TRADABLE_GATE
+        ),
         "benchmark_definition": BENCHMARK_DEFINITION,
         "risk_free_rate": RISK_FREE_ANNUAL,
         "annualization_periods_per_year": PERIODS_PER_YEAR,
@@ -1005,6 +1210,11 @@ def build_summary(
         "warnings": list(warnings),
         "disclaimer": DISCLAIMER,
     }
+    if amount_basis:
+        # Legacy raw-close ledgers keep their pre-R32 bytes; the explicit
+        # basis is only recorded when it is not the legacy assumption.
+        summary["raw_price_mode"] = simulation.raw_price_mode
+    return summary
 
 
 def run(
@@ -1014,6 +1224,7 @@ def run(
     capital: float = DEFAULT_CAPITAL,
     cost_mode: str = "impact",
     max_stale_sessions: int = DEFAULT_MAX_STALE_SESSIONS,
+    raw_price_mode: str = RAW_PRICE_MODE_AUTO,
 ) -> tuple[dict[str, Any], int, Path]:
     """Execute one paper-tracking run; returns (summary, n_new_rows, nav_path)."""
     if not math.isfinite(capital) or capital <= 0:
@@ -1025,7 +1236,7 @@ def run(
     out_dir = Path(out_dir)
 
     as_of, weights = load_target(target_path)
-    panels = load_cache(cache_path)
+    panels = load_cache(cache_path, raw_price_mode)
     target_sha256 = hashlib.sha256(target_path.read_bytes()).hexdigest()
     simulation = simulate(
         weights, as_of, panels, capital, cost_mode, max_stale_sessions,
@@ -1046,6 +1257,7 @@ def run(
     if summary_path.is_file():
         _check_existing_summary(
             summary_path, target_sha256, capital, cost_mode, max_stale_sessions,
+            panels.raw_price_mode,
         )
     if nav_path.is_file():
         existing_lines = _read_existing_nav(nav_path)
@@ -1147,6 +1359,7 @@ class RollSimulation:
     last_cache_date: pd.Timestamp
     cost_mode: str
     max_stale_sessions: int
+    raw_price_mode: str = RAW_PRICE_MODE_CLOSE
 
 
 def load_targets(paths: list[Path]) -> list[Target]:
@@ -1267,7 +1480,7 @@ def _rebalance_cost_fraction(
     daily_volume: pd.Series | None = None
     volatility: pd.Series | None = None
     if vol_row is not None:
-        # R9 basis: daily traded value in CNY = shares * raw close.
+        # R9 basis: daily traded value in CNY = shares * raw price.
         daily_volume = (
             panels.volume.loc[date].reindex(index).astype(float)
             * panels.close.loc[date].reindex(index).astype(float)
@@ -1631,6 +1844,7 @@ def simulate_roll(
         last_cache_date=last_cache_date,
         cost_mode=cost_mode,
         max_stale_sessions=max_stale_sessions,
+        raw_price_mode=panels.raw_price_mode,
     )
 
 
@@ -1708,7 +1922,8 @@ def build_roll_summary(
     )
     total_costs = float(series["costs"].sum())
     turnovers = [record.turnover for record in simulation.rebalances]
-    return {
+    amount_basis = simulation.raw_price_mode == RAW_PRICE_MODE_AMOUNT
+    summary: dict[str, Any] = {
         "mode": ROLL_MODE,
         "roll_ledger_version": ROLL_LEDGER_VERSION,
         "capital": float(capital),
@@ -1723,10 +1938,12 @@ def build_roll_summary(
         "last_ledger_date": dates[-1].strftime("%Y-%m-%d"),
         "cache_last_date": simulation.last_cache_date.strftime("%Y-%m-%d"),
         "n_sessions": int(len(daily)),
-        "stale_policy": STALE_POLICY,
-        "return_basis": RETURN_BASIS,
+        "stale_policy": STALE_POLICY_AMOUNT if amount_basis else STALE_POLICY,
+        "return_basis": RETURN_BASIS_AMOUNT if amount_basis else RETURN_BASIS,
         "volatility_basis": VOLATILITY_BASIS,
-        "tradable_gate": TRADABLE_GATE + (
+        "tradable_gate": (
+            TRADABLE_GATE_AMOUNT if amount_basis else TRADABLE_GATE
+        ) + (
             "; at a rebalance, limit-down blocks the sell and limit-up blocks "
             "the buy"
         ),
@@ -1797,6 +2014,11 @@ def build_roll_summary(
         "warnings": list(warnings),
         "disclaimer": DISCLAIMER,
     }
+    if amount_basis:
+        # Legacy raw-close ledgers keep their pre-R32 bytes; the explicit
+        # basis is only recorded when it is not the legacy assumption.
+        summary["raw_price_mode"] = simulation.raw_price_mode
+    return summary
 
 
 def run_roll(
@@ -1806,6 +2028,7 @@ def run_roll(
     capital: float = DEFAULT_CAPITAL,
     cost_mode: str = "impact",
     max_stale_sessions: int = DEFAULT_MAX_STALE_SESSIONS,
+    raw_price_mode: str = RAW_PRICE_MODE_AUTO,
 ) -> tuple[dict[str, Any], Path]:
     """Rebuild one rolling paper ledger; returns (summary, nav_path)."""
     if not math.isfinite(capital) or capital <= 0:
@@ -1813,7 +2036,7 @@ def run_roll(
     if max_stale_sessions < 0:
         raise PaperTrackError("--max-stale-sessions must be >= 0 (0 disables)")
     targets = load_targets([Path(path) for path in target_paths])
-    panels = load_cache(Path(cache_path))
+    panels = load_cache(Path(cache_path), raw_price_mode)
     simulation = simulate_roll(
         targets, panels, float(capital), cost_mode, int(max_stale_sessions),
     )
@@ -1855,8 +2078,8 @@ def run_roll(
                 "ledger; use a new --out-dir"
             )
         # A growing target schedule is the intended rebuild case, but a
-        # different capital / cost mode / stale policy is a configuration
-        # mistake that would silently rewrite the whole ledger.
+        # different capital / cost mode / stale policy / raw price basis is a
+        # configuration mistake that would silently rewrite the whole ledger.
         for key, expected, label in (
             ("capital", float(capital), "capital"),
             ("cost_mode", cost_mode, "cost mode"),
@@ -1869,6 +2092,14 @@ def run_roll(
                     f"different {label} ({current!r} != {expected!r}); use a "
                     "new --out-dir"
                 )
+        # Pre-R32 ledgers have no key and were all on the legacy close basis.
+        existing_mode = existing.get("raw_price_mode", RAW_PRICE_MODE_CLOSE)
+        if existing_mode != panels.raw_price_mode:
+            raise PaperTrackError(
+                f"{summary_path} belongs to a rolling ledger with a different "
+                f"raw price mode ({existing_mode!r} != "
+                f"{panels.raw_price_mode!r}); use a new --out-dir"
+            )
     out_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(
         nav_path,
@@ -1920,6 +2151,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="CostModel slippage mode (default impact, R9 basis)",
     )
     parser.add_argument(
+        "--raw-price-mode", choices=RAW_PRICE_MODES, default=RAW_PRICE_MODE_AUTO,
+        help=(
+            "raw CNY price basis for cost conversion, tradability and stale "
+            "liquidation: 'auto' samples amount vs close*volume and switches "
+            "to amount/volume on a >1%% median relative error (default), "
+            "'close' keeps the legacy assumption that the cached close is "
+            "raw, 'amount_over_volume' uses amount/volume unconditionally "
+            "(requires the amount column)"
+        ),
+    )
+    parser.add_argument(
         "--max-stale-sessions", type=int, default=DEFAULT_MAX_STALE_SESSIONS,
         help=(
             "consecutive stale sessions before a held asset is liquidated to "
@@ -1940,6 +2182,7 @@ def main(argv: list[str] | None = None) -> int:
                 capital=float(args.capital),
                 cost_mode=args.cost_mode,
                 max_stale_sessions=int(args.max_stale_sessions),
+                raw_price_mode=args.raw_price_mode,
             )
         else:
             if args.targets_dir is not None:
@@ -1953,6 +2196,7 @@ def main(argv: list[str] | None = None) -> int:
                 capital=float(args.capital),
                 cost_mode=args.cost_mode,
                 max_stale_sessions=int(args.max_stale_sessions),
+                raw_price_mode=args.raw_price_mode,
             )
     except PaperTrackError as exc:
         print(f"paper_track: error: {exc}", file=sys.stderr)
