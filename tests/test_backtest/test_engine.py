@@ -659,6 +659,224 @@ class TestUniverseBuyGate:
         )
 
 
+class TestCashConstrainedBuys:
+    """R18: sells settle before buys and buys are funded from real cash.
+
+    Before R18 a sell blocked at limit-down (or by a suspension) simply
+    vanished from the executable delta while the buys still executed. The
+    drift step's ``max(0, 1 - sum(weights))`` then hid the negative cash, so
+    the book ran on cost-free hidden leverage: the OOS audit found gross
+    exposure up to 107.2% and single names at 6.58% against a 5% target.
+    Execution now applies the allowed sells first and scales the buys to
+    ``max(0, 1 - sum(weights after sells))``; the unfilled buy remainder
+    stays in the deferred queue.
+    """
+
+    # Daily returns of the fixed-seed, no-gate scenario below, captured from
+    # the pre-R18 engine (HEAD e884d7c) before the change. The no-gate path
+    # must reproduce them bit for bit: the funding scale is exactly 1, so the
+    # new arithmetic may not move a single bit.
+    NO_GATE_GOLDEN = (
+        0.0,
+        -0.012926423411895798,
+        -0.0012393916975299898,
+        0.002957613955265238,
+        0.0016805768008237125,
+        0.001615784575766685,
+        -0.011864843954654071,
+        0.004468888837611401,
+        0.006798966309708326,
+        0.008029412003379609,
+        0.0032983780873104625,
+        0.00635974266481487,
+    )
+
+    @staticmethod
+    def _engine() -> BacktestEngine:
+        return BacktestEngine(
+            initial_capital=1_000_000,
+            rebalance_frequency="monthly",
+            optimizer="equal_weight",
+            constraints=PortfolioConstraints(max_turnover=1.0),
+            cost_model=CostModel(
+                commission=0, stamp_tax=0, slippage=0,
+                min_commission=0, transfer_fee=0,
+            ),
+        )
+
+    @staticmethod
+    def _setup(n_days: int = 4, seed: int = 99):
+        dates = pd.bdate_range("2024-01-01", periods=n_days)
+        rng = np.random.default_rng(seed)
+        returns = pd.DataFrame(
+            rng.normal(0.0, 0.01, (n_days, 4)), index=dates,
+            columns=["A", "B", "C", "D"],
+        )
+        return dates, returns
+
+    def test_blocked_sell_scales_buys_to_the_cash_the_other_sell_released(self):
+        """Test (a)/(d): A's sell is blocked at limit-down while D's fills.
+
+        The buys must fit D's proceeds: B and C are scaled by one common
+        factor, keep their relative ordering, and the executed book sums to
+        at most 1.
+        """
+        dates, returns = self._setup()
+        engine = self._engine()
+        engine.weights_history = {
+            dates[0]: pd.Series({"A": 0.6, "B": 0.0, "C": 0.0, "D": 0.4}),
+            dates[2]: pd.Series({"A": 0.0, "B": 0.5, "C": 0.5, "D": 0.0}),
+        }
+        limit_down = pd.DataFrame(False, index=dates, columns=returns.columns)
+        limit_down.loc[dates[3], "A"] = True
+
+        engine._simulate_pnl(returns, limit_down=limit_down)
+
+        held = engine.weights_history[dates[2]]
+        assert float(held.sum()) <= 1.0 + 1e-9
+        assert engine.n_funding_scaled_days == 1
+        # A is still held; B/C were cut from their 0.5 target to the same
+        # smaller weight (proportional scaling preserves relative ordering).
+        assert held["A"] > 0.0
+        assert held["B"] == pytest.approx(held["C"])
+        assert 0.0 < held["B"] < 0.5
+        assert held["D"] == pytest.approx(0.0)
+        # The funded amount is exactly the cash the allowed sell released.
+        assert held["B"] + held["C"] == pytest.approx(1.0 - held["A"], abs=1e-12)
+
+    def test_all_sells_blocked_scales_buys_to_zero_and_keeps_the_book(self):
+        """Test (c): fully invested in A, target B/C, A cannot be sold.
+
+        With no cash the buys are scaled to zero: nothing is traded, no
+        turnover is booked and the portfolio still earns exactly A's return.
+        """
+        dates, returns = self._setup()
+        engine = self._engine()
+        engine.weights_history = {
+            dates[0]: pd.Series({"A": 1.0, "B": 0.0, "C": 0.0, "D": 0.0}),
+            dates[2]: pd.Series({"A": 0.0, "B": 0.5, "C": 0.5, "D": 0.0}),
+        }
+        limit_down = pd.DataFrame(False, index=dates, columns=returns.columns)
+        limit_down.loc[dates[3], "A"] = True
+
+        engine._simulate_pnl(returns, limit_down=limit_down)
+
+        assert engine.n_funding_scaled_days == 1
+        # Nothing executes on the rebalance's execution day: no turnover or
+        # cost, and the book still holds only A.
+        assert list(engine.turnover_history.index) == [dates[1]]
+        assert engine.daily_returns.loc[dates[3]] == pytest.approx(
+            returns.loc[dates[3], "A"]
+        )
+        assert dates[2] not in engine._executed_signal_dates
+
+    def test_partial_fills_are_deferred_and_completed_when_the_sell_unblocks(self):
+        """The unfilled buy remainder is retried, not dropped.
+
+        Day 3: A's sell is blocked, D's proceeds fund a partial B/C fill.
+        Day 4: A's sell clears, and the retried buy deltas top B/C back up to
+        target. The cash constraint binds on exactly one day.
+        """
+        dates, returns = self._setup(n_days=6)
+        engine = self._engine()
+        engine.weights_history = {
+            dates[0]: pd.Series({"A": 0.6, "B": 0.0, "C": 0.0, "D": 0.4}),
+            dates[2]: pd.Series({"A": 0.0, "B": 0.5, "C": 0.5, "D": 0.0}),
+        }
+        limit_down = pd.DataFrame(False, index=dates, columns=returns.columns)
+        limit_down.loc[dates[3], "A"] = True
+
+        engine._simulate_pnl(returns, limit_down=limit_down)
+
+        held = engine.weights_history[dates[2]]
+        assert engine.n_funding_scaled_days == 1
+        assert held["A"] == pytest.approx(0.0, abs=1e-12)
+        assert held["B"] == pytest.approx(0.5, abs=1e-9)
+        assert held["C"] == pytest.approx(0.5, abs=1e-9)
+        assert float(held.sum()) == pytest.approx(1.0, abs=1e-9)
+
+    def test_no_gate_path_is_bit_identical_to_the_pre_r18_golden(self):
+        """Test (b): the default (no panels) path reproduces the old engine.
+
+        The golden returns were captured from the pre-R18 engine on this
+        exact deterministic scenario. No sell is blocked, so the funding
+        scale is exactly 1 and the arithmetic must not change a single bit.
+        """
+        dates, returns = self._setup(n_days=12, seed=99)
+        engine = self._engine()
+        engine.weights_history = {
+            dates[0]: pd.Series({"A": 0.6, "B": 0.0, "C": 0.0, "D": 0.4}),
+            dates[2]: pd.Series({"A": 0.0, "B": 0.5, "C": 0.5, "D": 0.0}),
+        }
+
+        engine._simulate_pnl(returns)
+
+        assert engine.daily_returns.to_list() == list(self.NO_GATE_GOLDEN)
+        assert engine.n_funding_scaled_days == 0
+        held = engine.weights_history[dates[2]]
+        assert [held[c] for c in ["A", "B", "C", "D"]] == [0.0, 0.5, 0.5, 0.0]
+
+    def test_run_summary_reports_funding_scaled_days(self):
+        """Test (f): the summary carries the new counter and gross stays <= 1.
+
+        Two monthly rebalances: the first buys S00; the second wants S01/S02
+        but S00's sell is blocked at limit-down on its execution day, so the
+        buys are scaled to zero and the day is counted once.
+        """
+        rng = np.random.default_rng(21)
+        n_days, n_assets = 70, 12
+        dates = pd.bdate_range("2023-01-02", periods=n_days)
+        assets = [f"S{i:02d}" for i in range(n_assets)]
+        prices = pd.DataFrame(
+            100 * np.exp(np.cumsum(rng.normal(0, 0.01, (n_days, n_assets)), axis=0)),
+            index=dates, columns=assets,
+        )
+        returns = prices.pct_change(fill_method=None).shift(-1)
+        signal = pd.DataFrame(
+            rng.normal(size=(n_days, n_assets)), index=dates, columns=assets,
+        )
+
+        class TwoStageOptimizer:
+            fallback_count = 0
+            last_fallback_reason = None
+
+            def __init__(self):
+                self.calls = 0
+
+            def optimize(self, signal=None, **_kwargs):
+                self.calls += 1
+                weights = pd.Series(0.0, index=signal.index)
+                if self.calls == 1:
+                    weights.iloc[0] = 1.0
+                else:
+                    weights.iloc[1] = 0.5
+                    weights.iloc[2] = 0.5
+                return weights
+
+        engine = self._engine()
+        engine._get_optimizer = lambda: TwoStageOptimizer()
+
+        rdates = engine._get_rebalance_dates(signal.index)
+        assert len(rdates) >= 2
+        second_exec = signal.index[signal.index.get_loc(rdates[1]) + 1]
+        limit_down = pd.DataFrame(False, index=dates, columns=assets)
+        limit_down.loc[second_exec, "S00"] = True
+
+        result = engine.run(
+            signal=signal, prices=prices, returns=returns,
+            benchmark_returns=None, sector_map=pd.Series("Tech", index=assets),
+            limit_down=limit_down,
+        )
+
+        summary = result["summary"]
+        assert isinstance(summary["n_funding_scaled_days"], int)
+        assert summary["n_funding_scaled_days"] == 1
+        assert summary["n_funding_scaled_days"] <= summary["n_rebalances"]
+        # Every executed rebalance leaves an unlevered book.
+        for weights in result["weights_history"].values():
+            assert float(weights.sum()) <= 1.0 + 1e-9
+
+
 class TestCapacityWiring:
     """R8: the engine hands the optimizer ADV in CNY = volume (shares) x
     raw (unadjusted) close, averaged over 20 sessions, plus the run's AUM
