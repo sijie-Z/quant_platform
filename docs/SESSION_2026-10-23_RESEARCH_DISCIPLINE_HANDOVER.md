@@ -56,10 +56,10 @@
 
 ## 3. 分支与远端状态（重要）
 
-- 本地分支 `feature/system-hardening`，HEAD `4a8a639`；**未 push**。
-- 远端同名分支仍停在 `c19d28b`（本轮开始前的提交）。
-- 会话内 `gh` 未登录（交互式提示），GitHub 写操作未执行；PR #84 未在本会话绑定/更新。
-- 因此：本轮全部成果仅存在于本地工作树。恢复后第一件事若是交付，需 `git push` 并更新 PR（注意 GitHub 限流钩子，聚合操作）。
+- 本地分支 `feature/system-hardening`，HEAD 已推送；远端同名分支 head = `def17e5`（2026-10-24 聚合推送，`c19d28b..def17e5`）。
+- PR **#84**（base `develop`）已更新描述，包含 R1–R16 的摘要与真实数据研究结论；CI 由推送触发。
+- 说明：本会话 `gh` CLI 未登录，PR 更新通过本机 git 凭据调 GitHub REST API 完成；后续如需 CI 结果请查看 PR 页面。
+- 另有 R16 工具化提交（`tools/real_data_research.py`）在同一分支上。
 
 ## 4. 已知残余与风险（评审记录在案）
 
