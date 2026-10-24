@@ -81,6 +81,10 @@ MIN_HISTORY_SESSIONS = 252
 IC_LOOKBACK = 252
 IC_MIN_OBS = 20
 TURNOVER_WINDOW = 20
+# A signal dated more than this many calendar days past the last cached
+# session is treated as stale (10 days clears the longest A-share holiday
+# closures without a trading calendar).
+STALE_CACHE_DAYS = 10
 
 COST_BPS = 20.0
 TURNOVER_PENALTY = 0.5
@@ -321,8 +325,6 @@ def compute_ic_weights(
     """
     raw_weights: dict[str, float] = {}
     stats: dict[str, dict[str, Any]] = {}
-    window_starts: list[pd.Timestamp] = []
-    window_ends: list[pd.Timestamp] = []
 
     for name, panel in factors.items():
         try:
@@ -357,8 +359,6 @@ def compute_ic_weights(
             "window_start": recent.index[0].date().isoformat(),
             "window_end": recent.index[-1].date().isoformat(),
         }
-        window_starts.append(recent.index[0])
-        window_ends.append(recent.index[-1])
 
     has_history = {name: stats[name]["n_obs"] >= IC_MIN_OBS for name in factors}
     if not any(has_history.values()):
@@ -382,13 +382,17 @@ def compute_ic_weights(
     for name in factors:
         stats[name]["weight"] = float(weights[name])
     window = None
-    if window_starts:
+    usable_names = [name for name in factors if has_history[name]]
+    if usable_names:
+        # Report one coherent window instead of a min-start/max-end union that
+        # may not belong to any single factor: use the factor with the most
+        # IC observations (all of them end before as_of).
+        best = max(usable_names, key=lambda name: stats[name]["n_obs"])
         window = {
-            "start": min(window_starts).date().isoformat(),
-            "end": max(window_ends).date().isoformat(),
-            "n": max(
-                stats[name]["n_obs"] for name in factors if has_history[name]
-            ),
+            "start": stats[best]["window_start"],
+            "end": stats[best]["window_end"],
+            "n": stats[best]["n_obs"],
+            "factor": best,
         }
     diagnostics: dict[str, Any] = {
         "lookback": IC_LOOKBACK,
@@ -571,7 +575,7 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
     data_lag_days = int(
         (as_of.normalize() - signal_date.normalize()).days
     )
-    if data_lag_days > 7:
+    if data_lag_days > STALE_CACHE_DAYS:
         warnings.append(
             f"stale cache: --as-of {as_of.date()} but the last cached session "
             f"is {signal_date.date()} ({data_lag_days} calendar days earlier); "
@@ -701,10 +705,11 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
             )
             raise SignalError(
                 "prev weights exceed --max-weight "
-                f"{constraints.max_weight:.4f} ({top}); with the "
-                f"{constraints.max_turnover:.2f} one-sided turnover cap the "
-                "book cannot be brought back under the cap in one rebalance "
-                "(the optimiser falls back and keeps the over-cap holdings)"
+                f"{constraints.max_weight:.4f} ({top}); the optimiser could "
+                "not produce a compliant book within the "
+                f"{constraints.max_turnover:.2f} one-sided turnover cap (it "
+                "fell back to equal weight and kept the over-cap holdings); "
+                "provide a compliant prev book or raise --max-turnover"
             )
         raise SignalError(
             "internal consistency check failed: max weight "
