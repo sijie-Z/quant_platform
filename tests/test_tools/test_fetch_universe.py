@@ -482,6 +482,150 @@ def test_two_runs_are_deterministic_except_timestamp(tool, tmp_path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# robustness / regression cases raised in review
+# ---------------------------------------------------------------------------
+
+
+def test_read_error_is_reported_and_skipped(tool, tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    stocks_dir = out / "stocks"
+    write_seed_stock(tool, stocks_dir, "600002")
+    (stocks_dir / "600001.parquet").write_bytes(b"definitely not parquet")
+
+    fake = FakeAK(responses={"600000": ConnectionError("down")})
+    install(tool, monkeypatch, ak=fake)
+    rc = run_cli(tool, out, codes="600000", retries=0)
+    assert rc == 0  # 600002 still provides data; the run does not crash on the bad file
+
+    payload = json.loads((out / "failures.json").read_text(encoding="utf-8"))
+    assert {entry["code"] for entry in payload["failures"]} == {"600000", "600001"}
+    read_error = next(entry for entry in payload["failures"] if entry["code"] == "600001")
+    assert read_error["error_type"] == "ReadError"
+    wide = pd.read_parquet(out / "daily_wide.parquet")
+    assert sorted(wide.index.get_level_values("asset").unique()) == ["600002"]
+
+
+def test_only_unreadable_files_exit_2(tool, tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    (out / "stocks").mkdir(parents=True)
+    (out / "stocks" / "600001.parquet").write_bytes(b"garbage")
+    fake = FakeAK(responses={"600000": ConnectionError("down")})
+    install(tool, monkeypatch, ak=fake)
+    rc = run_cli(tool, out, codes="600000", retries=0)
+    assert rc == 2
+    payload = json.loads((out / "failures.json").read_text(encoding="utf-8"))
+    assert {entry["error_type"] for entry in payload["failures"]} == {"ReadError", "ConnectionError"}
+
+
+def test_codes_and_refresh_must_be_six_digits(tool, tmp_path, monkeypatch):
+    fake = FakeAK(default=hist_frame())
+    install(tool, monkeypatch, ak=fake)
+
+    rc = run_cli(tool, tmp_path / "out_traversal", codes="../../../EVIL")
+    assert rc == 2
+    assert fake.calls == []
+    assert not (tmp_path / "EVIL.parquet").exists()
+
+    rc = run_cli(tool, tmp_path / "out_refresh", codes="600000", extra=["--refresh", "../x"])
+    assert rc == 2
+    assert fake.calls == []
+
+
+def test_text_delisting_date_sentinels(tool, tmp_path):
+    codes = ["000001", "000002", "000003", "000004", "000005", "000006"]
+    frame = pd.DataFrame(
+        {"delisting_date": [None, "", "null", "NaN", "-", "2020-01-01"]},
+        index=pd.Index(codes, name="asset"),
+    )
+    frame["delisting_date"] = frame["delisting_date"].astype(object)
+    path = tmp_path / "metadata_text.parquet"
+    frame.to_parquet(path)
+    assert tool.load_listed_codes(path) == codes[:5]
+
+
+def test_backoff_waits_are_capped(tool):
+    waits: list[float] = []
+
+    def always_fail():
+        raise RuntimeError("boom")
+
+    _, attempts, error = tool.fetch_with_retries(always_fail, retries=2, sleep_seconds=1000.0, sleep_fn=waits.append)
+    assert attempts == 3
+    assert error[0] == "RuntimeError"
+    assert waits == [60.0, 60.0]
+
+
+def test_keyboard_interrupt_is_not_swallowed(tool):
+    calls = {"count": 0}
+
+    def interrupt():
+        calls["count"] += 1
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        tool.fetch_with_retries(interrupt, retries=3, sleep_seconds=0.0, sleep_fn=lambda seconds: None)
+    assert calls["count"] == 1
+
+
+def test_refresh_failure_keeps_the_old_file(tool, tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    stocks_dir = out / "stocks"
+    write_seed_stock(tool, stocks_dir, "600001", close=10.0)
+
+    fake = FakeAK(responses={"600001": ConnectionError("refresh outage")})
+    install(tool, monkeypatch, ak=fake)
+    rc = run_cli(tool, out, codes="600001", extra=["--refresh", "600001"], retries=1)
+    assert rc == 0
+    assert len(fake.calls) == 2
+    saved = pd.read_parquet(stocks_dir / "600001.parquet")
+    assert saved["close"].iloc[0] == pytest.approx(10.0)
+    payload = json.loads((out / "failures.json").read_text(encoding="utf-8"))
+    assert payload["count"] == 1
+    assert payload["failures"][0]["attempts"] == 2
+
+
+def test_write_error_is_recorded_and_run_continues(tool, tmp_path, monkeypatch):
+    fake = FakeAK(responses={"600001": hist_frame("600001"), "600002": hist_frame("600002")})
+    install(tool, monkeypatch, ak=fake)
+    original_write = tool.write_stock
+
+    def flaky_write(frame, code, stocks_dir):
+        if code == "600001":
+            raise OSError("disk full")
+        return original_write(frame, code, stocks_dir)
+
+    monkeypatch.setattr(tool, "write_stock", flaky_write)
+    out = tmp_path / "out"
+    rc = run_cli(tool, out, codes="600001,600002", retries=0)
+    assert rc == 0
+    payload = json.loads((out / "failures.json").read_text(encoding="utf-8"))
+    assert payload["failures"][0]["code"] == "600001"
+    assert payload["failures"][0]["error_type"] == "WriteError"
+    assert (out / "stocks" / "600002.parquet").exists()
+
+
+def test_empty_universe_warns_and_exits_2(tool, tmp_path, monkeypatch, capsys):
+    meta_path, _ = write_metadata(tmp_path / "metadata_empty.parquet", n=3, delisted=(0, 1, 2))
+    fake = FakeAK(default=hist_frame())
+    install(tool, monkeypatch, ak=fake)
+    rc = run_cli(tool, tmp_path / "out", universe_file=meta_path)
+    assert rc == 2
+    assert fake.calls == []
+    assert "0 codes" in capsys.readouterr().err
+
+
+def test_zero_success_warns_about_stale_panel(tool, tmp_path, monkeypatch, capsys):
+    out = tmp_path / "out"
+    out.mkdir(parents=True)
+    pd.DataFrame({"stale": [1]}).to_parquet(out / "daily_wide.parquet")
+    fake = FakeAK(responses={"600000": ConnectionError("down")})
+    install(tool, monkeypatch, ak=fake)
+    rc = run_cli(tool, out, codes="600000", retries=0)
+    assert rc == 2
+    assert "stale" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # optional Baostock source
 # ---------------------------------------------------------------------------
 
@@ -520,3 +664,14 @@ def test_baostock_login_failure_exits_1_after_two_attempts(tool, tmp_path, monke
     assert bs.logins == 2
     assert bs.queries == []
     assert not (out / "daily_wide.parquet").exists()
+
+
+def test_baostock_fully_resumed_pool_skips_login(tool, tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    write_seed_stock(tool, out / "stocks", "600000")
+    bs = FakeBS(rows=[], login_ok=False)  # would fail if a login were attempted
+    install(tool, monkeypatch, bs=bs)
+    rc = run_cli(tool, out, codes="600000", source="baostock")
+    assert rc == 0
+    assert bs.logins == 0 and bs.logouts == 0
+    assert bs.queries == []

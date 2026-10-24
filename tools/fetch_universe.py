@@ -9,6 +9,11 @@ skipped on the next run (breakpoint resume), unless ``--refresh CODE`` names
 it. After the fetch loop every ``stocks/*.parquet`` file is merged into
 ``<out-dir>/daily_wide.parquet`` with a ``(date, asset)`` MultiIndex.
 
+Existing per-stock files are trusted as-is: widening ``--start``/``--end``
+or switching ``--source`` does not refetch them; use ``--refresh`` for that.
+Unreadable files in ``stocks/`` are recorded as ``ReadError`` failures and
+excluded from the panel rather than aborting the run.
+
 Universe selection: ``--codes A,B,C`` uses the codes verbatim (delisted names
 included if asked for); otherwise ``--universe-file`` (a parquet whose index
 holds 6-digit codes and whose ``delisting_date`` column is null for live
@@ -49,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -131,6 +137,13 @@ def normalize_code(value: Any) -> str:
     return code
 
 
+def _require_code(code: str) -> str:
+    """Reject anything that is not a plain 6-digit A-share code (path safety)."""
+    if len(code) == 6 and code.isascii() and code.isdigit():
+        return code
+    raise ValueError(f"unsupported stock code {code!r}: expected 6 ASCII digits")
+
+
 def load_listed_codes(path: str | Path) -> list[str]:
     """Read a metadata parquet and return sorted codes with no delisting date."""
     path = Path(path)
@@ -139,14 +152,14 @@ def load_listed_codes(path: str | Path) -> list[str]:
     frame = pd.read_parquet(path)
     if frame.empty:
         return []
-    codes = [normalize_code(code) for code in frame.index]
+    codes = [_require_code(normalize_code(code)) for code in frame.index]
     if "delisting_date" in frame.columns:
         delisted = frame["delisting_date"]
         if pd.api.types.is_datetime64_any_dtype(delisted):
             listed_mask = delisted.isna().to_numpy()
         else:
-            text = delisted.astype(str).str.strip()
-            listed_mask = delisted.isna().to_numpy() | text.isin(["", "nan", "NaT", "None"]).to_numpy()
+            text = delisted.astype(str).str.strip().str.lower()
+            listed_mask = delisted.isna().to_numpy() | text.isin(["", "nan", "nat", "none", "null", "-"]).to_numpy()
     else:
         listed_mask = np.ones(len(frame), dtype=bool)
     return sorted({code for code, keep in zip(codes, listed_mask, strict=True) if keep})
@@ -170,7 +183,7 @@ def resolve_codes(args: argparse.Namespace) -> list[str]:
         for chunk in args.codes.split(","):
             if not chunk.strip():
                 continue
-            code = normalize_code(chunk)
+            code = _require_code(normalize_code(chunk))
             if code not in seen:
                 seen.add(code)
                 codes.append(code)
@@ -305,12 +318,30 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def aggregate_stocks(stocks_dir: Path, out_path: Path) -> pd.DataFrame | None:
-    """Merge ``stocks/*.parquet`` into a deduplicated (date, asset) panel."""
+def aggregate_stocks(
+    stocks_dir: Path,
+    out_path: Path,
+    errors: list[dict[str, Any]] | None = None,
+) -> pd.DataFrame | None:
+    """Merge ``stocks/*.parquet`` into a deduplicated (date, asset) panel.
+
+    When ``errors`` is a list, unreadable files are appended to it as
+    ``ReadError`` entries (and warned about) instead of aborting the run.
+    """
     files = sorted(Path(stocks_dir).glob("*.parquet"))
     frames = []
     for path in files:
-        frame = pd.read_parquet(path)
+        try:
+            frame = pd.read_parquet(path)
+        except Exception as exc:
+            if errors is None:
+                raise
+            message = f"{type(exc).__name__}: {exc}"
+            if len(message) > 300:
+                message = message[:297] + "..."
+            errors.append({"code": path.stem, "error_type": "ReadError", "reason": message, "attempts": 0})
+            print(f"WARN: cannot read {path}: {message}", file=sys.stderr)
+            continue
         if "date" not in frame.columns:
             frame = frame.reset_index()
         if "asset" not in frame.columns:
@@ -359,13 +390,15 @@ def run(
     except Exception as exc:  # user input / parquet read errors are reported, not raised
         print(f"ERROR: cannot resolve stock universe: {exc}", file=sys.stderr)
         return 2
+    if not codes:
+        print("WARN: universe selection produced 0 codes", file=sys.stderr)
 
     out_dir = Path(args.out_dir)
     stocks_dir = out_dir / "stocks"
     stocks_dir.mkdir(parents=True, exist_ok=True)
     existing = {path.stem for path in stocks_dir.glob("*.parquet")}
     try:
-        refresh = {normalize_code(code) for code in (args.refresh or [])}
+        refresh = {_require_code(normalize_code(code)) for code in (args.refresh or [])}
     except ValueError as exc:
         print(f"ERROR: invalid --refresh code: {exc}", file=sys.stderr)
         return 2
@@ -380,15 +413,18 @@ def run(
 
     fetch_call: Callable[[str], pd.DataFrame]
     bs: Any = None
+    bs_logged_in = False
     if args.source == "akshare":
         ak = ak_module if ak_module is not None else _import_akshare()
         fetch_call = lambda code: fetch_akshare(ak, code, start, end)  # noqa: E731
     else:
         bs = bs_module if bs_module is not None else _import_baostock()
-        login_error = baostock_login(bs, sleep_fn)
-        if login_error is not None:
-            print(f"ERROR: Baostock {login_error}", file=sys.stderr)
-            return 1
+        if to_fetch:  # a fully resumed pool needs no login at all
+            login_error = baostock_login(bs, sleep_fn)
+            if login_error is not None:
+                print(f"ERROR: Baostock {login_error}", file=sys.stderr)
+                return 1
+            bs_logged_in = True
         fetch_call = lambda code: fetch_baostock(bs, code, start, end)  # noqa: E731
 
     failures: list[dict[str, Any]] = []
@@ -415,17 +451,21 @@ def run(
             if index < total and args.sleep > 0:
                 sleep_fn(args.sleep)
     finally:
-        if bs is not None:
+        if bs is not None and bs_logged_in:
             try:
                 bs.logout()
             except Exception:  # pragma: no cover - logout errors must not mask fetch results
                 pass
 
+    out_path = out_dir / "daily_wide.parquet"
+    read_errors: list[dict[str, Any]] = []
+    panel = aggregate_stocks(stocks_dir, out_path, errors=read_errors)
+    failures.extend(read_errors)
+
     failures_path = out_dir / "failures.json"
     write_json_atomic(failures_path, {"generated_at": _utc_now(), "count": len(failures), "failures": failures})
-
-    out_path = out_dir / "daily_wide.parquet"
-    panel = aggregate_stocks(stocks_dir, out_path)
+    if panel is None and out_path.exists():
+        print(f"WARN: {out_path} was not rebuilt this run and may be stale", file=sys.stderr)
     success_codes = sorted(panel.index.get_level_values("asset").unique()) if panel is not None else []
 
     distribution = Counter(failure["error_type"] for failure in failures)
@@ -469,8 +509,8 @@ def _non_negative_int(text: str) -> int:
 
 def _non_negative_float(text: str) -> float:
     value = float(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError("expected a non-negative number")
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("expected a finite non-negative number")
     return value
 
 
