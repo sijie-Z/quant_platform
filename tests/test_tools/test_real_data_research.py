@@ -309,6 +309,44 @@ def test_buyhold_last_label_uses_next_session_from_full_panel(tool):
     assert sliced_returns.loc[dates[3], "A"] == pytest.approx(0.04)
 
 
+@pytest.mark.filterwarnings("ignore:Mean of empty slice:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:invalid value encountered in scalar power:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:invalid value encountered in scalar divide:RuntimeWarning")
+def test_run_research_passes_full_adj_to_benchmark(tool, tmp_path, monkeypatch):
+    """--end wiring: run_research must hand the benchmark the unsliced adj panel.
+
+    The buy&hold label on the last included session needs the next session
+    from the full cache (same lookahead the forward-labelled returns keep).
+    The warning filters cover platform warm-up NaNs (the first factor rows
+    are all-NaN on a short synthetic panel), not this tool's code.
+    """
+    cache = tmp_path / "panel.parquet"
+    frame = write_panel(cache, n_days=220, n_assets=10, seed=13)
+    dates = frame.index.get_level_values("date").unique()
+    end = str(dates[180].date())
+
+    captured = {}
+    real = tool.compute_benchmark_returns
+
+    def spy(returns, adj, oos_index):
+        captured["adj_rows"] = len(adj)
+        captured["return_rows"] = len(returns)
+        return real(returns, adj, oos_index)
+
+    monkeypatch.setattr(tool, "compute_benchmark_returns", spy)
+    exit_code = tool.main([
+        "--cache", str(cache), "--end", end,
+        "--train", "60", "--test", "30", "--step", "60",
+        "--factors", "turnover_20d", "--top-k", "1",
+        "--json-out", str(tmp_path / "end.json"),
+        "--md-out", str(tmp_path / "end.md"),
+    ])
+
+    assert exit_code == 0
+    assert captured["return_rows"] == 181  # sliced through --end
+    assert captured["adj_rows"] == 220     # full panel, next-session label
+
+
 def test_excess_sharpe_does_not_double_subtract_risk_free(tool):
     """An excess series' Sharpe is an information ratio: rf must be zero.
 

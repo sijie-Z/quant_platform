@@ -504,7 +504,8 @@ def run_research(args: argparse.Namespace) -> dict[str, Any]:
     # ``returns`` was shifted before slicing, so the last included session's
     # label already uses the next session from the full cache (documented in
     # --start/--end help). The buy&hold benchmark needs the same one-session
-    # lookahead for its last forward return; hand it the unsliced adj path.
+    # lookahead for its last forward return; hand it the unsliced adj path
+    # (build_panels order: close, volume, turnover, returns, adj, pct).
     full_adj = panels[4]
     close, volume, _turnover, returns, adj, pct = slice_panels(
         panels, args.start, args.end,
