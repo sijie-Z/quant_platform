@@ -519,7 +519,7 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 ### 数据与合并口径
 
 - **价格**：300 只新浪后复权日线，2,135 个交易日（2018-01-02..2026-10-23）；字段 open/high/low/close/volume/amount/turnover/pct_chg（turnover 百分数）。R30 抓取失败的 3 只（001312/301655/301686）本轮成功，但均为 **2026 年 IPO**（首个交易日 2026-04-21/2026-08-20/2026-09-22），2018-2025 研究窗口无任何数据，故研究面板仍为 **297 只 × 1,942 日**，与 R30 完全同宇宙；三只新样本只影响 2026 目标（本次均未入选）。
-- **估值**：百度 PE(TTM)/PB 各约 22.3 万条源观测（1991..2026-10-24，约半月频；PE 与 PB 的发布日期网格并不重合）。逐股按“先 `dropna()` 再 `reindex(price_dates, method="ffill")`”合并：只取 **≤ 价格日期**的最近一次观测，**不 bfill**；价格日期前无观测保持 NaN。先 dropna 是必要的——若直接对含 NaN 的源面板 reindex，最近一个源标签恰好只有 PB 时会返回 NaN，造成大面积假缺失。
+- **估值**：百度 PE(TTM)/PB 各约 22.3 万条源观测（1991..2026-10-24；逐股更新间隔 median 8 天、p10 1 天、p90 18 天）。逐股按“先 `dropna()` 再 `reindex(price_dates, method="ffill")`”合并：只取 **≤ 价格日期**的最近一次观测，**不 bfill**；价格日期前无观测保持 NaN。先 dropna 是必要的：源面板 (date × asset) 跨股票稀疏，任意一个源日期通常只有少数股票有观测；若直接对含 NaN 的源面板 `reindex(method="ffill")`，取到的是最近一个**行标签**的整行，该股票若恰在此行没有观测就返回 NaN（即使更早有观测），naive 全面板 ffill 会把 listed 覆盖率打到 **21.34%**。先 dropna 逐股 ffill 还能保留落在周末/节假日的源观测（逐列 `reindex(...).ffill()` 只有 95.26%）。PE 与 PB 的日期集合仅 6/300 只股票不同，不是覆盖率问题的主因。
 - **覆盖率**：有收盘价的 listed 行上 PE/PB 覆盖 **99.995%**（逐股最低 99.85%，无一只低于 50%）；含上市前单元的全网格覆盖 88.02%。PE<=0 占覆盖行 **20.42%**、PB<=0 占 **0.50%**；EP=1/PE 仅在 PE>0 时定义（PB/BP 同理），非正 PE 不作任何符号翻转。
 - **因果性**：合成变异测试通过（改后一个估值点，之前所有合并值不变、之后从该点起变化）；257 个随机 (股票, 日期) 点复核 PE/PB 合并值，max abs diff = 0。
 - **局限**：百度历史估值序列自身的 PIT 构造无法独立验证（假设 t 日估值只使用 t 日及以前可得的信息）；静态行业映射（最新分类，无 effective_date）；无 ST 标记/过滤；300 只全部为当前上市股票（退市在抽样前剔除，幸存者偏差未校正）；30xxxx 2020-08 后为 20% 涨跌幅而门禁仍用 ±9.8%（买卖两侧混合方向，同 R30）。
@@ -531,16 +531,17 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 | 变体 | 因子（中性化） | Sharpe | 年化 | 年化波动 | 最大回撤 | DSR p (N=60) | 基准 Sharpe | Sharpe 差 | IR vs EW | 风格 alpha（年化） | t(alpha) | R² |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | A | EP（行业中性，top1） | 0.497 | 11.31% | 16.72% | −26.65% | 0.8458 | 0.493 | +0.004 | −0.337 | −3.78% | −1.40 | 0.86 |
-| B | EP+turnover20（行业中性，top2） | 0.674 | 14.08% | 16.45% | −24.88% | 0.7401 | 0.493 | +0.180 | −0.138 | −1.73% | −0.62 | 0.85 |
+| B | EP+turnover20（行业中性，top2） | 0.674 | 14.08% | 16.45% | −24.88% | 0.7401 | 0.493 | +0.180 | −0.138 | −1.72% | −0.62 | 0.85 |
 | C | EP+turnover20（行业+成交额中性，top2） | 0.606 | 12.87% | 16.28% | −25.06% | 0.7838 | 0.493 | +0.113 | −0.218 | −0.84% | −0.30 | 0.85 |
 | D | turnover20（plain，top1；对照） | 0.805 | 15.47% | 15.49% | −20.23% | 0.6459 | 0.493 | **+0.312** | −0.044 | −1.39% | −0.47 | 0.83 |
 | — | 同池日频等权 | 0.493 | 14.44% | 23.19% | −32.28% | — | — | — | — | — | — | — |
 
-- **D 与 R30 wide-A 逐位复现**：Sharpe 0.80496、年化 15.47%、MDD −20.23%、IR −0.044、funding 3,107 天全部一致；两次数值最大差 ≤1.5e-13（浮点末位），证明 R31 合并面板/因子处理没有引入口径漂移。DSR 由 R30 的 N=58 改按本轮任务书 N=60，p 0.641→0.646 为纯计数差异。
+- **D 与 R30 wide-A 逐位复现**：Sharpe 0.80496、年化 15.47%、MDD −20.23%、IR −0.044、funding 3,107 天全部一致；headline 指标与 OOS 日收益最大差 ≤2.1e-14，`weights_history` ≤1.7e-13；`cost_events` 的 CNY 金额绝对差 2.08e-7（相对 1.4e-12）。证明 R31 合并面板/因子处理没有引入口径漂移。DSR 由 R30 的 N=58 改按本轮任务书 N=60，p 0.641→0.646 为纯计数差异。
 - **判定：宽池 EP 无增量证据。** B/C 的 DSR p = 0.740/0.784、风格 alpha t = −0.62/−0.30，双重门槛均远未达到；加入 EP 反而把宽池换手对照的 Sharpe 从 0.805 拉低到 0.674（B）/0.606（C），年化从 15.47% 降到 14.08%/12.87%。EP 单因子 A 与同池等权打平（Sharpe 差 +0.004），风格 alpha 为 −3.78%/年（t −1.40），即高 EP 暴露没有带来正残余收益。
 - **为什么 EP 在宽池无效**：EP 的全样本 rank IC 虽为正（plain +0.0197、ICIR 0.128；行业中性 +0.0145、0.152）且 8/8 年为正，但量级只有 turnover20（−0.0435、ICIR −0.210）的约一半；在 5% 单票/30% 行业约束下，EP 多头组合的收益被风格（R² 0.85–0.86）解释，残余 alpha 为负。B/C 的 IR vs EW 分别 −0.138/−0.218，CAGR 差 −0.35pp/−1.56pp——Sharpe 优势仍主要来自降波动（16.3–16.5% vs 等权 23.2%），不是增收益，与 §16 的宽池结论一致。
 - **fallback（真实计数）**：4 次 walk-forward 引擎 optimizer fallback **0**、selector fallback **0**、协方差失败 0；R18 现金约束 `n_funding_scaled_days` 3,107–3,443；优化器目标最大行业权重 17.6%–20.1%（30% cap 未顶到），0 违规。OOS 年化单边换手 0.91–1.05。
 - DSR 家族敏感性：按 R30 家族 58 + 本轮 4 = N=62 复算，四组 p 为 0.849/0.744/0.787/0.650，判定不变。本轮按任务书统一报告 N=60。
+- **复现前提与确定性**：官方 CLI 在 import numpy 前把 OMP/MKL/OPENBLAS/NUMEXPR 线程固定为 1。外部驱动若先 import numpy 再以默认线程直接调用，B 会得到 Sharpe 0.667、DSR p 0.745、alpha t −0.66（官方 0.674/0.740/−0.62），结论不变。确定性：A–D 四个变体各做两次独立 pinned 运行（第一次 JSON 备份后 `--research --force` 重跑），全部字段（含 per-fold weights/cost/daily returns，每变体 ≥26 万数值单元）0 差异；`runtime_s` 与运行名 excluded。
 
 ### 与 101 池 EP 结果并列
 
@@ -558,11 +559,12 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 用 `tools/daily_signal.py`（R26 版本，未改一行）在合并面板上生成：`--as-of 2026-10-23 --factors ep,turnover20d --industry-map .cache/baostock/industry_map.parquet`，MVO、5% 单票、30% 行业 cap、first build（无 prev_weights）。
 
 - **32 只持仓**；gross **99.9999%**（cash 0.0001%）；最大单票 **5.00%**（11 只顶格）；最大行业 **C35 13.49%**（30% cap 未约束，14 个行业有持仓）；估算单边换手 **50.00%**（first build 对零仓，cap 不适用）；optimizer fallback **0**。
+- **估值 vintage**：as_of 2026-10-23 使用的是“≤10-23 的最近一次观测”（300/300 只有 prior 观测；有效年龄 median **7 天**、p90 17 天、max **21 天**、12 只当天有观测）。估值源在 2026-10-24（周六）有 300/300 条观测，严格 PIT 下**排除**；反事实实验（用 10-24 快照替换 10-23 值）会把 32 只中 22 只权重移动（max 0.93pp、31/32 名称重叠），因此该 vintage 必须显式披露，而不是当作 10-23 当日估值。
 - IC 权重（252 obs，窗口 2025-10-09..2026-10-22，全部严格早于 as_of）：EP **+0.233**（IC +0.0118），turnover20d **−0.767**（IC −0.0389，负号即低换手方向）。
 - 信号日覆盖：300 只面板中 299 只有收盘（002717 停牌）；PE 299 只全有值（199 正 / 100 非正 → EP 无值）；turnover20 有效 298；EP 或 turnover 至少一项有效的选择池 299（= daily_signal 的 candidates）。**非正/缺失 PE 不被静默删除**：missing 因子在 composite 中按 0（z-score 后的中性值）处理，上述计数显式写入目标 JSON 的 `r31.cap_checks.coverage_on_signal_date`。
 - **PIT 验证**：向缓存注入 2026-10-26..30 五个交易日的极端未来行（价格 ±3%、PE 2/500 分半、turnover 1–13），`--as-of 2026-10-23` 的权重与基线**逐位相同**（max diff 0）；同缓存 `--as-of 2026-10-30` 权重最大变化 5pp——证明测试有功效且 as_of 截断真实生效。
-- 目标文件：`docs/research/target_portfolio_2026-10-23.{json,csv}`；JSON 与 CSV 首行均带 `paper tracking only; style-tilt demo, not validated alpha` 免责声明。
-- **forward paper 等待执行日**：执行日 = as_of 后首个交易日（预计 **2026-10-26**）；当前缓存止于 2026-10-23，台账无法启动。`docs/research/paper_track/forward_2026/README.md` 写明数据更新后重建合并面板并运行 `tools/paper_track.py --target ... --cache .scratch/orchestrate/merged_wide.parquet --out-dir docs/research/paper_track/forward_2026 --capital 2000000 --cost-mode impact`；台账等待。
+- 目标文件：`docs/research/target_portfolio_2026-10-23.{json,csv}`；JSON 顶层 `disclaimer` 字段与 CSV 首行均带 `paper tracking only; style-tilt demo, not validated alpha` 免责声明。
+- **forward paper 等待执行日**：执行日 = as_of 后首个交易日（预计 **2026-10-26**）；当前缓存止于 2026-10-23，台账无法启动。`docs/research/paper_track/forward_2026/README.md` 写明数据更新后重建合并面板并运行 `tools/paper_track.py --target ... --cache .scratch/orchestrate/merged_wide.parquet --out-dir docs/research/paper_track/forward_2026 --capital 2000000 --cost-mode impact`；README 同时注明冻结目标复核的权重容差 ≤1e-8（或把 BLAS 线程固定为 1 做位级比较）；台账等待。
 
 **限制（目标链路）**：宽缓存 `close` 为后复权，`paper_track.py` 用 `volume×close` 估计 CNY 成交额会高估 ADV（R30 实测逐股中位 2.78×），从而**低估** impact 成本；NAV 收益本身由 `pct_chg` 构建，不受影响。目标组合包含 2026 年新上市股票风险（本次未选中）；002717 停牌不入选；行业映射静态、无 ST、权重层面不取整手。
 

@@ -18,6 +18,10 @@ first cached session *after* that date exists. The expected execution day is
   first build (no `--prev-weights`).
 - Estimated one-sided turnover of the first build:
   50.00% (against a zero book).
+- Effective valuation age on 2026-10-23 (Baidu points are sparse):
+  median 7 days,
+  max 21 days.
+  The 2026-10-24 source point is excluded by construction (strict PIT).
 
 Top 10 weights:
 
@@ -47,9 +51,12 @@ Top 10 weights:
 3. Sanity-check the frozen target: re-run `daily_signal` with
    `--as-of 2026-10-23` against the refreshed cache and confirm the weights
    are unchanged. Post-as_of rows must not move the book (R31's PIT test uses
-   exactly this construction). Do **not** overwrite this file with a
-   later-`as_of` book; write a new dated target instead (paper_track refuses
-   to mix targets in one ledger).
+   exactly this construction). Weights are rounded to 1e-10; compare with a
+   tolerance of 1e-8, or set `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+   OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1` for bit-level equality (R31
+   pins these threads for every research run). Do **not** overwrite this file
+   with a later-`as_of` book; write a new dated target instead (paper_track
+   refuses to mix targets in one ledger).
 4. Run the forward ledger:
 
    ```

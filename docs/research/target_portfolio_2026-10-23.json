@@ -163,7 +163,28 @@
     "merge_cache": ".scratch/orchestrate/merged_wide.parquet",
     "strategy": "EP + turnover20d, industry-neutral factors, rank-normalised MVO, 30% sector cap, 5% single-name cap",
     "execution_note": "paper tracking only; execution day is the first cached session strictly after as_of (expected 2026-10-26; not yet in the cache)",
-    "data_vintage": "Sina hfq daily through 2026-10-23; Baidu PE(TTM)/PB causally ffilled through 2026-10-23",
+    "data_vintage": "Sina hfq daily through 2026-10-23; Baidu PE(TTM)/PB causally ffilled to 2026-10-23 from the last observed point at or before it (effective PE age: median 7d, max 21d; the 2026-10-24 source point is excluded)",
+    "valuation_vintage": {
+      "pe_ttm": {
+        "n_assets_with_prior_observation": 300,
+        "median_age_days": 7.0,
+        "p90_age_days": 17.0,
+        "min_age_days": 0,
+        "max_age_days": 21,
+        "n_same_day": 12,
+        "last_source_date_overall": "2026-10-24"
+      },
+      "pb_mrq": {
+        "n_assets_with_prior_observation": 300,
+        "median_age_days": 7.0,
+        "p90_age_days": 17.0,
+        "min_age_days": 0,
+        "max_age_days": 21,
+        "n_same_day": 12,
+        "last_source_date_overall": "2026-10-24"
+      },
+      "note": "Baidu publishes valuation points sparsely (per-asset median gap ~8 days). The book therefore uses the last observation at or before as_of; a later source point (2026-10-24) exists in the vendor file and is excluded by construction."
+    },
     "research_caveat": "R31 wide-pool EP variants found no statistically significant incremental alpha; this book is a style-tilt demo, not validated alpha",
     "cap_checks": {
       "n_holdings": 32,
@@ -197,6 +218,27 @@
       "first_build": true,
       "optimizer_fallbacks": 0,
       "factor_skipped": [],
+      "valuation_vintage_on_signal_date": {
+        "pe_ttm": {
+          "n_assets_with_prior_observation": 300,
+          "median_age_days": 7.0,
+          "p90_age_days": 17.0,
+          "min_age_days": 0,
+          "max_age_days": 21,
+          "n_same_day": 12,
+          "last_source_date_overall": "2026-10-24"
+        },
+        "pb_mrq": {
+          "n_assets_with_prior_observation": 300,
+          "median_age_days": 7.0,
+          "p90_age_days": 17.0,
+          "min_age_days": 0,
+          "max_age_days": 21,
+          "n_same_day": 12,
+          "last_source_date_overall": "2026-10-24"
+        },
+        "note": "Baidu publishes valuation points sparsely (per-asset median gap ~8 days). The book therefore uses the last observation at or before as_of; a later source point (2026-10-24) exists in the vendor file and is excluded by construction."
+      },
       "coverage_on_signal_date": {
         "date": "2026-10-23",
         "universe_with_close": 299,
