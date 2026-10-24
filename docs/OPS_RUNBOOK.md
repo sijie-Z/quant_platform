@@ -236,3 +236,29 @@ python main.py data retention --events-days 90 --signals-days 365 --trades-days 
 删除 `orders` 时还会检查是否仍有被保留的 `trades` 引用该订单，避免留下孤儿成交。
 删除后默认 `PRAGMA wal_checkpoint(TRUNCATE)` + `VACUUM`（`--no-vacuum` 跳过）。
 建议在 EOD 之后、备份之前运行 retention。
+
+---
+
+## 13. Forward paper 跟踪（只读，不动钱）
+
+**目的**：用真实行情按冻结策略逐日记录模拟盘，积累真实前向记录；不接券商、不下单。
+
+**策略与目标**
+- EP+换手：`docs/research/paper_track/forward_targets/ep_turnover/`
+- 换手单因子：`docs/research/paper_track/forward_targets/turnover/`
+- 首批目标 as_of `2026-10-23`，执行日 `2026-10-26`；此后每个**交易所月末最后交易日**收盘后自动生成下一期目标（`daily_signal --prev-weights` 链接上一期）。
+
+**每日流程**（工作日收盘后）
+```bash
+# 抓新浪数据到当天 → 重建 merged panel → 月末生成新目标 → 重建两个滚动台账
+python .scratch/orchestrate/forward_update.py --track
+```
+- 数据：`.scratch/wide_sina_2026/stocks/`（300 只、后复权、含 amount/turnover）；
+- 合并面板：`.scratch/orchestrate/merged_wide.parquet`（估值按日 ffill，无 bfill）；
+- 台账：`docs/research/paper_track/forward_2026/`（EP+换手）与 `forward_2026_turnover/`（换手）；
+- 成本：佣金 0.03%（最低 5 元）、印花税按日期、平方根冲击；原始价由 `paper_track --raw-price-mode auto` 自动识别（新浪面板用 `amount/volume`）。
+
+**自动化**：桌面端 Scheduled 任务 `quant-forward-paper-daily`，工作日 16:20 运行；失败写入 `.scratch/orchestrate/forward_update_failures.log`。
+**首次运行前**：在 Scheduled 页点一次 “Run now” 预授权 Bash 等工具，否则可能停在权限确认。
+
+**已知限制**：宽池只含当前上市股票（幸存者偏差）；PE/PB 为半月频 ffill（≤3 周旧值）；行业映射静态；权重层面不取整手；这是模拟跟踪，不是实盘成交。
