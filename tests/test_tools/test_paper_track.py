@@ -1273,6 +1273,27 @@ def test_roll_refuses_a_different_config_in_the_same_out_dir(tool, tmp_path, cap
     assert (out_dir / "nav.csv").read_bytes() == nav_bytes
 
 
+def test_roll_commission_floor_applies_on_small_notional(tool, tmp_path):
+    # 10k capital / 40-40 book -> 4k notional per asset: 0.03% is 1.2 CNY, so
+    # the CNY 5 per-order floor binds (5 + 0.04 transfer + 4 slippage each).
+    close, volume, pct = make_panel({"A": [10.0] * 4, "B": [10.0] * 4})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.4, "B": 0.4}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(
+        tool, cache, out_dir, targets_dir=target_dir, capital=10_000.0,
+    ) == 0
+    nav = read_nav(out_dir)
+    expected = 2 * (5.0 + 4_000.0 * 0.00001 + 4_000.0 * 0.001)
+    assert expected == pytest.approx(18.08, abs=1e-12)
+    assert nav.loc[0, "costs_paid"] == pytest.approx(expected, abs=1e-6)
+    assert nav.loc[0, "nav"] == pytest.approx(10_000.0 - expected, abs=1e-6)
+
+
 def test_roll_refuses_to_mix_with_a_single_target_ledger(tool, tmp_path, capsys):
     close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0, 10.0]})
     dates = close.index
@@ -1287,6 +1308,26 @@ def test_roll_refuses_to_mix_with_a_single_target_ledger(tool, tmp_path, capsys)
     assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 2
     stderr = capsys.readouterr().err
     assert "not a rolling ledger" in stderr
+
+
+def test_single_target_refuses_to_mix_with_a_rolling_ledger(tool, tmp_path, capsys):
+    close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0, 10.0]})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [(dates[0].strftime("%Y-%m-%d"), {"A": 0.5})])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    nav_bytes = (out_dir / "nav.csv").read_bytes()
+    summary_bytes = (out_dir / "summary.json").read_bytes()
+    single = write_target(
+        tmp_path / "single.json", dates[0].strftime("%Y-%m-%d"), {"A": 0.5},
+    )
+    assert run_tool(tool, single, cache, out_dir) == 2
+    stderr = capsys.readouterr().err
+    assert "ledger_version" in stderr
+    assert (out_dir / "nav.csv").read_bytes() == nav_bytes
+    assert (out_dir / "summary.json").read_bytes() == summary_bytes
 
 
 # ---------------------------------------------------------------------------
