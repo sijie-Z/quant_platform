@@ -91,10 +91,14 @@ def append_future_rows(frame: pd.DataFrame, n_future: int = 5) -> pd.DataFrame:
     return pd.concat([frame, extra]).sort_index()
 
 
-def write_industry_map(path: Path, assets: list[str]) -> None:
-    sectors = ["A", "B", "C"] * (len(assets) // 3)
+def write_industry_map(
+    path: Path, assets: list[str], n_sectors: int = 6,
+) -> None:
+    """Cyclic industry map; six sectors keep the 30% cap non-binding by default."""
+    sectors = [f"S{i}" for i in range(n_sectors)]
+    labels = [sectors[i % n_sectors] for i in range(len(assets))]
     pd.DataFrame(
-        {"industry": sectors}, index=pd.Index(assets, name="code"),
+        {"industry": labels}, index=pd.Index(assets, name="code"),
     ).to_parquet(path)
 
 
@@ -254,7 +258,8 @@ def test_industry_neutralization_on_off(tool, panels_dir, tmp_path):
         "--industry-map", str(directory / "industry.parquet"), as_of=as_of_text,
     )
     code_off, json_off, _ = run_tool(
-        tool, cache, tmp_path / "off", as_of=as_of_text,
+        tool, cache, tmp_path / "off",
+        "--max-sector", "1.0", as_of=as_of_text,
     )
     assert code_on == 0
     assert code_off == 0
@@ -420,7 +425,7 @@ def test_stale_cache_warns(tool, panels_dir, tmp_path):
     directory, _ = panels_dir
     code, json_path, _ = run_tool(
         tool, directory / "panel.parquet", tmp_path / "stale",
-        as_of="2023-06-30",
+        "--max-sector", "1.0", as_of="2023-06-30",
     )
     assert code == 0
     payload = load_targets(json_path)
@@ -496,3 +501,218 @@ def test_prev_over_cap_is_a_clear_input_error(
     assert "prev weights exceed --max-weight" in capsys.readouterr().err
     assert not json_path.exists()
     assert not csv_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# R26: portfolio-level sector cap and construction modes
+# ---------------------------------------------------------------------------
+
+def test_project_sector_cap_scales_two_50pct_sectors(tool):
+    """Acceptance (a): two sectors at 50% each -> each <= 30%, caps projected."""
+    weights = pd.Series({"a": 0.25, "b": 0.25, "c": 0.25, "d": 0.25})
+    sectors = pd.Series({"a": "X", "b": "X", "c": "Y", "d": "Y"})
+    projected = tool.project_sector_cap(weights, sectors, 0.30)
+    totals = tool.sector_weights(projected, sectors)
+    assert float(totals.max()) <= 0.30 + 1e-12
+    assert totals["X"] == pytest.approx(0.30)
+    assert totals["Y"] == pytest.approx(0.30)
+    assert float(projected.sum()) == pytest.approx(0.60)
+    # Projection only scales down; the per-name cap can never be breached.
+    assert float(projected.max()) <= 0.25 + 1e-12
+
+
+def test_two_sector_book_is_capped_or_fails_loudly(
+    tool, panels_dir, tmp_path, capsys,
+):
+    """Acceptance (a, end to end): a 2-sector universe cannot fund a 30% cap."""
+    directory, as_of = panels_dir
+    as_of_text = as_of.date().isoformat()
+    assets = list(pd.read_parquet(directory / "industry.parquet").index)
+    split = len(assets) // 2
+    two_sector = pd.DataFrame(
+        {"industry": ["X"] * split + ["Y"] * (len(assets) - split)},
+        index=pd.Index(assets, name="code"),
+    )
+    two_sector.to_parquet(tmp_path / "industry_two.parquet")
+
+    code, json_path, _ = run_tool(
+        tool, directory / "panel.parquet", tmp_path / "two",
+        "--industry-map", str(tmp_path / "industry_two.parquet"),
+        as_of=as_of_text,
+    )
+    if code == 0:
+        payload = load_targets(json_path)
+        diagnostics = payload["diagnostics"]
+        assert diagnostics["max_sector_weight"] <= 0.30 + 1e-6
+        assert diagnostics["sector_cap"]["n_sectors_holdings"] <= 2
+        # Two 30% caps cannot fund a gross-1 book: the fallback is explicit.
+        assert diagnostics["optimizer"]["fallback_count"] >= 1
+        assert any(
+            "fell back" in warning
+            for warning in diagnostics["warnings"]
+        )
+        assert payload["diagnostics"]["gross_weight"] <= 0.60 + 1e-6
+    else:
+        error = capsys.readouterr().err.lower()
+        assert "sector" in error
+        assert "cap" in error or "infeasible" in error
+
+
+def test_default_construction_is_mvo(tool, panels_dir, tmp_path):
+    """Acceptance (b): no --construction -> R25's recommended MVO default."""
+    directory, as_of = panels_dir
+    code, json_path, _ = run_tool(
+        tool, directory / "panel.parquet", tmp_path / "default",
+        "--industry-map", str(directory / "industry.parquet"),
+        as_of=as_of.date().isoformat(),
+    )
+    assert code == 0
+    payload = load_targets(json_path)
+    assert payload["provenance"]["construction"] == "mvo"
+    assert payload["provenance"]["top_n"] is None
+    assert payload["diagnostics"]["optimizer"]["name"] == "MeanVarianceOptimizer"
+
+
+def test_topn_ew_is_equal_weight_and_capped(tool, panels_dir, tmp_path):
+    """Acceptance (b): topn_ew outputs equal weights within the caps."""
+    directory, as_of = panels_dir
+    code, json_path, _ = run_tool(
+        tool, directory / "panel.parquet", tmp_path / "ew",
+        "--industry-map", str(directory / "industry.parquet"),
+        "--construction", "topn_ew", "--top-n", "20",
+        as_of=as_of.date().isoformat(),
+    )
+    assert code == 0
+    payload = load_targets(json_path)
+    assert payload["provenance"]["construction"] == "topn_ew"
+    assert payload["provenance"]["top_n"] == 20
+    values = np.array(list(payload["weights"].values()), dtype=float)
+    assert len(values) == 20
+    assert np.allclose(values, 1.0 / 20.0, atol=1e-9)
+    assert float(values.max()) <= 0.05 + 1e-9
+    assert payload["diagnostics"]["max_sector_weight"] <= 0.30 + 1e-6
+
+
+def test_topn_rank_weights_are_monotone(tool):
+    """Acceptance (b): top-N rank weights decrease with the signal rank."""
+    assets = ["a", "b", "c", "d", "e", "f", "g"]
+    alpha = pd.Series(
+        {"a": 0.4, "b": 0.2, "c": 0.0, "d": -0.2, "e": -0.4, "f": 0.1, "g": -0.1}
+    )
+    cov = pd.DataFrame(
+        np.eye(len(assets)), index=assets, columns=assets,
+    )
+    constraints = tool.PortfolioConstraints(
+        max_weight=0.30, max_sector_exposure=0.30, max_turnover=0.30,
+    )
+    weights, info = tool.build_simple_book(
+        "topn_rank", alpha, cov, None, None, constraints, 5, [],
+    )
+    assert info["selected"] == 5
+    selected = ["a", "b", "f", "c", "g"]
+    ordered = [float(weights[name]) for name in selected]
+    assert ordered == sorted(ordered, reverse=True)
+    assert float(weights.sum()) == pytest.approx(1.0)
+    assert float(weights.max()) <= 0.30 + 1e-12
+    assert float(weights.min()) >= 0.0
+
+
+def test_risk_parity_construction_is_finite_and_capped(
+    tool, panels_dir, tmp_path,
+):
+    """Acceptance (b): risk_parity weights are finite and inside both caps."""
+    directory, as_of = panels_dir
+    code, json_path, _ = run_tool(
+        tool, directory / "panel.parquet", tmp_path / "rp",
+        "--industry-map", str(directory / "industry.parquet"),
+        "--construction", "risk_parity", "--top-n", "20",
+        as_of=as_of.date().isoformat(),
+    )
+    assert code == 0
+    payload = load_targets(json_path)
+    values = np.array(list(payload["weights"].values()), dtype=float)
+    assert np.isfinite(values).all()
+    assert (values >= 0.0).all()
+    assert float(values.max()) <= 0.05 + 1e-6
+    assert float(values.sum()) <= 1.0 + 1e-6
+    assert payload["diagnostics"]["max_sector_weight"] <= 0.30 + 1e-6
+    assert payload["diagnostics"]["optimizer"]["name"] == "RiskParityOptimizer"
+
+
+def test_mvo_receives_the_real_sector_map(
+    tool, panels_dir, tmp_path, monkeypatch,
+):
+    """Acceptance (a, instrumented): the solver gets the real multi-sector map."""
+    directory, as_of = panels_dir
+    captured: dict = {}
+    real_optimize = tool.MeanVarianceOptimizer.optimize
+
+    def spy(self, signal, cov_matrix=None, prices=None, prev_weights=None,
+            sector_map=None, adv=None, aum=None):
+        captured["sector_map"] = (
+            None if sector_map is None else sector_map.copy()
+        )
+        captured["max_sector_exposure"] = self.constraints.max_sector_exposure
+        return real_optimize(
+            self, signal, cov_matrix, prices, prev_weights, sector_map, adv, aum,
+        )
+
+    monkeypatch.setattr(tool.MeanVarianceOptimizer, "optimize", spy)
+    code, _, _ = run_tool(
+        tool, directory / "panel.parquet", tmp_path / "spy",
+        "--industry-map", str(directory / "industry.parquet"),
+        as_of=as_of.date().isoformat(),
+    )
+    assert code == 0
+    sector_map = captured["sector_map"]
+    assert sector_map is not None
+    assert sector_map.nunique() > 1
+    # The old bug passed a single dummy "A" sector; the real map has S0..S5.
+    assert "A" not in set(sector_map.unique())
+    assert captured["max_sector_exposure"] == pytest.approx(0.30)
+
+
+def test_deterministic_simple_construction(tool, panels_dir, tmp_path):
+    """Acceptance (c): a top-N construction is byte-identical across runs."""
+    directory, as_of = panels_dir
+    args = (
+        "--industry-map", str(directory / "industry.parquet"),
+        "--construction", "topn_rank", "--top-n", "20",
+    )
+    code_a, json_a, _ = run_tool(
+        tool, directory / "panel.parquet", tmp_path / "ra", *args,
+        as_of=as_of.date().isoformat(),
+    )
+    code_b, json_b, _ = run_tool(
+        tool, directory / "panel.parquet", tmp_path / "rb", *args,
+        as_of=as_of.date().isoformat(),
+    )
+    assert code_a == code_b == 0
+    assert json_a.read_text(encoding="utf-8") == json_b.read_text(encoding="utf-8")
+
+
+def test_chained_targets_respect_sector_cap(tool, panels_dir, tmp_path):
+    """Acceptance (e): monthly chaining keeps every target's sectors <= 30%."""
+    directory, _ = panels_dir
+    frame = pd.read_parquet(directory / "panel.parquet")
+    dates = sorted(pd.Index(frame.index.get_level_values("date")).unique())
+    picks = [dates[-40], dates[-20], dates[-1]]
+    industry = str(directory / "industry.parquet")
+    cache = directory / "panel.parquet"
+    previous: Path | None = None
+    for index, session in enumerate(picks):
+        extra = ["--industry-map", industry]
+        if previous is not None:
+            extra += ["--prev-weights", str(previous)]
+        code, json_path, _ = run_tool(
+            tool, cache, tmp_path / f"chain{index}", *extra,
+            as_of=pd.Timestamp(session).date().isoformat(),
+        )
+        assert code == 0
+        payload = load_targets(json_path)
+        diagnostics = payload["diagnostics"]
+        assert diagnostics["max_sector_weight"] <= 0.30 + 1e-6
+        if index > 0:
+            assert diagnostics["first_build"] is False
+            assert diagnostics["turnover"] <= 0.30 + 1e-6
+        previous = json_path

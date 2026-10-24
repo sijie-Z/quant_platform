@@ -20,12 +20,22 @@ Point-in-time contract (the reason this tool exists):
   (winsorise 1/99 -> z-score -> optional static-industry neutralisation).
 
 Portfolio step: one-period mean-variance optimisation with a long-only
-constraint, a per-name cap, a one-sided turnover cap, and the R8/R9 cost
-terms (20bp linear + 0.5 quadratic on ``w - w_prev``). ``--prev-weights``
-reads the previous targets JSON (either a bare ``{code: weight}`` object or
-a ``targets.json`` with a ``weights`` object). With no previous book this is
-a first build and the turnover cap is not applied (a 30% cap against a zero
-book is infeasible and would silently force the equal-weight fallback).
+constraint, a per-name cap, a **portfolio-level sector cap** (30% by default:
+the real ``--industry-map`` is passed to the optimiser as ``sector_map``, so
+the cap binds inside the solver rather than only neutralising factors), a
+one-sided turnover cap, and the R8/R9 cost terms (20bp linear + 0.5 quadratic
+on ``w - w_prev``). ``--prev-weights`` reads the previous targets JSON (either
+a bare ``{code: weight}`` object or a ``targets.json`` with a ``weights``
+object). With no previous book this is a first build and the turnover cap is
+not applied (a 30% cap against a zero book is infeasible and would silently
+force the equal-weight fallback).
+
+``--construction`` exposes the R25 alternatives (``mvo`` keeps the production
+default; ``topn_ew`` / ``topn_rank`` / ``risk_parity`` select the top
+``--top-n`` names and then project the result onto the same per-name and
+sector caps). The simple rules exist as a documented parameter entry, not as
+a replacement default: R25's pre-registered comparison found no simple rule
+that beat MVO on Sharpe, drawdown and turnover simultaneously.
 
 Outputs: ``targets.json`` (as_of, data_end, factors, weights, signal_date,
 provenance, diagnostics) and ``targets.csv``
@@ -69,7 +79,11 @@ from quant_platform.factors.evaluation import rank_ic
 from quant_platform.factors.processing import process_factor
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.portfolio.covariance import estimate_covariance
-from quant_platform.portfolio.optimizers import MeanVarianceOptimizer
+from quant_platform.portfolio.optimizers import (
+    MeanVarianceOptimizer,
+    RiskParityOptimizer,
+    _limit_turnover,
+)
 
 DEFAULT_CACHE = (
     ROOT / ".cache" / "baostock" / "daily_2018-01-01_2025-12-31_500.parquet"
@@ -90,6 +104,14 @@ COST_BPS = 20.0
 TURNOVER_PENALTY = 0.5
 RISK_AVERSION = 1.0
 COVARIANCE_METHOD = "ledoit_wolf"
+
+DEFAULT_CONSTRUCTION = "mvo"  # R25: MVO stays the production default.
+CONSTRUCTION_CHOICES = ("mvo", "topn_ew", "topn_rank", "risk_parity")
+DEFAULT_TOP_N = 30
+DEFAULT_MAX_SECTOR = 0.30
+# Maximum tolerated overshoot of the sector cap after solver tolerance,
+# renormalisation, rounding and dust pruning (weights are rounded to 1e-10).
+SECTOR_CAP_TOLERANCE = 1e-6
 
 WEIGHT_DECIMALS = 10
 # Weights below this (0.01% of the book, 200 CNY at 2M capital) are solver
@@ -307,6 +329,190 @@ def load_industry_map(path: Path, assets: pd.Index) -> pd.Series:
         dtype=object,
     )
     return sectors.astype(str)
+
+
+# ---------------------------------------------------------------------------
+# Sector cap and top-N construction
+# ---------------------------------------------------------------------------
+
+def _sector_series(
+    weights: pd.Series, sector_map: pd.Series,
+) -> pd.Series:
+    """Asset -> sector aligned to ``weights``; unmapped assets are explicit."""
+    sectors = sector_map.reindex(weights.index)
+    return sectors.where(sectors.notna(), "Unknown").astype(str)
+
+
+def sector_weights(
+    weights: pd.Series, sector_map: pd.Series,
+) -> pd.Series:
+    """Portfolio weight per sector (sorted by sector name)."""
+    if weights is None or len(weights) == 0:
+        return pd.Series(dtype=float)
+    grouped = weights.astype(float).clip(lower=0.0).groupby(
+        _sector_series(weights, sector_map)
+    )
+    return grouped.sum().sort_index()
+
+
+def project_sector_cap(
+    weights: pd.Series, sector_map: pd.Series, max_sector: float,
+) -> pd.Series:
+    """Scale over-cap sectors down proportionally until each is <= cap.
+
+    The projection is deterministic and only *reduces* weights, so the
+    long-only bound and the per-name cap survive unchanged. The weight lost
+    to the cap becomes cash (the returned book may sum to less than 1).
+    """
+    projected = weights.astype(float).clip(lower=0.0).copy()
+    for _ in range(10):
+        totals = sector_weights(projected, sector_map)
+        over = totals[totals > max_sector + 1e-12]
+        if over.empty:
+            break
+        sectors = _sector_series(projected, sector_map)
+        for sector, total in over.items():
+            mask = sectors == sector
+            projected.loc[mask] = projected.loc[mask] * (
+                max_sector / float(total)
+            )
+    return projected
+
+
+def cap_and_redistribute(weights: pd.Series, cap: float) -> pd.Series:
+    """Bound proportional weights by ``cap`` while staying fully invested.
+
+    The book is normalised to gross 1 first. Values above the cap are clipped
+    to it. If that leaves cash and the caps can still fund the book
+    (``n * cap > 1``), the *smallest* weights are raised to a common floor
+    until gross returns to 1; the result is ``clip(w, floor, cap)``. That is
+    deterministic and monotone, so a rank-ordered book stays ordered (a
+    proportional redistribution can bounce the largest names back above the
+    cap indefinitely). When ``n * cap <= 1`` the caps are exhausted and the
+    residual stays cash.
+    """
+    w = weights.astype(float).clip(lower=0.0)
+    total = float(w.sum())
+    if total <= 1e-15:
+        return w * 0.0
+    w = w / total
+    values = w.to_numpy(dtype=float)
+    capped = np.minimum(values, float(cap))
+    if float(capped.sum()) >= 1.0 - 1e-12:
+        return pd.Series(capped, index=w.index)
+    n = len(capped)
+    ordered = np.sort(capped)
+    cumulative = np.cumsum(ordered)
+    tail_total = float(capped.sum())
+    floor = float(cap)
+    for k in range(1, n + 1):
+        tail = tail_total - float(cumulative[k - 1])
+        candidate = (1.0 - tail) / k
+        if k == n or ordered[k] >= candidate:
+            floor = min(float(candidate), float(cap))
+            break
+    return pd.Series(np.maximum(capped, floor), index=w.index)
+
+
+def select_top_assets(alpha: pd.Series, top_n: int) -> pd.Series:
+    """Top-``top_n`` assets by signal, deterministic on ties (stable sort)."""
+    ranked = alpha.dropna().sort_values(ascending=False, kind="mergesort")
+    return ranked.head(int(top_n))
+
+
+def build_simple_book(
+    construction: str,
+    alpha: pd.Series,
+    cov_matrix: pd.DataFrame,
+    prev_weights: pd.Series | None,
+    sector_map: pd.Series | None,
+    constraints: PortfolioConstraints,
+    top_n: int,
+    warnings: list[str],
+) -> tuple[pd.Series, dict[str, Any]]:
+    """R25 simple construction, projected onto the same caps as the MVO.
+
+    ``topn_ew`` is equal weight over the selected names; ``topn_rank`` is
+    proportional to the descending signal rank; ``risk_parity`` runs the
+    platform risk-parity optimiser on the selected names with the same
+    covariance matrix. Every path applies the per-name cap and the sector
+    cap (by projection) so the output is always a valid production book.
+    """
+    selected = select_top_assets(alpha, top_n)
+    if len(selected) == 0:
+        raise SignalError(
+            f"construction {construction}: no candidates with a signal"
+        )
+    if len(selected) < int(top_n):
+        warnings.append(
+            f"construction {construction}: only {len(selected)} candidates "
+            f"available (< --top-n {top_n}); using all of them"
+        )
+    selected_index = selected.index
+    enforced_sector = (
+        sector_map is not None and constraints.max_sector_exposure < 1.0
+    )
+    fallback_count = 0
+    fallback_reason: str | None = None
+    optimizer_name = construction
+
+    if construction == "risk_parity":
+        # Restrict the optimiser's candidate set to the selected top-N by
+        # passing only those names in the signal.
+        subset = alpha.reindex(selected_index)
+        optimizer = RiskParityOptimizer(constraints)
+        raw = optimizer.optimize(
+            subset, cov_matrix=cov_matrix, prices=None,
+            prev_weights=prev_weights, sector_map=sector_map,
+        )
+        fallback_count = int(optimizer.fallback_count)
+        fallback_reason = optimizer.last_fallback_reason
+        weights = raw.reindex(alpha.index, fill_value=0.0).clip(lower=0.0)
+        if enforced_sector:
+            weights = project_sector_cap(
+                weights, sector_map, constraints.max_sector_exposure,
+            )
+        # RiskParityOptimizer already applied the platform turnover blend.
+        return weights, {
+            "selected": int(len(selected_index)),
+            "fallback_count": fallback_count,
+            "fallback_reason": fallback_reason,
+            "optimizer_name": "RiskParityOptimizer",
+        }
+
+    if construction == "topn_ew":
+        raw = pd.Series(1.0 / len(selected_index), index=selected_index)
+    elif construction == "topn_rank":
+        ranks = np.arange(len(selected_index), 0, -1, dtype=float)
+        raw = pd.Series(ranks / ranks.sum(), index=selected_index)
+    else:  # pragma: no cover - guarded by argparse choices
+        raise SignalError(f"unknown construction {construction!r}")
+
+    weights = pd.Series(0.0, index=alpha.index)
+    weights.loc[selected_index] = cap_and_redistribute(
+        raw, constraints.max_weight,
+    )
+    if enforced_sector:
+        weights = project_sector_cap(
+            weights, sector_map, constraints.max_sector_exposure,
+        )
+    # The turnover blend comes last so the book is tradable from the previous
+    # one. A convex blend of two compliant books stays compliant; the
+    # defensive projection below only matters for an over-cap prior book,
+    # which the final check reports instead of writing silently.
+    weights = _limit_turnover(
+        weights, prev_weights, constraints.max_turnover, alpha.index,
+    )
+    if enforced_sector:
+        weights = project_sector_cap(
+            weights, sector_map, constraints.max_sector_exposure,
+        )
+    return weights, {
+        "selected": int(len(selected_index)),
+        "fallback_count": fallback_count,
+        "fallback_reason": fallback_reason,
+        "optimizer_name": optimizer_name,
+    }
 
 
 def compute_ic_weights(
@@ -556,6 +762,8 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
     if missing:
         raise SignalError(f"cache panel is missing required column(s): {missing}")
 
+    max_sector = float(args.max_sector)
+    sector_cap_active = max_sector < 1.0
     sector_map = None
     industry_source = None
     if args.industry_map:
@@ -565,6 +773,13 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
         )
         industry_source = str(industry_path)
     else:
+        if sector_cap_active:
+            raise SignalError(
+                "a portfolio sector cap (--max-sector < 1) requires "
+                "--industry-map; refusing to emit a book whose sector "
+                "exposure cannot be enforced (pass --max-sector 1.0 to "
+                "disable the cap explicitly)"
+            )
         warnings.append(
             "no industry map supplied (--industry-map); industry "
             "neutralization skipped"
@@ -628,6 +843,30 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
     # (AlphaPipeline convention); the composite z is the delivered signal.
     alpha = composite.rank(pct=True) - 0.5
 
+    construction = str(args.construction)
+    if args.top_n is not None:
+        top_n: int | None = int(args.top_n)
+    elif construction == "mvo":
+        top_n = None
+    else:
+        top_n = DEFAULT_TOP_N
+    if construction == "mvo" and args.top_n is not None:
+        warnings.append("--top-n is ignored for --construction mvo")
+
+    candidates_index = alpha.dropna().index
+    n_sectors_universe: int | None = None
+    unknown_assets_universe: int | None = None
+    if sector_map is not None:
+        candidate_sectors = sector_map.reindex(candidates_index)
+        n_sectors_universe = int(candidate_sectors.nunique())
+        unknown_assets_universe = int((candidate_sectors == "Unknown").sum())
+        if sector_cap_active and n_sectors_universe < 2:
+            warnings.append(
+                "sector map has a single sector among the candidates; the "
+                "optimiser skips single-sector sector constraints and the "
+                "final cap check will refuse an over-cap book"
+            )
+
     cov_input = known_returns.dropna(how="all")
     try:
         cov_matrix = estimate_covariance(
@@ -641,31 +880,67 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
     constraints = PortfolioConstraints(
         long_only=True,
         max_weight=float(args.max_weight),
-        max_sector_exposure=1.0,  # no sector cap; risk control comes via factors
+        max_sector_exposure=max_sector,
         max_turnover=float(args.max_turnover),
         risk_aversion=RISK_AVERSION,
         transaction_cost_bps=COST_BPS,
         turnover_penalty=TURNOVER_PENALTY,
     )
-    optimizer = MeanVarianceOptimizer(constraints)
 
     prev_weights = None
     if args.prev_weights:
         prev_weights = load_prev_weights(Path(args.prev_weights))
     first_build = prev_weights is None or float(prev_weights.abs().sum()) <= 1e-12
     prev_for_opt = None if first_build else prev_weights
+    if prev_weights is not None and sector_map is not None and sector_cap_active:
+        prev_sector_totals = sector_weights(prev_weights, sector_map)
+        over_prev = prev_sector_totals[
+            prev_sector_totals > max_sector + SECTOR_CAP_TOLERANCE
+        ]
+        if len(over_prev):
+            detail = ", ".join(
+                f"{sector}={value:.4f}"
+                for sector, value in over_prev.sort_values(
+                    ascending=False,
+                ).items()
+            )
+            warnings.append(
+                "prev book exceeds --max-sector "
+                f"{max_sector:.4f} ({detail}); the turnover cap may prevent a "
+                "fully compliant rebalance"
+            )
 
-    raw_targets = optimizer.optimize(
-        alpha,
-        cov_matrix=cov_matrix,
-        prices=None,
-        prev_weights=prev_for_opt,
-        sector_map=None,
-    )
-    if optimizer.fallback_count:
+    construction_info: dict[str, Any] = {"selected": None}
+    if construction == "mvo":
+        optimizer = MeanVarianceOptimizer(constraints)
+        raw_targets = optimizer.optimize(
+            alpha,
+            cov_matrix=cov_matrix,
+            prices=None,
+            prev_weights=prev_for_opt,
+            sector_map=sector_map,
+        )
+        fallback_count = int(optimizer.fallback_count)
+        fallback_reason = optimizer.last_fallback_reason
+        optimizer_name = "MeanVarianceOptimizer"
+    else:
+        raw_targets, construction_info = build_simple_book(
+            construction,
+            alpha,
+            cov_matrix,
+            prev_for_opt,
+            sector_map,
+            constraints,
+            int(top_n),
+            warnings,
+        )
+        fallback_count = int(construction_info.pop("fallback_count"))
+        fallback_reason = construction_info.pop("fallback_reason")
+        optimizer_name = str(construction_info.pop("optimizer_name"))
+    if fallback_count:
         warnings.append(
             "optimizer fell back to equal weight: "
-            f"{optimizer.last_fallback_reason}"
+            f"{fallback_reason}"
         )
 
     values = raw_targets.reindex(alpha.index, fill_value=0.0).to_numpy(dtype=float)
@@ -717,6 +992,62 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
             f"{constraints.max_weight:.8f}"
         )
 
+    sector_cap_detail: dict[str, Any] = {
+        "max_sector_exposure": max_sector,
+        "enforced": bool(sector_cap_active),
+        "sector_map_assets": int(sector_map.size) if sector_map is not None else 0,
+    }
+    if sector_cap_active:
+        holdings_sectors = sector_weights(targets, sector_map)
+        max_sector_weight: float | None = float(holdings_sectors.max())
+        if max_sector_weight > max_sector + SECTOR_CAP_TOLERANCE:
+            prev_over = None
+            if prev_weights is not None:
+                prev_totals = sector_weights(prev_weights, sector_map)
+                prev_over = prev_totals[
+                    prev_totals > max_sector + SECTOR_CAP_TOLERANCE
+                ]
+            if prev_over is not None and len(prev_over):
+                detail = ", ".join(
+                    f"{sector}={value:.4f}"
+                    for sector, value in prev_over.sort_values(
+                        ascending=False,
+                    ).items()
+                )
+                raise SignalError(
+                    "prev book exceeds --max-sector "
+                    f"{max_sector:.4f} ({detail}) and the "
+                    f"{constraints.max_turnover:.2f} one-sided turnover cap "
+                    "could not repair it; provide a compliant prev book or "
+                    "raise --max-turnover"
+                )
+            worst = str(holdings_sectors.idxmax())
+            raise SignalError(
+                "sector cap violated: sector "
+                f"{worst!r} weight {max_sector_weight:.6f} exceeds "
+                f"--max-sector {max_sector:.6f}; refusing to write a "
+                "non-compliant target book"
+            )
+        binding = sorted(
+            str(sector)
+            for sector, value in holdings_sectors.items()
+            if value >= max_sector - SECTOR_CAP_TOLERANCE
+        )
+        sector_cap_detail.update({
+            "n_sectors_universe": n_sectors_universe,
+            "unknown_assets_universe": unknown_assets_universe,
+            "n_sectors_holdings": int(len(holdings_sectors)),
+            "binding_sectors": binding,
+            "sector_weights": {
+                str(sector): float(value)
+                for sector, value in holdings_sectors.items()
+            },
+        })
+        n_sector_cap_binding = int(len(binding))
+    else:
+        max_sector_weight = None
+        n_sector_cap_binding = 0
+
     turnover = one_sided_turnover(targets, prev_weights)
     if first_build and turnover > constraints.max_turnover + 1e-6:
         warnings.append(
@@ -750,6 +1081,10 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
             "cache": str(cache_path),
             "industry_map": industry_source,
             "industry_neutralization": sector_map is not None,
+            "construction": construction,
+            "top_n": int(top_n) if top_n is not None else None,
+            "max_sector": max_sector,
+            "sector_cap_enforced": bool(sector_cap_active),
             "prev_weights": str(args.prev_weights) if args.prev_weights else None,
             "capital_cny": capital,
             "max_weight": float(args.max_weight),
@@ -776,6 +1111,9 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
             "candidates": int(alpha.notna().sum()),
             "n_holdings": int(len(targets)),
             "max_weight_actual": max_actual,
+            "max_sector_weight": max_sector_weight,
+            "n_sector_cap_binding": n_sector_cap_binding,
+            "sector_cap": sector_cap_detail,
             "gross_weight": gross,
             "cash_weight": cash,
             "turnover": turnover,
@@ -799,9 +1137,13 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
             "covariance_sessions": int(min(len(cov_input), IC_LOOKBACK)),
             "covariance_input_sessions": int(len(cov_input)),
             "optimizer": {
-                "name": "MeanVarianceOptimizer",
-                "fallback_count": int(optimizer.fallback_count),
-                "fallback_reason": optimizer.last_fallback_reason,
+                "name": optimizer_name,
+                "construction": construction,
+                "top_n": int(top_n) if top_n is not None else None,
+                "selected": construction_info.get("selected"),
+                "fallback_count": fallback_count,
+                "fallback_reason": fallback_reason,
+                "received_sector_map": bool(sector_map is not None),
             },
             "warnings": warnings,
         },
@@ -820,9 +1162,25 @@ def format_console(payload: dict[str, Any]) -> str:
         for name, values in ic_per_factor.items()
     )
     window = diagnostics["factor_ic"]["window"] or {}
+    sector_cap = diagnostics["sector_cap"]
+    if sector_cap["enforced"]:
+        sector_text = (
+            f"Sector cap: {sector_cap['max_sector_exposure']:.0%} | max "
+            f"sector weight: {diagnostics['max_sector_weight']:.2%} | sectors "
+            f"at cap: {diagnostics['n_sector_cap_binding']} "
+            f"({', '.join(sector_cap.get('binding_sectors', [])) or 'none'})"
+        )
+    else:
+        sector_text = "Sector cap: disabled (--max-sector 1.0)"
     lines = [
         f"Daily signal as of {payload['as_of']} "
         f"(signal date {payload['signal_date']}, data end {payload['data_end']})",
+        f"Construction: {provenance['construction']}"
+        + (
+            f" (top {provenance['top_n']})"
+            if provenance["top_n"] is not None else ""
+        ),
+        sector_text,
         f"Factors: {', '.join(payload['factors'])} | IC weights: {ic_text}",
         f"Rank IC window: {window.get('start')} .. {window.get('end')} "
         f"({window.get('n', 0)} obs, all strictly before as_of)",
@@ -901,12 +1259,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--industry-map", default=None,
         help="static industry map parquet (6-digit code index, 'industry' "
-             "column) for industry-neutralised factors; omitted = neutralization "
-             "skipped with a warning",
+             "column) used for industry-neutralised factors and the portfolio "
+             "sector cap; required when --max-sector < 1",
     )
     parser.add_argument(
         "--max-weight", type=float, default=0.05,
         help="per-asset weight cap (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-sector", type=float, default=DEFAULT_MAX_SECTOR,
+        help="portfolio-level cap on the total weight of one industry "
+             f"(default: {DEFAULT_MAX_SECTOR}; requires --industry-map; "
+             "1.0 disables the cap)",
+    )
+    parser.add_argument(
+        "--construction", choices=CONSTRUCTION_CHOICES,
+        default=DEFAULT_CONSTRUCTION,
+        help="portfolio construction: mvo keeps the R25 production default; "
+             "the top-N rules are a documented parameter entry",
+    )
+    parser.add_argument(
+        "--top-n", type=int, default=None,
+        help=f"number of names for topN_ew/topN_rank/risk_parity "
+             f"(default: {DEFAULT_TOP_N}; ignored by mvo)",
     )
     parser.add_argument(
         "--max-turnover", type=float, default=0.30,
@@ -935,8 +1310,12 @@ def build_parser() -> argparse.ArgumentParser:
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if not 0.0 < float(args.max_weight) <= 1.0:
         parser.error("--max-weight must be in (0, 1]")
+    if not 0.0 < float(args.max_sector) <= 1.0:
+        parser.error("--max-sector must be in (0, 1]")
     if not 0.0 < float(args.max_turnover) <= 1.0:
         parser.error("--max-turnover must be in (0, 1]")
+    if args.top_n is not None and int(args.top_n) < 2:
+        parser.error("--top-n must be >= 2")
     if not math.isfinite(float(args.capital)) or float(args.capital) <= 0.0:
         parser.error("--capital must be a finite number > 0")
 
