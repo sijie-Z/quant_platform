@@ -593,6 +593,7 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
         processed, known_returns, as_of, warnings,
     )
     composite = build_signal(processed, ic_weights, signal_date)
+    composite_values = composite.dropna()
     # MeanVarianceOptimizer expects the platform's rank alpha in [-0.5, 0.5]
     # (AlphaPipeline convention); the composite z is the delivered signal.
     alpha = composite.rank(pct=True) - 0.5
@@ -725,6 +726,16 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
             "pruned_weight": pruned_weight,
             "factor_skipped": factor_skipped,
             "factor_ic": ic_diagnostics,
+            "signal": {
+                "composite_min": float(composite_values.min()),
+                "composite_max": float(composite_values.max()),
+                "composite_mean": float(composite_values.mean()),
+                "alpha_convention": (
+                    "cross-sectional percentile rank - 0.5 "
+                    "(MeanVarianceOptimizer input; composite z is the "
+                    "delivered signal)"
+                ),
+            },
             "covariance_assets": int(cov_matrix.shape[0]),
             "covariance_sessions": int(len(cov_input)),
             "optimizer": {
