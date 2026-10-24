@@ -234,7 +234,7 @@ quant_platform/
 │   ├── runs/
 │   ├── registry/
 │   └── reports/
-├── tools/                  # 研究工具：common_runner / sanity_check / attribution
+├── tools/                  # 研究工具：common_runner / sanity_check / attribution / daily_signal
 │
 ├── docs/                   # 文档：架构 / 里程碑 / 研究报告 / 协议
 ├── tests/                  # 单元测试（236 个测试文件，3,342 条用例，覆盖全部模块）
@@ -331,6 +331,7 @@ worker** 运行：不要给 `uvicorn` / `main.py web` 加 `--workers N` 或 `--r
 | `docs/OPS_RUNBOOK.md` | 运维手册（启停、故障、备份/恢复、升级迁移） |
 | `docs/research/` | 系统研究报告（Alpha Discovery / 市场结构 / Regime） |
 | `tools/real_data_research.py` | 真实数据研究一键复跑：缓存面板 → 技术因子 → walk-forward 选因子 → 成本感知 MVO → JSON/Markdown 报告 |
+| `tools/daily_signal.py` | 每日信号：缓存面板 → PIT 因子/Rank IC → 成本感知 MVO → 目标权重 JSON/CSV（不接 broker） |
 
 ---
 
