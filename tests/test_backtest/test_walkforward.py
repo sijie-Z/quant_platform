@@ -833,3 +833,38 @@ class TestSectorCapThroughTheWalkForwardChain:
                 f"max_sector_exposure=0.30 ({totals.to_dict()})"
             )
             assert float(weights.sum()) <= 1.0 + 1e-9
+
+    def test_solver_cap_binds_when_the_problem_is_feasible(self):
+        """With two sectors a 30% cap makes ``sum(w)=1`` infeasible, so the
+        two-sector test above ends in the equal-weight fallback (which also
+        respects the cap). Four sectors make the problem feasible: the MVO
+        solver itself must pin the favoured sector at 30% -- proving the
+        constraint reaches the solver, not just the fallback."""
+        rng = np.random.default_rng(41)
+        n_assets = 24
+        names = [f"A{i}" for i in range(n_assets)]
+        sectors = pd.Series(
+            [f"SEC{i // 6}" for i in range(n_assets)], index=names,
+        )
+        cov = pd.DataFrame(
+            np.diag(rng.uniform(1e-4, 3e-4, n_assets)),
+            index=names, columns=names,
+        )
+        signal = pd.Series(-0.5, index=names)
+        signal.iloc[:6] = 0.5  # SEC0 is strongly favoured
+
+        optimizer = MeanVarianceOptimizer(PortfolioConstraints(
+            long_only=True, max_weight=0.10, max_sector_exposure=0.30,
+            max_turnover=1.0,
+        ))
+        weights = optimizer.optimize(signal, cov, sector_map=sectors)
+
+        assert optimizer.fallback_count == 0, (
+            f"expected a solved MVO, got fallback: {optimizer.last_fallback_reason}"
+        )
+        totals = weights.groupby(sectors.reindex(weights.index)).sum()
+        assert float(totals.max()) <= 0.30 + 1e-6
+        assert float(totals.loc["SEC0"]) >= 0.30 - 1e-4, (
+            f"the cap did not bind: SEC0={float(totals.loc['SEC0']):.4f}"
+        )
+        assert abs(float(weights.sum()) - 1.0) <= 1e-6
