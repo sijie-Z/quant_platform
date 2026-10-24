@@ -202,7 +202,7 @@ def test_execution_next_session_and_drifted_return(tool, tmp_path):
 def test_build_cost_matches_hand_computed_cost_model(tool, tmp_path):
     # Constant prices give a zero-vol history; the impact rule clips daily
     # vol to 0.1%. The 6th session must be the execution day so the causal
-    # rolling(20, min_periods=5).std().shift(1) has five returns.
+    # rolling(20, min_periods=5).std() window has five returns.
     close, volume, pct = make_panel(
         {"A": [10.0] * 8, "B": [10.0] * 8}, volume_shares=1_000_000.0,
     )
@@ -266,6 +266,35 @@ def test_commission_floor_applies_on_small_notional(tool, tmp_path):
     assert expected == pytest.approx(20.1, abs=1e-12)
     assert nav.loc[0, "costs_paid"] == pytest.approx(expected, abs=1e-6)
     assert nav.loc[0, "nav"] == pytest.approx(10_000.0 - expected, abs=1e-6)
+
+
+def test_variable_volatility_feeds_the_impact_cost(tool, tmp_path):
+    # Pin the volatility input: pct_chg 1,-1,1,-1,0 (%) over the five-session
+    # window at the execution close gives a sample daily std (ddof=1) of
+    # 0.01, so the square-root impact is notional * sqrt(0.05) * 0.01 per
+    # asset. A shift(1)/extra-day vol window or a fixed fallback would miss it.
+    pct_pattern = [np.nan, 0.0, 1.0, -1.0, 1.0, -1.0, 0.0, 0.0]
+    close, volume, pct = make_panel(
+        {"A": [10.0] * 8, "B": [10.0] * 8},
+        pct_chg={"A": pct_pattern, "B": pct_pattern},
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target = write_target(
+        tmp_path / "target.json", dates[5].strftime("%Y-%m-%d"), {"A": 0.5, "B": 0.5},
+    )
+    capital = 1_000_000.0
+    out_dir = tmp_path / "out"
+    assert run_tool(
+        tool, target, cache, out_dir, capital=capital, cost_mode="impact",
+    ) == 0
+    notional = 0.5 * capital
+    expected_impact = 2 * notional * math.sqrt(notional / 1e7) * 0.01
+    assert expected_impact == pytest.approx(2_236.0679774997897, abs=1e-9)
+    expected = 2 * (notional * 0.0003 + notional * 0.00001) + expected_impact
+    nav = read_nav(out_dir)
+    assert nav.loc[0, "costs_paid"] == pytest.approx(expected, abs=1e-6)
+    assert nav.loc[0, "nav"] == pytest.approx(capital - expected, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +406,27 @@ def test_nan_close_gap_return_on_resume(tool, tmp_path):
     nav = read_nav(out_dir)
     assert nav.loc[1, "stale_assets"] == 1
     assert nav.loc[2, "daily_return"] == pytest.approx(0.5 * 0.2, abs=1e-9)
+
+
+def test_nan_close_with_valid_pct_is_stale(tool, tmp_path):
+    # A NaN close with a valid pct_chg is still stale: there is no price to
+    # mark or liquidate at, so the session must not book a return.
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, np.nan, 10.0], "B": [10.0, 10.0, 10.0, 10.0]},
+        pct_chg={"A": [np.nan, 0.0, 5.0, 0.0], "B": [np.nan, 0.0, 0.0, 0.0]},
+        volume={"A": [1e6] * 4, "B": [1e6] * 4},
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target = write_target(
+        tmp_path / "target.json", dates[0].strftime("%Y-%m-%d"), {"A": 0.5, "B": 0.5},
+    )
+    out_dir = tmp_path / "out"
+    assert run_tool(tool, target, cache, out_dir) == 0
+    nav = read_nav(out_dir)
+    assert nav.loc[1, "stale_assets"] == 1
+    assert nav.loc[1, "daily_return"] == pytest.approx(0.0, abs=1e-9)
+    assert nav.loc[1, "n_positions"] == 2
 
 
 def test_long_stale_liquidates_to_cash_after_limit(tool, tmp_path):
@@ -595,6 +645,21 @@ def test_integer_as_of_is_yyyymmdd(tool, tmp_path):
     assert summary["execution_date"] == "2025-07-01"
 
 
+def test_timezone_aware_as_of_keeps_its_wall_clock_date(tool, tmp_path):
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]}, start="2025-06-25",
+    )
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target = write_target(
+        tmp_path / "target.json", "2025-06-30T00:00:00+08:00", {"A": 1.0},
+    )
+    out_dir = tmp_path / "out"
+    assert run_tool(tool, target, cache, out_dir) == 0
+    summary = read_summary(out_dir)
+    assert summary["as_of"] == "2025-06-30"
+    assert summary["execution_date"] == "2025-07-01"
+
+
 def test_list_as_of_is_a_clean_error(tool, tmp_path, capsys):
     close, volume, pct = make_panel({"A": [10.0, 10.0]})
     cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
@@ -685,6 +750,8 @@ def test_orphan_nav_without_summary_is_refused(tool, tmp_path):
 
 
 def test_different_target_in_same_out_dir_is_refused(tool, tmp_path):
+    import hashlib
+
     close, volume, pct = make_panel(
         {"A": [10.0, 10.0, 10.5, 10.4], "B": [10.0, 10.0, 10.1, 10.2]}
     )
@@ -694,14 +761,19 @@ def test_different_target_in_same_out_dir_is_refused(tool, tmp_path):
         tmp_path / "target_a.json", dates[0].strftime("%Y-%m-%d"),
         {"A": 0.6, "B": 0.4},
     )
+    sha_a = hashlib.sha256(target_a.read_bytes()).hexdigest()
     out_dir = tmp_path / "out"
     assert run_tool(tool, target_a, cache, out_dir) == 0
+    nav_bytes = (out_dir / "nav.csv").read_bytes()
     target_b = write_target(
         tmp_path / "target_b.json", dates[0].strftime("%Y-%m-%d"),
         {"A": 0.5, "B": 0.5},
     )
     assert run_tool(tool, target_b, cache, out_dir) == 2
-    assert read_summary(out_dir)["target_sha256"] != ""  # untouched
+    assert (out_dir / "nav.csv").read_bytes() == nav_bytes
+    summary = read_summary(out_dir)
+    assert summary["target_sha256"] == sha_a
+    assert summary["target_file"].endswith("target_a.json")
 
 
 def test_cost_exceeding_capital_is_rejected(tool, tmp_path):

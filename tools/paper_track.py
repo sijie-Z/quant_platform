@@ -35,16 +35,18 @@ Execution and accounting contract
   commission floor, the both-sides transfer fee, and -- with
   ``--cost-mode impact`` -- the square-root impact rule on participation.
   Volatility is the causal ``rolling(20).std()`` estimate on the same
-  ``pct_chg`` returns (backward-looking rows make the unshifted window at
-  the execution close identical to the engine's forward-panel
-  ``shift(1)`` window). If the modelled build cost would
+  ``pct_chg`` returns with suspension and resume-day gap returns masked,
+  matching ``data/pipeline.py``'s return mask (R9 parity; backward rows make
+  the unshifted window at the execution close identical to the engine's
+  forward-panel ``shift(1)`` window). If the modelled build cost would
   exhaust the capital the run aborts before writing anything.
 * **Drift.** Between executions weights drift with the assets' returns; cash
   earns nothing. NAV is close-to-close: the execution row's only return is
   the build cost, and each later row's return is the drifted book's return
   from the previous close.
-* **Stale prices.** A session is *stale* for a held asset when its ``pct_chg``
-  or ``volume`` is missing/NaN or the volume is zero (the cache encodes
+* **Stale prices.** A session is *stale* for a held asset when its ``close``
+  is missing/non-positive, or its ``pct_chg`` or ``volume`` is missing/NaN, or
+  the volume is zero (the cache encodes
   intra-series suspensions as a repeated close with NaN/zero volume and
   ``pct_chg``, not as a NaN close). A stale session is held at the last valid
   close with return 0 and counted in ``stale_assets``; it is never silently
@@ -173,11 +175,17 @@ BENCHMARK_DEFINITION = (
     "excluded from that session"
 )
 STALE_POLICY = (
-    "a session is stale when pct_chg or volume is missing/zero; hold at the "
-    "last valid close (return 0, flagged stale); when the price returns the "
-    "resume-day pct_chg carries the gap return; after max_stale_sessions "
-    "consecutive stale sessions, liquidate at the last valid close with no "
-    "extra trade cost (no tradable price exists) and hold the proceeds as cash"
+    "a session is stale when close, pct_chg or volume is missing/invalid or "
+    "the volume is zero; hold at the last valid close (return 0, flagged "
+    "stale); when the price returns the resume-day pct_chg carries the gap "
+    "return; after max_stale_sessions consecutive stale sessions, liquidate "
+    "at the last valid close with no extra trade cost (no tradable price "
+    "exists) and hold the proceeds as cash"
+)
+VOLATILITY_BASIS = (
+    "rolling(20, min_periods=5).std() of pct_chg/100 through the execution "
+    "close, masking suspension and resume-day gap returns as data/pipeline.py "
+    "does; short histories fall back to 2% daily"
 )
 REVISION_NAV_TOLERANCE = 1e-6
 
@@ -207,12 +215,23 @@ def _parse_target_date(value: Any) -> pd.Timestamp:
             f"target 'as_of' must be a date string or YYYYMMDD integer; "
             f"got {type(value).__name__}: {value!r}"
         )
-    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
-        parsed = pd.to_datetime(str(int(value)), format="%Y%m%d", errors="coerce")
-    else:
-        parsed = pd.to_datetime(value, errors="coerce")
+    try:
+        if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+            parsed = pd.to_datetime(
+                str(int(value)), format="%Y%m%d", errors="coerce",
+            )
+        else:
+            parsed = pd.to_datetime(value, errors="coerce")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise PaperTrackError(
+            f"target 'as_of' is not a parseable date: {value!r}"
+        ) from exc
     if not isinstance(parsed, pd.Timestamp) or pd.isna(parsed):
         raise PaperTrackError(f"target 'as_of' is not a parseable date: {value!r}")
+    if parsed.tzinfo is not None:
+        # The cached sessions are naive dates; a tz-aware input keeps its
+        # wall-clock date instead of raising on the comparison.
+        parsed = parsed.tz_localize(None)
     return parsed.normalize()
 
 
@@ -291,9 +310,17 @@ class Panels:
     pct_chg: pd.DataFrame  # percent, Baostock ex-rights basis
 
     def observation_mask(self) -> pd.DataFrame:
-        """Sessions with a usable, traded observation (the stale complement)."""
+        """Sessions with a usable, traded observation (the stale complement).
+
+        Requires a positive raw close (the stale/liquidation reference price),
+        a finite ``pct_chg`` and a positive share volume -- the R9
+        ``tradable_mask``. A NaN close with a valid ``pct_chg`` is still
+        treated as stale: there is no price to mark or to liquidate at.
+        """
         return (
-            self.pct_chg.notna()
+            self.close.notna()
+            & (self.close > 0)
+            & self.pct_chg.notna()
             & self.volume.notna()
             & (self.volume > 0)
         )
@@ -301,6 +328,19 @@ class Panels:
     def returns(self) -> pd.DataFrame:
         """``pct_chg/100`` where the session observation is usable, else NaN."""
         return (self.pct_chg / 100.0).where(self.observation_mask())
+
+    def volatility_returns(self) -> pd.DataFrame:
+        """Returns for the cost model's volatility, with engine pipeline masking.
+
+        ``data/pipeline.py`` masks a forward return when the asset is
+        suspended on either end of it, which drops both the suspension day
+        and the resume-day gap return. On this backward panel that is
+        ``obs(d) & obs(d-1)``; the impact model then sees the same
+        observations the engine feeds it (R9 parity).
+        """
+        mask = self.observation_mask()
+        both = mask & mask.shift(1, fill_value=False)
+        return (self.pct_chg / 100.0).where(both)
 
 
 def load_cache(path: Path) -> Panels:
@@ -493,7 +533,7 @@ def simulate(
                 f"{execution.date()}: non-positive CNY volume for a bought "
                 "asset despite the tradability gate; refusing to price costs"
             )
-        vol_row = _vol_panel(panels.returns()).loc[execution].reindex(
+        vol_row = _vol_panel(panels.volatility_returns()).loc[execution].reindex(
             buy_weights.index
         )
     cost_model = _build_cost_model(cost_mode)
@@ -548,11 +588,14 @@ def simulate(
         for asset in held.index:
             change = pct_chg.at[date, asset]
             shares = volume.at[date, asset]
-            if np.isfinite(change) and np.isfinite(shares) and shares > 0:
+            price = close.at[date, asset]
+            if (
+                np.isfinite(change)
+                and np.isfinite(shares) and shares > 0
+                and np.isfinite(price) and price > 0
+            ):
                 asset_returns[asset] = float(change) / 100.0
-                price = close.at[date, asset]
-                if np.isfinite(price) and price > 0:
-                    last_price[asset] = float(price)
+                last_price[asset] = float(price)
                 stale_streak[asset] = 0
             else:
                 # Held at the last valid close: zero return, explicitly stale.
@@ -844,6 +887,7 @@ def build_summary(
         "max_stale_sessions": int(simulation.max_stale_sessions),
         "stale_policy": STALE_POLICY,
         "return_basis": RETURN_BASIS,
+        "volatility_basis": VOLATILITY_BASIS,
         "tradable_gate": TRADABLE_GATE,
         "benchmark_definition": BENCHMARK_DEFINITION,
         "risk_free_rate": RISK_FREE_ANNUAL,
@@ -967,7 +1011,7 @@ def run(
         simulation,
         merged_lines,
         capital,
-        str(target_path),
+        target_path.as_posix(),
         target_sha256,
         warnings,
     )
