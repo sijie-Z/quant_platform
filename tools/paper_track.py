@@ -79,10 +79,12 @@ close first, then trades **sells first, buys second** at the same close.
 Trading is cash-constrained: buys can spend only the cash left after the
 sells plus the existing cash, *and* they must leave enough to pay the
 transaction costs. A gross-100% target therefore executes with buys scaled
-down by the cost fraction; the book still ends fully invested (cash 0) and
-each weight is a hair above target. If the constraint binds harder -- for
-example a limit-down position that cannot be sold -- buys are scaled
-proportionally and a warning records the realised scale.
+down by the cost fraction and the book still ends fully invested (cash 0);
+on a uniform build (nothing kept from a previous book) the scaled buys
+reproduce the target weights exactly, while on a rebalance the positions
+kept from the old book retain their drifted weights. If the constraint
+binds harder -- for example a limit-down position that cannot be sold --
+buys are scaled proportionally and a warning records the realised scale.
 
 Tradability at a rebalance uses the R9/R19a gates on the execution close:
 an asset is sellable when it has a positive raw close, finite ``pct_chg``,
@@ -104,8 +106,9 @@ the drifted book return minus that cost fraction.
 
 A trailing target with no cached session after its ``as_of`` (only possible
 when ``as_of`` equals the cache's last date) is *pending*: it is listed in
-``summary.json`` and left for the next run once the cache extends, while the
-ledger ends at the last executed rebalance. A target whose ``as_of`` is
+``summary.json`` and left for the next run once the cache extends; the
+ledger still runs to the cache's last session (the pending target is simply
+not executed). A target whose ``as_of`` is
 beyond the cache end is an error, as are duplicate ``as_of`` values,
 duplicate execution sessions, unknown target assets, negative weights and
 weight sums above 1.
@@ -117,7 +120,9 @@ realised one-sided turnover of an executed rebalance -- half of buys plus
 sells over the pre-cost portfolio value -- and 0 on non-rebalance sessions).
 The rolling ledger is rebuilt from scratch on every run, so the same targets
 and cache produce byte-identical files; an existing non-rolling ledger in
-the out-dir is refused rather than mixed.
+the out-dir is refused rather than mixed. A growing target schedule (a new
+month) is expected and simply rebuilds the ledger; an existing rolling
+ledger with a different capital, cost mode or stale policy is refused.
 
 Idempotent accumulation
 -----------------------
@@ -1444,7 +1449,7 @@ def _rebalance_to_target(
         buy_cny=buy_cny,
         sell_cny=sell_cny,
         buy_scale=float(buy_scale),
-        n_buys=int(len(executed_buys)),
+        n_buys=int((executed_buys > 0).sum()),
         n_sells=int(len(sell_series)),
         blocked_buys=blocked_buys,
         blocked_sells=blocked_sells,
@@ -1849,6 +1854,21 @@ def run_roll(
                 f"{summary_path} belongs to a non-rolling paper_track "
                 "ledger; use a new --out-dir"
             )
+        # A growing target schedule is the intended rebuild case, but a
+        # different capital / cost mode / stale policy is a configuration
+        # mistake that would silently rewrite the whole ledger.
+        for key, expected, label in (
+            ("capital", float(capital), "capital"),
+            ("cost_mode", cost_mode, "cost mode"),
+            ("max_stale_sessions", int(max_stale_sessions), "stale policy"),
+        ):
+            if key not in existing or existing[key] != expected:
+                current = existing.get(key, "<missing>")
+                raise PaperTrackError(
+                    f"{summary_path} belongs to a rolling ledger with a "
+                    f"different {label} ({current!r} != {expected!r}); use a "
+                    "new --out-dir"
+                )
     out_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(
         nav_path,

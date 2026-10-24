@@ -1217,6 +1217,62 @@ def test_roll_blocked_sell_and_limit_up_buy_stay_cash_constrained(tool, tmp_path
     )
 
 
+def test_roll_zero_scale_reports_no_executed_buys(tool, tmp_path):
+    # Fully invested book, then a 100% target switch while the old holding is
+    # limit-down and cash is zero: the buy scale collapses to 0 and the record
+    # must not claim a buy that never happened.
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, 10.0, 9.0, 9.0, 9.0],
+         "B": [10.0] * 6},
+        pct_chg={"A": [np.nan, 0.0, 0.0, -10.0, 0.0, 0.0],
+                 "B": [np.nan, 0.0, 0.0, 0.0, 0.0, 0.0]},
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 1.0}),
+        (dates[2].strftime("%Y-%m-%d"), {"B": 1.0}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    summary = read_summary(out_dir)
+    record = summary["rebalances"][1]
+    assert record["blocked_sells"] == ["A"]
+    assert record["buy_scale"] == 0.0
+    assert record["buy_cny"] == 0.0
+    assert record["n_buys"] == 0
+    assert record["sell_cny"] == 0.0
+    assert any("cash constraint scaled" in w for w in summary["warnings"])
+
+
+def test_roll_refuses_a_different_config_in_the_same_out_dir(tool, tmp_path, capsys):
+    close, volume, pct = make_panel({"A": [10.0] * 4, "B": [10.0] * 4})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.4, "B": 0.4}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    nav_bytes = (out_dir / "nav.csv").read_bytes()
+
+    assert run_roll_tool(
+        tool, cache, out_dir, targets_dir=target_dir, capital=2_000_000.0,
+    ) == 2
+    stderr = capsys.readouterr().err
+    assert "different capital" in stderr
+    assert (out_dir / "nav.csv").read_bytes() == nav_bytes
+
+    assert run_roll_tool(
+        tool, cache, out_dir, targets_dir=target_dir, cost_mode="impact",
+    ) == 2
+    stderr = capsys.readouterr().err
+    assert "different cost mode" in stderr
+    assert (out_dir / "nav.csv").read_bytes() == nav_bytes
+
+
 def test_roll_refuses_to_mix_with_a_single_target_ledger(tool, tmp_path, capsys):
     close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0, 10.0]})
     dates = close.index
