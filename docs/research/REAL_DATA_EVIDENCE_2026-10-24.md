@@ -678,6 +678,25 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 2. 宽池估值 PIT 缺陷（#3）从“部分缓解”升级为“**已复核、结论稳健**”；残余限制是仍依赖 Baostock 自身的 PIT 实现（未逐条独立核对公告日），且 BP 只做了同源替换。若未来要用财务因子做正式结论，仍建议接 Tushare/Baostock 公告日财务自建面板。
 3. 这也意味着：在现有宽池上继续挖股票价值因子，边际收益很低——与外部评审“不要再无限追 alpha”的判断一致。
 
+## 23. PIT ST 复核（2026-10-25，缺陷 #2：结论有实质影响）
+
+101 池此前的 `is_st` 是全样本静态且全 False——ST 过滤在真实数据上实际失效。本轮用 **Baostock 日频 `isST`** 重建 PIT ST 掩码（2018–2025）：**101 只中有 22 只出现过 ST，共 7,859 个“股票×交易日”**（如 000005 于 2021-05~2024-04、000410 于 2019-08~2023-05，与公开历史一致）。用冻结策略的同一生产定义重跑两种处理：
+
+| 处理 | 标准 Sharpe | CAGR | MDD | DSR p（N=48） | 全期累计超额 |
+|---|---:|---:|---:|---:|---:|
+| 原版（ST 掩码全 False，等同不设 ST 过滤） | 0.474 | 9.27% | −21.1% | 0.873 | vs 全样本等权 **+2.4%** |
+| （i）仅禁止买入 ST（tradable_mask） | 0.382 | 7.80% | −20.6% | 0.912 | vs 全样本等权 **−10.4%** |
+| （ii）完整 ST 政策：ST 退出因子池 + 基准也剔除 ST | 0.375 | 7.71% | −20.3% | 0.915 | vs 可投资等权 **−11.2%** |
+
+参照基准（同窗口）：全样本日频等权 CAGR 9.30%、Sharpe 0.390；**剔除 ST 后的可投资等权 CAGR 10.90%、Sharpe 0.453**。
+
+解读：
+
+1. **原版 0.49 的历史证据被 ST 暴露显著高估**。生产链路本来就过滤 ST（pipeline 的 `excluded_mask`/`tradable_mask`），因此原版回测并不代表可部署策略的真实表现；两种 ST 处理互相印证（0.382 / 0.375）。
+2. 剔除 ST 同时**提高了基准**（ST 股票整体是输家，剔除后等权从 9.3% 升到 10.9%），一升一降，策略相对可投资等权的差距扩大到约 −3pp/年。
+3. 结论方向与成本压力测试（§21）、ETF 试点（`ETF_ROTATION_RESULTS_2026-10-25.md`）一致：现有证据不支持“存在稳定净优势”。**部署结论维持“不投真金白银”**，且今后任何股票策略回测必须带 PIT ST 掩码。
+4. 产物：`.scratch/orchestrate/{fetch_st_mask.py,cost_stress_101.py（--st-mask）,cost_stress_101_impact_10bps_st{,2}.json}`、`.scratch/st_mask/`。剩余限制：ST 判定依赖 Baostock；停牌/退市处理未变。
+
 ---
 
 _生成于 2026-10-24（R19b 重写；R20 口径对齐；R22 新增 §11；R23 新增 §12「正交 alpha 筛选（预注册）」，零结果；R24 新增 §13「生产链路交叉验证」；R25 新增 §14「组合构建方式对比（预注册）」，保留 MVO；R26 新增 §15「生产工具组合层约束」，原下一步顺延为 §16）。作者：Claude（监督—执行环）。R31 产物：`.scratch/orchestrate/{r31_wide_value.py,merged_wide.parquet,r31_merge_quality_2026-10-25.json,r31_wide_value_2026-10-25.json,r31_wide_value_2026-10-25.md,r31_checks_2026-10-25.json,r31_determinism_2026-10-25.json,r31_results/（A–D 四个 run JSON）,progress_R31.md,cc_report_R31_wide_value.md,review_R31.md}`、`docs/research/target_portfolio_2026-10-23.{json,csv}`、`docs/research/paper_track/forward_2026/README.md`（R31 新增 §17「宽池价值因子与 2026 实盘目标」，下一步顺延为 §18）。R30 产物：`.scratch/orchestrate/{r30_wide.py,r30_wide_2026-10-25.json,r30_wide_2026-10-25.md,r30_quality_2026-10-25.json,r30_ic_2026-10-25.json,r30_results/（12 个 run JSON）,r30_logs/,progress_R30.md,cc_report_R30_wide.md,review_R30.md}`（R30 新增 §16「宽池外部有效性验证」，下一步顺延为 §17）。R26 产物：`docs/research/target_portfolio_2025-12-31.{json,csv}`（重生成）、`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`（重生成）、`.scratch/orchestrate/{gen_roll_targets.py,roll_targets/（72 个目标，不入 git）,r26_compare_targets.py,r26_target_compare_2026-10-24.{json,md},r26_checks.py,r26_checks_2026-10-24.json,r26_compare_roll_wf.py,r26_compare_roll_wf_2026-10-24.json,cc_report_R26_prod_constraints.md,review_R26.md}`。R25 产物：`.scratch/orchestrate/r25_construct.py`、`r25_construct_2026-10-24.{json,md}`、`r25_results/`、`r25_capture/`、`r25_checks_2026-10-24.json`、`r25_determinism_2026-10-24.json`、`cc_report_R25_construct.md`、`review_R25.md`。R24 产物：`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`、`.scratch/orchestrate/gen_roll_targets.py`、`roll_targets/`（72 个目标，不入 git）、`compare_roll_wf.py`、`r24_compare_2026-10-24.json`、`cc_report_R24_roll_track.md`、`review_R24.md`。R23 产物：`.scratch/orchestrate/r23_orthogonal_2026-10-24.{json,md}`、`r23_orthogonal.py`、`r23_results/`、`r23_capture/`、`r23_checks_2026-10-24.json`、`r23_determinism_2026-10-24.json`、`cc_report_R23_orthogonal.md`、`review_R23.md`。R22 产物：`.scratch/orchestrate/r22_results/r22_voltarget_2026-10-24.{json,md}`、每组 `r22_<variant>_vt<target>_2026-10-24.{json,csv}`、`cc_report_R22_voltarget.md`、`review_R22.md`。R20 产物：`.scratch/orchestrate/real_variants2_r20_2026-10-24.{json,md}`（四变体重跑）、`real_variants2_r20_results/`、`r20_capture/`、`r20_style_attr_2026-10-24.{json,md}`、`r20_benchmark_2026-10-24.{json,md}`、`r20_cap_probe_2026-10-24.json`（15% 行业上限剂量探针）、`r20_old_vs_new_2026-10-24.json`、`r20_golden_check.py`（默认路径逐位对比 c5c919c）。R19b 产物：`.scratch/orchestrate/r19b_headline_2026-10-24.{json,md}`、`r19b_benchmark_2026-10-24.{json,md}`、`r19b_style_attr_2026-10-24.{json,md}`、`r19b_size_split_2026-10-24.{json,md}`、`r19b_ic_scan_2026-10-24.{json,md}`、`r19b_old_vs_new_2026-10-24.json`、`capacity_curve_ep_turn_oos_2026-10-24.{json,md}`。旧数字来源：`real_variants{4,5,7,9}_2026-10-24.json`（旧口径，仅用于对照）；旧基准行 0.222/4.50%/−25.71% 取自 R19b 之前的报告文本（git 历史），旧容量 1M 0.565/5 亿 0.420 取自被本轮覆盖前的 `capacity_ep_turn_oos_out.txt`（数值已固化在 `r19b_old_vs_new_2026-10-24.json`）。注意 `capacity_curve_ep_turn_2026-10-24.json` 是另一套**全期**容量配置，勿与本报告的 OOS 容量表混用。_
