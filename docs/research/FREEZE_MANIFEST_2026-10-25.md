@@ -43,7 +43,7 @@
 **修复**：
 - `tools/daily_signal.py` 新增 `--exclude-codes-file`（PIT 排除名单），并在 `provenance/diagnostics` 记录排除名单与实际剔除的代码；`_normalize_code` 支持 `sh600053/600053.SH` 形式。
 - `forward_update.py` 在每次月末生成目标前抓取新浪全市场快照，生成当日 ST 名单并传入；抓取失败会显著记录并**拒绝**把“无 ST 过滤”的目标当作合规目标。
-- 两个 2026-10-23 目标已用 **2026-10-23 的 PIT ST 名单**重建（排除上述 5 只）；v1 文件保留为 `target_2026-10-23_v1_no_st_filter.json`，不覆盖、不删除。
+- 两个 2026-10-23 目标已用 **2026-10-23 的 PIT ST 名单**重建（排除上述 5 只）；v1 文件保留在各自 `superseded/target_2026-10-23_v1_no_st_filter.json`（子目录不在 `paper_track` 的 targets 扫描范围内，避免同一 as_of 重复读入），不覆盖、不删除。
 
 **v2 哈希（sha256[:16]）**：
 

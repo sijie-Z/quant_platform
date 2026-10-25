@@ -716,7 +716,7 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 
 1. `daily_signal.py` 新增 `--exclude-codes-file`：在构造组合前把名单内代码从候选池剔除，排除名单与实际剔除代码写入 `provenance/diagnostics`；`_normalize_code` 兼容 `sh600053/600053.SH` 形式；新增单测（22 项全部通过）。
 2. `forward_update.py`（已移入 `tools/`，纳入版本管理）在每次月末生成目标前抓取新浪全市场快照生成当日 ST 名单；**抓取失败则拒绝生成目标**（fail closed），不再产出无 ST 过滤的账本。
-3. 两个 2026-10-23 目标用当日 PIT ST 名单重建为 v2（换手 37 只、EP+换手 33 只、均不含 ST）；v1 原文件保留为 `target_2026-10-23_v1_no_st_filter.json`，未删除。
+3. 两个 2026-10-23 目标用当日 PIT ST 名单重建为 v2（换手 37 只、EP+换手 33 只、均不含 ST）；v1 原文件保留在各策略目录的 `superseded/target_2026-10-23_v1_no_st_filter.json`（子目录不被 `paper_track` 扫描，避免同一 as_of 重复），未删除。
 4. 冻结清单升级到 v2（`FREEZE_MANIFEST_2026-10-25.md` §5），记录新旧 sha256；新 tag `forward-freeze-2026-10-25`。forward 台账尚未产生任何 NAV 记录，因此 v2 是**起点**，不存在对已跟踪记录的事后修改。
 
 该问题与 §23 的历史回测发现同源：只要 ST 不进买入池，原策略的相对优势就大幅缩水；实盘目标必须在源头排除 ST，否则 paper 记录会重复历史回测的偏差。
