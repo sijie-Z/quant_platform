@@ -132,6 +132,17 @@ def _normalize_code(value: Any) -> str:
     text = str(value).strip()
     if text.isdigit() and len(text) <= 6:
         return text.zfill(6)
+    lowered = text.lower()
+    if "." in text:
+        head, _, tail = text.partition(".")
+        if head.isdigit() and len(head) <= 6 and tail.lower() in ("sh", "sz", "bj"):
+            return head.zfill(6)
+    for prefix in ("sh.", "sz.", "bj.", "sh", "sz", "bj"):
+        if lowered.startswith(prefix):
+            rest = text[len(prefix):]
+            if rest.isdigit() and len(rest) <= 6:
+                return rest.zfill(6)
+            break
     return text
 
 
@@ -721,6 +732,33 @@ def load_prev_weights(path: Path) -> pd.Series | None:
     return series
 
 
+def load_excluded_codes(path: Path) -> list[str]:
+    """Read codes to drop from candidates (one per line or a JSON array).
+
+    Used for the point-in-time ST list: ST names must not enter the target
+    book. Accepts ``sh600053``/``600053.SH``/``600053`` forms.
+    """
+    source = Path(path)
+    if not source.is_file():
+        raise SignalError(f"exclude codes file not found: {path}")
+    text = source.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if text.lstrip().startswith("["):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise SignalError(
+                f"exclude codes file {path} is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(payload, list):
+            raise SignalError("exclude codes JSON must be an array")
+        raw = [str(value) for value in payload]
+    else:
+        raw = [line.split()[0] for line in text.splitlines() if line.strip()]
+    return sorted({_normalize_code(value) for value in raw})
+
+
 def one_sided_turnover(
     weights: pd.Series, prev_weights: pd.Series | None,
 ) -> float:
@@ -860,6 +898,25 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
     # MeanVarianceOptimizer expects the platform's rank alpha in [-0.5, 0.5]
     # (AlphaPipeline convention); the composite z is the delivered signal.
     alpha = composite.rank(pct=True) - 0.5
+
+    excluded_codes = (
+        load_excluded_codes(Path(args.exclude_codes_file))
+        if args.exclude_codes_file else []
+    )
+    excluded_dropped: list[str] = []
+    if excluded_codes:
+        wanted = set(excluded_codes)
+        dropped = [code for code in alpha.index
+                   if _normalize_code(code) in wanted]
+        if dropped:
+            alpha = alpha.drop(index=dropped)
+            composite = composite.drop(index=dropped)
+            composite_values = composite.dropna()
+            excluded_dropped = [str(code) for code in dropped]
+        warnings.append(
+            f"excluded {len(excluded_dropped)} of {len(excluded_codes)} "
+            "listed codes from candidates (--exclude-codes-file)"
+        )
 
     construction = str(args.construction)
     if args.top_n is not None:
@@ -1104,6 +1161,10 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
             "max_sector": max_sector,
             "sector_cap_enforced": bool(sector_cap_active),
             "prev_weights": str(args.prev_weights) if args.prev_weights else None,
+            "exclude_codes_file": (
+                str(args.exclude_codes_file) if args.exclude_codes_file else None
+            ),
+            "excluded_codes_count": len(excluded_codes),
             "capital_cny": capital,
             "max_weight": float(args.max_weight),
             "max_turnover": float(args.max_turnover),
@@ -1127,6 +1188,8 @@ def run_signal(args: argparse.Namespace) -> dict[str, Any]:
             "data_lag_days": data_lag_days,
             "universe_assets": int(alpha.size),
             "candidates": int(alpha.notna().sum()),
+            "excluded_codes": excluded_codes,
+            "excluded_dropped": excluded_dropped,
             "n_holdings": int(len(targets)),
             "max_weight_actual": max_actual,
             "max_sector_weight": max_sector_weight,
@@ -1313,6 +1376,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--prev-weights", default=None,
         help="previous target weights JSON (bare {code: weight} or a "
              "targets.json with 'weights'); omitted = first build",
+    )
+    parser.add_argument(
+        "--exclude-codes-file", default=None,
+        help="optional text file of codes to drop from candidates before "
+             "construction (one per line or a JSON array), e.g. the current "
+             "ST list; the file is recorded in provenance",
     )
     parser.add_argument(
         "--out-json", default="targets.json",

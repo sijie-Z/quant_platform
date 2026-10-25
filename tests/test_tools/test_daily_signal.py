@@ -420,6 +420,33 @@ def test_prev_weights_and_turnover_cap(tool, panels_dir, tmp_path):
     assert values.sum() <= 1.0 + 1e-6
 
 
+def test_exclude_codes_file_drops_candidates(tool, panels_dir, tmp_path):
+    """ST-style exclusion: listed codes never reach the target book."""
+    directory, as_of = panels_dir
+    frame = pd.read_parquet(directory / "panel.parquet")
+    assets = frame.index.get_level_values("asset").unique()
+    excluded = sorted({str(assets[0]), str(assets[1])})
+    exclude_path = tmp_path / "exclude.txt"
+    # Mixed formats exercise _normalize_code (shXXXXXX and bare 6 digits).
+    exclude_path.write_text(
+        f"sh{excluded[0]}\n{excluded[1]}\n", encoding="utf-8",
+    )
+    rc, json_path, _ = run_tool(
+        tool, directory / "panel.parquet", tmp_path / "excluded",
+        "--exclude-codes-file", str(exclude_path),
+        "--industry-map", str(directory / "industry.parquet"),
+        as_of=as_of.strftime("%Y-%m-%d"),
+    )
+    assert rc == 0
+    payload = load_targets(json_path)
+    weights = set(payload["weights"])
+    assert not (weights & set(excluded))
+    diagnostics = payload["diagnostics"]
+    assert set(diagnostics["excluded_dropped"]) == set(excluded)
+    assert payload["provenance"]["excluded_codes_count"] == 2
+    assert any("excluded" in warning for warning in diagnostics["warnings"])
+
+
 def test_stale_cache_warns(tool, panels_dir, tmp_path):
     """A cache that ends long before --as-of must not pass silently."""
     directory, _ = panels_dir
