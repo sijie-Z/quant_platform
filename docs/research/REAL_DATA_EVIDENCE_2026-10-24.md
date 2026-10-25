@@ -603,6 +603,43 @@ IC 不经过执行层，R19a 的门禁/波动率修复不影响它；本轮仍�
 5. **纪律**：任何新变体都登记进试验台账并计入 DSR 的 N；在真正 holdout（未参与本轮搜索的数据段）上做一次性评估。
 6. **把 R20 口径接进生产工具**：`tools/real_data_research.py` 目前仍传单一 "A" 行业且未启用 rank 归一化（§9 #11）；接入真实行业映射 + `rank_normalize_signal` 并补端到端测试。
 
+## 20. 口径审计与基准矩阵（2026-10-25，回应外部评审）
+
+外部评审指出：平台报告列的 Sharpe 是自定义口径 `(CAGR−3%)/年化波动`，不是标准年化 Sharpe `√252·mean(日超额)/std(日超额)`；两者不能与 DSR 的理论混用。核实结果：
+
+- **DSR 实现内部用的是标准口径**（`research/validation.py` 里 `sr = mean/std; observed_sr = sr·√252`），因此 DSR p 值本身无需重算；需要修正的是**报告表格列的标签与数值**。
+- 对已保存的 OOS 序列重算两种口径（见 `.scratch/orchestrate/metrics_audit_2026-10-25.{json,md}`）：
+
+| 序列 | 平台自定义 Sharpe | 标准年化 Sharpe | DSR p（N=10/25/48/60） |
+|---|---:|---:|---|
+| 101 turnover20_plain | 0.683 | 0.708 | 0.462/0.628/0.722/0.750 |
+| 101 turnover60_plain | 0.703 | 0.726 | 0.445/0.612/0.708/0.737 |
+| 101 turnover60_sector | 0.377 | 0.432 | 0.710/0.835/0.892/0.907 |
+| 101 ep_turn_sector | 0.486 | 0.533 | 0.624/0.770/0.842/0.862 |
+| 101 lowvol_sector | 0.568 | 0.607 | 0.557/0.714/0.796/0.820 |
+| 2026 holdout turnover | −0.573 | −0.501 | 0.977/0.992/0.996/0.997 |
+
+结论：标准 Sharpe 比自定义口径高约 0.03–0.05（正收益序列），排序与结论不变；DSR 在 N=48 时仍在 0.71–0.89。**今后报告以标准年化 Sharpe 为主，平台口径标注为自定义指标。**
+
+### 基准矩阵（宽池 300 只，同窗口）
+
+| 基准 | 2020-02-11..2025-12-31 CAGR / 波动 / 标准 Sharpe / MDD | 2026-02-02..10-23 CAGR / 波动 / Sharpe / MDD |
+|---|---|---|
+| 同池日频等权 | 15.3% / 23.6% / 0.595 / −32.3% | −16.6% / 23.7% / −0.773 / −22.2% |
+| 同池市值加权（换手率反推股本） | 8.6% / 20.5% / 0.361 / −37.3% | −20.3% / 21.4% / −1.096 / −22.0% |
+| constant-share buy&hold | 13.2% / 20.4% / 0.562 / −28.7% | −18.2% / 18.5% / −1.156 / −17.9% |
+| 宽池换手策略（plain） | 15.5% / 15.5% / — / −20.2% | −7.05% / 17.5% / −0.501 / −17.5% |
+
+解读：策略相对**市值加权**和**buy&hold**有明显优势（收益更高、波动更低）；相对**日频等权**是“收益接近、波动显著更低”。基准选择会改变优势大小，但方向和“防御性 tilt”的定性不变。2026 年策略跑赢全部三种基准。
+
+### 估值可得时间审计（部分）
+
+用 `隐含 EPS = 原始价 / PE` 的跳变月份检验估值更新是否集中在财报季：跳变在 4 月（1,557 次）、2 月（1,193）、5 月（1,151）、8 月（1,151）、10 月（1,078）最多，与 A 股年报/一季报/半年报/三季报披露窗口一致；但该方法受价格波动与估值更新频率干扰，**不能证明供应商未做历史回填**。在接入真正 PIT 财务面板前，宽池 EP 结论按“未通过完整 PIT 审查”对待。
+
+### 涨跌停门禁方向性
+
+引擎按方向门禁：**买入**在 `limit_up` 日被阻断、**卖出**在 `limit_down` 日被阻断（不是统一禁止涨跌停日交易）；研究脚本已改用执行日当天 `pct_chg`。ST 的 5% 限制未建模（用 9.8% 近似），30xxxx 的 20% 限制也未区分——这是已知的保守/偏松混合误差，列入限制清单。
+
 ---
 
 _生成于 2026-10-24（R19b 重写；R20 口径对齐；R22 新增 §11；R23 新增 §12「正交 alpha 筛选（预注册）」，零结果；R24 新增 §13「生产链路交叉验证」；R25 新增 §14「组合构建方式对比（预注册）」，保留 MVO；R26 新增 §15「生产工具组合层约束」，原下一步顺延为 §16）。作者：Claude（监督—执行环）。R31 产物：`.scratch/orchestrate/{r31_wide_value.py,merged_wide.parquet,r31_merge_quality_2026-10-25.json,r31_wide_value_2026-10-25.json,r31_wide_value_2026-10-25.md,r31_checks_2026-10-25.json,r31_determinism_2026-10-25.json,r31_results/（A–D 四个 run JSON）,progress_R31.md,cc_report_R31_wide_value.md,review_R31.md}`、`docs/research/target_portfolio_2026-10-23.{json,csv}`、`docs/research/paper_track/forward_2026/README.md`（R31 新增 §17「宽池价值因子与 2026 实盘目标」，下一步顺延为 §18）。R30 产物：`.scratch/orchestrate/{r30_wide.py,r30_wide_2026-10-25.json,r30_wide_2026-10-25.md,r30_quality_2026-10-25.json,r30_ic_2026-10-25.json,r30_results/（12 个 run JSON）,r30_logs/,progress_R30.md,cc_report_R30_wide.md,review_R30.md}`（R30 新增 §16「宽池外部有效性验证」，下一步顺延为 §17）。R26 产物：`docs/research/target_portfolio_2025-12-31.{json,csv}`（重生成）、`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`（重生成）、`.scratch/orchestrate/{gen_roll_targets.py,roll_targets/（72 个目标，不入 git）,r26_compare_targets.py,r26_target_compare_2026-10-24.{json,md},r26_checks.py,r26_checks_2026-10-24.json,r26_compare_roll_wf.py,r26_compare_roll_wf_2026-10-24.json,cc_report_R26_prod_constraints.md,review_R26.md}`。R25 产物：`.scratch/orchestrate/r25_construct.py`、`r25_construct_2026-10-24.{json,md}`、`r25_results/`、`r25_capture/`、`r25_checks_2026-10-24.json`、`r25_determinism_2026-10-24.json`、`cc_report_R25_construct.md`、`review_R25.md`。R24 产物：`docs/research/paper_track/roll_2020_2025/{nav.csv,summary.json}`、`.scratch/orchestrate/gen_roll_targets.py`、`roll_targets/`（72 个目标，不入 git）、`compare_roll_wf.py`、`r24_compare_2026-10-24.json`、`cc_report_R24_roll_track.md`、`review_R24.md`。R23 产物：`.scratch/orchestrate/r23_orthogonal_2026-10-24.{json,md}`、`r23_orthogonal.py`、`r23_results/`、`r23_capture/`、`r23_checks_2026-10-24.json`、`r23_determinism_2026-10-24.json`、`cc_report_R23_orthogonal.md`、`review_R23.md`。R22 产物：`.scratch/orchestrate/r22_results/r22_voltarget_2026-10-24.{json,md}`、每组 `r22_<variant>_vt<target>_2026-10-24.{json,csv}`、`cc_report_R22_voltarget.md`、`review_R22.md`。R20 产物：`.scratch/orchestrate/real_variants2_r20_2026-10-24.{json,md}`（四变体重跑）、`real_variants2_r20_results/`、`r20_capture/`、`r20_style_attr_2026-10-24.{json,md}`、`r20_benchmark_2026-10-24.{json,md}`、`r20_cap_probe_2026-10-24.json`（15% 行业上限剂量探针）、`r20_old_vs_new_2026-10-24.json`、`r20_golden_check.py`（默认路径逐位对比 c5c919c）。R19b 产物：`.scratch/orchestrate/r19b_headline_2026-10-24.{json,md}`、`r19b_benchmark_2026-10-24.{json,md}`、`r19b_style_attr_2026-10-24.{json,md}`、`r19b_size_split_2026-10-24.{json,md}`、`r19b_ic_scan_2026-10-24.{json,md}`、`r19b_old_vs_new_2026-10-24.json`、`capacity_curve_ep_turn_oos_2026-10-24.{json,md}`。旧数字来源：`real_variants{4,5,7,9}_2026-10-24.json`（旧口径，仅用于对照）；旧基准行 0.222/4.50%/−25.71% 取自 R19b 之前的报告文本（git 历史），旧容量 1M 0.565/5 亿 0.420 取自被本轮覆盖前的 `capacity_ep_turn_oos_out.txt`（数值已固化在 `r19b_old_vs_new_2026-10-24.json`）。注意 `capacity_curve_ep_turn_2026-10-24.json` 是另一套**全期**容量配置，勿与本报告的 OOS 容量表混用。_
