@@ -45,3 +45,17 @@
 2. **单变量**：每次只改变一个变量
 3. **有对照组**：每份报告都有清晰的基准（Benchmark）
 4. **结论导向**：每份报告回答一个具体的研究问题
+
+---
+
+## 真实数据研究（2026-10）
+
+| 文档 | 内容 |
+|---|---|
+| [REAL_DATA_EVIDENCE_2026-10-24.md](REAL_DATA_EVIDENCE_2026-10-24.md) | 101 池与宽池的真实数据证据、2026 holdout、口径审计（§20）、成本压力测试（§21） |
+| [DEPLOYMENT_DECISION_2026-10-25.md](DEPLOYMENT_DECISION_2026-10-25.md) | 部署决策备忘、复核门槛、90 天执行计划 |
+| [FREEZE_MANIFEST_2026-10-25.md](FREEZE_MANIFEST_2026-10-25.md) | 冻结策略清单（sha256/tag）、变更与终止规则 |
+| [DATA_DEFECT_LEDGER_2026-10-25.md](DATA_DEFECT_LEDGER_2026-10-25.md) | 15 项历史数据缺陷台账与处置状态 |
+| [PREREG_ETF_ROTATION_2026-10-25.md](PREREG_ETF_ROTATION_2026-10-25.md) | ETF 动量轮动预注册（数据、参数、验收标准） |
+| [ETF_ROTATION_RESULTS_2026-10-25.md](ETF_ROTATION_RESULTS_2026-10-25.md) | ETF 试点结果：OOS 达标、2026 holdout 失败 → 冻结 |
+| [EXTERNAL_REVIEW_PACKAGE_2026-10-25.md](EXTERNAL_REVIEW_PACKAGE_2026-10-25.md) | 给外部评审的自包含材料与处置记录（§13） |
