@@ -733,17 +733,19 @@ def load_prev_weights(path: Path) -> pd.Series | None:
 
 
 def load_excluded_codes(path: Path) -> list[str]:
-    """Read codes to drop from candidates (one per line or a JSON array).
+    """Read and validate codes to drop from candidates.
 
     Used for the point-in-time ST list: ST names must not enter the target
-    book. Accepts ``sh600053``/``600053.SH``/``600053`` forms.
+    book. Accepts ``sh600053``/``600053.SH``/``600053`` forms. An explicitly
+    supplied empty or malformed file is rejected rather than silently
+    disabling the exclusion policy.
     """
     source = Path(path)
     if not source.is_file():
         raise SignalError(f"exclude codes file not found: {path}")
     text = source.read_text(encoding="utf-8").strip()
     if not text:
-        return []
+        raise SignalError(f"exclude codes file is empty: {path}")
     if text.lstrip().startswith("["):
         try:
             payload = json.loads(text)
@@ -753,10 +755,22 @@ def load_excluded_codes(path: Path) -> list[str]:
             ) from exc
         if not isinstance(payload, list):
             raise SignalError("exclude codes JSON must be an array")
-        raw = [str(value) for value in payload]
+        raw = payload
     else:
         raw = [line.split()[0] for line in text.splitlines() if line.strip()]
-    return sorted({_normalize_code(value) for value in raw})
+    if not raw:
+        raise SignalError(f"exclude codes file contains no codes: {path}")
+    codes: set[str] = set()
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise SignalError(
+                f"exclude code must be a string or integer, got {value!r}"
+            )
+        code = _normalize_code(value)
+        if len(code) != 6 or not code.isdigit():
+            raise SignalError(f"invalid exclude code: {value!r}")
+        codes.add(code)
+    return sorted(codes)
 
 
 def one_sided_turnover(

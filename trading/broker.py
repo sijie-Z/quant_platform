@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -1202,12 +1203,21 @@ class QMTBroker(BrokerInterface):
         self._connected = False
         self._session_id: int = 0
         self._orders: list[Order] = []
+        # QMT reports the same execution through two channels: XtOrder carries
+        # a cumulative filled quantity/average price, while XtTrade carries an
+        # incremental execution. Keep both kinds of evidence separately so
+        # reconciling them never adds the same shares twice. Execution entries
+        # are keyed by the broker's traded_id and therefore survive repeated
+        # callbacks and query_stock_trades resyncs.
+        self._order_fill_snapshots: dict[str, dict[str, Any]] = {}
+        self._order_executions: dict[str, dict[str, tuple[int, float]]] = {}
         self._positions: dict[str, Position] = {}
         self._cash: float = initial_cash
         self._frozen_cash: float = 0.0
         self._market_value: float = 0.0
         #: Monotonic time of the last successful broker order/trade resync.
         self._last_resync_at: float | None = None
+        self._last_resync_ok = False
         #: Serializes resync so concurrent get_orders calls cannot both
         #: append the same unknown broker order (check-then-act on _orders).
         self._resync_lock = threading.Lock()
@@ -1317,6 +1327,7 @@ class QMTBroker(BrokerInterface):
                 # get_orders must reconcile against this connection (also
                 # covers explicit connect() calls made outside the lazy path).
                 self._last_resync_at = None
+                self._last_resync_ok = False
                 # Subscribe to account updates
                 try:
                     self._trader.subscribe(self._account)
@@ -1573,6 +1584,23 @@ class QMTBroker(BrokerInterface):
         traded = self._as_int(d.get("traded_volume"), 0)
         traded_price = self._as_float(d.get("traded_price"), 0.0)
 
+        # order_stock carries the durable local intent in strategy_name. A
+        # timeout leaves a pending local order without a broker id; the next
+        # broker query adopts that original order instead of appending a new
+        # one (and instead of allowing a retry to create a second order).
+        strategy_name = str(d.get("strategy_name") or "")
+        if strategy_name.startswith("quant_platform:"):
+            intent_id = strategy_name.split(":", 1)[1]
+            for order in self._orders:
+                if order.order_id == intent_id and not order.broker_order_id:
+                    order.broker_order_id = broker_id
+                    order.error_msg = ""
+                    logger.info(
+                        "QMT resync matched submission-unknown local order %s "
+                        "to broker order %s", intent_id, broker_id,
+                    )
+                    break
+
         for order in self._orders:
             if str(order.broker_order_id) != broker_id:
                 continue
@@ -1588,17 +1616,22 @@ class QMTBroker(BrokerInterface):
                     pass
                 else:
                     order.status = status
-            if traded > int(order.filled_quantity or 0):
-                order.filled_quantity = (
-                    min(traded, int(order.quantity)) if order.quantity > 0 else traded
-                )
-            if traded_price > 0:
-                order.filled_price = traded_price
+            self._record_order_fill_snapshot(order, traded, traded_price)
             order.updated_at = datetime.now().isoformat()
             return
 
         # Unknown order: submitted before this process started (or missed by
         # the callback chain). Rebuild it from the broker snapshot.
+        if strategy_name.startswith("quant_platform:"):
+            duplicate = next(
+                (o for o in self._orders if o.order_id == intent_id), None,
+            )
+            if duplicate is not None:
+                logger.warning(
+                    "QMT resync: local intent %s already tracked; refusing a "
+                    "duplicate entry for broker order %s", intent_id, broker_id,
+                )
+                return
         quantity = self._as_int(d.get("order_volume"), 0)
         order = Order(
             code=from_qmt_code(str(d.get("code", "") or "")),
@@ -1611,12 +1644,17 @@ class QMTBroker(BrokerInterface):
             status=status,
             broker_order_id=broker_id,
         )
+        if strategy_name.startswith("quant_platform:"):
+            # Preserve the durable local intent so a racing exception handler
+            # can adopt this recovered entry instead of appending a duplicate.
+            order.order_id = intent_id
         status_msg = str(d.get("status_msg", "") or "")
         if status_msg:
             order.error_msg = status_msg
         created_at = self._created_at_from_broker(d.get("order_time"))
         if created_at:
             order.created_at = created_at
+        self._record_order_fill_snapshot(order, traded, traded_price)
         self._orders.append(order)
         logger.info(
             "QMT resync: recovered broker order %s (%s %s x%d, status=%s)",
@@ -1625,11 +1663,16 @@ class QMTBroker(BrokerInterface):
         )
 
     def _cross_check_filled_with_trades(self) -> None:
-        """Raise stale cumulative fills from ``query_stock_trades`` (best effort).
+        """Merge unique ``query_stock_trades`` executions into order fills.
 
-        Trades only ever increase ``filled_quantity`` up to the order
-        quantity; they never create orders, lower fills, or change status.
-        Any failure warns; R10 does not fabricate trade data.
+        The trade endpoint shares the callback execution ledger, keyed by
+        broker ``traded_id``: repeated resyncs and callback/query overlap are
+        therefore idempotent, and multi-price executions produce a VWAP.
+        Trades never create orders, lower fills, or change lifecycle status.
+        The preceding cumulative order-query snapshot remains the fallback
+        for rows without a traded_id, because such rows cannot be deduplicated
+        safely across polls. Any query/parsing failure warns and leaves the
+        order-query values in place.
         """
         from quant_platform.trading.qmt_utils import qmt_trade_to_dict
 
@@ -1656,53 +1699,51 @@ class QMTBroker(BrokerInterface):
             )
             return
 
-        traded_by_order: dict[str, int] = {}
+        orders_by_broker_id = {
+            str(order.broker_order_id): order for order in self._orders
+            if str(order.broker_order_id or "")
+        }
         for raw in trades:
             d = qmt_trade_to_dict(raw)
             broker_id = str(d.get("order_id", "") or "")
-            if not broker_id:
+            order = orders_by_broker_id.get(broker_id)
+            if order is None:
+                continue
+            trade_id = str(d.get("trade_id", "") or "")
+            if not trade_id:
+                logger.warning(
+                    "QMT resync: trade for order %s has no traded_id; "
+                    "keeping the cumulative order-query fill snapshot",
+                    broker_id,
+                )
                 continue
             volume = self._as_int(d.get("quantity", d.get("volume")), 0)
-            if volume > 0:
-                traded_by_order[broker_id] = (
-                    traded_by_order.get(broker_id, 0) + volume
-                )
-
-        for order in self._orders:
-            traded = traded_by_order.get(str(order.broker_order_id or ""))
-            if traded is None:
+            if volume <= 0:
                 continue
-            current = int(order.filled_quantity or 0)
-            if traded <= current:
-                continue
-            if order.quantity > 0:
-                traded = min(traded, int(order.quantity))
-            if traded > current:
-                logger.info(
-                    "QMT resync: trades report %d filled for order %s (had %d)",
-                    traded, order.order_id, current,
-                )
-                order.filled_quantity = traded
+            price = self._as_float(d.get("price"), 0.0)
+            if self._record_unique_execution(order, trade_id, volume, price):
                 order.updated_at = datetime.now().isoformat()
 
-    def _maybe_resync(self) -> None:
+    def _maybe_resync(self) -> bool:
         """Refresh the order book from the broker at most once per TTL.
 
-        The TTL also rate-limits failed attempts: a broken query endpoint is
-        retried at most once per ``resync_ttl`` seconds rather than on every
-        poll. Failures degrade to the in-memory book (warning only).
+        The TTL also rate-limits failed attempts. The return value tells
+        order-generation callers whether the current book is authoritative;
+        display callers may still use the in-memory cache after a failure.
         """
         now = self._clock_fn()
         last = self._last_resync_at
         if last is not None and (now - last) < self._resync_ttl:
-            return
+            return getattr(self, "_last_resync_ok", False)
         self._last_resync_at = now
         try:
-            self._resync_from_broker()
+            self._last_resync_ok = self._resync_from_broker()
         except Exception as e:
+            self._last_resync_ok = False
             logger.warning(
                 "QMT resync failed unexpectedly: %s — serving cached orders", e,
             )
+        return self._last_resync_ok
 
     # ── Order lifecycle ──
 
@@ -1740,6 +1781,7 @@ class QMTBroker(BrokerInterface):
         """
         self._ensure_connected()
 
+        submission_started = False
         try:
             from quant_platform.trading.qmt_utils import to_qmt_code, to_qmt_order_type, to_qmt_price_type
 
@@ -1752,12 +1794,13 @@ class QMTBroker(BrokerInterface):
             if order.order_type == OrderType.MARKET:
                 price = 0.0  # QMT uses 0 for market orders
 
+            submission_started = True
             broker_id = self._trader.order_stock(
                 account=self._account,
                 stock_code=stock_code,
                 order_type=xt_order_type,
                 order_volume=order.quantity,
-                strategy_name="quant_platform",
+                strategy_name=f"quant_platform:{order.order_id}",
                 price_type=xt_price_type,
                 price=price,
             )
@@ -1808,11 +1851,33 @@ class QMTBroker(BrokerInterface):
             return order
 
         except Exception as e:
-            order.status = OrderStatus.REJECTED
-            order.error_msg = str(e)
+            # Once order_stock has been entered, an exception can mean the
+            # broker accepted the order but the response was lost. Recording
+            # that as a definite rejection invites a duplicate retry. Keep the
+            # intent pending and reconcile it by its embedded local order id.
             order.updated_at = datetime.now().isoformat()
             with self._resync_lock:
-                self._orders.append(order)
+                # A resync can recover the broker order between order_stock()
+                # raising and this handler. It uses the same local intent id;
+                # never append a second PENDING entry for that recovered order.
+                tracked = next(
+                    (o for o in self._orders if o.order_id == order.order_id),
+                    None,
+                )
+                if tracked is not None and tracked is not order:
+                    order = tracked
+                else:
+                    order.status = (
+                        OrderStatus.PENDING if submission_started
+                        else OrderStatus.REJECTED
+                    )
+                    order.error_msg = (
+                        f"QMT submission outcome UNKNOWN; reconcile before retry: {e}"
+                        if submission_started else str(e)
+                    )
+                    order.updated_at = datetime.now().isoformat()
+                    if tracked is None:
+                        self._orders.append(order)
             logger.error("QMT place_order error: %s", e)
             return order
 
@@ -1861,11 +1926,10 @@ class QMTBroker(BrokerInterface):
         ``BrokerConnectionError`` (fail loud: a fabricated flat book is more
         dangerous than an error).
 
-        Returns the cached book when the query raises, and **None** when the
-        terminal answers with no result at all. None means "unknown":
-        `query_stock_positions` returning None used to be converted to `[]`,
-        which the engine and health check read as a flat account -- one
-        transient failure made the engine buy a duplicate stake and prune the
+        Returns **None** when the query fails or the terminal answers with no
+        result. None means "unknown": a cached book is display-only and must
+        never be mistaken for a confirmed flat account. Treating a failed
+        query as ``[]`` made the engine buy a duplicate stake and prune the
         persisted book (D6).
         """
         self._ensure_connected()
@@ -1895,8 +1959,8 @@ class QMTBroker(BrokerInterface):
             return positions
 
         except Exception as e:
-            logger.error("QMT query positions failed: %s", e)
-            return list(self._positions.values())
+            logger.error("QMT query positions failed: %s; reporting UNKNOWN", e)
+            return None
 
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
         """Return tracked orders, refreshed from the broker at most per TTL.
@@ -1921,13 +1985,26 @@ class QMTBroker(BrokerInterface):
             return [o for o in self._orders if o.status == status]
         return list(self._orders)
 
+    def get_orders_authoritative(self) -> list[Order] | None:
+        """Return the order book only when its latest resync succeeded.
+
+        Display callers may use ``get_orders`` and its last-known cache. Order
+        generation must instead distinguish a real empty book from an
+        unreachable broker, otherwise an open order can be duplicated after a
+        restart or query outage.
+        """
+        self._ensure_connected()
+        if not self._maybe_resync():
+            return None
+        return list(self._orders)
+
     def get_account(self) -> dict:
         """Get account balance from QMT.
 
         Reconnects first; when the broker stays unreachable this raises
-        ``BrokerConnectionError`` (fail loud rather than serving a synthetic
-        balance). Falls back to internal cash tracking when the asset query
-        itself fails.
+        ``BrokerConnectionError``. Asset or position query failures also
+        raise: cached cash/positions are display-only and cannot be used for
+        sizing or reconciliation as if they were authoritative.
         """
         self._ensure_connected()
 
@@ -1940,33 +2017,29 @@ class QMTBroker(BrokerInterface):
 
         try:
             asset = self._trader.query_stock_asset(self._account)
-            if asset is not None:
-                cash = getattr(asset, "cash", 0.0) or getattr(asset, "enable_balance", 0.0)
-                market_value = getattr(asset, "market_value", 0.0)
-                total = getattr(asset, "total_asset", cash + market_value)
-                self._cash = cash
-                self._market_value = market_value
-                return {
-                    **base,
-                    "cash": round(cash, 2),
-                    "market_value": round(market_value, 2),
-                    "total_equity": round(total, 2),
-                    "initial_cash": self._initial_cash,
-                    "total_pnl": round(total - self._initial_cash, 2),
-                    "n_positions": len(self.get_positions() or []),
-                }
-
         except Exception as e:
-            logger.warning("QMT account query failed: %s", e)
+            raise self.BrokerConnectionError(
+                f"QMT account query failed: {e}"
+            ) from e
+        if asset is None:
+            raise self.BrokerConnectionError(
+                "QMT account query returned no result; account state UNKNOWN"
+            )
 
-        # Fallback
-        positions = self.get_positions() or []
-        mkt_val = sum(p.market_value for p in positions)
-        total = self._cash + mkt_val
+        cash = getattr(asset, "cash", 0.0) or getattr(asset, "enable_balance", 0.0)
+        market_value = getattr(asset, "market_value", 0.0)
+        total = getattr(asset, "total_asset", cash + market_value)
+        positions = self.get_positions()
+        if positions is None:
+            raise self.BrokerConnectionError(
+                "QMT position query failed; account state UNKNOWN"
+            )
+        self._cash = cash
+        self._market_value = market_value
         return {
             **base,
-            "cash": round(self._cash, 2),
-            "market_value": round(mkt_val, 2),
+            "cash": round(cash, 2),
+            "market_value": round(market_value, 2),
             "total_equity": round(total, 2),
             "initial_cash": self._initial_cash,
             "total_pnl": round(total - self._initial_cash, 2),
@@ -1975,13 +2048,57 @@ class QMTBroker(BrokerInterface):
 
     # ── Internals ──
 
+    @staticmethod
+    def _qmt_quote_age_seconds(timetag: Any, now: datetime | None = None) -> float | None:
+        """Age of a QMT tick in seconds, or None when it cannot be validated.
+
+        Calendar-form QMT values are exchange-local (Asia/Shanghai), never
+        interpreted in the host's timezone. ``now`` is an explicit test hook.
+        """
+        if timetag is None:
+            return None
+        try:
+            shanghai = ZoneInfo("Asia/Shanghai")
+            if isinstance(timetag, (int, float)):
+                text = str(int(timetag))
+            else:
+                text = str(timetag).strip()
+            if not text:
+                return None
+            if text.isdigit() and len(text) >= 14 and text.startswith("20"):
+                quoted_at = datetime.strptime(
+                    text[:14], "%Y%m%d%H%M%S",
+                ).replace(tzinfo=shanghai)
+                current = now or datetime.now(shanghai)
+                if current.tzinfo is None:
+                    current = current.replace(tzinfo=shanghai)
+                return (current - quoted_at).total_seconds()
+            if text.replace(".", "", 1).isdigit():
+                epoch = float(text)
+                if epoch > 1e12:
+                    epoch /= 1000.0
+                if epoch <= 0:
+                    return None
+                current_ts = (now.timestamp() if now is not None
+                              else datetime.now().timestamp())
+                return current_ts - epoch
+            quoted_at = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if quoted_at.tzinfo is None:
+                quoted_at = quoted_at.replace(tzinfo=shanghai)
+            current = now or datetime.now(quoted_at.tzinfo)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=quoted_at.tzinfo)
+            return (current - quoted_at).total_seconds()
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
     def get_quotes(self, codes: list[str]) -> dict[str, float]:
         """Fetch fresh last prices for ``codes`` from QMT market data.
 
         This is the quote feed a live run must use. Returns an empty mapping
-        when xtdata is unavailable or the query fails -- the caller must treat
-        that as "no fresh quote" and skip the cycle rather than inventing a
-        price.
+        when xtdata is unavailable, the query fails, or ticks have no valid
+        recent ``timetag`` -- the caller must treat that as "no fresh quote"
+        and skip the cycle rather than inventing a price.
         """
         if not codes:
             return {}
@@ -2001,6 +2118,17 @@ class QMTBroker(BrokerInterface):
                     tick.get("lastPrice") if isinstance(tick, dict)
                     else getattr(tick, "lastPrice", None)
                 )
+                timetag = (
+                    tick.get("timetag", tick.get("time")) if isinstance(tick, dict)
+                    else getattr(tick, "timetag", getattr(tick, "time", None))
+                )
+                age = self._qmt_quote_age_seconds(timetag)
+                if age is None or age > 120.0 or age < -60.0:
+                    logger.warning(
+                        "Dropping stale/undated QMT tick for %s: %r",
+                        qmt_code, timetag,
+                    )
+                    continue
                 try:
                     price = float(raw_price)
                 except (TypeError, ValueError):
@@ -2024,6 +2152,139 @@ class QMTBroker(BrokerInterface):
         if order_id:
             logger.debug("QMT placement ACK: %s", order_id)
             self._publish_event("qmt.order_ack", {"order_id": str(order_id)})
+
+    def _fill_tracking_for(
+        self, broker_order_id: str,
+    ) -> tuple[dict[str, Any], dict[str, tuple[int, float]]]:
+        """Return the cumulative-snapshot and unique-execution state.
+
+        A few embedded callers/tests construct QMTBroker with ``__new__``;
+        lazy initialization keeps the callback boundary compatible with them.
+        """
+        snapshots = getattr(self, "_order_fill_snapshots", None)
+        if snapshots is None:
+            snapshots = self._order_fill_snapshots = {}
+        executions = getattr(self, "_order_executions", None)
+        if executions is None:
+            executions = self._order_executions = {}
+        return (
+            snapshots.setdefault(
+                broker_order_id, {"quantity": 0, "price": 0.0},
+            ),
+            executions.setdefault(broker_order_id, {}),
+        )
+
+    def _refresh_order_fill_accounting(self, order: Order) -> None:
+        """Merge cumulative order evidence with unique trade executions.
+
+        Quantity is the maximum of the previous quantity, the latest
+        cumulative XtOrder snapshot and the sum of unique XtTrade executions
+        (capped at the order quantity). The two broker channels describe the
+        same fills and must never be added together.
+
+        When unique executions explain the whole filled quantity, their
+        quantity-weighted average is the fill price. If some executions were
+        missed, the cumulative XtOrder average covers more shares and takes
+        precedence. Existing/known prices are retained as a fallback when
+        neither source covers the full quantity; a partial print is never
+        presented as the VWAP of the whole order.
+        """
+        broker_order_id = str(order.broker_order_id or "")
+        if not broker_order_id:
+            return
+        snapshot, executions = self._fill_tracking_for(broker_order_id)
+        current = max(0, int(order.filled_quantity or 0))
+        snapshot_quantity = max(0, int(snapshot.get("quantity", 0) or 0))
+        execution_quantity = sum(
+            max(0, int(quantity)) for quantity, _price in executions.values()
+        )
+        filled = max(current, snapshot_quantity, execution_quantity)
+        if order.quantity > 0:
+            filled = min(filled, int(order.quantity))
+
+        execution_value = sum(
+            quantity * price
+            for quantity, price in executions.values()
+            if quantity > 0 and price > 0
+        )
+        priced_execution_quantity = sum(
+            quantity for quantity, price in executions.values()
+            if quantity > 0 and price > 0
+        )
+        all_executions_priced = (
+            execution_quantity > 0
+            and priced_execution_quantity == execution_quantity
+        )
+        execution_vwap = (
+            execution_value / priced_execution_quantity
+            if priced_execution_quantity > 0 else 0.0
+        )
+        snapshot_price = float(snapshot.get("price", 0.0) or 0.0)
+        current_price = float(order.filled_price or 0.0)
+
+        if execution_quantity >= filled and all_executions_priced:
+            filled_price = execution_value / execution_quantity
+        elif (
+            snapshot_quantity >= filled and snapshot_quantity > 0
+            and snapshot_price > 0
+        ):
+            filled_price = snapshot_price
+        elif filled == current and current_price > 0:
+            filled_price = current_price
+        elif snapshot_quantity > 0 and snapshot_price > 0:
+            # Incomplete trade coverage: this is the broker's cumulative
+            # average for the snapshot quantity, not a latest-print guess.
+            filled_price = snapshot_price
+        elif execution_vwap > 0:
+            filled_price = execution_vwap
+        else:
+            filled_price = current_price
+
+        order.filled_quantity = filled
+        if filled > 0 and filled_price > 0:
+            order.filled_price = filled_price
+
+    def _record_order_fill_snapshot(
+        self, order: Order, traded_volume: int, traded_price: float,
+    ) -> None:
+        """Record a monotonic XtOrder cumulative fill snapshot."""
+        broker_order_id = str(order.broker_order_id or "")
+        if not broker_order_id:
+            return
+        snapshot, _executions = self._fill_tracking_for(broker_order_id)
+        traded = max(0, int(traded_volume or 0))
+        if order.quantity > 0:
+            traded = min(traded, int(order.quantity))
+        previous = int(snapshot.get("quantity", 0) or 0)
+        if traded < previous:
+            return  # stale cumulative snapshot: never shrink quantity/price
+        if traded == previous:
+            if traded > 0 and traded_price > 0:
+                snapshot["price"] = float(traded_price)
+        else:
+            snapshot["quantity"] = traded
+            # A previous average does not describe newly added executions.
+            snapshot["price"] = (
+                float(traded_price)
+                if traded > 0 and traded_price > 0 else 0.0
+            )
+        self._refresh_order_fill_accounting(order)
+
+    def _record_unique_execution(
+        self, order: Order, trade_id: str, volume: int, price: float,
+    ) -> bool:
+        """Add one broker trade id; return False for an already-seen id."""
+        broker_order_id = str(order.broker_order_id or "")
+        if not broker_order_id or not trade_id:
+            return False
+        _snapshot, executions = self._fill_tracking_for(broker_order_id)
+        if trade_id in executions:
+            return False
+        executions[trade_id] = (
+            int(volume), float(price) if price > 0 else 0.0,
+        )
+        self._refresh_order_fill_accounting(order)
+        return True
 
     def _on_order_update(self, xt_order: Any) -> None:
         """Apply an XtOrder status update to the tracked order.
@@ -2070,19 +2331,25 @@ class QMTBroker(BrokerInterface):
                     )
                     break
                 order.status = status
-                if traded > 0:
-                    order.filled_quantity = max(
-                        int(order.filled_quantity or 0), traded,
-                    )
-                    if traded_price > 0:
-                        order.filled_price = traded_price
+                self._record_order_fill_snapshot(order, traded, traded_price)
                 order.updated_at = datetime.now().isoformat()
                 self._publish_event("qmt.order_update", order.to_dict())
                 break
 
     def _on_trade(self, xt_trade: Any) -> None:
-        """Apply an XtTrade fill report to the tracked order."""
+        """Apply one uniquely identified XtTrade execution.
+
+        ``traded_id`` is mandatory for incremental accounting. Without it a
+        repeated callback cannot be distinguished from a new execution, so
+        the conservative fallback is to leave quantity/price unchanged and
+        rely on the cumulative XtOrder callback or the next broker resync.
+        """
         broker_order_id = str(getattr(xt_trade, "order_id", ""))
+        trade_id = str(
+            getattr(xt_trade, "traded_id", "")
+            or getattr(xt_trade, "trade_id", "")
+            or ""
+        )
         volume = int(
             getattr(xt_trade, "traded_volume", 0)
             or getattr(xt_trade, "volume", 0)
@@ -2098,16 +2365,26 @@ class QMTBroker(BrokerInterface):
 
         for order in self._orders:
             if str(order.broker_order_id) == broker_order_id:
-                order.filled_quantity = min(
-                    order.quantity, int(order.filled_quantity or 0) + volume,
-                )
-                if price > 0:
-                    order.filled_price = price
-                order.status = (
-                    OrderStatus.FILLED
-                    if order.filled_quantity >= order.quantity
-                    else OrderStatus.PARTIAL
-                )
+                if not trade_id:
+                    logger.warning(
+                        "QMT trade for order %s has no traded_id; refusing "
+                        "non-idempotent incremental accounting and waiting "
+                        "for the cumulative order snapshot/resync",
+                        broker_order_id,
+                    )
+                    return
+                if not self._record_unique_execution(
+                    order, trade_id, volume, price,
+                ):
+                    return  # duplicate broker execution report
+                if order.status not in self._TERMINAL_STATUSES:
+                    order.status = (
+                        OrderStatus.FILLED
+                        if order.filled_quantity >= order.quantity
+                        else OrderStatus.PARTIAL
+                    )
+                # A late print may add quantity to a partially cancelled
+                # order, but it must not resurrect its terminal lifecycle.
                 order.updated_at = datetime.now().isoformat()
                 self._publish_event("qmt.trade", order.to_dict())
                 break

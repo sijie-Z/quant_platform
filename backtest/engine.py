@@ -725,11 +725,12 @@ class BacktestEngine:
         """Simulate daily P&L with costs and an execution-day tradability gate.
 
         ``daily_volume`` is a share-volume panel (provider unit). When
-        ``raw_prices`` (unadjusted CNY close) is supplied it is converted to
-        CNY (volume x raw close) before being handed to the cost model, whose
-        ``daily_volume`` argument is documented in CNY. Without
-        ``raw_prices`` the panel is dropped (warning) so the cost model falls
-        back to its fixed slippage instead of treating share counts as CNY.
+        ``raw_prices`` (unadjusted CNY close) is supplied, their product is
+        converted to causal CNY ADV using a 60-session median (minimum 20
+        observations) shifted one session before being handed to the cost
+        model. Without ``raw_prices`` the panel is dropped (warning) so the
+        cost model falls back to its fixed slippage instead of treating share
+        counts as CNY.
 
         Between executions, weights drift with price movements. On an
         execution date, the new weights take effect at that close, turnover is
@@ -746,13 +747,13 @@ class BacktestEngine:
         until they fill or a newer rebalance supersedes them; no cost or
         turnover is booked for a blocked trade.
 
-        R18: sells settle before buys and buys are capped by the cash they
-        release. If a blocked sell (or a cash-less book) would make the
-        requested buys exceed ``max(0, 1 - sum(weights after sells))``, all
-        buys are scaled by one common factor, the unfilled remainder stays
-        deferred, and the day is counted in ``n_funding_scaled_days``. The
-        executed book therefore never carries cost-free leverage
-        (``sum(weights) <= 1 + 1e-9``).
+        R18: sells settle before buys and buys are capped first by the gross
+        cash released, then by a conservative reserve for their estimated
+        transaction costs. If a blocked sell leaves insufficient gross cash,
+        the unfilled remainder stays deferred and the day is counted in
+        ``n_funding_scaled_days``. Cost-only sizing does not create endless
+        retries of an ideal fully-invested target. Executed positions and cash
+        are subsequently normalized by NAV after the same single cost debit.
         """
         all_dates = returns.index.sort_values()
         columns = returns.columns
@@ -804,6 +805,16 @@ class BacktestEngine:
                 if daily_volume is not None and raw_prices is not None
                 else None
             )
+            if volume_panel is not None and price_panel is not None:
+                # Cost participation uses causal ADV, not the execution day's
+                # realized volume. Row d contains only CNY amounts through
+                # d-1; zero/missing results are handled per asset downstream.
+                volume_panel = (
+                    (volume_panel * price_panel)
+                    .rolling(60, min_periods=20)
+                    .median()
+                    .shift(1)
+                )
 
         vol_panel = self._align_float(volatility, all_dates, columns)
         if (
@@ -957,71 +968,78 @@ class BacktestEngine:
                                 )
 
                 if turnover > 0 and capital > 0:
-                    # `turnover` is one-sided (the convention documented in
-                    # portfolio/constraints.py); the cost model is handed the
-                    # actual per-asset buy/sell *CNY notionals* so commission,
-                    # the per-order minimum and the sell-side stamp tax are
-                    # each charged exactly once, on the right side.
-                    buy_value = executable_delta.clip(lower=0.0)
-                    sell_value = (-executable_delta).clip(lower=0.0)
-                    buy_notional = buy_value * capital
-                    sell_notional = sell_value * capital
-
                     volume_row = None
                     if volume_panel is not None and date in volume_panel.index:
                         volume_row = volume_panel.loc[date]
-                        if volume_row.notna().any():
-                            volume_row = volume_row.fillna(
-                                float(volume_row.median())
-                            )
-                            if price_panel is not None and date in price_panel.index:
-                                # Shares -> CNY traded value, the cost model's
-                                # documented unit.
-                                volume_row = volume_row * price_panel.loc[date]
-                                if volume_row.notna().any():
-                                    volume_row = volume_row.fillna(
-                                        float(volume_row.median())
-                                    )
-                                else:
-                                    volume_row = None
-                        else:
+                        if not volume_row.notna().any():
                             volume_row = None
 
                     vol_row = None
                     if vol_panel is not None and date in vol_panel.index:
                         vol_row = vol_panel.loc[date]
-                        if vol_row.notna().any():
-                            vol_row = vol_row.fillna(float(vol_row.median()))
-                        else:
+                        if not vol_row.notna().any():
                             vol_row = None
 
-                    costs = self.cost_model.compute_costs(
-                        float(buy_notional.sum() + sell_notional.sum()),
-                        buy_turnover=buy_notional,
-                        sell_turnover=sell_notional,
-                        daily_volume=volume_row,
-                        volatility=vol_row,
-                        date=date,
-                        portfolio_value=capital,
-                    )
-                    rebalance_cost = float(np.sum(costs))
+                    # Estimate once at the gross-funded size. If fees make the
+                    # buys unaffordable, subtract that entire deficit from the
+                    # buy amount and recompute. Every production cost component
+                    # is non-increasing when buys shrink, so using the original
+                    # (larger) cost is a conservative deterministic reserve;
+                    # no iterative fixed-point solve is needed. R18's separate
+                    # funding_scale still governs deferral of gross-cash blocks.
+                    for cost_pass in range(2):
+                        # The cost model receives actual per-asset buy/sell CNY
+                        # notionals, so every component is charged on the right
+                        # side and the returned values are fractions of capital.
+                        buy_value = executable_delta.clip(lower=0.0)
+                        sell_value = (-executable_delta).clip(lower=0.0)
+                        buy_notional = buy_value * capital
+                        sell_notional = sell_value * capital
+                        costs = self.cost_model.compute_costs(
+                            float(buy_notional.sum() + sell_notional.sum()),
+                            buy_turnover=buy_notional,
+                            sell_turnover=sell_notional,
+                            daily_volume=volume_row,
+                            volatility=vol_row,
+                            date=date,
+                            portfolio_value=capital,
+                        )
+                        rebalance_cost = float(np.sum(costs))
+
+                        executed_buys = float(buy_value.sum())
+                        cash_after_costs = (
+                            available_cash - executed_buys - rebalance_cost
+                        )
+                        if (
+                            cost_pass == 1
+                            or executed_buys <= 0.0
+                            or cash_after_costs >= 0.0
+                        ):
+                            break
+
+                        affordable_buys = max(
+                            0.0, executed_buys + cash_after_costs,
+                        )
+                        if affordable_buys <= _FUNDING_TOL:
+                            affordable_buys = 0.0
+                        executable_delta = (
+                            executable_delta.clip(upper=0.0)
+                            + buy_value * (affordable_buys / executed_buys)
+                        )
+                        turnover = float(executable_delta.abs().sum()) / 2.0
+
                     self.total_cost_drag += rebalance_cost
 
-                    # `executable_delta` is indexed by the pending candidate
-                    # subset (blocked assets retried on later days), not by the
-                    # full portfolio. Plain `+` aligns the missing labels to
-                    # NaN and silently wiped every position that was not part
-                    # of today's retry subset.
-                    current_weights = current_weights.add(
-                        executable_delta, fill_value=0.0,
-                    ).clip(lower=0.0)
-                    turnover_records.append((date, turnover))
-                    self._executed_signal_dates.add(pending_rdate)
-                    # Record what was actually executed. Reporting, exposure
-                    # and capacity consume weights_history; storing the
-                    # pre-clamp target made them describe a portfolio that was
-                    # never held.
-                    self.weights_history[pending_rdate] = current_weights.copy()
+                    if turnover > 0:
+                        # `executable_delta` may cover only a retry subset;
+                        # label-aware addition keeps every other position.
+                        current_weights = current_weights.add(
+                            executable_delta, fill_value=0.0,
+                        ).clip(lower=0.0)
+                        turnover_records.append((date, turnover))
+                        self._executed_signal_dates.add(pending_rdate)
+                        # Record the affordable trades, not the pre-clamp target.
+                        self.weights_history[pending_rdate] = current_weights.copy()
 
                 if gates_enabled:
                     blocked = allowed[~allowed & (delta.abs() > 1e-12)].index
@@ -1060,11 +1078,13 @@ class BacktestEngine:
             # and every reported backtest was a daily-rebalanced portfolio.
             if current_weights.sum() > 1e-12:
                 growth = current_weights * (1.0 + daily_ret_assets.fillna(0.0))
-                # Real cash, not a forgotten negative balance: the R18 cash
-                # constraint keeps sum(weights) <= 1 after every execution, so
-                # this is non-negative by construction; max() stays as a
-                # floating-point guard only.
-                cash_weight = max(0.0, 1.0 - float(current_weights.sum()))
+                # Cash also pays the execution cost. The NAV deduction above
+                # and this denominator are two views of the same debit, not
+                # two charges: growth + cash now equals 1 + daily_ret exactly.
+                cash_weight = max(
+                    0.0,
+                    1.0 - float(current_weights.sum()) - rebalance_cost,
+                )
                 total_value = float(growth.sum()) + cash_weight
                 if total_value > 1e-12:
                     current_weights = growth / total_value

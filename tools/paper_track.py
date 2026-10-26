@@ -93,10 +93,13 @@ Rolling mode (``--targets-dir`` / ``--targets``)
 ------------------------------------------------
 Multiple ``daily_signal`` outputs are applied as a rebalance schedule:
 targets are sorted by ``as_of``; the first one builds the book at the close
-of the first cached session strictly after its ``as_of``, and every later
-target rebalances the book at the close of the first session strictly after
-*its* ``as_of``. On a rebalance session the tool marks the old book to that
-close first, then trades **sells first, buys second** at the same close.
+of the next exchange trading session strictly after its ``as_of``, and every
+later target rebalances on its own next exchange session. If that expected
+session is absent while later cached dates exist, the cache is incomplete and
+the run fails rather than executing late. A target whose expected session has
+not arrived yet is pending. On a rebalance session the tool marks the old
+book to that close first, then trades **sells first, buys second** at the same
+close.
 
 Trading is cash-constrained: buys can spend only the cash left after the
 sells plus the existing cash, *and* they must leave enough to pay the
@@ -143,9 +146,11 @@ realised one-sided turnover of an executed rebalance -- half of buys plus
 sells over the pre-cost portfolio value -- and 0 on non-rebalance sessions).
 The rolling ledger is rebuilt from scratch on every run, so the same targets
 and cache produce byte-identical files; an existing non-rolling ledger in
-the out-dir is refused rather than mixed. A growing target schedule (a new
-month) is expected and simply rebuilds the ledger; an existing rolling
-ledger with a different capital, cost mode or stale policy is refused.
+the out-dir is refused rather than mixed. ``summary.json`` persists every
+target's file, ``as_of`` and SHA-256. An existing target schedule must remain
+an unchanged hash prefix: mutation, removal and backdated insertion are
+refused without touching prior outputs, while strictly later targets may be
+appended. Different capital, cost mode or stale policy is also refused.
 
 Idempotent accumulation
 -----------------------
@@ -222,6 +227,7 @@ from quant_platform.backtest.metrics import (
     sharpe_ratio,
     tracking_error,
 )
+from quant_platform.utils.exchange_calendar import is_trading_day
 
 DISCLAIMER = "paper tracking only; style-tilt demo, not validated alpha"
 LEDGER_VERSION = 2
@@ -1430,6 +1436,14 @@ def target_paths_from_list(raw: str) -> list[Path]:
     return paths
 
 
+def _next_exchange_session(as_of: pd.Timestamp) -> pd.Timestamp:
+    """First exchange trading session strictly after ``as_of``."""
+    session = pd.Timestamp(as_of).normalize() + pd.Timedelta(days=1)
+    while not is_trading_day(session.date()):
+        session += pd.Timedelta(days=1)
+    return session
+
+
 def _observation_ok(
     close: pd.DataFrame,
     volume: pd.DataFrame,
@@ -1672,7 +1686,10 @@ def _rebalance_to_target(
             f"{available:.2f})"
         )
     for asset, amount in executed_buys.items():
-        holdings[asset] = holdings.get(asset, 0.0) + float(amount)
+        amount = float(amount)
+        if amount <= 0.0:
+            continue
+        holdings[asset] = holdings.get(asset, 0.0) + amount
     cash = available - buy_cny - cost_cny
     if cash < -tolerance:
         raise PaperTrackError(
@@ -1741,11 +1758,20 @@ def simulate_roll(
                 f"{target.path}: target as_of {target.as_of.date()} is beyond "
                 f"the cache end ({last_cache_date.date()}); no data to track"
             )
-        position = int(dates.searchsorted(target.as_of, side="right"))
+        execution = _next_exchange_session(target.as_of)
+        position = int(dates.searchsorted(execution))
         if position >= len(dates):
             pending.append((target.path, target.as_of))
             continue
-        schedule.append((target, pd.Timestamp(dates[position])))
+        cached = pd.Timestamp(dates[position])
+        if cached != execution:
+            raise PaperTrackError(
+                f"{target.path}: next exchange trading session after as_of "
+                f"{target.as_of.date()} is {execution.date()}, but that session "
+                f"is missing from the cache (next cached date {cached.date()}); "
+                "refusing to execute on a later session"
+            )
+        schedule.append((target, execution))
     if not schedule:
         raise PaperTrackError(
             "no target has an execution session after its as_of in the "
@@ -1763,7 +1789,7 @@ def simulate_roll(
         execution_seen[execution] = target.path
     if pending:
         warnings.append(
-            "pending target(s) with no cached session after as_of: "
+            "pending target(s) whose next exchange session is not cached yet: "
             + ", ".join(
                 f"{path.name} ({as_of.date()})" for path, as_of in pending
             )
@@ -1824,6 +1850,11 @@ def simulate_roll(
                 date, target, holdings, cash, panels, cost_model, date_vol_row,
                 warnings, price_label,
             )
+            if not rebalances and record.n_buys == 0:
+                raise PaperTrackError(
+                    f"{date.date()}: initial rebalance has zero executed buys; "
+                    "refusing to publish an all-cash inception ledger"
+                )
             rebalances.append(record)
             turnover = record.turnover
             costs_paid = record.costs_cny
@@ -1933,6 +1964,7 @@ def build_roll_summary(
     lines: list[str],
     capital: float,
     target_files: list[str],
+    target_identities: list[dict[str, str]],
     targets_sha256: str,
     warnings: list[str],
 ) -> dict[str, Any]:
@@ -1965,6 +1997,7 @@ def build_roll_summary(
         "n_pending_targets": int(len(simulation.pending)),
         "targets_sha256": targets_sha256,
         "target_files": list(target_files),
+        "target_identities": [dict(identity) for identity in target_identities],
         "first_ledger_date": dates[0].strftime("%Y-%m-%d"),
         "last_ledger_date": dates[-1].strftime("%Y-%m-%d"),
         "cache_last_date": simulation.last_cache_date.strftime("%Y-%m-%d"),
@@ -2038,7 +2071,7 @@ def build_roll_summary(
             {
                 "file": path.as_posix(),
                 "as_of": as_of.strftime("%Y-%m-%d"),
-                "reason": "no cached session after as_of yet",
+                "reason": "next exchange session is not cached yet",
             }
             for path, as_of in simulation.pending
         ],
@@ -2050,6 +2083,55 @@ def build_roll_summary(
         # basis is only recorded when it is not the legacy assumption.
         summary["raw_price_mode"] = simulation.raw_price_mode
     return summary
+
+
+def _assert_roll_target_prefix(
+    existing: dict[str, Any],
+    current: list[dict[str, str]],
+    current_digest: str,
+    summary_path: Path,
+) -> None:
+    """Allow only an unchanged historical target prefix plus later targets."""
+    def refuse(reason: str) -> None:
+        raise PaperTrackError(
+            f"{summary_path}: {reason}; rolling targets must remain an "
+            "unchanged hash prefix and only strictly later appends are allowed"
+        )
+
+    previous = existing.get("target_identities")
+    if previous is None:
+        current_files = [identity["file"] for identity in current]
+        if (
+            existing.get("targets_sha256") != current_digest
+            or existing.get("target_files") != current_files
+        ):
+            refuse("the legacy target schedule is not exactly unchanged")
+        # A legacy summary has no per-target prefix to validate. Its exact
+        # digest is sufficient for an idempotent rebuild, but not for appends.
+        return
+    if (
+        not isinstance(previous, list)
+        or not all(isinstance(identity, dict) for identity in previous)
+        or existing.get("n_targets") != len(previous)
+    ):
+        refuse("stored target identities are malformed")
+    if len(current) < len(previous):
+        refuse("the target schedule was shortened")
+    for index, old in enumerate(previous):
+        new = current[index]
+        if any(
+            old.get(key) != new.get(key)
+            for key in ("file", "as_of", "sha256")
+        ):
+            refuse(
+                f"target schedule changed at position {index + 1} "
+                f"({old.get('file')}, {old.get('as_of')})"
+            )
+    if previous and len(current) > len(previous):
+        previous_last = previous[-1].get("as_of")
+        first_append = current[len(previous)]["as_of"]
+        if not isinstance(previous_last, str) or first_append <= previous_last:
+            refuse("every appended target must have a strictly later as_of")
 
 
 def run_roll(
@@ -2076,12 +2158,21 @@ def run_roll(
         raise PaperTrackError("internal error: empty rolling ledger after simulation")
 
     digest = hashlib.sha256()
+    target_identities: list[dict[str, str]] = []
     for target in targets:
-        digest.update(hashlib.sha256(target.path.read_bytes()).digest())
-    target_files = [target.path.as_posix() for target in targets]
+        file_sha256 = hashlib.sha256(target.path.read_bytes()).hexdigest()
+        digest.update(bytes.fromhex(file_sha256))
+        target_identities.append(
+            {
+                "file": target.path.as_posix(),
+                "as_of": target.as_of.strftime("%Y-%m-%d"),
+                "sha256": file_sha256,
+            }
+        )
+    target_files = [identity["file"] for identity in target_identities]
     summary = build_roll_summary(
-        simulation, lines, float(capital), target_files, digest.hexdigest(),
-        list(simulation.warnings),
+        simulation, lines, float(capital), target_files, target_identities,
+        digest.hexdigest(), list(simulation.warnings),
     )
 
     out_dir = Path(out_dir)
@@ -2108,6 +2199,9 @@ def run_roll(
                 f"{summary_path} belongs to a non-rolling paper_track "
                 "ledger; use a new --out-dir"
             )
+        _assert_roll_target_prefix(
+            existing, target_identities, digest.hexdigest(), summary_path,
+        )
         # A growing target schedule is the intended rebuild case, but a
         # different capital / cost mode / stale policy / raw price basis is a
         # configuration mistake that would silently rewrite the whole ledger.

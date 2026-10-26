@@ -23,15 +23,19 @@ STALE_AGE = 3600.0
 
 
 class _StaticMarket:
-    def __init__(self, quotes):
+    def __init__(self, quotes, stale: bool = False):
         self._quotes = quotes
+        self.snapshot_is_stale = stale
 
     def get_quotes(self, universe):
         return list(self._quotes)
 
 
-def _quote(code: str, price: float) -> SimpleNamespace:
-    return SimpleNamespace(code=code, price=price, change_pct=0.0, volume=1000.0)
+def _quote(code: str, price: float, timestamp: str | None = None) -> SimpleNamespace:
+    quote = SimpleNamespace(code=code, price=price, change_pct=0.0, volume=1000.0)
+    if timestamp is not None:
+        quote.timestamp = timestamp
+    return quote
 
 
 def _make_engine(tmp_path, monkeypatch, broker=None,
@@ -87,6 +91,40 @@ def test_only_fresh_quotes_are_passed_to_the_broker(tmp_path, monkeypatch):
     )
     assert engine._quote_is_fresh("600519")
     assert not engine._quote_is_fresh("000001")
+
+
+def test_failed_refresh_does_not_re_certify_cached_quotes(tmp_path, monkeypatch):
+    engine = _make_engine(tmp_path, monkeypatch, patch_fetch=False)
+    engine._current_prices = {"000001": 8.0}
+    engine._price_history = {"000001": [8.0]}
+    engine._price_last_seen = {"000001": time.monotonic() - STALE_AGE}
+    engine._last_prices_update = "previous"
+    engine._last_prices_update_monotonic = time.monotonic() - STALE_AGE
+    engine._rt_market = _StaticMarket(
+        [_quote("000001", 4.0), _quote("600519", 1700.0)], stale=True,
+    )
+
+    engine._fetch_prices()
+
+    assert engine._current_prices == {"000001": 8.0}
+    assert engine._price_history == {"000001": [8.0]}
+    assert "600519" not in engine._price_last_seen
+    assert engine._last_prices_update == "previous"
+    assert not engine._quote_is_fresh("600519")
+
+
+def test_old_source_timestamp_is_not_accepted_as_fresh(tmp_path, monkeypatch):
+    engine = _make_engine(tmp_path, monkeypatch, patch_fetch=False)
+    engine._rt_market = _StaticMarket([
+        _quote("600519", 1700.0, timestamp="2020-01-02T09:30:00"),
+    ])
+
+    engine._fetch_prices()
+
+    assert engine._current_prices == {}
+    assert engine._price_history == {}
+    assert engine._price_last_seen == {}
+    assert not engine._quote_is_fresh("600519")
 
 
 def test_cycle_does_not_trade_a_symbol_with_a_dead_feed(tmp_path, monkeypatch):

@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from quant_platform.data.providers.base import normalize_corporate_actions
+from quant_platform.execution.models import OrderSide, OrderStatus
 from quant_platform.shared.symbols import normalize_symbol, price_limit_threshold
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,43 @@ logger = logging.getLogger(__name__)
 # fill or mark must never use them: shares and cash are denominated in the
 # traded CNY price, and a split/dividend would silently re-scale the book.
 ADJUSTED_PRICE_BASES = frozenset({"qfq", "hfq", "adjusted"})
+
+
+def working_order_quantities(
+    orders, side: OrderSide | None = None, include_partial: bool = True,
+) -> dict[str, int]:
+    """Remaining quantities by canonical symbol for genuinely working orders.
+
+    ``include_partial=False`` is for IOC-style adapters (SimulatedBroker)
+    whose partial fills have already had the unfilled remainder cancelled.
+    QMT partial orders remain working until a terminal status arrives.
+    """
+    active = {OrderStatus.PENDING, OrderStatus.SUBMITTED}
+    if include_partial:
+        active.add(OrderStatus.PARTIAL)
+    remaining: dict[str, int] = {}
+    for order in orders or []:
+        if getattr(order, "status", None) not in active:
+            continue
+        if side is not None and getattr(order, "side", None) != side:
+            continue
+        quantity = int(getattr(order, "quantity", 0) or 0)
+        filled = int(getattr(order, "filled_quantity", 0) or 0)
+        open_quantity = max(0, quantity - filled)
+        if open_quantity > 0:
+            code = normalize_symbol(getattr(order, "code", ""))
+            remaining[code] = remaining.get(code, 0) + open_quantity
+    return remaining
+
+
+def working_order_codes(orders, include_partial: bool = True) -> set[str]:
+    """Canonical symbols with unfilled quantity still working at the broker.
+
+    A submitted order is exposure already committed, even though it is not in
+    the position book yet. Callers use this to suppress duplicate intents
+    until the broker reports a fill or cancellation.
+    """
+    return set(working_order_quantities(orders, include_partial=include_partial))
 
 
 def normalize_corporate_action_feed(actions) -> pd.DataFrame:

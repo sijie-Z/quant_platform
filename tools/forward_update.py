@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Daily forward update with monthly rolling rebalances.
 
 - Refetches Sina prices through today, rebuilds the merged panel.
@@ -108,14 +107,19 @@ def rebuild():
     return merged
 
 
-def is_month_end(latest: pd.Timestamp) -> bool:
-    """True only on the last *exchange* trading day of the month."""
-    from quant_platform.core.exchange_calendar import is_trading_day
+def _month_end(value: pd.Timestamp) -> pd.Timestamp:
+    """Last exchange trading day in the value's month."""
+    from quant_platform.utils.exchange_calendar import is_trading_day
 
-    last = (latest + pd.offsets.MonthEnd(0)).date()
+    last = (pd.Timestamp(value) + pd.offsets.MonthEnd(0)).date()
     while not is_trading_day(last):
         last -= dt.timedelta(days=1)
-    return latest.normalize().date() == last
+    return pd.Timestamp(last)
+
+
+def is_month_end(latest: pd.Timestamp) -> bool:
+    """True only on the last *exchange* trading day of the month."""
+    return latest.normalize().date() == _month_end(latest).date()
 
 
 def latest_target(targets: Path) -> Path | None:
@@ -123,16 +127,52 @@ def latest_target(targets: Path) -> Path | None:
     return files[-1] if files else None
 
 
+def _target_date(path: Path) -> pd.Timestamp:
+    return pd.Timestamp(path.stem[len("target_"):]).normalize()
+
+
+def overdue_month_ends(targets: Path, latest: pd.Timestamp) -> list[pd.Timestamp]:
+    """Missing exchange month-ends after the latest known target."""
+    previous = latest_target(targets)
+    if previous is None:
+        return []
+    latest = pd.Timestamp(latest).normalize()
+    previous_date = _target_date(previous)
+    period = previous_date.to_period("M")
+    last_period = latest.to_period("M") - 1
+    overdue = []
+    while period <= last_period:
+        as_of = _month_end(period.start_time)
+        if previous_date < as_of < latest:
+            overdue.append(as_of)
+        period += 1
+    return overdue
+
+
 _ST_CACHE: dict[str, Path | None] = {}
 
 
-def current_st_codes() -> Path | None:
-    """Snapshot the current ST list from Sina and cache it as a code file.
+def current_st_codes(as_of: pd.Timestamp | None = None) -> Path | None:
+    """Return a current ST snapshot or an exact-dated historical PIT snapshot.
 
     The wide panel has no ST history, so target generation must exclude ST
-    names explicitly; otherwise the frozen book can buy ST stocks (observed
-    on 2026-10-23: 5 of 40 holdings were ST).
+    names explicitly. A partial provider frame is rejected. A historical
+    target may use only ``st_codes_YYYYMMDD.txt`` whose snapshot date equals
+    its as_of; the current ST list is never substituted.
     """
+    if as_of is not None and pd.Timestamp(as_of).date() != dt.date.today():
+        target_date = pd.Timestamp(as_of).date()
+        path = (ROOT / ".scratch" / "orchestrate" /
+                f"st_codes_{target_date:%Y%m%d}.txt")
+        if path.is_file():
+            log(f"ST snapshot: using dated PIT {path.name} for target "
+                f"{target_date}")
+            return path
+        log(f"ST snapshot failed: historical target {target_date} requires a "
+            f"dated PIT ST snapshot with snapshot_date == target as_of; "
+            f"expected {path.name}. The current ST list will not be used "
+            "(fail closed)")
+        return None
     today = dt.date.today().strftime("%Y%m%d")
     if today in _ST_CACHE:
         return _ST_CACHE[today]
@@ -143,10 +183,22 @@ def current_st_codes() -> Path | None:
         df = ak.stock_zh_a_spot()
         name_col = "名称" if "名称" in df.columns else "name"
         code_col = "代码" if "代码" in df.columns else "code"
+        if df.empty or name_col not in df.columns or code_col not in df.columns:
+            raise ValueError("empty or malformed ST snapshot")
+        covered = {str(value)[-6:] for value in df[code_col]}
+        expected = {p.stem[-6:] for p in STOCKS.glob("*.parquet")}
+        missing = sorted(expected - covered)
+        if missing:
+            raise ValueError(
+                f"ST snapshot misses {len(missing)} universe assets: "
+                f"{missing[:10]}"
+            )
         mask = df[name_col].astype(str).str.contains("ST", case=False, na=False)
         codes = sorted({str(value)[-6:] for value in df.loc[mask, code_col]})
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(codes), encoding="utf-8")
-        log(f"ST snapshot: {len(codes)} codes -> {path.name}")
+        log(f"ST snapshot: {len(codes)} codes across {len(covered)} assets "
+            f"-> {path.name}")
     except Exception as exc:  # noqa: BLE001
         log(f"ST snapshot failed ({type(exc).__name__}: {exc}); month-end "
             "target generation will be SKIPPED (fail closed)")
@@ -156,33 +208,61 @@ def current_st_codes() -> Path | None:
 
 
 def ensure_monthly_target(strategy, latest, st_file=None):
+    latest = pd.Timestamp(latest).normalize()
     tdir = strategy["targets"]
     tdir.mkdir(parents=True, exist_ok=True)
-    stamp = latest.strftime("%Y-%m-%d")
-    out = tdir / f"target_{stamp}.json"
-    if out.exists() or not is_month_end(latest):
-        return out if out.exists() else None
-    if st_file is None:
-        log(f"{strategy['name']} month-end target SKIPPED: the ST snapshot "
-            "is unavailable and an unfiltered target is not compliant")
-        return None
-    prev = latest_target(tdir)
-    cmd = [sys.executable, str(ROOT / "tools" / "daily_signal.py"),
-           "--cache", str(MERGED), "--as-of", stamp,
-           "--factors", strategy["factors"], "--industry-map", str(IMAP),
-           "--out-json", str(out), "--out-csv", str(out.with_suffix(".csv"))]
-    if prev is not None:
-        cmd += ["--prev-weights", str(prev)]
-    if st_file is not None:
-        cmd += ["--exclude-codes-file", str(st_file)]
-    r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
-    log(f"{strategy['name']} month-end target {stamp} rc={r.returncode}")
-    if r.returncode != 0:
-        print(r.stderr[-500:])
-        return None
-    if prev is not None:
-        log(f"{strategy['name']} new target chained from {prev.name}")
-    return out
+    current_out = tdir / f"target_{latest:%Y-%m-%d}.json"
+    pending = overdue_month_ends(tdir, latest)
+    if not current_out.exists() and is_month_end(latest):
+        pending.append(latest)
+    if not pending:
+        return current_out if current_out.exists() else None
+
+    generated = None
+    for as_of in pending:
+        stamp = as_of.strftime("%Y-%m-%d")
+        out = tdir / f"target_{stamp}.json"
+        overdue = as_of < latest
+        if overdue:
+            log(f"{strategy['name']} detected overdue month-end target "
+                f"{stamp}; dated-PIT catch-up required")
+            target_st = current_st_codes(as_of)
+            if target_st is None:
+                expected = (ROOT / ".scratch" / "orchestrate" /
+                            f"st_codes_{as_of:%Y%m%d}.txt")
+                raise RuntimeError(
+                    f"{strategy['name']} overdue month-end target {stamp} "
+                    f"is missing: a dated PIT ST snapshot is required with "
+                    f"snapshot_date == target as_of ({stamp}); expected "
+                    f"{expected}. Refusing to apply the current ST list"
+                )
+        else:
+            target_st = st_file
+            if target_st is None:
+                raise RuntimeError(
+                    f"{strategy['name']} month-end target skipped: the ST "
+                    "snapshot is unavailable and an unfiltered target is not "
+                    "compliant"
+                )
+        prev = latest_target(tdir)
+        cmd = [sys.executable, str(ROOT / "tools" / "daily_signal.py"),
+               "--cache", str(MERGED), "--as-of", stamp,
+               "--factors", strategy["factors"], "--industry-map", str(IMAP),
+               "--out-json", str(out), "--out-csv", str(out.with_suffix(".csv"))]
+        if prev is not None:
+            cmd += ["--prev-weights", str(prev)]
+        cmd += ["--exclude-codes-file", str(target_st)]
+        r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+        log(f"{strategy['name']} month-end target {stamp} rc={r.returncode}")
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"{strategy['name']} target generation failed for {stamp}: "
+                f"{(r.stderr or '')[-500:]}"
+            )
+        if prev is not None:
+            log(f"{strategy['name']} new target chained from {prev.name}")
+        generated = out
+    return current_out if current_out.exists() else generated
 
 
 def track(strategy):
@@ -197,6 +277,7 @@ def track(strategy):
     print((r.stdout or "")[-900:])
     if r.returncode != 0:
         print((r.stderr or "")[-400:])
+    return r.returncode
 
 
 def main():
@@ -204,17 +285,25 @@ def main():
     ap.add_argument("--skip-refetch", action="store_true")
     args = ap.parse_args()
     if not args.skip_refetch:
-        refetch()
+        failed = refetch()
+        if failed:
+            log(f"WARNING: {len(failed)} stocks could not be refreshed; "
+                "their last cached rows will be used")
     merged = rebuild()
     latest = merged.index.get_level_values("date").max()
-    st_file = current_st_codes()
+    st_file = current_st_codes(latest) if is_month_end(latest) else None
+    errors = []
     for s in STRATEGIES:
         try:
             ensure_monthly_target(s, latest, st_file)
-            track(s)
+            rc = track(s)
+            if rc != 0:
+                errors.append(f"{s['name']}: paper_track exited {rc}")
         except Exception as exc:  # noqa: BLE001
-            log(f"{s['name']} failed: {type(exc).__name__}: {exc}")
+            errors.append(f"{s['name']}: {type(exc).__name__}: {exc}")
+            log(errors[-1])
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

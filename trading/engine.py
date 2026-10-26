@@ -44,6 +44,7 @@ from quant_platform.risk.healthcheck import (
     install_alert_handler,
 )
 from quant_platform.risk.realtime_engine import RealTimeRiskEngine
+from quant_platform.shared.symbols import normalize_symbol
 from quant_platform.trading.broker import (
     BrokerInterface,
     Order,
@@ -54,6 +55,8 @@ from quant_platform.trading.broker import (
 from quant_platform.trading.live_engine import (
     normalize_corporate_action_feed,
     summarize_corporate_action_events,
+    working_order_codes,
+    working_order_quantities,
 )
 from quant_platform.trading.signal_generator import LiveSignalGenerator
 from quant_platform.trading.signals import (
@@ -1072,8 +1075,19 @@ class LiveTradingEngine:
         if positions is None:
             logger.error("De-risking skipped: position book unknown")
             return
+        orders = self._orders_for_signal_generation()
+        if orders is None:
+            logger.error("De-risking skipped: order book unknown")
+            return
+        working_sells = working_order_quantities(
+            orders, side=OrderSide.SELL,
+            include_partial=not isinstance(self._broker, SimulatedBroker),
+        )
         for pos in positions:
-            quantity = int(pos.available)
+            quantity = max(
+                0, int(pos.available)
+                - working_sells.get(normalize_symbol(pos.code), 0),
+            )
             if quantity <= 0:
                 continue
             # Only price from a fresh quote; otherwise send a market order and
@@ -2630,6 +2644,16 @@ class LiveTradingEngine:
                 self._rt_market = RealTimeMarket()
             rt = self._rt_market
             quotes = rt.get_quotes(self._universe)
+            if getattr(rt, "snapshot_is_stale", False):
+                # RealTimeMarket serves its last good frame after a failed
+                # refresh. Reusing it is fine for display, but stamping those
+                # quotes now would re-certify them as fresh on every cycle.
+                logger.warning("Skipping stale market snapshot for trading")
+                self._bus.publish(
+                    "market.snapshot", {"count": 0, "stale": True},
+                    source="realtime",
+                )
+                return
             updated = 0
             fresh_prices: dict[str, float] = {}
             for q in quotes:
@@ -2639,6 +2663,27 @@ class LiveTradingEngine:
                 if not math.isfinite(price) or price <= 0:
                     logger.warning("Dropping invalid quote for %s: %r", q.code, q.price)
                     continue
+                source_time = getattr(q, "timestamp", None)
+                if source_time:
+                    try:
+                        quoted_at = datetime.fromisoformat(
+                            str(source_time).replace("Z", "+00:00")
+                        )
+                        now = (datetime.now(quoted_at.tzinfo)
+                               if quoted_at.tzinfo is not None else datetime.now())
+                        age = (now - quoted_at).total_seconds()
+                        if age > self._max_quote_age_seconds or age < -60:
+                            logger.warning(
+                                "Dropping out-of-window quote for %s: %s",
+                                q.code, source_time,
+                            )
+                            continue
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Dropping quote with invalid timestamp for %s: %r",
+                            q.code, source_time,
+                        )
+                        continue
                 self._current_prices[q.code] = price
                 # D11: freshness is recorded per symbol. Only these symbols
                 # may be sized/marked from this cycle's data.
@@ -2708,6 +2753,26 @@ class LiveTradingEngine:
             )
         return composite_signal(price_df)
 
+    def _orders_for_signal_generation(self) -> list | None:
+        """Authoritative broker orders, or None when the book is unknown."""
+        try:
+            authoritative = getattr(self._broker, "get_orders_authoritative", None)
+            return (authoritative() if callable(authoritative)
+                    else self._broker.get_orders())
+        except Exception as exc:
+            logger.error("Order book unavailable; refusing new signals: %s", exc)
+            return None
+
+    def _working_order_codes(self) -> set[str] | None:
+        """Symbols with open broker intents, or None when the book is unknown."""
+        orders = self._orders_for_signal_generation()
+        if orders is None:
+            logger.error("Order book unavailable; refusing new signals")
+            return None
+        return working_order_codes(
+            orders, include_partial=not isinstance(self._broker, SimulatedBroker),
+        )
+
     def _generate_signals(self, positions: list | None = None) -> list[TradeSignal]:
         """Generate signals from the shared causal multi-factor composite.
 
@@ -2766,6 +2831,10 @@ class LiveTradingEngine:
         if not target_codes:
             return signals
 
+        working_codes = self._working_order_codes()
+        if working_codes is None:
+            return signals
+
         target_weight = 1.0 / max(len(target_codes), 1)
         position_map = {p.code: p for p in positions}
         current_codes = set(position_map)
@@ -2773,7 +2842,7 @@ class LiveTradingEngine:
 
         # Buy new targets (ranked order is deterministic)
         for code, score in ranked:
-            if code in current_codes:
+            if code in current_codes or normalize_symbol(code) in working_codes:
                 continue
             if self._quote_is_fresh(code):
                 signals.append(TradeSignal(
@@ -2785,6 +2854,8 @@ class LiveTradingEngine:
 
         # Sell removed positions
         for code in sorted(current_codes - target_codes):
+            if normalize_symbol(code) in working_codes:
+                continue
             if self._quote_is_fresh(code):
                 pos = position_map[code]
                 signals.append(TradeSignal(
@@ -2796,6 +2867,8 @@ class LiveTradingEngine:
 
         # Rebalance existing positions (drift > 2%)
         for code in sorted(target_codes & current_codes):
+            if normalize_symbol(code) in working_codes:
+                continue
             if self._quote_is_fresh(code):
                 pos = position_map[code]
                 current_weight = pos.market_value / equity

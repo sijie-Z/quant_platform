@@ -41,17 +41,74 @@ class TestSimulatePnl:
         engine.weights_history = {dates[1]: target}
         engine._simulate_pnl(returns)
 
-        # One-sided turnover is 0.5 (cash -> fully invested), so the two-way
-        # traded value is 1.0 and the cost is 1.0 * commission = 0.001 plus
-        # the B5 both-sides transfer fee (1e-5 of the 1.0 notional) = 0.00101.
-        # (The old figure passed one-sided turnover to a cost model that
-        # expects two-way.)
-        assert engine.portfolio_values.iloc[-1] == pytest.approx(998_990.0)
+        # The candidate 0.00101 cost reserves cash, scaling the purchase to
+        # 0.99899. Recomputed cost is 0.00101 * 0.99899 = 0.0010089799.
+        assert engine.portfolio_values.iloc[-1] == pytest.approx(998_991.0201)
         assert engine.turnover_history is not None
         assert len(engine.turnover_history) == 1
-        # The recorded turnover stays one-sided: it is a metric, not the base
-        # the cost model is fed.
-        assert engine.turnover_history.iloc[0] == pytest.approx(0.5)
+        # One-sided turnover is measured on the affordable executed notional.
+        assert engine.turnover_history.iloc[0] == pytest.approx(0.499495)
+
+    def test_cost_aware_cash_funding_reconciles_nav_weights_and_liquidation(self):
+        dates = pd.date_range("2024-01-01", periods=5, freq="D")
+        returns = pd.DataFrame(0.0, index=dates, columns=["A"])
+        returns.loc[dates[1], "A"] = 0.10
+
+        class RecordingCostModel(CostModel):
+            def __init__(self):
+                super().__init__(
+                    commission=0.01, stamp_tax=0.0, slippage=0.0,
+                    min_commission=0.0, transfer_fee=0.0,
+                )
+                self.trades = []
+
+            def compute_costs(self, turnover, **kwargs):
+                self.trades.append((
+                    float(kwargs["buy_turnover"].sum()),
+                    float(kwargs["sell_turnover"].sum()),
+                ))
+                return super().compute_costs(turnover, **kwargs)
+
+        cost_model = RecordingCostModel()
+        engine = BacktestEngine(
+            initial_capital=1_000.0,
+            rebalance_frequency="monthly",
+            cost_model=cost_model,
+            constraints=PortfolioConstraints(max_turnover=1.0),
+        )
+        engine.weights_history = {
+            dates[0]: pd.Series({"A": 1.0}),
+            dates[2]: pd.Series({"A": 0.0}),
+        }
+
+        engine._simulate_pnl(returns)
+
+        # Candidate cost is 10 on a 1,000 purchase. The deterministic reserve
+        # therefore scales the buy to 990; recomputed cost is 9.90 and cash is
+        # 0.10. After a 10% asset return, NAV is 990*1.10 + 0.10 = 1,089.10.
+        initial = engine.weights_history[dates[0]]
+        assert initial["A"] == pytest.approx(0.99)
+        assert float(initial.sum()) + 0.0099 <= 1.0
+        assert engine.daily_returns.loc[dates[1]] == pytest.approx(0.0891)
+        assert engine.portfolio_values.loc[dates[1]] == pytest.approx(1_089.10)
+
+        # Post-cost drift makes the sale notional exactly 1,089, not a figure
+        # normalized by gross cash. Its 1% fee is 10.89, charged exactly once.
+        assert cost_model.trades[0] == pytest.approx((1_000.0, 0.0))
+        assert cost_model.trades[1] == pytest.approx((990.0, 0.0))
+        assert cost_model.trades[2] == pytest.approx((0.0, 1_089.0))
+        assert engine.portfolio_values.iloc[-1] == pytest.approx(1_078.21)
+        expected_drag = 0.0099 + 10.89 / 1_089.10
+        assert engine.total_cost_drag == pytest.approx(expected_drag)
+
+        # Cost-only sizing neither invokes R18's gross-block counter nor
+        # creates repeated retries of an unreachable fully-invested target.
+        assert engine.n_funding_scaled_days == 0
+        assert list(engine.turnover_history.index) == [dates[1], dates[3]]
+        assert all(
+            float(weights.sum()) <= 1.0 + 1e-12
+            for weights in engine.weights_history.values()
+        )
 
     def test_execution_clamps_turnover_to_the_configured_cap(self):
         dates = pd.date_range("2024-01-01", periods=5, freq="D")
@@ -59,6 +116,10 @@ class TestSimulatePnl:
         engine = BacktestEngine(
             rebalance_frequency="monthly",
             constraints=PortfolioConstraints(max_turnover=0.30),
+            cost_model=CostModel(
+                commission=0.0, stamp_tax=0.0, slippage=0.0,
+                min_commission=0.0, transfer_fee=0.0,
+            ),
         )
         # First rebalance deploys from cash (exempt from the cap); the second
         # swaps half the portfolio, which must be clamped to 30%.
@@ -360,8 +421,9 @@ class TestExecutionTiming:
         signal_date = returns.index[self.SIGNAL_DAY]
         exec_date = returns.index[self.SIGNAL_DAY + 1]
         assert engine.daily_returns.loc[signal_date] == pytest.approx(0.0)
-        # One-sided turnover 0.5 -> two-way 1.0 -> 0.001 of capital.
-        assert engine.daily_returns.loc[exec_date] == pytest.approx(-0.001)
+        # A 0.1% candidate fee reserves cash, leaving a 0.999 purchase and
+        # an executed cost of 0.001 * 0.999 = 0.000999 on the execution date.
+        assert engine.daily_returns.loc[exec_date] == pytest.approx(-0.000999)
 
 
 class TestStampTaxDirection:
@@ -463,7 +525,7 @@ class TestExecutionDayTradability:
 
         assert engine.daily_returns.loc[dates[1]] == pytest.approx(0.0)
         assert list(engine.turnover_history.index) == [dates[2]]
-        assert engine.daily_returns.loc[dates[2]] == pytest.approx(-0.001)
+        assert engine.daily_returns.loc[dates[2]] == pytest.approx(-0.000999)
 
     def test_buy_on_a_suspended_day_is_deferred(self):
         returns, dates = self._flat_returns()
@@ -493,11 +555,13 @@ class TestExecutionDayTradability:
 
         engine._simulate_pnl(returns, limit_down=limit_down)
 
-        # Build executes on dates[1]; the liquidation is blocked on dates[3]
-        # (no turnover, no cost) and fills on dates[4].
+        # Build executes on dates[1] with 999,000 notional, 999 fees and
+        # 1 cash; liquidation is blocked on dates[3] and fills on dates[4].
         assert list(engine.turnover_history.index) == [dates[1], dates[4]]
         assert engine.daily_returns.loc[dates[3]] == pytest.approx(0.0)
-        assert engine.daily_returns.loc[dates[4]] == pytest.approx(-0.001)
+        assert engine.daily_returns.loc[dates[4]] == pytest.approx(
+            -999.0 / 999_001.0
+        )
 
     def test_a_single_gate_panel_does_not_require_the_others(self):
         """Supplying only limit_up must work; the omitted panels are neutral."""
@@ -1070,11 +1134,8 @@ class TestCapacityWiring:
 
 
     def test_share_volume_is_converted_to_cny_for_the_cost_model(self):
-        """R8 redefined run(daily_volume=...) as a share panel. The cost
-        model still expects CNY, so the engine must multiply by the *raw*
-        close before handing the row over (the old pass-through would
-        overstate the participation rate by 1/price)."""
-        dates = pd.date_range("2024-01-01", periods=5, freq="D")
+        """Cost ADV uses shares times raw close, never adjusted prices."""
+        dates = pd.date_range("2024-01-01", periods=65, freq="D")
         returns = pd.DataFrame(0.0, index=dates, columns=["A", "B"])
         raw_prices = pd.DataFrame(10.0, index=dates, columns=["A", "B"])
         volume = pd.DataFrame(1_000_000.0, index=dates, columns=["A", "B"])
@@ -1089,15 +1150,97 @@ class TestCapacityWiring:
             ),
             constraints=PortfolioConstraints(max_turnover=1.0),
         )
-        engine.weights_history = {dates[0]: pd.Series({"A": 1.0, "B": 0.0})}
+        engine.weights_history = {dates[60]: pd.Series({"A": 1.0, "B": 0.0})}
         engine._simulate_pnl(returns, daily_volume=volume, raw_prices=raw_prices)
 
-        # Buy 1,000,000 CNY of A against 10,000,000 CNY daily traded value:
-        # 10% participation -> slippage 0.001 * sqrt(0.10).
-        expected_cost = 0.001 * np.sqrt(1_000_000.0 / (1_000_000.0 * 10.0))
-        assert engine.daily_returns.loc[dates[1]] == pytest.approx(
+        execution_date = dates[61]
+        expected_adv = (
+            (volume * raw_prices).rolling(60, min_periods=20).median().shift(1)
+        )
+        assert expected_adv.loc[execution_date, "A"] == pytest.approx(10_000_000.0)
+        candidate_cost = 0.001 * np.sqrt(1_000_000.0 / 10_000_000.0)
+        funded_weight = 1.0 - candidate_cost
+        expected_cost = candidate_cost * funded_weight**1.5
+        assert engine.daily_returns.loc[execution_date] == pytest.approx(
             -expected_cost
         )
+
+    def test_cost_adv_excludes_execution_day_and_uses_median(self):
+        dates = pd.date_range("2024-01-01", periods=65, freq="D")
+        returns = pd.DataFrame(0.0, index=dates, columns=["A"])
+        raw_prices = pd.DataFrame(10.0, index=dates, columns=["A"])
+        volume = pd.DataFrame(100_000_000.0, index=dates, columns=["A"])
+        # The causal window at dates[61] is rows 1..60: 31 small and
+        # 29 large observations, whose median is 1m shares. Including the
+        # execution day would instead produce a 50.5m-share median.
+        volume.iloc[1:32, 0] = 1_000_000.0
+
+        engine = BacktestEngine(
+            initial_capital=1_000_000,
+            rebalance_frequency="monthly",
+            cost_model=CostModel(
+                commission=0, stamp_tax=0, slippage=0.001,
+                slippage_model="proportional", min_commission=0,
+                transfer_fee=0,
+            ),
+            constraints=PortfolioConstraints(max_turnover=1.0),
+        )
+        engine.weights_history = {dates[60]: pd.Series({"A": 1.0})}
+        engine._simulate_pnl(returns, daily_volume=volume, raw_prices=raw_prices)
+
+        execution_date = dates[61]
+        amount = volume * raw_prices
+        causal_adv = amount.rolling(60, min_periods=20).median().shift(1)
+        unshifted_median = amount.rolling(60, min_periods=20).median()
+        assert causal_adv.loc[execution_date, "A"] == pytest.approx(10_000_000.0)
+        assert unshifted_median.loc[execution_date, "A"] == pytest.approx(
+            505_000_000.0
+        )
+        candidate_cost = 0.001 * np.sqrt(1_000_000.0 / 10_000_000.0)
+        funded_weight = 1.0 - candidate_cost
+        expected_cost = candidate_cost * funded_weight**1.5
+        assert engine.daily_returns.loc[execution_date] == pytest.approx(
+            -expected_cost
+        )
+
+    def test_zero_adv_impact_falls_back_without_nav_blow_up(self):
+        pytest.importorskip("quant_core")
+        dates = pd.date_range("2024-01-01", periods=25, freq="D")
+        returns = pd.DataFrame(0.0, index=dates, columns=["A"])
+        raw_prices = pd.DataFrame(10.0, index=dates, columns=["A"])
+        volume = pd.DataFrame(0.0, index=dates, columns=["A"])
+        volatility = pd.DataFrame(0.02, index=dates, columns=["A"])
+        engine = BacktestEngine(
+            initial_capital=1_000_000,
+            rebalance_frequency="monthly",
+            cost_model=CostModel(
+                commission=0.0003, stamp_tax=0.0, slippage=0.0007,
+                slippage_model="impact",
+            ),
+            constraints=PortfolioConstraints(max_turnover=1.0),
+        )
+        engine.weights_history = {dates[20]: pd.Series({"A": 1.0})}
+
+        engine._simulate_pnl(
+            returns,
+            daily_volume=volume,
+            raw_prices=raw_prices,
+            volatility=volatility,
+        )
+
+        execution_date = dates[21]
+        adv = (volume * raw_prices).rolling(60, min_periods=20).median().shift(1)
+        assert adv.loc[execution_date, "A"] == 0.0  # not an ADV warmup fallback
+        expected_cost = 0.00101 * 0.99899
+        assert engine.daily_returns.loc[execution_date] == pytest.approx(
+            -expected_cost
+        )
+        assert engine.total_cost_drag == pytest.approx(expected_cost)
+        assert engine.portfolio_values.iloc[-1] == pytest.approx(
+            1_000_000.0 * (1.0 - expected_cost)
+        )
+        assert np.isfinite(engine.daily_returns.to_numpy()).all()
+        assert np.isfinite(engine.portfolio_values.to_numpy()).all()
 
 
     def test_capacity_and_slippage_share_the_same_raw_close_basis(self):
@@ -1132,11 +1275,14 @@ class TestCapacityWiring:
         )
 
         expected_cny = volume * raw
+        expected_cost_adv = (
+            expected_cny.rolling(60, min_periods=20).median().shift(1)
+        )
         assert cost_model.volume_by_date, "the cost model never saw a volume"
         for date, row in cost_model.volume_by_date.items():
             pd.testing.assert_series_equal(
                 row.sort_index(),
-                expected_cny.loc[date].sort_index(),
+                expected_cost_adv.loc[date].sort_index(),
                 check_names=False,
             )
 
@@ -1186,9 +1332,9 @@ class TestCapacityWiring:
             "dropping the volume" in record.getMessage()
             for record in caplog.records
         )
-        # Fixed slippage on the 1.0 two-way traded value, not the
-        # participation-based proportional cost.
-        assert engine.daily_returns.loc[dates[1]] == pytest.approx(-0.001)
+        # Fixed-slippage candidate cost reserves 0.001 for cash, leaving a
+        # 0.999 purchase whose actual fixed cost is 0.000999.
+        assert engine.daily_returns.loc[dates[1]] == pytest.approx(-0.000999)
 
 
 class TestWeeklyIsoYearBoundary:

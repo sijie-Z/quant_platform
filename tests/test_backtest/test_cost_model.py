@@ -449,6 +449,29 @@ class TestCostsAreChargedExactlyOnce:
         assert sell == pytest.approx(notional * (common + 0.0005))
         assert swap == pytest.approx(buy + sell)
 
+    def test_impact_sell_cost_decomposes_exactly(self):
+        pytest.importorskip("quant_core")
+        model = CostModel(
+            commission=0.0003, slippage=0.0007, min_commission=0.0,
+            transfer_fee=0.00001, slippage_model="impact",
+        )
+        notional = 1_000_000.0
+        sell = pd.Series({"A": notional})
+
+        cost = model.compute_costs(
+            notional,
+            sell_turnover=sell,
+            daily_volume=pd.Series({"A": 100_000_000.0}),
+            volatility=pd.Series({"A": 0.02}),
+            date="2024-06-03",
+        )
+
+        expected = notional * (
+            0.0003 + 0.00001 + 0.0005 + 0.02 * np.sqrt(0.01)
+        )
+        assert cost.loc["A"] == pytest.approx(expected)
+        assert expected == pytest.approx(2_810.0)
+
 
 class TestImpactCostScalesWithParticipation:
     """R9: with volume (CNY) and volatility supplied, impact slippage grows
@@ -515,6 +538,85 @@ class TestImpactCostScalesWithParticipation:
             "fallback to fixed" in m and "daily_volume" in m
             for m in messages
         ), messages
+
+
+class TestInvalidSlippageInputsFallBack:
+    """Invalid market data uses fixed slippage per asset, never CNY-1 ADV."""
+
+    notional = 1_000_000.0
+    fixed_cost = notional * 0.0007
+
+    @staticmethod
+    def _model(model_name):
+        return CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0007,
+            transfer_fee=0.0, min_commission=0.0,
+            slippage_model=model_name,
+        )
+
+    @pytest.mark.parametrize("model_name", ["impact", "proportional"])
+    def test_mixed_valid_and_invalid_adv_falls_back_per_asset(self, model_name):
+        if model_name == "impact":
+            pytest.importorskip("quant_core")
+        assets = ["valid", "zero", "negative", "nan", "pos_inf", "neg_inf"]
+        traded = pd.Series(self.notional, index=assets)
+        volume = pd.Series(
+            [100_000_000.0, 0.0, -1.0, np.nan, np.inf, -np.inf],
+            index=assets,
+        )
+        kwargs = {"daily_volume": volume}
+        if model_name == "impact":
+            kwargs["volatility"] = pd.Series(0.02, index=assets)
+
+        costs = self._model(model_name).compute_costs(traded, **kwargs)
+
+        participation = self.notional / 100_000_000.0
+        if model_name == "impact":
+            expected_valid = self.notional * 0.02 * np.sqrt(participation)
+        else:
+            expected_valid = self.notional * 0.0007 * np.sqrt(participation)
+        assert costs.loc["valid"] == pytest.approx(expected_valid)
+        assert costs.loc[assets[1:]].to_numpy() == pytest.approx(
+            np.full(len(assets) - 1, self.fixed_cost)
+        )
+        assert np.isfinite(costs.to_numpy()).all()
+
+    def test_mixed_non_finite_volatility_falls_back_per_asset(self):
+        pytest.importorskip("quant_core")
+        assets = ["valid", "nan", "pos_inf", "neg_inf"]
+        traded = pd.Series(self.notional, index=assets)
+        volume = pd.Series(100_000_000.0, index=assets)
+        volatility = pd.Series([0.02, np.nan, np.inf, -np.inf], index=assets)
+
+        costs = self._model("impact").compute_costs(
+            traded, daily_volume=volume, volatility=volatility,
+        )
+
+        assert costs.loc["valid"] == pytest.approx(2_000.0)
+        assert costs.loc[assets[1:]].to_numpy() == pytest.approx(
+            np.full(3, self.fixed_cost)
+        )
+        assert np.isfinite(costs.to_numpy()).all()
+
+    @pytest.mark.parametrize("model_name", ["impact", "proportional"])
+    @pytest.mark.parametrize("bad_volume", [0.0, -1.0, np.nan, np.inf, -np.inf])
+    def test_scalar_invalid_adv_uses_fixed_slippage(self, model_name, bad_volume):
+        if model_name == "impact":
+            pytest.importorskip("quant_core")
+        cost = self._model(model_name).compute_costs(
+            self.notional, daily_volume=bad_volume, volatility=0.02,
+        )
+        assert cost == pytest.approx(self.fixed_cost)
+
+    @pytest.mark.parametrize("bad_volatility", [np.nan, np.inf, -np.inf])
+    def test_scalar_non_finite_volatility_uses_fixed_slippage(self, bad_volatility):
+        pytest.importorskip("quant_core")
+        cost = self._model("impact").compute_costs(
+            self.notional,
+            daily_volume=100_000_000.0,
+            volatility=bad_volatility,
+        )
+        assert cost == pytest.approx(self.fixed_cost)
 
 
 class TestImpactModelSelection:

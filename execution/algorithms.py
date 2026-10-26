@@ -82,9 +82,8 @@ class TWAPAlgorithm:
     ) -> ExecutionPlan:
         """Create TWAP execution plan.
 
-        Slices are whole A-share lots (default 100 shares). Any odd-lot
-        remainder from the parent order is carried by the final slice, so the
-        plan still sums to the parent quantity.
+        Slices are whole A-share lots (default 100 shares). The parent order's
+        odd-lot remainder, if any, is left unexecuted and reported in a warning.
         """
         total_lots = order.quantity // self.lot_size
         num_slices = min(self.num_slices, total_lots) if total_lots > 0 else 0
@@ -305,6 +304,8 @@ class IcebergAlgorithm:
                 slice_qty = (remaining // self.lot_size) * self.lot_size
 
             slice_qty = min(slice_qty, remaining)
+            if slice_qty <= 0:
+                break
             remaining -= slice_qty
 
             target_time = start_time + timedelta(minutes=i * interval)
@@ -320,6 +321,7 @@ class IcebergAlgorithm:
             if remaining <= 0:
                 break
 
+        plan.num_slices = len(plan.slices)
         logger.info("Iceberg plan: %s %s x%d, visible=%d, %d slices",
                      order.side.value, order.ticker, order.quantity,
                      visible_qty, len(plan.slices))

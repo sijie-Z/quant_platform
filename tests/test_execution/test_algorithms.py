@@ -101,6 +101,24 @@ class TestIceberg:
         # Visible should be ~10% of total
         assert plan.slices[0].quantity <= 2000  # with jitter
 
+    @pytest.mark.parametrize("quantity", [1, 50, 99])
+    def test_below_one_lot_produces_no_slices(self, quantity):
+        plan = IcebergAlgorithm().create_plan(
+            make_order(quantity=quantity), start_time=_START,
+        )
+        assert plan.slices == []
+        assert plan.num_slices == 0
+
+    @pytest.mark.parametrize("quantity", [100, 150, 250, 500, 1000, 10_000])
+    def test_slice_count_and_quantities_are_consistent(self, quantity):
+        plan = IcebergAlgorithm().create_plan(
+            make_order(quantity=quantity), start_time=_START,
+        )
+        quantities = [slice_.quantity for slice_ in plan.slices]
+        assert plan.num_slices == len(plan.slices)
+        assert all(qty > 0 and qty % 100 == 0 for qty in quantities)
+        assert sum(quantities) == quantity - quantity % 100
+
 
 class TestSmartRouter:
     def test_small_order_direct(self):

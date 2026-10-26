@@ -48,6 +48,9 @@ docker compose stop        # stop_grace_period: 30s
 | 故障 | 现象 | 处理 |
 |------|------|------|
 | 数据源断开 | log 显示 connection error / `DataFetchIncomplete` | 检查网络/切换备用数据源；真实源默认 fail closed，不要用 `--allow-synthetic-fallback` 掩盖 |
+| 行情快照陈旧 / QMT tick 无有效 `timetag` | log 显示 `Skipping stale market snapshot` 或 `Dropping stale/undated QMT tick` | 本周期不下单；检查实时行情与 miniQMT。旧缓存不会重新标记为新鲜，也不会继续写入信号历史 |
+| QMT 下单超时 / `submission outcome UNKNOWN` | 订单保持 PENDING，提示 `reconcile before retry` | **不要手工重复下单**。先查券商委托；系统会用 `strategy_name=quant_platform:<本地订单号>` 在 resync 时找回原委托，找回前该股票不生成新信号 |
+| 持仓/账户/订单簿查询失败 | `UNKNOWN` / `BrokerConnectionError` | 跳过 sizing 与新信号；缓存账本只用于展示，不能作为空仓或可用现金依据。EOD 对账应为 unknown，而不是假通过 |
 | 调仓失败 | 部分股票未成交 | 回测中未成交目标会顺延到下一个可交易日（`tradable_mask`）；实盘 LiveRunner 每周期重算信号，未成交余量按券商/模拟盘撤单规则处理（SimulatedBroker 会撤销未成交余量），必要时手动补单并记录偏差 |
 | 净值异常下跌 | 单日跌幅 > 10% | 触发 kill switch，检查行情数据 |
 | 系统崩溃 | 进程退出 | 重启，检查 log；Web API 的 `LiveTradingEngine` / daemon 的 `LiveEngine` 从 `engine_state` 恢复持仓/现金/Kill Switch；CLI `main.py trade` 每次新建 broker 账本，**不会恢复上一次会话**，必须与券商/Store 实际持仓对账 |
@@ -251,14 +254,14 @@ python main.py data retention --events-days 90 --signals-days 365 --trades-days 
 **每日流程**（工作日收盘后）
 ```bash
 # 抓新浪数据到当天 → 重建 merged panel → 月末生成新目标 → 重建两个滚动台账
-python .scratch/orchestrate/forward_update.py --track
+python tools/forward_update.py
 ```
 - 数据：`.scratch/wide_sina_2026/stocks/`（300 只、后复权、含 amount/turnover）；
 - 合并面板：`.scratch/orchestrate/merged_wide.parquet`（估值按日 ffill，无 bfill）；
 - 台账：`docs/research/paper_track/forward_2026/`（EP+换手）与 `forward_2026_turnover/`（换手）；
 - 成本：佣金 0.03%（最低 5 元）、印花税按日期、平方根冲击；原始价由 `paper_track --raw-price-mode auto` 自动识别（新浪面板用 `amount/volume`）。
 
-**自动化**：桌面端 Scheduled 任务 `quant-forward-paper-daily`，工作日 16:20 运行；失败写入 `.scratch/orchestrate/forward_update_failures.log`。
+**自动化**：桌面端 Scheduled 任务 `quant-forward-paper-daily`，工作日 16:20 运行；失败写入 `.scratch/orchestrate/forward_update_failures.log`。月末目标生成前会抓取当日 ST 名单并强制排除；快照或目标生成失败、任一台账子进程失败时，主脚本以非零状态退出（fail closed），不得把旧台账当成当日更新成功。
 **首次运行前**：在 Scheduled 页点一次 “Run now” 预授权 Bash 等工具，否则可能停在权限确认。
 
 **已知限制**：宽池只含当前上市股票（幸存者偏差）；PE/PB 为半月频 ffill（≤3 周旧值）；行业映射静态；权重层面不取整手；这是模拟跟踪，不是实盘成交。

@@ -57,6 +57,7 @@ from quant_platform.trading.live_engine import (
     ensure_raw_price_basis,
     normalize_corporate_action_feed,
     summarize_corporate_action_events,
+    working_order_codes,
 )
 from quant_platform.trading.signals import (
     DEFAULT_MIN_SIGNAL_SCORE,
@@ -623,11 +624,24 @@ class LiveRunner:
         held = {
             normalize_symbol(p.code): p for p in self._broker.get_positions()
         }
+        try:
+            authoritative = getattr(self._broker, "get_orders_authoritative", None)
+            orders = (authoritative() if callable(authoritative)
+                      else self._broker.get_orders())
+        except Exception as exc:
+            logger.error("Order book unavailable; refusing new signals: %s", exc)
+            return []
+        if orders is None:
+            logger.error("Order book unavailable; refusing new signals")
+            return []
+        working = working_order_codes(
+            orders, include_partial=not isinstance(self._broker, SimulatedBroker),
+        )
         wanted = {code for code, _score in ranked}
 
         # Exit anything that has dropped out of the target set.
         for ticker, pos in held.items():
-            if ticker in wanted or pos.quantity <= 0:
+            if ticker in wanted or ticker in working or pos.quantity <= 0:
                 continue
             signals.append({
                 "code": ticker,
@@ -639,6 +653,8 @@ class LiveRunner:
 
         # Buy only the shortfall on names we want, not the whole target again.
         for code, score in ranked:
+            if normalize_symbol(code) in working:
+                continue
             price = self._current_prices.get(code, 0)
             if price <= 0:
                 continue

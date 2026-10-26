@@ -210,13 +210,15 @@ class CostModel:
             daily_volume: Average daily traded value per asset in CNY
                 (人民币成交额), **not** a share count. Used by the
                 proportional and impact slippage models; participation is
-                traded CNY / daily traded CNY.
+                traded CNY / daily traded CNY. Zero, negative, and non-finite
+                values use fixed slippage per asset.
             symbol: Instrument symbol for per-instrument cost lookup. For a
                 Series input, either a scalar symbol (single-asset Series) or
                 a sequence of symbols aligned to the Series. When omitted the
                 Series index itself is treated as the symbol list, which is
                 what the backtest engine relies on (B7).
             volatility: Daily volatility for impact model (annualized / sqrt(252)).
+                Non-finite values use fixed slippage per asset.
             buy_turnover: Per-asset buy notional (same units as ``turnover``).
                 When given, commission and slippage are charged on the total
                 two-way value and stamp tax on ``sell_turnover`` only.
@@ -283,12 +285,23 @@ class CostModel:
             # traded value (both in CNY). Series inputs are aligned by label.
             index = _common_index(traded, daily_volume)
             traded_values, volume = _aligned_arrays(traded, daily_volume, index=index)
+            volume = np.asarray(volume, dtype=float)
+            valid_volume = np.isfinite(volume) & (volume > 0)
+            # Never turn missing/illiquid inputs into a CNY 1 denominator:
+            # that makes sqrt(participation) explode. Invalid assets pay the
+            # documented fixed rate while valid assets keep the sized rate.
+            safe_volume = np.clip(np.where(valid_volume, volume, 1.0), 1.0, None)
             participation = np.where(
                 np.asarray(traded_values) != 0,
-                np.asarray(traded_values) / np.clip(volume, 1.0, None),
+                np.asarray(traded_values) / safe_volume,
                 0.0,
             )
-            slippage_cost = traded_values * self.slippage * np.sqrt(participation)
+            slippage_rate = np.where(
+                valid_volume,
+                self.slippage * np.sqrt(participation),
+                self.slippage,
+            )
+            slippage_cost = traded_values * slippage_rate
             if index is not None:
                 slippage_cost = pd.Series(slippage_cost, index=index)
         else:
@@ -396,17 +409,21 @@ class CostModel:
             traded = float(turnover)
             if traded <= 0:
                 return 0.0
+            volume = float(daily_volume)
+            vol = float(volatility)
+            if not np.isfinite(volume) or volume <= 0 or not np.isfinite(vol):
+                return float(self.slippage)
             price = self._IMPACT_REFERENCE_PRICE
             quantity = max(1, int(traded / price))
             # daily_volume is traded value in CNY; the impact model takes a
             # share count, so use the same reference price as for quantity.
-            market_volume = max(1, int(float(daily_volume) / price))
+            market_volume = max(1, int(volume / price))
             cost = self._impact_calculator.calculate(
                 order_quantity=quantity,
                 price=price,
                 side="buy",
                 market_volume=market_volume,
-                volatility=float(volatility),
+                volatility=vol,
             )
             return float(cost.market_impact.total) * quantity / traded
 
@@ -418,12 +435,18 @@ class CostModel:
         traded, volume, vol = _aligned_arrays(
             turnover, daily_volume, volatility, index=index,
         )
+        volume = np.asarray(volume, dtype=float)
+        vol = np.asarray(vol, dtype=float)
+        valid_inputs = np.isfinite(volume) & (volume > 0) & np.isfinite(vol)
+        safe_volume = np.clip(np.where(valid_inputs, volume, 1.0), 1.0, None)
+        safe_vol = np.where(valid_inputs, vol, 0.001)
         participation = np.where(
             np.asarray(traded) != 0,
-            np.abs(np.asarray(traded)) / np.clip(volume, 1.0, None),
+            np.abs(np.asarray(traded)) / safe_volume,
             0.0,
         )
-        rate = np.sqrt(participation) * np.clip(vol, 0.001, None)
+        impact_rate = np.sqrt(participation) * np.clip(safe_vol, 0.001, None)
+        rate = np.where(valid_inputs, impact_rate, self.slippage)
         return pd.Series(rate, index=index) if index is not None else rate
 
     def _init_impact_calculator(self):

@@ -955,6 +955,51 @@ def test_roll_execution_and_rebalance_match_hand_computed_ledger(tool, tmp_path)
     assert summary["disclaimer"] == DISCLAIMER
 
 
+def test_roll_missing_next_exchange_session_is_rejected(tool, tmp_path, capsys):
+    close, volume, pct = make_panel({"A": [10.0] * 4})
+    dates = close.index
+    missing = dates[1]
+    close = close.drop(index=missing)
+    volume = volume.drop(index=missing)
+    pct = pct.drop(index=missing)
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+    ])
+    out_dir = tmp_path / "out"
+
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 2
+    stderr = capsys.readouterr().err
+    assert "next exchange trading session" in stderr
+    assert f"is {missing.date()}" in stderr
+    assert "missing from the cache" in stderr
+    assert f"next cached date {close.index[1].date()}" in stderr
+    assert not out_dir.exists()
+
+
+def test_roll_next_exchange_session_skips_genuine_holiday(tool, tmp_path):
+    close, volume, pct = make_panel(
+        {"A": [10.0] * 4}, start="2023-12-29",
+    )
+    # The synthetic business-day grid includes New Year's Day; the exchange
+    # calendar does not. Removing it must not look like a missing data session.
+    close = close.drop(index=pd.Timestamp("2024-01-01"))
+    volume = volume.drop(index=pd.Timestamp("2024-01-01"))
+    pct = pct.drop(index=pd.Timestamp("2024-01-01"))
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [("2023-12-29", {"A": 0.5})])
+    out_dir = tmp_path / "out"
+
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    nav = read_nav(out_dir)
+    summary = read_summary(out_dir)
+    assert summary["rebalances"][0]["execution_date"] == "2024-01-02"
+    assert list(nav["date"]) == list(dates[1:])
+
+
 def test_roll_impact_cost_matches_square_root_rule(tool, tmp_path):
     # Constant prices -> zero vol, clipped to 0.1% by the impact rule; daily
     # CNY volume = 1e6 shares * 10 CNY = 1e7; 400k notional per asset.
@@ -1089,6 +1134,78 @@ def test_roll_idempotent_rebuild_is_byte_identical(tool, tmp_path):
     assert (out_list / "summary.json").read_bytes() == summary_bytes
 
 
+@pytest.mark.parametrize("case", ["mutation", "removal", "backdated"])
+def test_roll_rejects_changed_target_history_without_touching_outputs(
+    tool, tmp_path, capsys, case,
+):
+    close, volume, pct = make_panel({"A": [10.0] * 8, "B": [10.0] * 8})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    paths = write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+        (dates[4].strftime("%Y-%m-%d"), {"A": 0.25, "B": 0.25}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    nav_bytes = (out_dir / "nav.csv").read_bytes()
+    summary_bytes = (out_dir / "summary.json").read_bytes()
+
+    if case == "mutation":
+        write_target(
+            paths[1], dates[4].strftime("%Y-%m-%d"), {"A": 0.2, "B": 0.3},
+        )
+    elif case == "backdated":
+        write_target(
+            target_dir / "target_backdated.json",
+            dates[2].strftime("%Y-%m-%d"), {"B": 0.25},
+        )
+
+    if case == "removal":
+        result = run_roll_tool(tool, cache, out_dir, targets=paths[:1])
+    else:
+        result = run_roll_tool(tool, cache, out_dir, targets_dir=target_dir)
+    assert result == 2
+    stderr = capsys.readouterr().err
+    assert "unchanged hash prefix" in stderr
+    assert "only strictly later appends are allowed" in stderr
+    assert (out_dir / "nav.csv").read_bytes() == nav_bytes
+    assert (out_dir / "summary.json").read_bytes() == summary_bytes
+
+
+def test_roll_strictly_later_target_append_preserves_identity_prefix(
+    tool, tmp_path,
+):
+    close, volume, pct = make_panel({"A": [10.0] * 8, "B": [10.0] * 8})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    initial = read_summary(out_dir)
+    assert len(initial["target_identities"]) == 1
+
+    write_target(
+        target_dir / "target_01.json", dates[4].strftime("%Y-%m-%d"),
+        {"A": 0.25, "B": 0.25},
+    )
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    summary = read_summary(out_dir)
+    identities = summary["target_identities"]
+    assert len(identities) == 2
+    assert identities[0] == initial["target_identities"][0]
+    assert identities[1]["as_of"] == dates[4].strftime("%Y-%m-%d")
+    assert all(len(identity["sha256"]) == 64 for identity in identities)
+    assert summary["n_targets"] == 2
+    assert summary["n_rebalances"] == 2
+    assert summary["rebalances"][1]["execution_date"] == dates[5].strftime(
+        "%Y-%m-%d"
+    )
+
+
 def test_roll_duplicate_as_of_names_both_files(tool, tmp_path, capsys):
     close, volume, pct = make_panel({"A": [10.0, 10.0, 10.0]})
     dates = close.index
@@ -1143,6 +1260,29 @@ def test_roll_target_beyond_cache_is_rejected(tool, tmp_path, capsys):
     stderr = capsys.readouterr().err
     assert path.name in stderr
     assert "beyond the cache end" in stderr
+    assert not out_dir.exists()
+
+
+def test_roll_initial_zero_fill_fails_without_publishing(tool, tmp_path, capsys):
+    close, volume, pct = make_panel(
+        {"A": [10.0, 10.0, 10.0], "B": [10.0, 10.0, 10.0]},
+        volume={"A": [1_000_000.0, 0.0, 1_000_000.0],
+                "B": [1_000_000.0, 0.0, 1_000_000.0]},
+    )
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5, "B": 0.5}),
+    ])
+    out_dir = tmp_path / "out"
+
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 2
+    stderr = capsys.readouterr().err
+    assert "initial rebalance has zero executed buys" in stderr
+    assert "all-cash inception ledger" in stderr
+    assert not (out_dir / "nav.csv").exists()
+    assert not (out_dir / "summary.json").exists()
     assert not out_dir.exists()
 
 
@@ -1267,13 +1407,16 @@ def test_roll_blocked_sell_and_limit_up_buy_stay_cash_constrained(tool, tmp_path
 
 def test_roll_zero_scale_reports_no_executed_buys(tool, tmp_path):
     # Fully invested book, then a 100% target switch while the old holding is
-    # limit-down and cash is zero: the buy scale collapses to 0 and the record
-    # must not claim a buy that never happened.
+    # limit-down and cash is zero: the buy scale collapses to 0. The unfilled
+    # asset must not become a position or a later stale liquidation.
     close, volume, pct = make_panel(
         {"A": [10.0, 10.0, 10.0, 9.0, 9.0, 9.0],
          "B": [10.0] * 6},
         pct_chg={"A": [np.nan, 0.0, 0.0, -10.0, 0.0, 0.0],
-                 "B": [np.nan, 0.0, 0.0, 0.0, 0.0, 0.0]},
+                 "B": [np.nan, 0.0, 0.0, 0.0, np.nan, np.nan]},
+        volume={"A": [1_000_000.0] * 6,
+                "B": [1_000_000.0, 1_000_000.0, 1_000_000.0,
+                      1_000_000.0, 0.0, 0.0]},
     )
     dates = close.index
     cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
@@ -1283,7 +1426,10 @@ def test_roll_zero_scale_reports_no_executed_buys(tool, tmp_path):
         (dates[2].strftime("%Y-%m-%d"), {"B": 1.0}),
     ])
     out_dir = tmp_path / "out"
-    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    assert run_roll_tool(
+        tool, cache, out_dir, targets_dir=target_dir, max_stale_sessions=1,
+    ) == 0
+    nav = read_nav(out_dir)
     summary = read_summary(out_dir)
     record = summary["rebalances"][1]
     assert record["blocked_sells"] == ["A"]
@@ -1292,6 +1438,9 @@ def test_roll_zero_scale_reports_no_executed_buys(tool, tmp_path):
     assert record["n_buys"] == 0
     assert record["sell_cny"] == 0.0
     assert any("cash constraint scaled" in w for w in summary["warnings"])
+    assert nav["n_positions"].tolist() == [1] * 5
+    assert nav["stale_assets"].tolist() == [0] * 5
+    assert not any("B had no valid price" in w for w in summary["warnings"])
 
 
 def test_roll_refuses_a_different_config_in_the_same_out_dir(tool, tmp_path, capsys):

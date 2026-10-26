@@ -447,6 +447,23 @@ def test_exclude_codes_file_drops_candidates(tool, panels_dir, tmp_path):
     assert any("excluded" in warning for warning in diagnostics["warnings"])
 
 
+def test_exclude_codes_rejects_empty_or_malformed_entries(tool, tmp_path):
+    for content in ("", "[]", "[null]", "[1.5]", "[true]",
+                    '[{"code": "600053"}]', '["not-a-code"]'):
+        path = tmp_path / "bad_exclude.txt"
+        path.write_text(content, encoding="utf-8")
+        with pytest.raises(tool.SignalError):
+            tool.load_excluded_codes(path)
+
+
+def test_exclude_codes_accepts_supported_code_forms(tool, tmp_path):
+    path = tmp_path / "exclude.json"
+    path.write_text(
+        '["sh600053", 600001, "000002.SZ"]', encoding="utf-8",
+    )
+    assert tool.load_excluded_codes(path) == ["000002", "600001", "600053"]
+
+
 def test_stale_cache_warns(tool, panels_dir, tmp_path):
     """A cache that ends long before --as-of must not pass silently."""
     directory, _ = panels_dir

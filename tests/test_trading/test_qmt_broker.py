@@ -297,6 +297,63 @@ class TestQMTBrokerOrders:
         assert result.error_msg
         broker._trader.order_stock.assert_called_once()
 
+    def test_submission_exception_is_unknown_not_definite_rejection(self):
+        broker = self.broker
+        broker._trader.order_stock.side_effect = TimeoutError("response lost")
+        order = Order(code="600519", side=OrderSide.BUY,
+                      order_type=OrderType.LIMIT, quantity=100, price=1800.0)
+
+        result = broker.place_order(order)
+
+        assert result.status == OrderStatus.PENDING
+        assert result.broker_order_id == ""
+        assert "UNKNOWN" in result.error_msg
+        assert broker._trader.order_stock.call_args.kwargs["strategy_name"].endswith(
+            result.order_id
+        )
+
+    def test_submission_unknown_recovers_original_order_by_intent_id(self):
+        broker = self.broker
+        broker._trader.order_stock.side_effect = TimeoutError("response lost")
+        order = Order(code="600519", side=OrderSide.BUY,
+                      order_type=OrderType.LIMIT, quantity=100, price=1800.0)
+        result = broker.place_order(order)
+        xt = _xt_order("9001", status=50)
+        xt.strategy_name = f"quant_platform:{result.order_id}"
+        broker._trader.query_stock_orders.return_value = [xt]
+        broker._trader.query_stock_trades.return_value = []
+
+        assert broker._resync_from_broker() is True
+
+        assert result.broker_order_id == "9001"
+        assert result.status == OrderStatus.SUBMITTED
+        assert result.error_msg == ""
+        assert len(broker._orders) == 1
+
+    def test_submission_timeout_racing_resync_never_duplicates_intent(self):
+        broker = self.broker
+        order = Order(code="600519", side=OrderSide.BUY,
+                      order_type=OrderType.LIMIT, quantity=100, price=1800.0)
+        xt = _xt_order("9001", status=50)
+        xt.strategy_name = f"quant_platform:{order.order_id}"
+        broker._trader.query_stock_orders.return_value = [xt]
+        broker._trader.query_stock_trades.return_value = []
+
+        def accept_then_lose_response(**_kwargs):
+            broker._resync_from_broker()
+            raise TimeoutError("response lost after broker acceptance")
+
+        broker._trader.order_stock.side_effect = accept_then_lose_response
+        result = broker.place_order(order)
+
+        assert len(broker._orders) == 1
+        assert result is broker._orders[0]
+        assert result.broker_order_id == "9001"
+        assert result.status == OrderStatus.SUBMITTED
+        assert broker._resync_from_broker() is True
+        assert len(broker._orders) == 1
+        assert all(o.status != OrderStatus.PENDING for o in broker._orders)
+
     def test_place_order_market(self):
         broker = self.broker
         order = Order(code="300750", side=OrderSide.SELL,
@@ -400,6 +457,38 @@ class TestQMTBrokerQueries:
         assert positions[0].code == "600519"
         assert positions[0].quantity == 100
 
+    def test_position_query_failure_is_unknown_not_cached(self):
+        broker = self.broker
+        broker._positions["600519"] = MagicMock()
+        broker._trader.query_stock_positions.side_effect = RuntimeError("query down")
+
+        assert broker.get_positions() is None
+
+    def test_account_query_failure_raises_instead_of_cached_balance(self):
+        broker = self.broker
+        broker._cash = 5_000_000.0
+        broker._trader.query_stock_asset.side_effect = RuntimeError("asset down")
+
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            broker.get_account()
+
+    def test_account_none_asset_is_unknown(self):
+        broker = self.broker
+        broker._trader.query_stock_asset.return_value = None
+
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            broker.get_account()
+
+    def test_account_position_failure_is_unknown_even_with_asset(self):
+        broker = self.broker
+        asset = MagicMock(cash=3_000_000.0, market_value=0.0,
+                          total_asset=3_000_000.0)
+        broker._trader.query_stock_asset.return_value = asset
+        broker._trader.query_stock_positions.side_effect = RuntimeError("positions down")
+
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            broker.get_account()
+
     def test_get_orders_filter_by_status(self):
         broker = self.broker
         o1 = Order(code="600519", side=OrderSide.BUY, quantity=100, price=1800.0)
@@ -411,6 +500,58 @@ class TestQMTBrokerQueries:
         filled = broker.get_orders(status=OrderStatus.FILLED)
         assert len(filled) == 1
         assert filled[0].code == "600519"
+
+
+class TestQmtQuoteFreshness:
+    def setup_method(self):
+        self.broker = QMTBroker(account="sim001")
+        self.broker._connected = True
+
+    def _ticks(self, monkeypatch, ticks):
+        xtdata = SimpleNamespace(get_full_tick=lambda _codes: ticks)
+        monkeypatch.setitem(sys.modules, "xtquant", SimpleNamespace(xtdata=xtdata))
+
+    def test_fresh_epoch_millis_tick_is_accepted(self, monkeypatch):
+        from datetime import datetime
+        tick = {"lastPrice": 10.5,
+                "timetag": datetime.now().timestamp() * 1000}
+        self._ticks(monkeypatch, {"600519.SH": tick})
+        assert self.broker.get_quotes(["600519"]) == {"600519": 10.5}
+
+    def test_old_tick_is_rejected(self, monkeypatch):
+        from datetime import datetime
+        tick = {"lastPrice": 10.5,
+                "timetag": (datetime.now().timestamp() - 3600) * 1000}
+        self._ticks(monkeypatch, {"600519.SH": tick})
+        assert self.broker.get_quotes(["600519"]) == {}
+
+    def test_missing_timetag_is_rejected(self, monkeypatch):
+        self._ticks(monkeypatch, {"600519.SH": {"lastPrice": 10.5}})
+        assert self.broker.get_quotes(["600519"]) == {}
+
+    def test_qmt_datetime_string_is_accepted(self, monkeypatch):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        tick = {"lastPrice": 10.5,
+                "timetag": datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
+                    "%Y%m%d%H%M%S"
+                ) + "000"}
+        self._ticks(monkeypatch, {"600519.SH": tick})
+        assert self.broker.get_quotes(["600519"]) == {"600519": 10.5}
+
+    def test_calendar_timetag_is_shanghai_not_host_timezone(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now_utc = datetime(2026, 10, 26, 2, 0, tzinfo=ZoneInfo("UTC"))
+        age = QMTBroker._qmt_quote_age_seconds("20261026100000", now=now_utc)
+        assert age == pytest.approx(0.0)
+
+    def test_future_tick_is_rejected(self, monkeypatch):
+        from datetime import datetime
+        tick = {"lastPrice": 10.5,
+                "timetag": (datetime.now().timestamp() + 3600) * 1000}
+        self._ticks(monkeypatch, {"600519.SH": tick})
+        assert self.broker.get_quotes(["600519"]) == {}
 
 
 class TestQMTBrokerDisconnect:
@@ -482,6 +623,7 @@ class TestCallbackLifecycle:
 
         class XtTrade:
             order_id = 12345
+            traded_id = "T1"
             traded_volume = 100
             traded_price = 10.5
 
@@ -490,6 +632,102 @@ class TestCallbackLifecycle:
         assert order.status == OrderStatus.FILLED
         assert order.filled_quantity == 100
         assert order.filled_price == 10.5
+
+    @pytest.mark.parametrize("snapshot_first", [True, False])
+    def test_order_snapshot_and_trade_do_not_double_count(
+        self, snapshot_first,
+    ):
+        """XtOrder cumulative volume and its XtTrade are the same shares."""
+        broker, order = self._broker_with_order()
+        order.quantity = 200
+        snapshot = SimpleNamespace(
+            order_id=12345, order_status=55,
+            traded_volume=100, traded_price=10.2,
+        )
+        trade = SimpleNamespace(
+            order_id=12345, traded_id="T-partial",
+            traded_volume=100, traded_price=10.2,
+        )
+
+        if snapshot_first:
+            broker._on_order_update(snapshot)
+            broker._on_trade(trade)
+        else:
+            broker._on_trade(trade)
+            broker._on_order_update(snapshot)
+
+        assert order.filled_quantity == 100
+        assert order.filled_price == pytest.approx(10.2)
+        assert order.status == OrderStatus.PARTIAL
+
+    def test_duplicate_trade_id_is_applied_once(self):
+        broker, order = self._broker_with_order()
+        order.quantity = 300
+        trade = SimpleNamespace(
+            order_id=12345, traded_id="T-duplicate",
+            traded_volume=100, traded_price=10.0,
+        )
+
+        broker._on_trade(trade)
+        broker._on_trade(trade)
+
+        assert order.filled_quantity == 100
+        assert order.filled_price == pytest.approx(10.0)
+        assert order.status == OrderStatus.PARTIAL
+
+    def test_partial_cancellation_keeps_quantity_and_terminal_status(self):
+        broker, order = self._broker_with_order()
+        order.quantity = 200
+        broker._on_order_update(SimpleNamespace(
+            order_id=12345, order_status=53,  # PART_CANCEL
+            traded_volume=100, traded_price=10.0,
+        ))
+        trade = SimpleNamespace(
+            order_id=12345, traded_id="T-before-cancel",
+            traded_volume=100, traded_price=10.0,
+        )
+
+        broker._on_trade(trade)
+        broker._on_trade(trade)  # replay after the terminal snapshot
+
+        assert order.filled_quantity == 100
+        assert order.filled_price == pytest.approx(10.0)
+        assert order.status == OrderStatus.CANCELLED
+
+    def test_multiple_trade_prices_use_quantity_weighted_vwap(self):
+        broker, order = self._broker_with_order()
+        order.quantity = 200
+
+        broker._on_trade(SimpleNamespace(
+            order_id=12345, traded_id="T-cheap",
+            traded_volume=100, traded_price=10.0,
+        ))
+        broker._on_trade(SimpleNamespace(
+            order_id=12345, traded_id="T-expensive",
+            traded_volume=100, traded_price=11.0,
+        ))
+
+        assert order.filled_quantity == 200
+        assert order.filled_price == pytest.approx(10.5)
+        assert order.status == OrderStatus.FILLED
+
+    def test_missing_trade_id_waits_for_cumulative_order_snapshot(self):
+        """An unidentifiable print must not be applied non-idempotently."""
+        broker, order = self._broker_with_order()
+        broker._on_trade(SimpleNamespace(
+            order_id=12345, traded_volume=40, traded_price=10.2,
+        ))
+
+        assert order.filled_quantity == 0
+        assert order.status == OrderStatus.SUBMITTED
+
+        broker._on_order_update(SimpleNamespace(
+            order_id=12345, order_status=55,
+            traded_volume=40, traded_price=10.2,
+        ))
+        assert order.filled_quantity == 40
+        assert order.filled_price == pytest.approx(10.2)
+        assert order.status == OrderStatus.PARTIAL
 
     def test_order_update_applies_status_and_partial_fill(self):
         broker, order = self._broker_with_order()
@@ -849,7 +1087,10 @@ class TestBrokerResync:
             _xt_order("9001", status=50, traded_volume=0),
         ]
         broker._trader.query_stock_trades.return_value = [
-            SimpleNamespace(order_id="9001", traded_volume=60, traded_price=10.1),
+            SimpleNamespace(
+                order_id="9001", traded_id="T-cross-check",
+                traded_volume=60, traded_price=10.1,
+            ),
         ]
 
         broker.get_orders()
@@ -864,13 +1105,65 @@ class TestBrokerResync:
             _xt_order("9001", status=50, traded_volume=0),
         ]
         broker._trader.query_stock_trades.return_value = [
-            SimpleNamespace(order_id="9001", traded_volume=80),
-            SimpleNamespace(order_id="9001", traded_volume=80),
+            SimpleNamespace(
+                order_id="9001", traded_id="T-overfill-1", traded_volume=80,
+            ),
+            SimpleNamespace(
+                order_id="9001", traded_id="T-overfill-2", traded_volume=80,
+            ),
         ]
 
         broker.get_orders()
 
         assert known.filled_quantity == 100
+
+    def test_trade_resync_deduplicates_ids_and_computes_vwap(self):
+        broker, known = self._broker_with_known_order(resync_ttl=0.0)
+        known.quantity = 200
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order("9001", volume=200, status=50, traded_volume=0),
+        ]
+        broker._trader.query_stock_trades.return_value = [
+            SimpleNamespace(
+                order_id="9001", traded_id="T-vwap-1",
+                traded_volume=80, traded_price=10.0,
+            ),
+            SimpleNamespace(
+                order_id="9001", traded_id="T-vwap-2",
+                traded_volume=80, traded_price=12.0,
+            ),
+            SimpleNamespace(  # duplicate row in the same broker response
+                order_id="9001", traded_id="T-vwap-1",
+                traded_volume=80, traded_price=10.0,
+            ),
+        ]
+
+        broker.get_orders()
+        assert known.filled_quantity == 160
+        assert known.filled_price == pytest.approx(11.0)
+
+        broker.get_orders()  # the same full-day trade snapshot is idempotent
+        assert known.filled_quantity == 160
+        assert known.filled_price == pytest.approx(11.0)
+
+    def test_trade_resync_without_id_keeps_cumulative_order_snapshot(self):
+        broker, known = self._broker_with_known_order(resync_ttl=0.0)
+        broker._trader.query_stock_orders.return_value = [
+            _xt_order(
+                "9001", status=55, traded_volume=40, traded_price=10.2,
+            ),
+        ]
+        broker._trader.query_stock_trades.return_value = [
+            SimpleNamespace(
+                order_id="9001", traded_volume=60, traded_price=11.0,
+            ),
+        ]
+
+        broker.get_orders()
+
+        assert known.filled_quantity == 40
+        assert known.filled_price == pytest.approx(10.2)
+        assert known.status == OrderStatus.PARTIAL
 
     def test_trade_query_failure_warns_but_keeps_order_data(self, caplog):
         broker, known = self._broker_with_known_order(resync_ttl=0.0)
@@ -903,6 +1196,22 @@ class TestResyncFailurePolicy:
         assert any(
             "query_stock_orders failed" in r.getMessage() for r in caplog.records
         )
+
+    def test_authoritative_order_book_is_unknown_on_resync_failure(self):
+        broker = _connected_broker()
+        existing = Order(code="600519", side=OrderSide.BUY, quantity=100, price=10.0)
+        broker._orders = [existing]
+        broker._trader.query_stock_orders.side_effect = RuntimeError("boom")
+
+        assert broker.get_orders_authoritative() is None
+        # The display/read path keeps its explicitly last-known cache.
+        assert broker.get_orders() == [existing]
+
+    def test_authoritative_order_book_returns_after_successful_resync(self):
+        broker = _connected_broker()
+        broker._trader.query_stock_orders.return_value = []
+
+        assert broker.get_orders_authoritative() == []
 
     def test_submit_proceeds_when_only_resync_fails(self):
         """Reconnect OK + resync broken -> order is still sent (gateway up)."""
