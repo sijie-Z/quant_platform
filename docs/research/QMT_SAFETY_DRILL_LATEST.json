@@ -1,0 +1,88 @@
+{
+  "timestamp": "2026-10-27T03:04:01",
+  "mode": "simulated fault injection; no real broker connection",
+  "xtquant_installed": false,
+  "real_miniqmt_certified": false,
+  "results": [
+    {
+      "name": "stale_quotes",
+      "status": "PASS",
+      "details": {
+        "old_age_seconds": 3600.0004720687866,
+        "fresh_age_seconds": 0.00047206878662109375,
+        "shanghai_vs_utc_age": 0.0
+      }
+    },
+    {
+      "name": "fill_dedup_vwap",
+      "status": "PASS",
+      "details": {
+        "filled_quantity": 200,
+        "filled_price_vwap": 10.5,
+        "duplicate_trade_ignored": true
+      }
+    },
+    {
+      "name": "partial_cancellation",
+      "status": "PASS",
+      "details": {
+        "filled_quantity": 150,
+        "terminal_status": "cancelled",
+        "ambiguous_incremental_print_not_guessed": true
+      }
+    },
+    {
+      "name": "submission_timeout_race",
+      "status": "PASS",
+      "details": {
+        "tracked_orders": 1,
+        "recovered_broker_id": "b-race",
+        "working_codes": [
+          "600519.SH"
+        ]
+      }
+    },
+    {
+      "name": "kill_switch_delayed_sell",
+      "status": "PASS",
+      "details": {
+        "cycles": 2,
+        "orders_submitted": 1,
+        "quantity": 100
+      }
+    },
+    {
+      "name": "account_fail_closed",
+      "status": "PASS",
+      "details": {
+        "positions_known": false,
+        "account_error": "BrokerConnectionError",
+        "authoritative_orders": null
+      }
+    },
+    {
+      "name": "cost_and_cash_funding",
+      "status": "PASS",
+      "details": {
+        "invalid_adv_cost": 700.0,
+        "initial_weight": 0.99,
+        "final_nav": 1078.2099999999998,
+        "cost_calls": [
+          [
+            1000.0,
+            0.0
+          ],
+          [
+            990.0,
+            0.0
+          ],
+          [
+            0.0,
+            1089.0
+          ]
+        ]
+      }
+    }
+  ],
+  "all_passed": true
+}

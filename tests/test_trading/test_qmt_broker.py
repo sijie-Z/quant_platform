@@ -694,6 +694,30 @@ class TestCallbackLifecycle:
         assert order.filled_price == pytest.approx(10.0)
         assert order.status == OrderStatus.CANCELLED
 
+    def test_cancelled_order_accepts_larger_cumulative_fill_only(self):
+        broker, order = self._broker_with_order()
+        order.quantity = 200
+        broker._on_order_update(SimpleNamespace(
+            order_id=12345, order_status=53,
+            traded_volume=100, traded_price=10.0,
+        ))
+        assert order.status == OrderStatus.CANCELLED
+
+        broker._on_order_update(SimpleNamespace(
+            order_id=12345, order_status=53,
+            traded_volume=150, traded_price=10.2,
+        ))
+        assert order.filled_quantity == 150
+        assert order.filled_price == pytest.approx(10.2)
+        assert order.status == OrderStatus.CANCELLED
+
+        broker._on_order_update(SimpleNamespace(
+            order_id=12345, order_status=53,
+            traded_volume=100, traded_price=9.0,
+        ))
+        assert order.filled_quantity == 150
+        assert order.filled_price == pytest.approx(10.2)
+
     def test_multiple_trade_prices_use_quantity_weighted_vwap(self):
         broker, order = self._broker_with_order()
         order.quantity = 200

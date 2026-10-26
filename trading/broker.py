@@ -2308,10 +2308,21 @@ class QMTBroker(BrokerInterface):
         for order in self._orders:
             if str(order.broker_order_id) == broker_order_id:
                 if order.status in self._TERMINAL_STATUSES:
-                    logger.debug(
-                        "Ignoring stale QMT update %s for terminal order %s (%s)",
-                        status.value, order.order_id, order.status.value,
-                    )
+                    if (order.status == OrderStatus.CANCELLED
+                            and traded > int(order.filled_quantity or 0)):
+                        # A partially cancelled order can still have late
+                        # executions. Only the broker's larger cumulative
+                        # snapshot may raise the fill; lifecycle stays closed.
+                        self._record_order_fill_snapshot(
+                            order, traded, traded_price,
+                        )
+                        order.updated_at = datetime.now().isoformat()
+                        self._publish_event("qmt.order_update", order.to_dict())
+                    else:
+                        logger.debug(
+                            "Ignoring stale QMT update %s for terminal order %s (%s)",
+                            status.value, order.order_id, order.status.value,
+                        )
                     break
                 if (order.status == OrderStatus.PARTIAL
                         and status in (OrderStatus.PENDING, OrderStatus.SUBMITTED)):
