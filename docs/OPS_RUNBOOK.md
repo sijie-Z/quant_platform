@@ -268,7 +268,7 @@ python tools/forward_update.py
 python tools/forward_realtime.py                         # 单快照
 python tools/forward_realtime.py --interval 300 --count 12  # 每 5 分钟，共 12 次
 ```
-该工具用新浪实时 `最新价/昨收` 为当前 v3 目标计算盘中 gross return 和 indicative NAV，输出仅写入 `.scratch/forward_realtime/`。它不包含正式执行成本、不改变“次日收盘执行”的冻结规则，也不会写入或覆盖 `forward_2026*` 台账。
+该工具用新浪实时 `最新价/昨收` 计算盘中参考值，输出仅写入 `.scratch/forward_realtime/`。正式 `summary.json` 含 `book` 后，它按**实际持仓、参考价和现金**相对正式收盘 NAV 重估（`basis=official_book`）；没有该字段时才回退到目标权重参考（`basis=target_weights`）。它不包含新的执行成本、不改变“次日收盘执行”的冻结规则，也不会写入或覆盖 `forward_2026*` 台账。
 
 **首次运行前**：在 Scheduled 页点一次 “Run now” 预授权 Bash 等工具，否则可能停在权限确认。
 

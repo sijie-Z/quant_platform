@@ -204,7 +204,7 @@ import json
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -1387,6 +1387,8 @@ class RollSimulation:
     cost_mode: str
     max_stale_sessions: int
     raw_price_mode: str = RAW_PRICE_MODE_CLOSE
+    positions: list[dict[str, Any]] = field(default_factory=list)
+    cash: float = 0.0
 
 
 def load_targets(paths: list[Path]) -> list[Target]:
@@ -1897,6 +1899,20 @@ def simulate_roll(
         )
         nav_prev_row = nav
 
+    positions = []
+    for asset, value in sorted(holdings.items()):
+        reference = float(last_price.get(asset, float("nan")))
+        shares = (
+            float(value) / reference
+            if math.isfinite(reference) and reference > 0 else None
+        )
+        positions.append({
+            "code": asset,
+            "value": float(value),
+            "reference_price": reference,
+            "shares": shares,
+        })
+
     return RollSimulation(
         rows=rows,
         warnings=warnings,
@@ -1907,6 +1923,8 @@ def simulate_roll(
         cost_mode=cost_mode,
         max_stale_sessions=max_stale_sessions,
         raw_price_mode=panels.raw_price_mode,
+        positions=positions,
+        cash=float(cash),
     )
 
 
@@ -2067,6 +2085,14 @@ def build_roll_summary(
             }
             for record in simulation.rebalances
         ],
+        "book": {
+            "as_of": dates[-1].strftime("%Y-%m-%d"),
+            "cash": float(simulation.cash),
+            "positions": [dict(position) for position in simulation.positions],
+            "positions_value": float(
+                sum(position["value"] for position in simulation.positions)
+            ),
+        },
         "pending_targets": [
             {
                 "file": path.as_posix(),

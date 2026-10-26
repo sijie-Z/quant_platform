@@ -16,7 +16,12 @@ from pathlib import Path
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = ROOT / "docs" / "research" / "paper_track" / "forward_targets"
+PAPER_ROOT = ROOT / "docs" / "research" / "paper_track"
+BASE = PAPER_ROOT / "forward_targets"
+LEDGERS = {
+    "turnover": PAPER_ROOT / "forward_2026_turnover",
+    "ep_turnover": PAPER_ROOT / "forward_2026",
+}
 STOCKS = ROOT / ".scratch" / "wide_sina_2026" / "stocks"
 DEFAULT_OUT = ROOT / ".scratch" / "forward_realtime"
 
@@ -30,6 +35,20 @@ def load_targets() -> dict[str, pd.Series]:
         payload = json.loads(paths[-1].read_text(encoding="utf-8"))
         targets[name] = pd.Series(payload["weights"], dtype=float)
     return targets
+
+
+def load_book(name: str) -> dict | None:
+    """Return the official end-of-day book when the ledger provides one."""
+    path = LEDGERS[name] / "summary.json"
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    book = payload.get("book")
+    if not isinstance(book, dict) or not isinstance(book.get("positions"), list):
+        return None
+    if not isinstance(book.get("cash"), (int, float)):
+        return None
+    return book
 
 
 def spot_panel() -> pd.DataFrame:
@@ -60,6 +79,7 @@ def strategy_snapshot(name: str, weights: pd.Series, spot: pd.DataFrame,
     cash_weight = max(0.0, 1.0 - float(weights.sum()))
     indicative_nav = 2_000_000.0 * (1.0 + gross_return)
     return {
+        "basis": "target_weights",
         "target_as_of": "2026-10-23",
         "target_assets": int(len(weights)),
         "quoted_assets": int(valid.sum()),
@@ -75,6 +95,46 @@ def strategy_snapshot(name: str, weights: pd.Series, spot: pd.DataFrame,
     }
 
 
+def book_snapshot(book: dict, spot: pd.DataFrame) -> dict:
+    """Mark the actual official positions and cash to the latest quotes."""
+    cash = float(book["cash"])
+    positions_value = float(book.get(
+        "positions_value",
+        sum(float(position["value"]) for position in book["positions"]),
+    ))
+    official_nav = cash + positions_value
+    current_value = 0.0
+    quoted = 0
+    stale = []
+    for position in book["positions"]:
+        code = position["code"]
+        reference = float(position["reference_price"])
+        shares = position.get("shares")
+        if shares is None:
+            shares = float(position["value"]) / reference
+        latest = spot["latest"].get(code, float("nan"))
+        if pd.notna(latest) and float(latest) > 0:
+            price = float(latest)
+            quoted += 1
+        else:
+            price = reference
+            stale.append(code)
+        current_value += float(shares) * price
+    indicative_nav = cash + current_value
+    return {
+        "basis": "official_book",
+        "official_ledger_date": book["as_of"],
+        "official_nav": official_nav,
+        "indicative_nav": indicative_nav,
+        "return_since_official_close": indicative_nav / official_nav - 1.0,
+        "n_positions": len(book["positions"]),
+        "quoted_assets": quoted,
+        "stale_assets": stale,
+        "cash": cash,
+        "complete": not stale,
+    }
+
+
 def snapshot() -> dict:
     targets = load_targets()
     spot = spot_panel()
@@ -83,19 +143,25 @@ def snapshot() -> dict:
     benchmark_return = (
         float(universe_returns.mean()) if not universe_returns.empty else None
     )
+    strategies = {}
+    for name, weights in targets.items():
+        book = load_book(name)
+        if book is not None:
+            strategies[name] = book_snapshot(book, spot)
+        else:
+            strategies[name] = strategy_snapshot(
+                name, weights, spot, benchmark_return,
+            )
     return {
         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-        "mode": "indicative_realtime_target_monitor",
+        "mode": "indicative_realtime_monitor",
         "official_ledger": False,
         "price_basis": "latest/raw and previous-close/raw; reference only, not an execution price",
-        "costs": "excluded; official execution costs are only in the close ledger",
+        "costs": "target mode excludes costs; official-book mode carries the official cash and booked costs",
         "source": "sina stock_zh_a_spot",
         "universe": {"assets": len(universe), "quoted": int(universe_returns.size),
                      "equal_weight_return": benchmark_return},
-        "strategies": {
-            name: strategy_snapshot(name, weights, spot, benchmark_return)
-            for name, weights in targets.items()
-        },
+        "strategies": strategies,
     }
 
 
@@ -108,8 +174,14 @@ def write_snapshot(payload: dict, out_dir: Path) -> None:
         rows.append({
             "timestamp": payload["timestamp"],
             "strategy": name,
-            "gross_return": values["gross_return_since_previous_close"],
-            "indicative_nav_gross": values["indicative_nav_gross"],
+            "basis": values.get("basis", "target_weights"),
+            "gross_return": values.get(
+                "gross_return_since_previous_close",
+                values.get("return_since_official_close"),
+            ),
+            "indicative_nav_gross": values.get(
+                "indicative_nav_gross", values.get("indicative_nav"),
+            ),
             "universe_ew_return": payload["universe"]["equal_weight_return"],
             "quoted_assets": values["quoted_assets"],
             "complete": values["complete"],

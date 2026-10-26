@@ -953,6 +953,16 @@ def test_roll_execution_and_rebalance_match_hand_computed_ledger(tool, tmp_path)
     assert nav.loc[5:, "turnover"].eq(0.0).all()
     assert nav["n_positions"].tolist() == [2] * 9
     assert summary["disclaimer"] == DISCLAIMER
+    book = summary["book"]
+    assert book["as_of"] == summary["last_ledger_date"]
+    assert book["positions_value"] + book["cash"] == pytest.approx(
+        summary["since_inception"]["final_nav"], abs=1e-6,
+    )
+    assert {position["code"] for position in book["positions"]} == {"A", "B"}
+    for position in book["positions"]:
+        assert position["shares"] * position["reference_price"] == pytest.approx(
+            position["value"], abs=1e-6,
+        )
 
 
 def test_roll_missing_next_exchange_session_is_rejected(tool, tmp_path, capsys):

@@ -50,6 +50,39 @@ def test_missing_quote_is_explicit(realtime):
     assert result["indicative_excess_vs_universe"] is None
 
 
+def test_official_book_marks_actual_positions_and_cash(realtime):
+    book = {
+        "as_of": "2026-10-26",
+        "cash": 1000.0,
+        "positions_value": 2000.0,
+        "positions": [
+            {"code": "000001", "value": 1000.0,
+             "reference_price": 10.0, "shares": 100.0},
+            {"code": "600000", "value": 1000.0,
+             "reference_price": 20.0, "shares": 50.0},
+        ],
+    }
+    result = realtime.book_snapshot(book, _spot())
+    assert result["basis"] == "official_book"
+    assert result["official_nav"] == pytest.approx(3000.0)
+    assert result["indicative_nav"] == pytest.approx(2580.0)
+    assert result["return_since_official_close"] == pytest.approx(-0.14)
+    assert result["quoted_assets"] == 2
+    assert result["complete"] is True
+
+
+def test_official_book_uses_reference_price_for_missing_quote(realtime):
+    book = {
+        "as_of": "2026-10-26", "cash": 0.0, "positions_value": 1000.0,
+        "positions": [{"code": "300000", "value": 1000.0,
+                       "reference_price": 10.0, "shares": 100.0}],
+    }
+    result = realtime.book_snapshot(book, _spot())
+    assert result["indicative_nav"] == pytest.approx(1000.0)
+    assert result["stale_assets"] == ["300000"]
+    assert result["complete"] is False
+
+
 def test_snapshots_stay_in_scratch_and_append(realtime, tmp_path):
     payload = {
         "timestamp": "2026-10-26T16:00:00",
