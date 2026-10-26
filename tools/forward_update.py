@@ -122,6 +122,22 @@ def is_month_end(latest: pd.Timestamp) -> bool:
     return latest.normalize().date() == _month_end(latest).date()
 
 
+def stale_cache_reason(latest: pd.Timestamp, today) -> str | None:
+    """Explain a missing current close after a real refetch, if any."""
+    from quant_platform.utils.exchange_calendar import is_trading_day
+
+    if not is_trading_day(today):
+        return None
+    latest_date = pd.Timestamp(latest).date()
+    if latest_date >= today:
+        return None
+    return (
+        f"merged cache ends {latest_date}, but {today} is an exchange "
+        "trading day; the provider has not published the current close yet. "
+        "Refusing to build a forward ledger from stale data"
+    )
+
+
 def latest_target(targets: Path) -> Path | None:
     files = sorted(targets.glob("target_*.json"))
     return files[-1] if files else None
@@ -291,6 +307,11 @@ def main():
                 "their last cached rows will be used")
     merged = rebuild()
     latest = merged.index.get_level_values("date").max()
+    if not args.skip_refetch:
+        stale_reason = stale_cache_reason(latest, dt.date.today())
+        if stale_reason:
+            log(f"ERROR: {stale_reason}")
+            return 2
     st_file = current_st_codes(latest) if is_month_end(latest) else None
     errors = []
     for s in STRATEGIES:

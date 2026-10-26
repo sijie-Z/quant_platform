@@ -170,6 +170,26 @@ def test_st_snapshot_writes_only_after_full_coverage(
     assert path.parent == root / ".scratch" / "orchestrate"
 
 
+def test_stale_cache_reason_flags_unpublished_current_close(forward_update):
+    import datetime as dt
+    reason = forward_update.stale_cache_reason(
+        pd.Timestamp("2026-10-23"), dt.date(2026, 10, 26),
+    )
+    assert reason is not None
+    assert "2026-10-23" in reason
+    assert "2026-10-26" in reason
+
+
+def test_stale_cache_reason_allows_current_or_holiday_cache(forward_update):
+    import datetime as dt
+    assert forward_update.stale_cache_reason(
+        pd.Timestamp("2026-10-26"), dt.date(2026, 10, 26),
+    ) is None
+    assert forward_update.stale_cache_reason(
+        pd.Timestamp("2026-09-30"), dt.date(2026, 10, 1),
+    ) is None
+
+
 def _strategy_with_target(tmp_path, stamp: str):
     targets = tmp_path / "targets"
     targets.mkdir()

@@ -261,7 +261,7 @@ python tools/forward_update.py
 - 台账：`docs/research/paper_track/forward_2026/`（EP+换手）与 `forward_2026_turnover/`（换手）；
 - 成本：佣金 0.03%（最低 5 元）、印花税按日期、平方根冲击；原始价由 `paper_track --raw-price-mode auto` 自动识别（新浪面板用 `amount/volume`）。
 
-**自动化**：桌面端 Scheduled 任务 `quant-forward-paper-daily`，工作日 16:20 运行；失败写入 `.scratch/orchestrate/forward_update_failures.log`。月末目标生成前会抓取当日 ST 名单并强制排除；快照或目标生成失败、任一台账子进程失败时，主脚本以非零状态退出（fail closed），不得把旧台账当成当日更新成功。
+**自动化**：桌面端 Scheduled 任务 `quant-forward-paper-daily`，工作日 16:20 运行；失败写入 `.scratch/orchestrate/forward_update_failures.log`。月末目标生成前会抓取当日 ST 名单并强制排除；快照或目标生成失败、任一台账子进程失败时，主脚本以非零状态退出（fail closed），不得把旧台账当成当日更新成功。若日志出现 `merged cache ends <旧日期> ... provider has not published the current close yet`，说明数据源尚未发布当日收盘数据（2026-10-26 15:20 的新浪日线即仍停在 10-23），等待下一次运行即可，不要手工伪造当日行或放宽检查。
 **首次运行前**：在 Scheduled 页点一次 “Run now” 预授权 Bash 等工具，否则可能停在权限确认。
 
 **已知限制**：宽池只含当前上市股票（幸存者偏差）；PE/PB 为半月频 ffill（≤3 周旧值）；行业映射静态；权重层面不取整手；这是模拟跟踪，不是实盘成交。

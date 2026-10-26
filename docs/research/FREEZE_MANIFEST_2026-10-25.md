@@ -79,7 +79,7 @@
 | 完整 ST 名单 `st_codes_2026-10-23.txt` | `b42b7ab7a67a28f6` |
 | `tools/daily_signal.py` | `d353668be760cba2` |
 | `tools/paper_track.py` | `672c8aa58ef9956f` |
-| `tools/forward_update.py` | `c234e2ff1d1944ce` |
+| `tools/forward_update.py` | `f68b9cca15ec612d` |
 | `backtest/engine.py` | `324b29c392994090` |
 | `backtest/cost_model.py` | `69e1f38af626c36f` |
 
