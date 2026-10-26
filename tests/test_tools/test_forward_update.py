@@ -190,6 +190,86 @@ def test_stale_cache_reason_allows_current_or_holiday_cache(forward_update):
     ) is None
 
 
+def test_stale_cache_reason_requires_previous_session_on_weekend(forward_update):
+    import datetime as dt
+    saturday = dt.date(2026, 10, 31)
+    reason = forward_update.stale_cache_reason(
+        pd.Timestamp("2026-10-29"), saturday,
+    )
+    assert reason is not None
+    assert "2026-10-30" in reason
+    assert forward_update.stale_cache_reason(
+        pd.Timestamp("2026-10-30"), saturday,
+    ) is None
+
+
+def test_failed_refresh_reason_checks_watched_assets(forward_update, tmp_path):
+    targets = tmp_path / "targets"
+    targets.mkdir()
+    (targets / "target_2026-10-23.json").write_text(
+        '{"weights": {"600519": 0.5}}', encoding="utf-8",
+    )
+    strategy = {"name": "turnover", "targets": targets,
+                "ledger": tmp_path / "ledger"}
+    reason = forward_update.failed_refresh_reason(
+        [["600519", "timeout"]], [strategy], pd.Timestamp("2026-10-26"),
+    )
+    assert reason is not None and "600519" in reason
+    assert forward_update.failed_refresh_reason(
+        [["000001", "timeout"]], [strategy], pd.Timestamp("2026-10-26"),
+    ) is None
+
+
+def test_failed_refresh_reason_blocks_any_failure_before_month_end(forward_update):
+    reason = forward_update.failed_refresh_reason(
+        [["000001", "timeout"]], [], pd.Timestamp("2026-10-30"),
+    )
+    assert reason is not None and "month-end" in reason
+
+
+def test_overdue_month_ends_includes_earlier_gaps_and_uses_prior_target(
+    forward_update, tmp_path,
+):
+    targets = tmp_path / "targets"
+    targets.mkdir()
+    for stamp in ("2026-08-31", "2026-10-30"):
+        (targets / f"target_{stamp}.json").write_text("{}", encoding="utf-8")
+    overdue = forward_update.overdue_month_ends(
+        targets, pd.Timestamp("2026-11-02"),
+    )
+    assert [value.strftime("%Y-%m-%d") for value in overdue] == ["2026-09-30"]
+    assert forward_update.target_before(
+        targets, pd.Timestamp("2026-09-30"),
+    ) == targets / "target_2026-08-31.json"
+
+
+def test_atomic_parquet_write_replaces_only_after_success(forward_update, tmp_path):
+    path = tmp_path / "panel.parquet"
+    frame = pd.DataFrame({"close": [1.0, 2.0]})
+    forward_update.atomic_write_parquet(frame, path, index=False)
+    assert pd.read_parquet(path).equals(frame)
+    assert not path.with_name(path.name + ".tmp").exists()
+
+
+def test_atomic_parquet_failure_preserves_previous_file(
+    forward_update, tmp_path, monkeypatch,
+):
+    path = tmp_path / "panel.parquet"
+    path.write_bytes(b"previous-good-data")
+
+    def broken_write(_self, target, **_kwargs):
+        Path(target).write_bytes(b"partial-new-data")
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", broken_write)
+    with pytest.raises(RuntimeError, match="disk full"):
+        forward_update.atomic_write_parquet(
+            pd.DataFrame({"close": [3.0]}), path, index=False,
+        )
+    assert path.read_bytes() == b"previous-good-data"
+    assert path.with_name(path.name + ".tmp").read_bytes() == b"partial-new-data"
+
+
 def _strategy_with_target(tmp_path, stamp: str):
     targets = tmp_path / "targets"
     targets.mkdir()

@@ -40,6 +40,18 @@ def log(msg):
     print(f"{dt.datetime.now():%H:%M:%S} {msg}", flush=True)
 
 
+def atomic_write_parquet(frame: pd.DataFrame, path: Path, index: bool = True) -> None:
+    """Write a parquet file without exposing a partial replacement.
+
+    If serialization or replacement fails, the previous file remains in
+    place. The temporary artifact is deliberately left for diagnosis.
+    """
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    frame.to_parquet(temporary, index=index)
+    temporary.replace(path)
+
+
 def refetch():
     today = dt.date.today().strftime("%Y%m%d")
     import time
@@ -67,7 +79,8 @@ def refetch():
                 df["asset"] = code
                 keep = ["date", "open", "high", "low", "close", "volume",
                         "amount", "turnover", "pct_chg", "asset"]
-                df[[c for c in keep if c in df.columns]].to_parquet(p, index=False)
+                atomic_write_parquet(df[[c for c in keep if c in df.columns]], p,
+                                     index=False)
                 break
             except Exception as exc:  # noqa: BLE001
                 if attempt == 2:
@@ -102,7 +115,7 @@ def rebuild():
         out.append(g.reset_index())
     merged = pd.concat(out, ignore_index=True).set_index(["date", "asset"]).sort_index()
     MERGED.parent.mkdir(parents=True, exist_ok=True)
-    merged.to_parquet(MERGED)
+    atomic_write_parquet(merged, MERGED)
     log(f"merged panel {merged.shape} last={merged.index.get_level_values('date').max().date()}")
     return merged
 
@@ -123,18 +136,19 @@ def is_month_end(latest: pd.Timestamp) -> bool:
 
 
 def stale_cache_reason(latest: pd.Timestamp, today) -> str | None:
-    """Explain a missing current close after a real refetch, if any."""
+    """Explain a missing latest expected close after a real refetch, if any."""
     from quant_platform.utils.exchange_calendar import is_trading_day
 
-    if not is_trading_day(today):
-        return None
+    expected = today
+    while not is_trading_day(expected):
+        expected -= dt.timedelta(days=1)
     latest_date = pd.Timestamp(latest).date()
-    if latest_date >= today:
+    if latest_date >= expected:
         return None
     return (
-        f"merged cache ends {latest_date}, but {today} is an exchange "
-        "trading day; the provider has not published the current close yet. "
-        "Refusing to build a forward ledger from stale data"
+        f"merged cache ends {latest_date}, but the latest expected exchange "
+        f"session is {expected}; the provider has not published that close "
+        "yet. Refusing to build a forward ledger from stale data"
     )
 
 
@@ -143,23 +157,68 @@ def latest_target(targets: Path) -> Path | None:
     return files[-1] if files else None
 
 
+def target_before(targets: Path, as_of: pd.Timestamp) -> Path | None:
+    """Newest target strictly before ``as_of`` (never a future book)."""
+    candidates = sorted(
+        path for path in targets.glob("target_*.json")
+        if _target_date(path) < pd.Timestamp(as_of).normalize()
+    )
+    return candidates[-1] if candidates else None
+
+
+def _watched_codes(strategy: dict) -> set[str]:
+    """Codes whose stale data could change current holdings or the next book."""
+    codes: set[str] = set()
+    target = latest_target(strategy["targets"])
+    if target is not None:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        codes.update(str(code).zfill(6) for code in payload.get("weights", {}))
+    summary_path = strategy["ledger"] / "summary.json"
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        book = summary.get("book") or {}
+        codes.update(str(position["code"]).zfill(6)
+                     for position in book.get("positions", []))
+    return codes
+
+
+def failed_refresh_reason(failed: list, strategies: list[dict],
+                          latest: pd.Timestamp) -> str | None:
+    """Explain why failed per-asset refreshes make this update unsafe."""
+    failed_codes = {str(row[0]).zfill(6) for row in failed or []}
+    if not failed_codes:
+        return None
+    if is_month_end(latest):
+        return (f"{len(failed_codes)} asset(s) failed to refresh before a "
+                f"month-end signal: {sorted(failed_codes)[:10]}")
+    impacted = []
+    for strategy in strategies:
+        overlap = sorted(failed_codes & _watched_codes(strategy))
+        if overlap:
+            impacted.append(f"{strategy['name']}={overlap[:10]}")
+    if impacted:
+        return "failed refreshes affect current target/book assets: " + "; ".join(impacted)
+    return None
+
+
 def _target_date(path: Path) -> pd.Timestamp:
     return pd.Timestamp(path.stem[len("target_"):]).normalize()
 
 
 def overdue_month_ends(targets: Path, latest: pd.Timestamp) -> list[pd.Timestamp]:
-    """Missing exchange month-ends after the latest known target."""
-    previous = latest_target(targets)
-    if previous is None:
+    """Every missing exchange month-end after the first known target."""
+    files = sorted(targets.glob("target_*.json"))
+    if not files:
         return []
     latest = pd.Timestamp(latest).normalize()
-    previous_date = _target_date(previous)
-    period = previous_date.to_period("M")
+    known = {_target_date(path) for path in files}
+    first = min(known)
+    period = first.to_period("M")
     last_period = latest.to_period("M") - 1
     overdue = []
     while period <= last_period:
         as_of = _month_end(period.start_time)
-        if previous_date < as_of < latest:
+        if first < as_of < latest and as_of not in known:
             overdue.append(as_of)
         period += 1
     return overdue
@@ -260,7 +319,7 @@ def ensure_monthly_target(strategy, latest, st_file=None):
                     "snapshot is unavailable and an unfiltered target is not "
                     "compliant"
                 )
-        prev = latest_target(tdir)
+        prev = target_before(tdir, as_of)
         cmd = [sys.executable, str(ROOT / "tools" / "daily_signal.py"),
                "--cache", str(MERGED), "--as-of", stamp,
                "--factors", strategy["factors"], "--industry-map", str(IMAP),
@@ -311,6 +370,10 @@ def main():
         stale_reason = stale_cache_reason(latest, dt.date.today())
         if stale_reason:
             log(f"ERROR: {stale_reason}")
+            return 2
+        failed_reason = failed_refresh_reason(failed, STRATEGIES, latest)
+        if failed_reason:
+            log(f"ERROR: {failed_reason}")
             return 2
     st_file = current_st_codes(latest) if is_month_end(latest) else None
     errors = []
