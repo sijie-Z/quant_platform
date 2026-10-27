@@ -83,6 +83,58 @@ def test_official_book_uses_reference_price_for_missing_quote(realtime):
     assert result["complete"] is False
 
 
+def test_transient_snapshot_failure_does_not_end_session(realtime, tmp_path, monkeypatch):
+    payload = {
+        "timestamp": "2026-10-27T10:00:00",
+        "universe": {"equal_weight_return": 0.01},
+        "strategies": {
+            "turnover": {
+                "gross_return_since_previous_close": 0.02,
+                "indicative_nav_gross": 2_040_000.0,
+                "quoted_assets": 1,
+                "complete": True,
+            }
+        },
+    }
+    calls = {"count": 0}
+
+    def flaky_snapshot():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise IndexError("temporary provider response")
+        return payload
+
+    monkeypatch.setattr(realtime, "snapshot", flaky_snapshot)
+    monkeypatch.setattr(realtime.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["forward_realtime.py", "--interval", "1", "--count", "3",
+         "--out-dir", str(tmp_path)],
+    )
+    realtime.main()
+    assert len(pd.read_csv(tmp_path / "snapshots.csv")) == 2
+    assert len((tmp_path / "errors.log").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_three_consecutive_snapshot_failures_stop_without_stale_output(
+    realtime, tmp_path, monkeypatch,
+):
+    def failed_snapshot():
+        raise IndexError("provider still unavailable")
+
+    monkeypatch.setattr(realtime, "snapshot", failed_snapshot)
+    monkeypatch.setattr(realtime.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["forward_realtime.py", "--interval", "1", "--count", "3",
+         "--out-dir", str(tmp_path)],
+    )
+    with pytest.raises(RuntimeError, match="3 consecutive"):
+        realtime.main()
+    assert not (tmp_path / "snapshots.csv").exists()
+    assert len((tmp_path / "errors.log").read_text(encoding="utf-8").splitlines()) == 3
+
+
 def test_snapshots_stay_in_scratch_and_append(realtime, tmp_path):
     payload = {
         "timestamp": "2026-10-26T16:00:00",

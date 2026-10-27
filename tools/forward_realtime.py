@@ -191,6 +191,20 @@ def write_snapshot(payload: dict, out_dir: Path) -> None:
                               index=False)
 
 
+def log_snapshot_error(out_dir: Path, exc: Exception, consecutive: int) -> None:
+    """Record a failed fetch without publishing a stale snapshot as fresh."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+        "consecutive_failures": consecutive,
+        "error_type": type(exc).__name__,
+        "error": str(exc)[:300],
+    }
+    with (out_dir / "errors.log").open("a", encoding="utf-8") as log:
+        log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(json.dumps(entry, ensure_ascii=False), flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--interval", type=int, default=0,
@@ -200,12 +214,26 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
     iterations = args.count if args.interval > 0 else 1
+    consecutive_failures = 0
     for index in range(iterations):
-        payload = snapshot()
-        write_snapshot(payload, args.out_dir)
-        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        try:
+            payload = snapshot()
+        except Exception as exc:  # noqa: BLE001
+            consecutive_failures += 1
+            log_snapshot_error(args.out_dir, exc, consecutive_failures)
+            if consecutive_failures >= 3:
+                raise RuntimeError(
+                    f"{consecutive_failures} consecutive realtime snapshot "
+                    f"failures: {exc}"
+                ) from exc
+        else:
+            consecutive_failures = 0
+            write_snapshot(payload, args.out_dir)
+            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
         if index + 1 < iterations:
             time.sleep(args.interval)
+    if consecutive_failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
