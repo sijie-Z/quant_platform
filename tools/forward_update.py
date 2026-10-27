@@ -53,10 +53,12 @@ def atomic_write_parquet(frame: pd.DataFrame, path: Path, index: bool = True) ->
 
 
 def refetch():
-    today = dt.date.today().strftime("%Y%m%d")
+    today_date = dt.date.today()
+    today = today_date.strftime("%Y%m%d")
     import time
 
     import akshare as ak
+    from quant_platform.utils.exchange_calendar import is_trading_day
 
     files = sorted(STOCKS.glob("*.parquet"))
     log(f"refetch {len(files)} stocks through {today}")
@@ -64,13 +66,22 @@ def refetch():
     for i, p in enumerate(files, 1):
         code = p.stem
         sym = ("sh" if code.startswith("6") else "sz") + code
-        for attempt in (1, 2):
+        for attempt in (1, 2, 3):
             try:
                 df = ak.stock_zh_a_daily(symbol=sym, start_date="20180101",
                                          end_date=today, adjust="hfq")
                 if df is None or df.empty:
                     raise ValueError("empty")
                 df["date"] = pd.to_datetime(df["date"])
+                latest = df["date"].max().date()
+                if is_trading_day(today_date) and latest < today_date:
+                    # A non-empty but stale response is a failure, not proof
+                    # of suspension. Retry; never overwrite good data with it.
+                    if attempt < 3:
+                        time.sleep(0.8 * attempt)
+                        continue
+                    failed.append([code, f"stale_response:{latest}"])
+                    break
                 for c in ("open", "high", "low", "close", "volume", "amount", "turnover"):
                     if c in df.columns:
                         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -83,7 +94,7 @@ def refetch():
                                      index=False)
                 break
             except Exception as exc:  # noqa: BLE001
-                if attempt == 2:
+                if attempt == 3:
                     failed.append([code, f"{type(exc).__name__}: {str(exc)[:80]}"])
                 else:
                     time.sleep(1.0)
@@ -188,6 +199,9 @@ def failed_refresh_reason(failed: list, strategies: list[dict],
     failed_codes = {str(row[0]).zfill(6) for row in failed or []}
     if not failed_codes:
         return None
+    if len(failed_codes) > 5:
+        return (f"{len(failed_codes)} assets failed to refresh; a mixed-date "
+                "cache would corrupt the universe benchmark")
     if is_month_end(latest):
         return (f"{len(failed_codes)} asset(s) failed to refresh before a "
                 f"month-end signal: {sorted(failed_codes)[:10]}")

@@ -227,6 +227,81 @@ def test_failed_refresh_reason_blocks_any_failure_before_month_end(forward_updat
     assert reason is not None and "month-end" in reason
 
 
+def test_failed_refresh_reason_blocks_widespread_stale_responses(forward_update):
+    failed = [[f"{index:06d}", "stale_response"] for index in range(6)]
+    reason = forward_update.failed_refresh_reason(
+        failed, [], pd.Timestamp("2026-10-27"),
+    )
+    assert reason is not None and "mixed-date" in reason
+
+
+def test_refetch_retries_stale_response_and_only_writes_fresh_data(
+    forward_update, tmp_path, monkeypatch,
+):
+    stocks = tmp_path / "stocks"
+    stocks.mkdir()
+    path = stocks / "000001.parquet"
+    today = __import__("datetime").date.today()
+    old_date = pd.Timestamp(today) - pd.Timedelta(days=1)
+    pd.DataFrame({"date": [old_date], "close": [10.0]}).to_parquet(path, index=False)
+    monkeypatch.setattr(forward_update, "STOCKS", stocks)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    import quant_platform.utils.exchange_calendar as calendar
+    monkeypatch.setattr(calendar, "is_trading_day", lambda _day: True)
+    calls = {"count": 0}
+
+    def fake_daily(**_kwargs):
+        calls["count"] += 1
+        date = old_date if calls["count"] < 3 else pd.Timestamp(today)
+        return pd.DataFrame({
+            "date": [date], "open": [11.0], "high": [11.0], "low": [11.0],
+            "close": [11.0], "volume": [1000.0], "amount": [11000.0],
+            "turnover": [0.1],
+        })
+
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_daily=fake_daily),
+    )
+    failed = forward_update.refetch()
+    assert failed == []
+    assert calls["count"] == 3
+    result = pd.read_parquet(path)
+    assert result["close"].iloc[0] == 11.0
+
+
+def test_refetch_keeps_previous_file_when_response_stays_stale(
+    forward_update, tmp_path, monkeypatch,
+):
+    stocks = tmp_path / "stocks"
+    stocks.mkdir()
+    path = stocks / "000001.parquet"
+    today = __import__("datetime").date.today()
+    old_date = pd.Timestamp(today) - pd.Timedelta(days=1)
+    pd.DataFrame({"date": [old_date], "close": [10.0]}).to_parquet(path, index=False)
+    monkeypatch.setattr(forward_update, "STOCKS", stocks)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    import quant_platform.utils.exchange_calendar as calendar
+    monkeypatch.setattr(calendar, "is_trading_day", lambda _day: True)
+
+    def fake_daily(**_kwargs):
+        return pd.DataFrame({
+            "date": [old_date], "open": [11.0], "high": [11.0], "low": [11.0],
+            "close": [11.0], "volume": [1000.0], "amount": [11000.0],
+            "turnover": [0.1],
+        })
+
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_daily=fake_daily),
+    )
+    failed = forward_update.refetch()
+    assert failed and failed[0][0] == "000001"
+    assert failed[0][1].startswith("stale_response:")
+    result = pd.read_parquet(path)
+    assert result["close"].iloc[0] == 10.0
+
+
 def test_overdue_month_ends_includes_earlier_gaps_and_uses_prior_target(
     forward_update, tmp_path,
 ):

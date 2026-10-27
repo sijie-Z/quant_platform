@@ -261,7 +261,7 @@ python tools/forward_update.py
 - 台账：`docs/research/paper_track/forward_2026/`（EP+换手）与 `forward_2026_turnover/`（换手）；
 - 成本：佣金 0.03%（最低 5 元）、印花税按日期、平方根冲击；原始价由 `paper_track --raw-price-mode auto` 自动识别（新浪面板用 `amount/volume`）。
 
-**自动化**：桌面端 Scheduled 任务 `quant-forward-paper-daily`，工作日 16:20 运行；失败写入 `.scratch/orchestrate/forward_update_failures.log`。月末目标生成前会抓取当日 ST 名单并强制排除；快照或目标生成失败、任一台账子进程失败时，主脚本以非零状态退出（fail closed），不得把旧台账当成当日更新成功。若日志出现 `merged cache ends <旧日期> ... provider has not published the current close yet`，说明数据源尚未发布当日收盘数据（2026-10-26 15:20 的新浪日线即仍停在 10-23），等待下一次运行即可，不要手工伪造当日行或放宽检查。周末/节假日按最近交易日校验，月末 Friday 不会因周末运行而被跳过。个股与合并面板均先写临时文件再原子替换；目标/当前持仓资产刷新失败、或月末任一资产刷新失败时退出 2，不把混合日期缓存用于调仓或台账。补生成历史月末时只使用该月末之前的权重，拒绝用未来权重链接。
+**自动化**：桌面端 Scheduled 任务 `quant-forward-paper-daily`，工作日 16:20 运行；失败写入 `.scratch/orchestrate/forward_update_failures.log`。月末目标生成前会抓取当日 ST 名单并强制排除；快照或目标生成失败、任一台账子进程失败时，主脚本以非零状态退出（fail closed），不得把旧台账当成当日更新成功。若日志出现 `merged cache ends <旧日期> ... provider has not published the current close yet`，说明数据源尚未发布当日收盘数据（2026-10-26 15:20 的新浪日线即仍停在 10-23），等待下一次运行即可，不要手工伪造当日行或放宽检查。周末/节假日按最近交易日校验，月末 Friday 不会因周末运行而被跳过。个股与合并面板均先写临时文件再原子替换；**非空但落后于当日的响应同样视为失败并重试**，不得覆盖旧的好数据。目标/当前持仓资产刷新失败、月末任一资产刷新失败、或超过 5 只刷新失败时退出 2，不把混合日期缓存用于调仓、基准或台账。补生成历史月末时只使用该月末之前的权重，拒绝用未来权重链接。
 
 **盘中实时监控（仅参考，不是正式 NAV）**：
 ```bash
