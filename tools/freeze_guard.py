@@ -77,6 +77,14 @@ def prefix_digest(path: Path, lines: int) -> tuple[str, int]:
 
 
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--accept", action="store_true",
+        help="after human review of a reported drift, rebaseline the state",
+    )
+    args = parser.parse_args()
     problems: list[str] = []
 
     for relative, expected in FROZEN.items():
@@ -136,8 +144,10 @@ def main() -> int:
     if problems:
         for problem in problems:
             print(f"DRIFT {problem}")
-        print("state not updated: drift alarms persist until a person resolves it")
-        return 1
+        if not args.accept:
+            print("state not updated: drift alarms persist until a person resolves it")
+            return 1
+        print("drift accepted after review: rebaselining state")
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(new_state, indent=2), encoding="utf-8")
     print(f"OK {len(FROZEN)} frozen artifacts, "
