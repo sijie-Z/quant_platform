@@ -270,6 +270,8 @@ python tools/forward_update.py
 - 目标文件只认可解析、`as_of` 与文件名一致、权重非空的版本；损坏文件会被重新生成，month-end 扫描忽略损坏文件。`daily_signal` 输出为原子替换，不会留下半截目标。
 - 月度目标被拒时台账照常重建（按现有持仓估值），不会因换仓失败丢掉当日 NAV。
 
+**v3.2 估值刷新（2026-10-28）**：`tools/fetch_valuation.py` 位于每日任务的 freeze_guard 之后、forward_update 之前，从百度追加供应商日期的最新 PE(TTM)/PB 观测（只追加、≤当天、逐资产原子写、按股票池重建合并文件），并写 `.scratch/valuation_baidu/vintage.json`。失败资产 >5% 或中位 vintage >21 天退出 2；**月末交易日刷新失败时当日不生成新目标**。不要手工编辑 `.scratch/valuation_baidu/` 下的文件。
+
 **盘中实时监控（仅参考，不是正式 NAV）**：
 ```bash
 python tools/forward_realtime.py                         # 单快照
