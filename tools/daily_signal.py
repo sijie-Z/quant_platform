@@ -1313,17 +1313,25 @@ def format_console(payload: dict[str, Any]) -> str:
 def write_outputs(
     payload: dict[str, Any], json_path: Path, csv_path: Path,
 ) -> None:
-    """Write ``targets.json`` and ``targets.csv`` (only after success)."""
+    """Write ``targets.json`` and ``targets.csv`` (only after success).
+
+    Both files are replaced atomically: a killed process must never leave a
+    truncated target that later runs would treat as an existing book.
+    """
     json_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
-    json_path.write_text(text + "\n", encoding="utf-8")
+    json_temporary = json_path.with_name(json_path.name + ".tmp")
+    json_temporary.write_text(text + "\n", encoding="utf-8")
+    json_temporary.replace(json_path)
     capital = float(payload["provenance"]["capital_cny"])
-    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+    csv_temporary = csv_path.with_name(csv_path.name + ".tmp")
+    with csv_temporary.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["code", "weight", "target_value_cny"])
         for code, weight in sorted(payload["weights"].items()):
             writer.writerow([code, f"{weight:.10f}", f"{weight * capital:.2f}"])
+    csv_temporary.replace(csv_path)
 
 
 # ---------------------------------------------------------------------------

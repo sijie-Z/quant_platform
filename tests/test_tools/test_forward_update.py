@@ -121,13 +121,25 @@ def _st_test_root(forward_update, tmp_path, monkeypatch):
     monkeypatch.setattr(forward_update, "ROOT", root)
     monkeypatch.setattr(forward_update, "STOCKS", stocks)
     forward_update._ST_CACHE.clear()
+    forward_update._SPOT_CACHE.clear()
+    forward_update._SPOT_FAILURE.clear()
     return root
+
+
+def _market_spot(rows, fillers=120):
+    """A market-wide-shaped spot frame: explicit rows plus traded fillers."""
+    codes = [code for code, _ in rows] + [
+        f"sz{index:06d}" for index in range(500, 500 + fillers)
+    ]
+    volumes = [volume for _, volume in rows] + [1000.0] * fillers
+    return pd.DataFrame({"代码": codes, "成交量": volumes})
 
 
 def test_st_snapshot_requires_complete_universe_coverage(
     forward_update, tmp_path, monkeypatch,
 ):
     root = _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
     frame = pd.DataFrame({"代码": ["sh600519"], "名称": ["正常"]})
     monkeypatch.setitem(
         sys.modules, "akshare",
@@ -139,6 +151,7 @@ def test_st_snapshot_requires_complete_universe_coverage(
 
 def test_st_snapshot_rejects_empty_frame(forward_update, tmp_path, monkeypatch):
     _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
     frame = pd.DataFrame({"代码": [], "名称": []})
     monkeypatch.setitem(
         sys.modules, "akshare",
@@ -207,7 +220,7 @@ def test_failed_refresh_reason_checks_watched_assets(forward_update, tmp_path):
     targets = tmp_path / "targets"
     targets.mkdir()
     (targets / "target_2026-10-23.json").write_text(
-        '{"weights": {"600519": 0.5}}', encoding="utf-8",
+        '{"as_of": "2026-10-23", "weights": {"600519": 0.5}}', encoding="utf-8",
     )
     strategy = {"name": "turnover", "targets": targets,
                 "ledger": tmp_path / "ledger"}
@@ -308,7 +321,10 @@ def test_overdue_month_ends_includes_earlier_gaps_and_uses_prior_target(
     targets = tmp_path / "targets"
     targets.mkdir()
     for stamp in ("2026-08-31", "2026-10-30"):
-        (targets / f"target_{stamp}.json").write_text("{}", encoding="utf-8")
+        (targets / f"target_{stamp}.json").write_text(
+            f'{{"as_of": "{stamp}", "weights": {{"600519": 0.5}}}}',
+            encoding="utf-8",
+        )
     overdue = forward_update.overdue_month_ends(
         targets, pd.Timestamp("2026-11-02"),
     )
@@ -349,7 +365,10 @@ def _strategy_with_target(tmp_path, stamp: str):
     targets = tmp_path / "targets"
     targets.mkdir()
     previous = targets / f"target_{stamp}.json"
-    previous.write_text("{}", encoding="utf-8")
+    previous.write_text(
+        f'{{"as_of": "{stamp}", "weights": {{"600519": 0.5}}}}',
+        encoding="utf-8",
+    )
     return {
         "name": "turnover", "factors": "turnover20d", "targets": targets,
     }
@@ -369,12 +388,15 @@ def test_main_detects_overdue_october_without_dated_st_snapshot(
     current = root / ".scratch" / "orchestrate" / "st_codes_20261102.txt"
     current.parent.mkdir(parents=True)
     current.write_text("600519\n", encoding="utf-8")
-
-    def unexpected_track(_strategy):
-        raise AssertionError("ledger must not run after a failed overdue target")
-
-    monkeypatch.setattr(forward_update, "track", unexpected_track)
+    tracked = []
+    monkeypatch.setattr(
+        forward_update, "track",
+        lambda strategy: tracked.append(strategy["name"]) or 0,
+    )
     assert forward_update.main() == 1
+    # The ledger still rebuilds with the existing book when the overdue
+    # target is blocked; skipping it would silently freeze the NAV record.
+    assert tracked == ["turnover"]
     output = capsys.readouterr().out
     assert "detected overdue month-end target 2026-10-30" in output
     assert "dated PIT ST snapshot" in output
@@ -461,3 +483,438 @@ def test_non_month_end_with_up_to_date_target_is_noop(
     assert forward_update.ensure_monthly_target(
         strategy, pd.Timestamp("2026-11-02"), None,
     ) is None
+
+
+def test_st_snapshot_retries_transient_failures(
+    forward_update, tmp_path, monkeypatch,
+):
+    _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    frame = pd.DataFrame({
+        "代码": ["sh600519", "sz000001"],
+        "名称": ["正常", "ST测试"],
+    })
+    calls = {"count": 0}
+
+    def flaky_spot():
+        calls["count"] += 1
+        if calls["count"] < 2:
+            raise IndexError("list index out of range")
+        return frame
+
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=flaky_spot),
+    )
+    path = forward_update.current_st_codes(pd.Timestamp.today())
+    assert path is not None
+    assert calls["count"] == 2
+    assert path.read_text(encoding="utf-8") == "000001"
+
+
+def test_st_snapshot_reuses_same_day_file_after_fetch_failure(
+    forward_update, tmp_path, monkeypatch,
+):
+    import datetime as dt
+
+    root = _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    stamp = dt.date.today().strftime("%Y%m%d")
+    path = root / ".scratch" / "orchestrate" / f"st_codes_{stamp}.txt"
+    path.parent.mkdir(parents=True)
+    path.write_text("\n".join(f"{index:06d}" for index in range(1, 13)),
+                    encoding="utf-8")
+
+    def always_fail():
+        raise IndexError("list index out of range")
+
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=always_fail),
+    )
+    assert forward_update.current_st_codes(pd.Timestamp.today()) == path
+
+
+def test_st_snapshot_fails_closed_without_same_day_file(
+    forward_update, tmp_path, monkeypatch,
+):
+    _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    def always_fail():
+        raise IndexError("list index out of range")
+
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=always_fail),
+    )
+    assert forward_update.current_st_codes(pd.Timestamp.today()) is None
+
+
+def _stale_daily_refetch(forward_update, tmp_path, monkeypatch):
+    """One stock whose daily response stays at yesterday's bar."""
+    stocks = tmp_path / "stocks"
+    stocks.mkdir()
+    path = stocks / "000001.parquet"
+    today = __import__("datetime").date.today()
+    old_date = pd.Timestamp(today) - pd.Timedelta(days=1)
+    pd.DataFrame({"date": [old_date], "close": [10.0]}).to_parquet(path, index=False)
+    monkeypatch.setattr(forward_update, "STOCKS", stocks)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    import quant_platform.utils.exchange_calendar as calendar
+    monkeypatch.setattr(calendar, "is_trading_day", lambda _day: True)
+
+    def fake_daily(**_kwargs):
+        return pd.DataFrame({
+            "date": [old_date], "open": [11.0], "high": [11.0], "low": [11.0],
+            "close": [11.0], "volume": [1000.0], "amount": [11000.0],
+            "turnover": [0.1],
+        })
+
+    return path, old_date, fake_daily
+
+
+def _install_akshare(monkeypatch, fake_daily, spot):
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_daily=fake_daily, stock_zh_a_spot=spot),
+    )
+
+
+def test_refetch_reclassifies_stale_response_confirmed_suspended(
+    forward_update, tmp_path, monkeypatch,
+):
+    path, old_date, fake_daily = _stale_daily_refetch(
+        forward_update, tmp_path, monkeypatch,
+    )
+    spot = _market_spot([("sz000001", 0.0)])
+    _install_akshare(monkeypatch, fake_daily, lambda: spot)
+    assert forward_update.refetch() == []
+    result = pd.read_parquet(path)
+    assert result["date"].iloc[0] == old_date
+    assert result["close"].iloc[0] == 10.0
+
+
+def test_refetch_keeps_stale_response_when_spot_shows_trading(
+    forward_update, tmp_path, monkeypatch,
+):
+    _path, _old_date, fake_daily = _stale_daily_refetch(
+        forward_update, tmp_path, monkeypatch,
+    )
+    spot = _market_spot([("sz000001", 500.0)])
+    _install_akshare(monkeypatch, fake_daily, lambda: spot)
+    failed = forward_update.refetch()
+    assert failed and failed[0][0] == "000001"
+    assert failed[0][1].startswith("stale_response:")
+
+
+def test_refetch_keeps_stale_response_when_spot_unavailable(
+    forward_update, tmp_path, monkeypatch,
+):
+    _path, _old_date, fake_daily = _stale_daily_refetch(
+        forward_update, tmp_path, monkeypatch,
+    )
+
+    def broken_spot():
+        raise ConnectionError("spot endpoint down")
+
+    _install_akshare(monkeypatch, fake_daily, broken_spot)
+    failed = forward_update.refetch()
+    assert failed and failed[0][0] == "000001"
+    assert failed[0][1].startswith("stale_response:")
+
+
+def test_refetch_reclassifies_error_response_confirmed_suspended(
+    forward_update, tmp_path, monkeypatch,
+):
+    _path, _old_date, _fake = _stale_daily_refetch(
+        forward_update, tmp_path, monkeypatch,
+    )
+
+    def empty_daily(**_kwargs):
+        return pd.DataFrame()
+
+    spot = _market_spot([("sz000001", 0.0)])
+    _install_akshare(monkeypatch, empty_daily, lambda: spot)
+    assert forward_update.refetch() == []
+
+
+def _wide_spot(codes, volumes):
+    return pd.DataFrame({"代码": codes, "成交量": volumes})
+
+
+def test_confirm_rejects_zeroed_market_wide_feed(
+    forward_update, tmp_path, monkeypatch,
+):
+    _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    failed = [["000001", "stale_response:2026-10-29"],
+              ["600519", "ValueError: empty"]]
+    codes = ["sz000001", "sh600519"] + [f"sz{index:06d}" for index in range(1, 300)]
+    spot = _wide_spot(codes, [0.0] * len(codes))
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=lambda: spot),
+    )
+    remaining, suspended = forward_update.confirm_suspended_stale(failed)
+    assert suspended == []
+    assert remaining == failed
+
+
+def test_confirm_requires_duplicate_rows_to_all_be_untraded(
+    forward_update, tmp_path, monkeypatch,
+):
+    _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    failed = [["000001", "stale_response:2026-10-29"]]
+    spot = _market_spot([("sz000001", 0.0), ("sz000001", 500.0)])
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=lambda: spot),
+    )
+    remaining, suspended = forward_update.confirm_suspended_stale(failed)
+    assert suspended == []
+    assert remaining == failed
+
+
+def test_confirm_treats_nan_volume_row_as_doubt(
+    forward_update, tmp_path, monkeypatch,
+):
+    _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    failed = [["000001", "stale_response:2026-10-29"]]
+    spot = _market_spot([("sz000001", float("nan")), ("sz000001", 0.0)])
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=lambda: spot),
+    )
+    remaining, suspended = forward_update.confirm_suspended_stale(failed)
+    assert suspended == []
+    assert remaining == failed
+
+
+def test_confirm_rejects_partial_realtime_frame(
+    forward_update, tmp_path, monkeypatch,
+):
+    _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    failed = [["000001", "stale_response:2026-10-29"]]
+    spot = _wide_spot(["sz000001"], [0.0])
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=lambda: spot),
+    )
+    remaining, suspended = forward_update.confirm_suspended_stale(failed)
+    assert suspended == []
+    assert remaining == failed
+
+
+def test_confirm_caps_mass_reclassification(forward_update, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    stocks = root / "stocks"
+    stocks.mkdir(parents=True)
+    codes = [f"{index:06d}" for index in range(1, 16)]
+    for code in codes:
+        (stocks / f"{code}.parquet").write_bytes(b"")
+    monkeypatch.setattr(forward_update, "ROOT", root)
+    monkeypatch.setattr(forward_update, "STOCKS", stocks)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    failed = [[code, "stale_response:2026-10-29"] for code in codes]
+    spot = _market_spot([(f"sz{code}", 0.0) for code in codes])
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=lambda: spot),
+    )
+    remaining, suspended = forward_update.confirm_suspended_stale(failed)
+    assert suspended == []
+    assert remaining == failed
+
+
+def test_st_snapshot_rejects_implausible_zero_match(
+    forward_update, tmp_path, monkeypatch,
+):
+    _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    frame = pd.DataFrame({
+        "代码": ["sh600519", "sz000001"],
+        "名称": ["正常", "另一只"],
+    })
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=lambda: frame),
+    )
+    assert forward_update.current_st_codes(pd.Timestamp.today()) is None
+
+
+def test_st_snapshot_reuse_rejects_malformed_same_day_file(
+    forward_update, tmp_path, monkeypatch,
+):
+    import datetime as dt
+
+    root = _st_test_root(forward_update, tmp_path, monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    stamp = dt.date.today().strftime("%Y%m%d")
+    path = root / ".scratch" / "orchestrate" / f"st_codes_{stamp}.txt"
+    path.parent.mkdir(parents=True)
+    path.write_text("not-a-code", encoding="utf-8")
+
+    def always_fail():
+        raise IndexError("list index out of range")
+
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=always_fail),
+    )
+    assert forward_update.current_st_codes(pd.Timestamp.today()) is None
+
+
+def test_ensure_monthly_target_regenerates_corrupt_existing_target(
+    forward_update, tmp_path, monkeypatch,
+):
+    strategy = _strategy_with_target(tmp_path, "2026-10-23")
+    corrupt = strategy["targets"] / "target_2026-10-30.json"
+    corrupt.write_text('{"weights": {}', encoding="utf-8")
+    snapshot = tmp_path / "current_st.txt"
+    snapshot.write_text("000001\n", encoding="utf-8")
+    monkeypatch.setattr(forward_update, "is_month_end", lambda _latest: True)
+    commands = []
+
+    def signal_success(cmd, **kwargs):
+        commands.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(forward_update.subprocess, "run", signal_success)
+    forward_update.ensure_monthly_target(
+        strategy, pd.Timestamp("2026-10-30"), snapshot,
+    )
+    assert len(commands) == 1
+    assert commands[0][commands[0].index("--as-of") + 1] == "2026-10-30"
+
+
+def test_overdue_month_ends_ignores_corrupt_known_target(
+    forward_update, tmp_path,
+):
+    targets = tmp_path / "targets"
+    targets.mkdir()
+    for stamp in ("2026-08-31", "2026-10-30"):
+        (targets / f"target_{stamp}.json").write_text(
+            f'{{"as_of": "{stamp}", "weights": {{"600519": 0.5}}}}',
+            encoding="utf-8",
+        )
+    (targets / "target_2026-09-30.json").write_text(
+        '{"as_of": "2026-09-30", "weights": {"600', encoding="utf-8",
+    )
+    overdue = forward_update.overdue_month_ends(
+        targets, pd.Timestamp("2026-11-02"),
+    )
+    assert [value.strftime("%Y-%m-%d") for value in overdue] == ["2026-09-30"]
+
+
+def test_failed_refresh_reason_strict_override_blocks_single_failure(
+    forward_update,
+):
+    reason = forward_update.failed_refresh_reason(
+        [["000001", "stale_response"]], [], pd.Timestamp("2026-11-02"),
+        strict_month_end=True,
+    )
+    assert reason is not None and "month-end" in reason
+
+
+def test_main_captures_dated_st_before_gate_failure(
+    forward_update, monkeypatch,
+):
+    monkeypatch.setattr(sys, "argv", ["forward_update.py"])
+    monkeypatch.setattr(forward_update, "_month_end_session_today", lambda: True)
+    monkeypatch.setattr(
+        forward_update, "rebuild", lambda: _merged("2026-10-30"),
+    )
+    monkeypatch.setattr(forward_update, "stale_cache_reason",
+                        lambda latest, today: None)
+    monkeypatch.setattr(
+        forward_update, "failed_refresh_reason",
+        lambda failed, strategies, latest, strict=None: "blocked for test",
+    )
+    monkeypatch.setattr(forward_update, "refetch", lambda: [])
+    calls = []
+
+    def capture(as_of=None):
+        calls.append(as_of)
+        return None
+
+    monkeypatch.setattr(forward_update, "current_st_codes", capture)
+    assert forward_update.main() == 2
+    assert len(calls) == 1
+
+
+def test_main_survives_early_st_capture_crash(forward_update, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["forward_update.py"])
+    monkeypatch.setattr(forward_update, "_month_end_session_today", lambda: True)
+
+    def locked(_as_of=None):
+        raise OSError("file locked by antivirus")
+
+    monkeypatch.setattr(forward_update, "current_st_codes", locked)
+    monkeypatch.setattr(forward_update, "refetch", lambda: [])
+    monkeypatch.setattr(
+        forward_update, "rebuild", lambda: _merged("2026-10-30"),
+    )
+    monkeypatch.setattr(forward_update, "stale_cache_reason",
+                        lambda latest, today: None)
+    monkeypatch.setattr(
+        forward_update, "failed_refresh_reason", lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(forward_update, "is_month_end", lambda _latest: False)
+    monkeypatch.setattr(
+        forward_update, "ensure_monthly_target",
+        lambda strategy, latest, st_file=None: None,
+    )
+    monkeypatch.setattr(forward_update, "track", lambda _strategy: 0)
+    assert forward_update.main() == 0
+
+
+def test_spot_snapshot_deadline_and_failure_memo(forward_update, monkeypatch):
+    import time as time_module
+
+    original_sleep = time_module.sleep
+    monkeypatch.setattr(forward_update, "SPOT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(time_module, "sleep", lambda _seconds: None)
+    forward_update._SPOT_CACHE.clear()
+    forward_update._SPOT_FAILURE.clear()
+    calls = {"count": 0}
+
+    def hung():
+        calls["count"] += 1
+        original_sleep(0.2)
+        return pd.DataFrame({"代码": ["sz000001"], "成交量": [0.0]})
+
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=hung),
+    )
+    with pytest.raises(RuntimeError, match="unavailable after 2 attempts"):
+        forward_update.today_spot_snapshot()
+    assert calls["count"] == 2
+    with pytest.raises(RuntimeError, match="recent failure cached"):
+        forward_update.today_spot_snapshot()
+    assert calls["count"] == 2
+
+
+def test_st_snapshot_does_not_multiply_fetch_attempts(
+    forward_update, tmp_path, monkeypatch,
+):
+    _st_test_root(forward_update, tmp_path, monkeypatch)
+    import time as time_module
+
+    monkeypatch.setattr(time_module, "sleep", lambda _seconds: None)
+    calls = {"count": 0}
+
+    def down():
+        calls["count"] += 1
+        raise ConnectionError("feed down")
+
+    monkeypatch.setitem(
+        sys.modules, "akshare",
+        SimpleNamespace(stock_zh_a_spot=down),
+    )
+    assert forward_update.current_st_codes(pd.Timestamp.today()) is None
+    assert calls["count"] == 2

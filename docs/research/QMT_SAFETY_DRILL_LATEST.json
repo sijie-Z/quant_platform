@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-27T03:04:01",
+  "timestamp": "2026-10-28T09:10:48",
   "mode": "simulated fault injection; no real broker connection",
   "xtquant_installed": false,
   "real_miniqmt_certified": false,
@@ -8,8 +8,8 @@
       "name": "stale_quotes",
       "status": "PASS",
       "details": {
-        "old_age_seconds": 3600.0004720687866,
-        "fresh_age_seconds": 0.00047206878662109375,
+        "old_age_seconds": 3600.000540971756,
+        "fresh_age_seconds": 0.0005409717559814453,
         "shanghai_vs_utc_age": 0.0
       }
     },
