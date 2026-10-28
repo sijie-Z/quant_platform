@@ -115,3 +115,48 @@
 | `tools/daily_signal.py`（v3.1，原子输出） | `ee4773925b1a7d5f` |
 
 其余 v3 冻结哈希不变（见 §6）。相关回归：`tests/test_tools` 176 项通过（含 15 项新增故障注入用例）；2026-10-28 用 v3 的 13 只 ST 名单在 scratch 完成月末目标生成演练（权重和=1、单票≤5%、无 ST、无未来数据）。两轮独立对抗审查（1 个阻断级 + 5 个重要级 + 若干次要问题）已全部修复或记录为残余风险。
+
+## 8. 深度过拟合审计与处置（2026-10-28）
+
+独立审计（只读 subagent）对冻结前向管线做了未来信息注入、可复现性、台账数学与评估纪律攻击。**主链路干净**：向面板注入 2026-10-28..30 的极端未来行后，2026-10-23 目标权重逐位不变（max|Δw|=0）；两次运行权重差为 0；prev-weights 链拒绝未来权重；13 只 ST 名单与当日全市场快照在池内完全一致；估值 ffill 无 bfill；用当前缓存重算两份台账与已存 nav 差异 < 4e-7 CNY。
+
+**守卫口径变更**：自本日起冻结哈希统一按 **LF 归一化** 计算（`\r\n`→`\n`，parquet 除外），避免 git autocrlf 在异机 checkout 造成误报；§6/§7 中的原哈希为原始字节口径，对应同一内容。守卫覆盖从 5 个代码文件扩展为 **13 个代码/数据文件 + 2 个期初目标 + ST 名单**，新增：portfolio/optimizers、covariance、constraints，factors/processing、evaluation，backtest/metrics，utils/exchange_calendar，行业映射 parquet。守卫检测到漂移后**不再自动重设基线**，警报持续到人工处置。
+
+**归一化哈希（守卫权威值，sha256[:16]）**：
+
+| 文件 | 哈希 |
+|---|---|
+| tools/daily_signal.py | `ee4773925b1a7d5f` |
+| tools/paper_track.py | `ef4d8323d38375e6` |
+| tools/forward_update.py | `1d97834af3e14448` |
+| backtest/engine.py | `d937c3403d83c2fd` |
+| backtest/cost_model.py | `18a71fb6cec9e2be` |
+| portfolio/optimizers.py | `1e703bd95fd68a57` |
+| portfolio/covariance.py | `20a51b273adc9550` |
+| portfolio/constraints.py | `7e1c65c80599921b` |
+| factors/processing.py | `467221452b51130b` |
+| factors/evaluation.py | `0a8c0dfb1d08878e` |
+| backtest/metrics.py | `49399a9141d95171` |
+| utils/exchange_calendar.py | `00260b954308468a` |
+| .cache/baostock/industry_map.parquet | `5da906a2e4bca0c0` |
+| turnover 目标 2026-10-23 | `bdfb3e7c814aa3b7` |
+| ep_turnover 目标 2026-10-23 | `b4d49582459af14c` |
+| ST 名单 2026-10-23 | `b42b7ab7a67a28f6` |
+
+**发现与处置**：
+
+| # | 发现 | 处置 | 截止 |
+|---|---|---|---|
+| B1 | 守卫只覆盖 5 个代码文件，优化器/因子处理/指标/日历/行业映射未校验 | 已修复（见上表），每日任务先跑守卫 | 2026-10-28 ✅ |
+| B2 | EP 的估值输入自 2026-10-24 起无刷新，11-30 目标 vintage 将达 ~37 天（历史 p90=18 天），ep_turnover 会退化为静态截面 | 在月末流程中接入因果估值刷新（当日观测、写入 provenance vintage）；10-30 目标不受影响（vintage 6 天） | 2026-11-30 前 |
+| B3 | 3/6 个月评估规则未钉死公式/基准构造/窗口/多重比较；0.2 与 0.3 门槛、3 与 6 个月终止权限在文档间冲突 | 编写唯一权威评估规范 + 冻结评估脚本（从 nav.csv 重算，含 ST 剔除基准与 CI），调和文档冲突 | 2027-01 评估前 |
+| M1 | 滚动台账全量重写；守卫漂移后自动重设基线 | 守卫已改为不重设基线；paper_track 逐日差异比对列入新版本变更 | 2026-11 月内 |
+| M2 | 交易日历无 2027 数据；`QUANT_EXCHANGE_HOLIDAYS` 可改执行日 | 国务院公布 2027 假期后更新日历（已建 11-25 提醒）；评估前复核 | 2026-12 中 |
+| M3 | 台账基准含 13 只不可买 ST 股，研究口径为剔除 ST 的可投资等权 | 评估基准定为 ST 剔除口径（评估脚本双列输出）；nav.csv 历史列不改写 | 与 B3 同 |
+| M4 | 目标无法从今日缓存逐字节复现（新浪 turnover 历史被修订，重跑权重差 ≤3.1e-3） | 目标哈希已锁定；provenance 将记录面板/估值 vintage；补生成限制写入 B2 处置 | 与 B2 同 |
+| M5 | paper_track 对涨跌停被阻的处置（放弃至下月）与回测引擎（逐日重试）不同 | 记录为前向实验的冻结执行规则；评估以 paper_track 语义为准，差异写入评估规范 | 与 B3 同 |
+| m1 | §6 的 paper_track 哈希曾在首日 NAV 生成后被原地更新（a94cb13），与 §4.1 冲突 | 在此如实记录：首日 NAV 由 `672c8aa` 产生，行值经独立重算一致；此后冻结变更必须走新版本 | 已记录 ✅ |
+| m5 | summary.json 不在冻结范围，终止指标若直接引用可被重写 | 评估脚本强制从 nav.csv 重算 | 与 B3 同 |
+| m8 | 6 个月 Sharpe 标准误约 0.09，统计功效有限；两个策略 + 3 个月 interim 无多重性控制 | 评估规范中报告置信区间与多重性说明；interim 不授权提前终止（维持 §4.4） | 与 B3 同 |
+
+**残余风险（如实记录，不修复）**：M4 的历史数据修订通道无技术手段完全消除（供应商会重算 hfq/turnover）；M5 的执行语义差异会系统性低估或高估前向表现（方向未知）；m4 的 9.8% 统一涨跌停近似会误挡创业板/科创板 20% 涨跌停（影响小、方向保守）。

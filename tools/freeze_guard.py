@@ -30,13 +30,21 @@ FREEZE_DATE = "2026-10-23"
 FROZEN = {
     "tools/daily_signal.py": "ee4773925b1a7d5f",
     "tools/paper_track.py": "ef4d8323d38375e6",
-    "tools/forward_update.py": "5c0b973724947ce5",
-    "backtest/engine.py": "324b29c392994090",
-    "backtest/cost_model.py": "69e1f38af626c36f",
+    "tools/forward_update.py": "1d97834af3e14448",
+    "backtest/engine.py": "d937c3403d83c2fd",
+    "backtest/cost_model.py": "18a71fb6cec9e2be",
+    "portfolio/optimizers.py": "1e703bd95fd68a57",
+    "portfolio/covariance.py": "20a51b273adc9550",
+    "portfolio/constraints.py": "7e1c65c80599921b",
+    "factors/processing.py": "467221452b51130b",
+    "factors/evaluation.py": "0a8c0dfb1d08878e",
+    "backtest/metrics.py": "49399a9141d95171",
+    "utils/exchange_calendar.py": "00260b954308468a",
+    ".cache/baostock/industry_map.parquet": "5da906a2e4bca0c0",
     "docs/research/paper_track/forward_targets/turnover/target_2026-10-23.json":
-        "738fca0071edbc99",
+        "bdfb3e7c814aa3b7",
     "docs/research/paper_track/forward_targets/ep_turnover/target_2026-10-23.json":
-        "e466c21411405372",
+        "b4d49582459af14c",
     "docs/research/paper_track/forward_targets/st_codes_2026-10-23.txt":
         "b42b7ab7a67a28f6",
 }
@@ -55,13 +63,17 @@ STATE = ROOT / ".scratch" / "orchestrate" / "freeze_guard_state.json"
 
 
 def digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    data = path.read_bytes()
+    if path.suffix != ".parquet":
+        data = data.replace(b"\r\n", b"\n")
+    return hashlib.sha256(data).hexdigest()[:16]
 
 
 def prefix_digest(path: Path, lines: int) -> tuple[str, int]:
     content = path.read_text(encoding="utf-8").splitlines(keepends=True)
     head = content[:lines]
-    return hashlib.sha256("".join(head).encode("utf-8")).hexdigest(), len(content)
+    normalized = "".join(head).replace("\r\n", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest(), len(content)
 
 
 def main() -> int:
@@ -121,13 +133,13 @@ def main() -> int:
         head_hash, total = prefix_digest(ledger, 10**9)
         new_state[key] = {"lines": total, "head_hash": head_hash}
 
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(new_state, indent=2), encoding="utf-8")
-
     if problems:
         for problem in problems:
             print(f"DRIFT {problem}")
+        print("state not updated: drift alarms persist until a person resolves it")
         return 1
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(new_state, indent=2), encoding="utf-8")
     print(f"OK {len(FROZEN)} frozen artifacts, "
           f"{len(new_targets)} targets pinned, {len(LEDGERS)} ledgers append-only")
     return 0
