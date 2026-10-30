@@ -24,12 +24,13 @@ import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date
 
 setup_logging()
 logger = get_logger("ceiling")
 
 REAL_START = "2018-01-01"
-REAL_END = "2025-12-31"
+REAL_END = resolve_end_date()  # as-of resolved at run time
 SELECT_PCT = 0.20
 
 
@@ -90,6 +91,8 @@ def main():
 
     returns = load()
     logger.info("Data: %d days, %d assets", len(returns), len(returns.columns))
+    logger.info("Data window: %s → %s (requested end %s)",
+                returns.index.min().date(), returns.index.max().date(), REAL_END)
 
     # ── 1. S 扫描 (H=80固定) ──
     print("\n─── 1. Signal Horizon 扫描 (H=80) ───")

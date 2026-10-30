@@ -58,7 +58,15 @@ class MonteCarloSimulator:
         """
         n = len(returns)
         ret_values = returns.values
+        if block_size < 1:
+            raise ValueError(f"block_size must be >= 1, got {block_size!r}")
         n_blocks = self.horizon_days // block_size + 1
+        # Start indices 0..n-block_size inclusive. The old high endpoint
+        # `n - block_size` was exclusive, so the final block (and therefore
+        # the most recent return) could never be sampled; use the inclusive
+        # range and fall back to the whole series when it is shorter than one
+        # block.
+        max_start = n - block_size
 
         terminal_values = []
         max_drawdowns = []
@@ -70,7 +78,7 @@ class MonteCarloSimulator:
             # Sample blocks with replacement
             blocks = []
             for _ in range(n_blocks):
-                start = self.rng.randint(0, max(1, n - block_size))
+                start = self.rng.randint(0, max_start + 1) if max_start > 0 else 0
                 blocks.append(ret_values[start:start + block_size])
 
             path_returns = np.concatenate(blocks)[:self.horizon_days]
@@ -80,9 +88,11 @@ class MonteCarloSimulator:
             terminal_value = cum_returns[-1]
             terminal_values.append(terminal_value)
 
-            # Max drawdown
-            peak = np.maximum.accumulate(cum_returns)
-            dd = (cum_returns - peak) / peak
+            # Max drawdown measured from the initial wealth of 1.0. Starting
+            # the peak scan at 1+r0 made a first-period loss invisible.
+            wealth = np.concatenate(([1.0], cum_returns))
+            peak = np.maximum.accumulate(wealth)
+            dd = (wealth - peak) / peak
             max_drawdowns.append(float(dd.min()))
 
             # Annualized return
@@ -167,10 +177,29 @@ class MonteCarloSimulator:
             dict with simulation results
         """
         # Fit Student-t distribution
-        df, loc, scale = sp_stats.t.fit(returns.dropna().values)
-        df = np.clip(df, df_range[0], df_range[1])
+        sample = returns.dropna().values
+        df_raw, loc, scale_raw = sp_stats.t.fit(sample)
+        df = float(np.clip(df_raw, df_range[0], df_range[1]))
 
-        logger.info("Fitted Student-t: df=%.1f, loc=%.4f, scale=%.4f", df, loc, scale)
+        # Clipping df without touching the scale changes the distribution's
+        # variance: Var(t(df)) = scale^2 * df/(df-2), so a fitted df of 2.3
+        # clipped to 3 shrinks the simulated std by ~36% and materially
+        # understates fat-tail risk. Rescale so the simulated distribution
+        # keeps the fitted distribution's standard deviation (or the sample
+        # standard deviation when the fitted df has infinite variance).
+        if df_raw > 2:
+            target_std = float(scale_raw) * np.sqrt(df_raw / (df_raw - 2))
+        else:
+            target_std = float(np.std(sample, ddof=1))
+        if df > 2 and np.isfinite(target_std) and target_std > 0:
+            scale = float(target_std / np.sqrt(df / (df - 2)))
+        else:
+            scale = float(scale_raw)
+
+        logger.info(
+            "Fitted Student-t: df=%.1f (raw %.1f), loc=%.4f, scale=%.4f (raw %.4f)",
+            df, df_raw, loc, scale, scale_raw,
+        )
 
         terminal_values = []
         max_drawdowns = []
@@ -186,8 +215,11 @@ class MonteCarloSimulator:
             cum_returns = np.cumprod(1 + sim_returns)
             terminal_values.append(cum_returns[-1])
 
-            peak = np.maximum.accumulate(cum_returns)
-            dd = (cum_returns - peak) / peak
+            # Peak scan includes the initial wealth 1.0 (a first-period loss
+            # must count toward max drawdown).
+            wealth = np.concatenate(([1.0], cum_returns))
+            peak = np.maximum.accumulate(wealth)
+            dd = (wealth - peak) / peak
             max_drawdowns.append(float(dd.min()))
 
             ann_ret = cum_returns[-1] ** (252 / self.horizon_days) - 1
@@ -208,6 +240,8 @@ class MonteCarloSimulator:
                 "df": round(df, 2),
                 "loc": round(loc, 6),
                 "scale": round(scale, 6),
+                "df_raw": round(float(df_raw), 2),
+                "scale_raw": round(float(scale_raw), 6),
                 "skew": round(float(sp_stats.t.stats(df, loc=loc, scale=scale, moments='s')), 4),
                 "kurtosis": round(float(sp_stats.t.stats(df, loc=loc, scale=scale, moments='k')), 4),
             },
@@ -245,12 +279,43 @@ class MonteCarloSimulator:
         self,
         trades: list[dict],
         n_shuffles: int = 1000,
+        cost_per_trade: float = 0.0,
     ) -> dict:
-        """Shuffle trade sequence to test if trade timing drives results."""
-        from quant_platform.backtest.metrics import (
-            annualized_return,
-            annualized_volatility,
-        )
+        """Shuffle the trade sequence and score order-dependent outcomes.
+
+        A trade-shuffle test is only informative if the scored statistics
+        depend on the *order* of the trades. The old implementation scored the
+        compound annualized return and the standard deviation of per-trade
+        returns -- both permutation invariant -- so every shuffle produced the
+        same value (std_shuffled=0, stability_score=1.0 on every run) and it
+        annualized trade-level returns with 252, inflating Sharpe by up to
+        ~15.9x.
+
+        Each permutation is now scored by:
+
+        - **max drawdown** of the compounded equity path, with the peak scan
+          starting at the initial wealth of 1.0 (so a loss on the first trade
+          counts);
+        - **terminal wealth**, after ``cost_per_trade`` (round-trip fees +
+          slippage as a fraction of capital) is charged on every trade:
+          ``r_net = (1 + r) * (1 - cost) - 1``;
+        - the **per-trade Sharpe ratio**, ``mean(r_net)/std(r_net)``, with no
+          252 annualization. It is reported for reference but is
+          permutation-invariant by construction; the order-sensitive
+          distribution is the max-drawdown one, which drives
+          ``stability_score``.
+
+        Args:
+            trades: list of dicts with a ``return_pct`` per trade.
+            n_shuffles: number of random permutations.
+            cost_per_trade: round-trip cost per trade (0.002 = 20bp).
+
+        Returns:
+            dict with original statistics, shuffled max-drawdown /
+            terminal-wealth / Sharpe distributions and a stability score.
+        """
+        if cost_per_trade < 0:
+            raise ValueError(f"cost_per_trade must be >= 0, got {cost_per_trade!r}")
 
         returns = np.array(
             [t.get('return_pct', 0) for t in trades if 'return_pct' in t],
@@ -263,29 +328,68 @@ class MonteCarloSimulator:
                 "stability_score": None,
             }
 
-        orig_arr = pd.Series(returns)
-        orig_ret = float(annualized_return(orig_arr))
-        orig_vol = float(annualized_volatility(orig_arr))
-        orig_sharpe = orig_ret / orig_vol if orig_vol > 0 else 0.0
+        # Net trade returns after fees/slippage.
+        net_returns = (1.0 + returns) * (1.0 - cost_per_trade) - 1.0
+        n = len(net_returns)
 
-        shuffled_sharpes = np.zeros(n_shuffles)
+        def _path_stats(path: np.ndarray) -> tuple[float, float, float]:
+            """(max drawdown from wealth 1.0, terminal wealth, per-trade Sharpe)."""
+            wealth = np.concatenate(([1.0], np.cumprod(1.0 + path)))
+            peak = np.maximum.accumulate(wealth)
+            max_dd = float(((wealth - peak) / peak).min())
+            terminal = float(wealth[-1])
+            vol = float(np.std(path, ddof=1)) if n > 1 else 0.0
+            sharpe = float(np.mean(path) / vol) if vol > 1e-12 else 0.0
+            return max_dd, terminal, sharpe
+
+        orig_mdd, orig_terminal, orig_sharpe = _path_stats(net_returns)
+
+        mdd_shuffled = np.zeros(n_shuffles)
+        terminal_shuffled = np.zeros(n_shuffles)
+        sharpe_shuffled = np.zeros(n_shuffles)
         for i in range(n_shuffles):
-            s = self.rng.permutation(returns)
-            s_arr = pd.Series(s)
-            s_ret = float(annualized_return(s_arr))
-            s_vol = float(annualized_volatility(s_arr))
-            shuffled_sharpes[i] = s_ret / s_vol if s_vol > 0 else 0.0
+            perm = self.rng.permutation(net_returns)
+            mdd_shuffled[i], terminal_shuffled[i], sharpe_shuffled[i] = (
+                _path_stats(perm)
+            )
 
-        cv = float(np.std(shuffled_sharpes) / max(abs(np.mean(shuffled_sharpes)), 1e-6))
+        # Stability is dispersion of the path-dependent outcome (max
+        # drawdown) across orderings: a strategy whose drawdown depends
+        # heavily on the order of its trades is not stable.
+        mdd_scale = max(abs(float(np.mean(mdd_shuffled))), 1e-6)
+        cv = float(np.std(mdd_shuffled) / mdd_scale)
         stability_score = float(np.clip(1.0 / (1.0 + cv), 0, 1))
+
         return {
-            "n_trades": len(returns),
+            "n_trades": n,
             "n_shuffles": n_shuffles,
+            "cost_per_trade": float(cost_per_trade),
             "original_sharpe": round(orig_sharpe, 4),
-            "mean_shuffled": round(float(np.mean(shuffled_sharpes)), 4),
-            "std_shuffled": round(float(np.std(shuffled_sharpes)), 4),
-            "sharpe_5pct": round(float(np.percentile(shuffled_sharpes, 5)), 4),
-            "sharpe_95pct": round(float(np.percentile(shuffled_sharpes, 95)), 4),
+            "original_max_drawdown": round(orig_mdd, 6),
+            "original_terminal_wealth": round(orig_terminal, 6),
+            "max_drawdown": {
+                "mean": round(float(np.mean(mdd_shuffled)), 6),
+                "std": round(float(np.std(mdd_shuffled)), 6),
+                "worst": round(float(np.min(mdd_shuffled)), 6),
+                "p5": round(float(np.percentile(mdd_shuffled, 5)), 6),
+                "p95": round(float(np.percentile(mdd_shuffled, 95)), 6),
+                "original": round(orig_mdd, 6),
+            },
+            "terminal_wealth": {
+                "mean": round(float(np.mean(terminal_shuffled)), 6),
+                "std": round(float(np.std(terminal_shuffled)), 6),
+                "p5": round(float(np.percentile(terminal_shuffled, 5)), 6),
+                "p95": round(float(np.percentile(terminal_shuffled, 95)), 6),
+                "original": round(orig_terminal, 6),
+            },
+            "sharpe": {
+                # Unannualized per-trade Sharpe (permutation invariant).
+                "mean": round(float(np.mean(sharpe_shuffled)), 4),
+                "std": round(float(np.std(sharpe_shuffled)), 4),
+                "p5": round(float(np.percentile(sharpe_shuffled, 5)), 4),
+                "p95": round(float(np.percentile(sharpe_shuffled, 95)), 4),
+                "original": round(orig_sharpe, 4),
+            },
             "stability_score": round(stability_score, 4),
         }
 

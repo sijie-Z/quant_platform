@@ -5,9 +5,18 @@ RQ1: Cluster Attribution — Alpha Discovery v2
 Protocol-frozen experiment: Alpha 来源于哪些 Alpha 簇？
 
 只记录结果，不解释。
+
+Experiment 1.3 note (revised): cluster correlation is computed per date across
+the intersection of the assets covered by the two clusters, then summarised
+over dates (mean / median / distribution / sample counts). The old statistic —
+correlating each cluster's daily cross-sectional *mean* — is retained only as a
+renamed diagnostic column because it mostly measures coverage and warm-up
+noise, not asset-level co-movement.
 """
 
+import json
 import sys
+from itertools import combinations
 from pathlib import Path
 
 # Ensure package is importable.
@@ -30,6 +39,7 @@ from quant_platform.factors.technical import register_all as register_technical
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.reporting.dashboard import generate_dashboard
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 
 setup_logging()
 logger = get_logger("rq1")
@@ -39,8 +49,11 @@ logger = get_logger("rq1")
 # ---------------------------------------------------------------------------
 ALPHA_STRENGTH = 0.06       # "normal" strength per protocol
 N_STOCKS = 500
+SEED = 42
 START_DATE = "2021-01-01"
-END_DATE = "2025-12-31"
+# Resolved at run time (QUANT_RESEARCH_END_DATE or today); the old hardcoded
+# "2025-12-31" made every artifact silently stale.
+END_DATE = resolve_end_date()
 INITIAL_CAPITAL = 10_000_000
 
 # Top 8 factors from Ablation #001
@@ -87,6 +100,7 @@ def load_data():
         n_stocks=N_STOCKS,
         start_date=START_DATE,
         end_date=END_DATE,
+        seed=SEED,
         embedded_alpha=True,
         alpha_strength=ALPHA_STRENGTH,
     )
@@ -134,12 +148,17 @@ def compute_all_factors(prices, returns, sector_map, turnover):
         except Exception as e:
             logger.warning("Factor %s failed: %s", name, e)
 
-    # Process (winsorize → standardize → neutralize)
+    # Process (winsorize → standardize → neutralize). R79: market_cap=None
+    # means NO size neutralization — only sector neutralization is applied.
+    # The comment used to claim market-cap neutralization unconditionally.
+    # Supplying a market-cap panel would change this protocol-frozen
+    # experiment's results, so the deviation is declared, not applied.
     processed = {}
     for name, factor in raw_factors.items():
         processed[name] = process_factor(factor, sector_map=sector_map, market_cap=None)
 
-    logger.info("Computed %d factors: %s", len(processed), list(processed.keys()))
+    logger.info("Computed %d factors: %s (sector-neutralized; market-cap "
+                "neutralization NOT applied: R79)", len(processed), list(processed.keys()))
     return processed
 
 
@@ -164,11 +183,14 @@ def build_cluster_signals(processed_factors):
     return cluster_signals
 
 
-def build_experiment_signal(cluster_signals, combo_clusters):
+def build_experiment_signal(cluster_signals, combo_clusters, processed_factors):
     """Build the combined signal for an experiment.
 
     Equal-weights across clusters, then rank-standardize to [-0.5, 0.5].
     For TOP8: equal-weight all 8 individual factors.
+
+    ``processed_factors`` used to be an undefined global here, so the TOP8
+    experiment raised NameError; it is now an explicit argument.
     """
     if combo_clusters is None:
         # TOP8: all 8 individual factors, equal-weight
@@ -237,21 +259,174 @@ def extract_metrics(bt_results, signal_ic):
     """Extract protocol metrics from backtest results and IC."""
     summary = bt_results.get("summary", {})
     metrics = {
-        "IC":        signal_ic.get("mean_ic", 0),
-        "ICIR":      signal_ic.get("icir", 0),
-        "Sharpe":    summary.get("sharpe_ratio", 0),
-        "MDD":       summary.get("max_drawdown", 0),
-        "Turnover":  summary.get("avg_turnover", summary.get("turnover", 0)),
+        "IC":        signal_ic.get("mean_ic", np.nan),
+        "ICIR":      signal_ic.get("icir", np.nan),
+        "Sharpe":    summary.get("sharpe_ratio", np.nan),
+        "MDD":       summary.get("max_drawdown", np.nan),
+        # BacktestEngine.summary exposes annual_turnover. The old fallback
+        # keys (avg_turnover/turnover) never exist, so every Turnover cell
+        # in the CSV was 0.
+        "Turnover":  summary.get("annual_turnover", np.nan),
+        "Status":    "ok",
+        "Error":     "",
     }
     return metrics
 
 
+def failed_metrics(signal_ic, exc):
+    """Metrics for a failed backtest: NaN, never 0 (R64)."""
+    return {
+        "IC": signal_ic.get("mean_ic", np.nan),
+        "ICIR": signal_ic.get("icir", np.nan),
+        "Sharpe": np.nan, "MDD": np.nan, "Turnover": np.nan,
+        "Status": "failed",
+        "Error": f"{type(exc).__name__}: {exc}",
+    }
+
+
+def per_date_cross_sectional_corr(signal_a, signal_b, method="pearson", min_assets=10):
+    """Correlation between two cluster signals *across assets*, date by date.
+
+    For each date present in both signals, the correlation is computed only on
+    the assets that both clusters cover on that date (non-NaN intersection).
+    This measures whether the two clusters rank the same stocks similarly,
+    instead of correlating each cluster's daily cross-sectional mean.
+
+    Returns (corr_series, n_assets_series); dates with fewer than
+    ``min_assets`` common names or with a constant signal are skipped.
+    """
+    common_dates = signal_a.index.intersection(signal_b.index)
+    common_assets = signal_a.columns.intersection(signal_b.columns)
+
+    corr_values = {}
+    n_values = {}
+    if len(common_assets) >= min_assets:
+        a = signal_a.loc[common_dates, common_assets]
+        b = signal_b.loc[common_dates, common_assets]
+        for date in common_dates:
+            x = a.loc[date]
+            y = b.loc[date]
+            mask = x.notna() & y.notna()
+            n_common = int(mask.sum())
+            if n_common < min_assets:
+                continue
+            xv = x[mask]
+            yv = y[mask]
+            if xv.nunique() < 2 or yv.nunique() < 2:
+                continue
+            c = xv.corr(yv, method=method)
+            if pd.notna(c):
+                corr_values[date] = float(c)
+                n_values[date] = n_common
+
+    return (
+        pd.Series(corr_values, dtype=float, name=f"xs_{method}"),
+        pd.Series(n_values, dtype=int, name="n_assets"),
+    )
+
+
+def daily_mean_timeseries_corr(signal_a, signal_b, method="pearson"):
+    """Correlation of the two clusters' DAILY CROSS-SECTIONAL MEAN series.
+
+    This is the statistic the original protocol reported. Each cluster's daily
+    mean is taken over whatever assets it covers that day, and the mean of a
+    rank-standardised signal is ~0 by construction. The resulting correlation
+    therefore mostly measures coverage / warm-up differences between clusters
+    (noise), NOT whether the clusters agree on individual stocks. It is kept
+    as a renamed diagnostic column only.
+    """
+    a = signal_a.mean(axis=1)
+    b = signal_b.mean(axis=1)
+    joined = pd.concat(
+        [a.rename("a"), b.rename("b")], axis=1, join="inner"
+    ).dropna()
+    if len(joined) < 3:
+        return np.nan
+    return float(joined["a"].corr(joined["b"], method=method))
+
+
+def _corr_distribution(corr_series, prefix):
+    """Summary of a per-date correlation distribution."""
+    return {
+        f"{prefix}_mean": float(corr_series.mean()),
+        f"{prefix}_median": float(corr_series.median()),
+        f"{prefix}_std": float(corr_series.std()),
+        f"{prefix}_min": float(corr_series.min()),
+        f"{prefix}_q25": float(corr_series.quantile(0.25)),
+        f"{prefix}_q75": float(corr_series.quantile(0.75)),
+        f"{prefix}_max": float(corr_series.max()),
+    }
+
+
+def summarize_cross_sectional_corr(signal_a, signal_b, min_assets=10):
+    """Per-date asset-level correlation distribution plus the old TS diagnostic."""
+    pearson, n_assets = per_date_cross_sectional_corr(
+        signal_a, signal_b, method="pearson", min_assets=min_assets
+    )
+    spearman, _ = per_date_cross_sectional_corr(
+        signal_a, signal_b, method="spearman", min_assets=min_assets
+    )
+
+    if pearson.empty:
+        result = {
+            "n_dates": 0,
+            "n_assets_mean": np.nan,
+            "n_assets_min": 0,
+            "n_assets_max": 0,
+        }
+        for prefix in ("xs_pearson", "xs_spearman"):
+            result.update({f"{prefix}_{s}": np.nan for s in
+                           ("mean", "median", "std", "min", "q25", "q75", "max")})
+    else:
+        result = {
+            "n_dates": int(len(pearson)),
+            "n_assets_mean": float(n_assets.mean()),
+            "n_assets_min": int(n_assets.min()),
+            "n_assets_max": int(n_assets.max()),
+        }
+        result.update(_corr_distribution(pearson, "xs_pearson"))
+        if not spearman.empty:
+            result.update(_corr_distribution(spearman, "xs_spearman"))
+        else:
+            result.update({f"xs_spearman_{s}": np.nan for s in
+                           ("mean", "median", "std", "min", "q25", "q75", "max")})
+
+    result["ts_pearson_of_daily_means"] = daily_mean_timeseries_corr(
+        signal_a, signal_b, method="pearson")
+    result["ts_spearman_of_daily_means"] = daily_mean_timeseries_corr(
+        signal_a, signal_b, method="spearman")
+    result["ts_note"] = (
+        "time-series corr of daily cross-sectional MEANS; coverage/warm-up "
+        "diagnostic, not asset-level co-movement"
+    )
+    return result
+
+
+def compute_cross_sectional_correlation_summary(cluster_signals, min_assets=10):
+    """Pairwise cluster correlation summary (Experiment 1.3, revised).
+
+    Primary statistics are per-date cross-sectional correlations on the asset
+    intersection, summarised over dates. The old daily-mean time-series
+    correlation is retained as an explicitly renamed diagnostic column.
+    """
+    rows = []
+    for name_a, name_b in combinations(list(cluster_signals), 2):
+        row = {"cluster_a": name_a, "cluster_b": name_b}
+        row.update(summarize_cross_sectional_corr(
+            cluster_signals[name_a], cluster_signals[name_b], min_assets=min_assets))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def compute_correlation_matrix(cluster_signals):
-    """Compute pairwise correlation between cluster signals (Experiment 1.3)."""
-    # Align all to the same timestamp
+    """Time-series correlation matrices of daily cross-sectional means.
+
+    Diagnostic only — see :func:`daily_mean_timeseries_corr`. The old output
+    name is kept for continuity; the printed titles and CSV column names now
+    state what the statistic actually measures.
+    """
     aligned = {}
     for name, sig in cluster_signals.items():
-        # Take the mean across assets per day to get a single time series per cluster
         aligned[name] = sig.mean(axis=1)
 
     df = pd.DataFrame(aligned)
@@ -280,16 +455,46 @@ def print_results_table(results_list):
     print()
 
 
+def print_cross_sectional_correlation_table(summary):
+    """Print the per-date cross-sectional cluster correlation distribution."""
+    print()
+    print("=" * 132)
+    print("  EXPERIMENT 1.3 — CLUSTER CORRELATION (asset-level, per date, distribution over dates)")
+    print("  xs_*: correlation across the asset intersection on each date, then summarised over dates.")
+    print("  ts_*: time-series correlation of DAILY CROSS-SECTIONAL MEANS — coverage/warm-up")
+    print("        diagnostic, NOT asset-level co-movement. Kept only for continuity with old output.")
+    print("=" * 132)
+    if summary.empty:
+        print("  (no overlapping dates/assets with enough names)")
+        print("=" * 132)
+        print()
+        return
+
+    print(f"  {'Pair':<34} {'xsP_mean':>9} {'xsP_med':>8} {'xsP_q25':>8} {'xsP_q75':>8} "
+          f"{'xsS_med':>8} {'n_dates':>8} {'n_assets':>9} {'tsP_dailyMean':>14}")
+    print(f"  {'─'*34} {'─'*9} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*9} {'─'*14}")
+    for _, row in summary.iterrows():
+        pair = f"{row['cluster_a']} vs {row['cluster_b']}"
+        print(f"  {pair:<34} {row['xs_pearson_mean']:>9.4f} {row['xs_pearson_median']:>8.4f} "
+              f"{row['xs_pearson_q25']:>8.4f} {row['xs_pearson_q75']:>8.4f} "
+              f"{row['xs_spearman_median']:>8.4f} {int(row['n_dates']):>8d} "
+              f"{row['n_assets_mean']:>9.1f} {row['ts_pearson_of_daily_means']:>14.4f}")
+    print("=" * 132)
+    print()
+
+
 def print_correlation_matrix(pearson, spearman):
-    """Print correlation matrix (Experiment 1.3)."""
+    """Print the legacy daily-mean time-series correlation matrices (diagnostic)."""
     print()
     print("=" * 70)
-    print("  EXPERIMENT 1.3 — CLUSTER CORRELATION MATRIX (PEARSON)")
+    print("  EXPERIMENT 1.3 — TIME-SERIES CORRELATION OF DAILY CROSS-SECTIONAL MEANS (PEARSON)")
+    print("  Diagnostic only: reflects coverage / warm-up noise, not asset-level co-movement.")
     print("=" * 70)
     print(pearson.to_string(float_format=lambda x: f"{x:.4f}"))
     print()
     print("=" * 70)
-    print("  EXPERIMENT 1.3 — CLUSTER CORRELATION MATRIX (SPEARMAN)")
+    print("  EXPERIMENT 1.3 — TIME-SERIES CORRELATION OF DAILY CROSS-SECTIONAL MEANS (SPEARMAN)")
+    print("  Diagnostic only: reflects coverage / warm-up noise, not asset-level co-movement.")
     print("=" * 70)
     print(spearman.to_string(float_format=lambda x: f"{x:.4f}"))
     print("=" * 70)
@@ -314,6 +519,9 @@ if __name__ == "__main__":
     # Step 1: Load data
     logger.info("[1/4] Loading data...")
     prices, returns, benchmark, metadata, sector_map, turnover = load_data()
+    data_start = str(prices.index[0].date())
+    data_end = str(prices.index[-1].date())
+    logger.info("Data window: %s → %s (requested end %s)", data_start, data_end, END_DATE)
 
     # Step 2: Compute all 8 factors
     logger.info("[2/4] Computing factors...")
@@ -323,8 +531,10 @@ if __name__ == "__main__":
     logger.info("[3/4] Building cluster signals...")
     cluster_signals = build_cluster_signals(processed_factors)
 
-    # Experiment 1.3: Correlation matrix (doesn't depend on backtest)
-    logger.info("Computing cluster correlation matrix...")
+    # Experiment 1.3: Correlation (doesn't depend on backtest)
+    logger.info("Computing cluster correlation (per-date cross-sectional + daily-mean diagnostic)...")
+    xs_corr_summary = compute_cross_sectional_correlation_summary(cluster_signals)
+    print_cross_sectional_correlation_table(xs_corr_summary)
     pearson_corr, spearman_corr = compute_correlation_matrix(cluster_signals)
     print_correlation_matrix(pearson_corr, spearman_corr)
 
@@ -338,7 +548,7 @@ if __name__ == "__main__":
         logger.info("  Experiment: %s", exp_name)
 
         # Build signal
-        signal = build_experiment_signal(cluster_signals, combo_clusters)
+        signal = build_experiment_signal(cluster_signals, combo_clusters, processed_factors)
         if signal is None:
             logger.warning("  Skipping %s: no signal", exp_name)
             continue
@@ -352,8 +562,7 @@ if __name__ == "__main__":
             metrics = extract_metrics(bt_results, signal_ic)
         except Exception as e:
             logger.error("  Backtest failed for %s: %s", exp_name, e)
-            metrics = {"IC": signal_ic.get("mean_ic", 0), "ICIR": signal_ic.get("icir", 0),
-                       "Sharpe": 0, "MDD": 0, "Turnover": 0}
+            metrics = failed_metrics(signal_ic, e)
 
         metrics["Experiment"] = exp_name
         results_list.append(metrics)
@@ -369,18 +578,49 @@ if __name__ == "__main__":
     df_raw = pd.DataFrame(raw_records)
     print_raw_section("RQ1_RAW", df_raw)
 
-    # Save to CSV
-    output_path = Path("results/rq1_cluster_attribution.csv")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save to CSV (with the actual data window and provider as provenance).
+    # Outputs are anchored to the repo root, not the cwd (R76).
+    output_dir = _project_root / "results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    df_raw = stamp_provenance(df_raw, data_start, data_end)
+    df_raw["provider"] = "synthetic"
+    df_raw["alpha_strength"] = ALPHA_STRENGTH
+    df_raw["seed"] = SEED
+    output_path = output_dir / "rq1_cluster_attribution.csv"
     df_raw.to_csv(output_path, index=False)
     logger.info("Raw results saved to: %s", output_path)
 
-    # Save correlation matrices
-    pearson_path = Path("results/rq1_cluster_correlation_pearson.csv")
-    spearman_path = Path("results/rq1_cluster_correlation_spearman.csv")
+    # Save correlation outputs. The summary is long-format and can carry the
+    # provenance columns; the two matrices are square date-free panels, so a
+    # sidecar manifest records their window/provider instead.
+    xs_corr_summary = stamp_provenance(xs_corr_summary, data_start, data_end)
+    xs_corr_summary["provider"] = "synthetic"
+    xs_corr_summary["alpha_strength"] = ALPHA_STRENGTH
+    xs_corr_summary["seed"] = SEED
+    xs_corr_path = output_dir / "rq1_cluster_cross_sectional_correlation.csv"
+    xs_corr_summary.to_csv(xs_corr_path, index=False)
+    pearson_path = output_dir / "rq1_cluster_correlation_pearson.csv"
+    spearman_path = output_dir / "rq1_cluster_correlation_spearman.csv"
     pearson_corr.to_csv(pearson_path)
     spearman_corr.to_csv(spearman_path)
-    logger.info("Correlation matrices saved.")
+    manifest = {
+        "script": "run_rq1_cluster_attribution.py",
+        "generated_at": pd.Timestamp.now("UTC").isoformat(),
+        "provider": "synthetic",
+        "seed": SEED,
+        "alpha_strength": ALPHA_STRENGTH,
+        "n_stocks": N_STOCKS,
+        "requested_end": END_DATE,
+        "data_start": data_start,
+        "data_end": data_end,
+        "artifacts": [p.name for p in (
+            output_path, xs_corr_path, pearson_path, spearman_path,
+        )],
+    }
+    (output_dir / "rq1_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    logger.info("Cross-sectional correlation summary, diagnostic matrices and manifest saved.")
 
     logger.info("RQ1 complete. %d experiments run.", len(results_list))
     logger.info("End of RQ1. Awaiting RQ2.")

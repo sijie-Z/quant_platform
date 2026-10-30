@@ -220,16 +220,19 @@ class FactorOrthogonalizer:
 
         for date in dates:
             # Build matrix: rows = assets, cols = factors (in priority order)
-            vals = []
+            # Rows must be the SAME assets for every factor: independent
+            # dropna() calls line up different assets positionally.
+            common = None
             for name in priority_order:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            # Find common length
-            min_len = min(len(v) for v in vals)
+                index = factors[name].loc[date].dropna().index
+                common = index if common is None else common.intersection(index)
+            min_len = len(common) if common is not None else 0
             if min_len < n_factors + 1:
                 continue
 
-            mat = np.column_stack([v[:min_len] for v in vals])
+            mat = np.column_stack([
+                factors[name].loc[date, common].values for name in priority_order
+            ])
 
             # Standardize each column
             means = mat.mean(axis=0)
@@ -252,10 +255,27 @@ class FactorOrthogonalizer:
                 col_std = orth[:, i].std()
                 if col_std > 1e-10:
                     orth[:, i] = orth[:, i] / col_std
-                assets = factors[name].loc[date].dropna().index[:min_len]
+                assets = common
                 result[name].loc[date, assets] = orth[:, i]
 
         return result, transform
+
+    @staticmethod
+    def _fix_eigenvector_signs(eigenvectors: np.ndarray) -> np.ndarray:
+        """Fix each eigenvector's sign so the largest-|component| is positive.
+
+        Eigenvectors are defined up to sign.  Re-estimating a decomposition on
+        a slightly different window can flip a component's sign, silently
+        turning an "orthogonalized factor" into its negation.  Pinning the
+        sign makes the output deterministic.
+        """
+        if eigenvectors.size == 0:
+            return eigenvectors
+        columns = np.arange(eigenvectors.shape[1])
+        anchor = np.abs(eigenvectors).argmax(axis=0)
+        signs = np.sign(eigenvectors[anchor, columns])
+        signs[signs == 0] = 1.0
+        return eigenvectors * signs
 
     def _pca(
         self,
@@ -263,13 +283,19 @@ class FactorOrthogonalizer:
         n_components: int | None,
         variance_threshold: float,
     ) -> tuple[dict[str, pd.DataFrame], np.ndarray, pd.Series, int]:
-        """PCA-based orthogonalization.
+        """PCA-based orthogonalization, estimated causally.
 
-        Decomposes factors into principal components, then reconstructs
-        using the top components that explain sufficient variance.
+        At each date t the covariance matrix is estimated over every valid
+        cross-section up to and including t, and decomposed once.  Earlier
+        implementations averaged eigenvectors over the whole sample (future
+        data, and an average of arbitrary-sign vectors), so every date's
+        output depended on the future and the components were not even
+        guaranteed to be orthogonal.
 
-        This is order-independent and captures maximum information in
-        minimum dimensions.
+        The number of kept components is fixed from the first valid
+        cross-section: the output width must not change when later data
+        changes, or past rows of the result frame would silently depend on
+        the future.
 
         Args:
             factors: Aligned factor DataFrames.
@@ -283,21 +309,31 @@ class FactorOrthogonalizer:
         names = list(factors.keys())
         n_factors = len(names)
 
-        # Accumulate PCA across dates
-        all_components = None
-        all_eigenvalues = None
+        cov_sum = np.zeros((n_factors, n_factors))
         count = 0
+        n_comp: int | None = None
+        out_names: list[str] = []
+        last_eigenvalues: np.ndarray | None = None
+        transform: np.ndarray | None = None
+        # (date, common assets, scores) for valid cross-sections; frames are
+        # assembled at the end because the component count is only known
+        # after the first valid date.
+        date_scores: list[tuple[pd.Timestamp, pd.Index, np.ndarray]] = []
 
         for date in dates:
-            vals = []
+            # Rows must be the SAME assets for every factor: independent
+            # dropna() calls line up different assets positionally.
+            common = None
             for name in names:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            min_len = min(len(v) for v in vals)
+                index = factors[name].loc[date].dropna().index
+                common = index if common is None else common.intersection(index)
+            min_len = len(common) if common is not None else 0
             if min_len < n_factors + 1:
                 continue
 
-            mat = np.column_stack([v[:min_len] for v in vals])
+            mat = np.column_stack([
+                factors[name].loc[date, common].values for name in names
+            ])
 
             # Standardize
             means = mat.mean(axis=0)
@@ -307,85 +343,68 @@ class FactorOrthogonalizer:
 
             # Covariance matrix
             cov = np.cov(mat_std, rowvar=False)
-            if cov.ndim == 0:
+            if cov.ndim == 0 or not np.isfinite(cov).all():
                 continue
 
-            # Eigendecomposition
-            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+            # Expanding window: the estimate on date t uses only dates <= t.
+            cov_sum += cov
+            count += 1
+            avg_cov = cov_sum / count
+
+            # Eigendecomposition of the as-of-t covariance matrix.
+            eigenvalues, eigenvectors = np.linalg.eigh(avg_cov)
 
             # Sort descending
             idx = np.argsort(eigenvalues)[::-1]
             eigenvalues = eigenvalues[idx]
             eigenvectors = eigenvectors[:, idx]
+            eigenvectors = self._fix_eigenvector_signs(eigenvectors)
 
-            if all_eigenvalues is None:
-                all_eigenvalues = eigenvalues
-                all_components = eigenvectors
-            else:
-                all_eigenvalues += eigenvalues
-                all_components += eigenvectors
-            count += 1
+            if n_comp is None:
+                # Determine the number of components once, from the first
+                # valid cross-section (causal by construction).
+                total_var = eigenvalues.clip(min=0).sum()
+                if total_var <= 0:
+                    n_comp = n_factors
+                elif n_components is not None:
+                    n_comp = min(n_components, n_factors)
+                else:
+                    cum_var = (
+                        np.cumsum(eigenvalues.clip(min=0)) / total_var
+                    )
+                    n_comp = int(np.searchsorted(cum_var, variance_threshold)) + 1
+                    n_comp = max(1, min(n_comp, n_factors))
+                out_names = names[:n_comp]
+
+            # PCA scores: uncorrelated by construction (within the window the
+            # transform was estimated on).
+            scores = mat_std @ eigenvectors[:, :n_comp]
+
+            # Re-standardize each component for consistent scale
+            for i in range(n_comp):
+                col_std = scores[:, i].std()
+                if col_std > 1e-10:
+                    scores[:, i] = scores[:, i] / col_std
+
+            date_scores.append((date, common, scores))
+            last_eigenvalues = eigenvalues
+            transform = eigenvectors[:, :n_comp]
 
         if count == 0:
             raise ValueError("No valid dates for PCA")
 
-        avg_eigenvalues = all_eigenvalues / count
-        avg_components = all_components / count
+        result = {name: factors[name].copy() for name in out_names}
+        for date, common, scores in date_scores:
+            for i, name in enumerate(out_names):
+                result[name].loc[date, common] = scores[:, i]
 
-        # Determine number of components
-        total_var = avg_eigenvalues.sum()
-        if total_var <= 0:
-            n_comp = n_factors
-        else:
-            cum_var = np.cumsum(avg_eigenvalues) / total_var
-            if n_components is not None:
-                n_comp = min(n_components, n_factors)
-            else:
-                n_comp = int(np.searchsorted(cum_var, variance_threshold)) + 1
-                n_comp = max(1, min(n_comp, n_factors))
-
-        # Variance explained
+        # Variance explained, reported from the latest (largest) window.
+        total_var = float(last_eigenvalues.clip(min=0).sum())
         var_explained = pd.Series(
-            avg_eigenvalues / total_var if total_var > 0 else np.zeros(n_factors),
+            last_eigenvalues / total_var if total_var > 0 else np.zeros(n_factors),
             index=[f"PC{i+1}" for i in range(n_factors)],
             name="variance_explained",
         )
-
-        # Use top n_comp components
-        top_components = avg_components[:, :n_comp]
-        transform = top_components
-
-        # Project factors into PCA space (scores are uncorrelated by construction)
-        # Map first n_comp original factor names to PCA components
-        out_names = names[:n_comp]
-        result = {name: factors[names[0]].copy() for name in out_names}
-
-        for date in dates:
-            vals = []
-            for name in names:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            min_len = min(len(v) for v in vals)
-            if min_len < n_factors + 1:
-                continue
-
-            mat = np.column_stack([v[:min_len] for v in vals])
-            means = mat.mean(axis=0)
-            stds = mat.std(axis=0)
-            stds[stds < 1e-10] = 1.0
-            mat_std = (mat - means) / stds
-
-            # PCA scores: uncorrelated by construction
-            scores = mat_std @ top_components  # (assets × n_comp)
-
-            # Re-standardize each component for consistent scale
-            assets = factors[names[0]].loc[date].dropna().index[:min_len]
-            for i, name in enumerate(out_names):
-                col = scores[:, i]
-                col_std = col.std()
-                if col_std > 1e-10:
-                    col = col / col_std
-                result[name].loc[date, assets] = col
 
         return result, transform, var_explained, n_comp
 
@@ -393,17 +412,19 @@ class FactorOrthogonalizer:
         self,
         factors: dict[str, pd.DataFrame],
     ) -> tuple[dict[str, pd.DataFrame], np.ndarray]:
-        """Symmetric (canonical) orthogonalization.
+        """Symmetric (canonical) orthogonalization, estimated causally.
 
         Uses eigendecomposition of the factor correlation matrix to
         create orthogonal factors that are symmetric transforms of
         the originals. No factor is privileged.
 
-        This is the recommended method for multi-factor models where
-        no factor has a natural priority ordering.
-
         The transform is: F_orth = F × V × D^{-1/2} × V'
         where V is the eigenvector matrix and D is the eigenvalue matrix.
+
+        The correlation matrix is the average of the daily cross-sectional
+        correlations observed up to and including the current date (an
+        expanding window).  Estimating it on the full sample -- the old
+        behaviour -- let a date's output depend on future returns.
 
         Args:
             factors: Aligned factor DataFrames.
@@ -415,55 +436,46 @@ class FactorOrthogonalizer:
         names = list(factors.keys())
         n_factors = len(names)
 
-        # Accumulate correlation matrix
+        result = {name: factors[name].copy() for name in names}
+
+        # Expanding-window correlation estimate.
         corr_sum = np.zeros((n_factors, n_factors))
         count = 0
+        transform = np.eye(n_factors)
 
         for date in dates:
-            vals = []
+            # Rows must be the SAME assets for every factor: independent
+            # dropna() calls line up different assets positionally.
+            common = None
             for name in names:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            min_len = min(len(v) for v in vals)
+                index = factors[name].loc[date].dropna().index
+                common = index if common is None else common.intersection(index)
+            min_len = len(common) if common is not None else 0
             if min_len < n_factors + 1:
                 continue
 
-            mat = np.column_stack([v[:min_len] for v in vals])
+            mat = np.column_stack([
+                factors[name].loc[date, common].values for name in names
+            ])
             corr = np.corrcoef(mat, rowvar=False)
+            if not np.isfinite(corr).all():
+                continue
             corr_sum += corr
             count += 1
+            avg_corr = corr_sum / count
+            np.fill_diagonal(avg_corr, 1.0)
 
-        if count == 0:
-            raise ValueError("No valid dates for symmetric orthogonalization")
+            # Eigendecomposition of the as-of-date correlation matrix.
+            eigenvalues, eigenvectors = np.linalg.eigh(avg_corr)
+            eigenvectors = self._fix_eigenvector_signs(eigenvectors)
 
-        avg_corr = corr_sum / count
-        np.fill_diagonal(avg_corr, 1.0)
+            # Clip small eigenvalues to avoid numerical issues
+            eigenvalues = np.maximum(eigenvalues, 1e-8)
 
-        # Eigendecomposition
-        eigenvalues, eigenvectors = np.linalg.eigh(avg_corr)
-
-        # Clip small eigenvalues to avoid numerical issues
-        eigenvalues = np.maximum(eigenvalues, 1e-8)
-
-        # Transform: V × D^{-1/2} × V'
-        # This maps correlated factors to uncorrelated space
-        d_inv_sqrt = np.diag(1.0 / np.sqrt(eigenvalues))
-        transform = eigenvectors @ d_inv_sqrt @ eigenvectors.T
-
-        # Apply transformation
-        result = {}
-        for date in dates:
-            vals = []
-            for name in names:
-                vals.append(factors[name].loc[date].dropna().values)
-
-            min_len = min(len(v) for v in vals)
-            if min_len < n_factors + 1:
-                for name in names:
-                    result.setdefault(name, factors[name].copy())
-                continue
-
-            mat = np.column_stack([v[:min_len] for v in vals])
+            # Transform: V × D^{-1/2} × V'
+            # This maps correlated factors to uncorrelated space
+            d_inv_sqrt = np.diag(1.0 / np.sqrt(eigenvalues))
+            transform = eigenvectors @ d_inv_sqrt @ eigenvectors.T
 
             # Standardize
             means = mat.mean(axis=0)
@@ -476,13 +488,14 @@ class FactorOrthogonalizer:
 
             # Re-standardize for consistent scale
             for i, name in enumerate(names):
-                assets = factors[name].loc[date].dropna().index[:min_len]
-                result.setdefault(name, factors[name].copy())
                 col = orth[:, i]
                 col_std = col.std()
                 if col_std > 1e-10:
                     col = col / col_std
-                result[name].loc[date, assets] = col
+                result[name].loc[date, common] = col
+
+        if count == 0:
+            raise ValueError("No valid dates for symmetric orthogonalization")
 
         return result, transform
 

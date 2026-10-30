@@ -29,19 +29,24 @@ dependencies = [
     "asyncpg==0.30.0",
     "matplotlib==3.8.4",
     "seaborn==0.13.2",
-    "fastapi==0.128.0",
+    "fastapi==0.157.0",
+    "starlette==1.9.0",
     "uvicorn==0.40.0",
     "pydantic==2.12.5",
-    "python-multipart==0.0.6",
+    "python-multipart==0.0.32",
     "websocket-client==1.9.0",
     "httpx==0.28.1",
+    "anyio>=4.15.1",
+    "certifi>=2026.10.19",
+    "urllib3>=2.8.0",
     # CPU-only build; the plain `xgboost` wheel pulls in 342 MB of
     # nvidia-nccl-cu12 on Linux. Same version, same `xgboost` module.
     "xgboost-cpu==2.1.4",
-    "lightgbm==4.5.0",
+    "lightgbm==4.6.0",
     "shap==0.46.0",
     "pyyaml==6.0.2",
     "python-dotenv==1.0.0",
+    "tzdata==2026.2",
     "openpyxl==3.1.5",
     "adata>=1.0.0",
 ]
@@ -58,14 +63,66 @@ classifiers = [
 ]
 
 [project.scripts]
-quant = "main:main"
+quant = "quant_platform.main:main"
 
-[tool.setuptools.packages.find]
-# The repo root IS the quant_platform package; subpackages (core, data, ...)
-# are discovered directly. Using include=["*"] because find_packages returns
-# subpackage names (core, data) without the "quant_platform." prefix, so
-# "quant_platform*" would match nothing.
-include = ["*"]
+[tool.setuptools]
+# The repo root IS the `quant_platform` package. Package it under that name
+# instead of installing its 46 subdirectories as top-level packages: the old
+# `packages.find include=["*"]` installed `data`, `core`, ... directly, which
+# created a second module identity (`data.x` vs `quant_platform.data.x`) and
+# split every module-level singleton in two (issue #69).
+#
+# Subpackages must be listed explicitly. With only the root package, a
+# non-editable `pip install .` produced a wheel containing four top-level
+# modules and none of the subpackages, so the installed CLI failed on import.
+# `package-dir` maps the `quant_platform` prefix to the repo root, so the
+# remaining dotted path (`data.providers`) resolves to `./data/providers`.
+# `tests/test_architecture/test_package_manifest.py` fails if a new
+# subpackage is added without updating this list.
+packages = [
+    "quant_platform",
+    "quant_platform.agent",
+    "quant_platform.alpha",
+    "quant_platform.api",
+    "quant_platform.backtest",
+    "quant_platform.compliance",
+    "quant_platform.config",
+    "quant_platform.core",
+    "quant_platform.core.protocols",
+    "quant_platform.data",
+    "quant_platform.data.providers",
+    "quant_platform.execution",
+    "quant_platform.factors",
+    "quant_platform.factors.expressions",
+    "quant_platform.factors.store",
+    "quant_platform.framework",
+    "quant_platform.framework.contracts",
+    "quant_platform.kernel",
+    "quant_platform.lab",
+    "quant_platform.lab.registry",
+    "quant_platform.lab.reports",
+    "quant_platform.lab.runs",
+    "quant_platform.operations",
+    "quant_platform.portfolio",
+    "quant_platform.regime_router",
+    "quant_platform.reporting",
+    "quant_platform.research",
+    "quant_platform.risk",
+    "quant_platform.services",
+    "quant_platform.shared",
+    "quant_platform.trading",
+    "quant_platform.utils",
+    "quant_platform.utils.cyext",
+]
+
+[tool.setuptools.package-dir]
+quant_platform = "."
+
+[tool.setuptools.package-data]
+# `load_config(None)` resolves the default YAML relative to the installed
+# package. Wheels do not include non-code files unless declared here, so a
+# pip-installed `quant` command failed with FileNotFoundError.
+"quant_platform.config" = ["*.yaml"]
 
 # ---------------------------------------------------------------------------
 # ruff — fast Python linter (replaces flake8 + isort + autoflake)
@@ -144,6 +201,9 @@ markers = [
     "asyncio: marks tests as async",
 ]
 asyncio_mode = "auto"
+# A hung test must fail with a stack dump instead of eating the job timeout.
+timeout = 600
+timeout_method = "thread"
 filterwarnings = [
     "ignore::DeprecationWarning:dateutil.*",
     "ignore::DeprecationWarning:pytz.*",

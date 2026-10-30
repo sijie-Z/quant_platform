@@ -11,6 +11,7 @@ import pytest
 
 from quant_platform.core.state_machine import PortfolioState, PortfolioStateMachine
 from quant_platform.core.store import Store
+from quant_platform.risk.circuit_breaker import RiskMonitor
 from quant_platform.trading.broker import SimulatedBroker
 from quant_platform.trading.engine import LiveTradingEngine
 
@@ -21,6 +22,10 @@ def engine(tmp_path, monkeypatch):
         broker=SimulatedBroker(initial_cash=1_000_000),
         store=Store(str(tmp_path / "engine.db")),
         state_machine=PortfolioStateMachine(),
+        # D13 made the process-wide RiskMonitor the default; inject a fresh
+        # one here so kill switches activated by one test cannot leak into
+        # the next (the singleton persists for the whole pytest process).
+        risk_monitor=RiskMonitor(),
     )
     # No network in tests; prices are not what these assertions are about.
     monkeypatch.setattr(eng, "_fetch_prices", lambda: None)
@@ -35,6 +40,63 @@ def _kill(engine, active: bool) -> None:
         engine._risk.activate_kill_switch("test")
     else:
         engine._risk.deactivate_kill_switch()
+
+
+class TestTheKillSwitchDeRisks:
+    """The early return happened before signal generation, so the reducing
+    sells that the pre-trade checks explicitly allow were never created: the
+    switch halted the engine with the whole book still exposed."""
+
+    def test_available_positions_are_sold(self, engine):
+        from types import SimpleNamespace
+
+        from quant_platform.execution.models import OrderStatus
+        from quant_platform.trading.broker import OrderSide
+
+        engine._current_prices = {"600519": 10.0}
+        engine._broker.get_positions = lambda: [
+            SimpleNamespace(code="600519", available=100, quantity=100),
+        ]
+        placed = []
+
+        class _Result:
+            status = OrderStatus.FILLED
+
+            def to_dict(self):
+                return {
+                    "order_id": "derisk-1", "code": "600519",
+                    "side": "sell", "quantity": 100, "price": 10.0,
+                    "filled_quantity": 100, "filled_price": 10.0,
+                }
+
+        def place(order):
+            placed.append(order)
+            return _Result()
+
+        engine._broker.place_order = place
+        engine._risk.activate_kill_switch("test")
+
+        cycle = engine._execute_cycle()
+
+        assert len(placed) == 1
+        assert placed[0].side == OrderSide.SELL
+        assert placed[0].quantity == 100
+        assert cycle.orders, "the cycle result must report the de-risking order"
+        assert engine._sm.state == PortfolioState.HALTED
+
+    def test_t_plus_one_locked_shares_are_left_alone(self, engine):
+        from types import SimpleNamespace
+
+        engine._current_prices = {"600519": 10.0}
+        engine._broker.get_positions = lambda: [
+            SimpleNamespace(code="600519", available=0, quantity=100),
+        ]
+        engine._broker.place_order = lambda order: pytest.fail(
+            "T+1-locked shares must not be sold"
+        )
+        engine._risk.activate_kill_switch("test")
+
+        engine._execute_cycle()
 
 
 class TestTheKillSwitchReachesTheStateMachine:
@@ -79,3 +141,9 @@ class TestTheKillSwitchReachesTheStateMachine:
         engine._execute_cycle()
 
         assert engine._sm.state != PortfolioState.HALTED
+
+
+def test_state_transitions_are_written_to_the_audit_log(engine):
+    """`AuditLog.log_state_change` existed but nothing called it."""
+    events = engine._store.get_events(topic="audit.state_change")
+    assert events, "engine state transitions were not audited"

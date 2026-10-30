@@ -68,9 +68,11 @@ class TWAPAlgorithm:
     Typical: 30min-2hr execution window, 5-20 slices.
     """
 
-    def __init__(self, num_slices: int = 10, max_participation: float = 0.1):
+    def __init__(self, num_slices: int = 10, max_participation: float = 0.1,
+                 lot_size: int = 100):
         self.num_slices = num_slices
         self.max_participation = max_participation
+        self.lot_size = max(1, int(lot_size))
 
     def create_plan(
         self,
@@ -78,10 +80,16 @@ class TWAPAlgorithm:
         start_time: datetime,
         duration_minutes: int = 60,
     ) -> ExecutionPlan:
-        """Create TWAP execution plan."""
-        interval = duration_minutes / self.num_slices
-        qty_per_slice = order.quantity // self.num_slices
-        remainder = order.quantity - qty_per_slice * self.num_slices
+        """Create TWAP execution plan.
+
+        Slices are whole A-share lots (default 100 shares). The parent order's
+        odd-lot remainder, if any, is left unexecuted and reported in a warning.
+        """
+        total_lots = order.quantity // self.lot_size
+        num_slices = min(self.num_slices, total_lots) if total_lots > 0 else 0
+        base_lots = total_lots // num_slices if num_slices else 0
+        extra_lots = total_lots - base_lots * num_slices if num_slices else 0
+        interval = duration_minutes / num_slices if num_slices else 0.0
 
         plan = ExecutionPlan(
             parent_order_id=order.order_id,
@@ -91,12 +99,13 @@ class TWAPAlgorithm:
             total_quantity=order.quantity,
             start_time=start_time.isoformat(),
             end_time=(start_time + timedelta(minutes=duration_minutes)).isoformat(),
-            num_slices=self.num_slices,
+            num_slices=num_slices,
             max_participation=self.max_participation,
         )
 
-        for i in range(self.num_slices):
-            slice_qty = qty_per_slice + (1 if i < remainder else 0)
+        for i in range(num_slices):
+            lots = base_lots + (1 if i < extra_lots else 0)
+            slice_qty = lots * self.lot_size
             target_time = start_time + timedelta(minutes=i * interval)
 
             plan.slices.append(ExecutionSlice(
@@ -107,9 +116,18 @@ class TWAPAlgorithm:
                 target_time=target_time.isoformat(),
             ))
 
+        allocated = sum(s.quantity for s in plan.slices)
+        if allocated != order.quantity:
+            logger.warning(
+                "TWAP plan for %s allocates %d of %d shares; %d share(s) are "
+                "not a whole %d-share lot and were left unexecuted",
+                order.ticker, allocated, order.quantity,
+                order.quantity - allocated, self.lot_size,
+            )
+
         logger.info("TWAP plan: %s %s x%d over %d min in %d slices",
                      order.side.value, order.ticker, order.quantity,
-                     duration_minutes, self.num_slices)
+                     duration_minutes, len(plan.slices))
         return plan
 
 
@@ -123,9 +141,11 @@ class VWAPAlgorithm:
     Requires: Historical intraday volume profile data.
     """
 
-    def __init__(self, num_slices: int = 10, max_participation: float = 0.08):
+    def __init__(self, num_slices: int = 10, max_participation: float = 0.08,
+                 lot_size: int = 100):
         self.num_slices = num_slices
         self.max_participation = max_participation
+        self.lot_size = max(1, int(lot_size))
 
     def get_volume_profile(self, ticker: str) -> list[float]:
         """Get typical intraday volume distribution (normalized to sum=1).
@@ -185,7 +205,9 @@ class VWAPAlgorithm:
                 break
 
             if i == n_slices - 1:
-                slice_qty = remaining  # last slice takes the remainder
+                # The final slice must be a whole lot too: an odd-lot
+                # remainder cannot be bought on the exchange.
+                slice_qty = (remaining // self.lot_size) * self.lot_size
             else:
                 # The lot floor can exceed what is left on a small order: a flat
                 # volume profile with a 200-share order over 10 slices wants
@@ -194,8 +216,8 @@ class VWAPAlgorithm:
                 # and the plan came out as
                 #     [100, 100, 0, -100, -200, ..., -700]
                 # -- negative child quantities for a 200-share parent.
-                slice_qty = max(100, int(order.quantity * volume_profile[i]))
-                slice_qty = (slice_qty // 100) * 100  # round down to a lot
+                slice_qty = max(self.lot_size, int(order.quantity * volume_profile[i]))
+                slice_qty = (slice_qty // self.lot_size) * self.lot_size  # round down to a lot
                 slice_qty = min(slice_qty, remaining)
 
             if slice_qty <= 0:
@@ -237,9 +259,11 @@ class IcebergAlgorithm:
     Typical: visible_qty = 5-10% of total.
     """
 
-    def __init__(self, visible_pct: float = 0.1, randomize: bool = True):
+    def __init__(self, visible_pct: float = 0.1, randomize: bool = True,
+                 lot_size: int = 100):
         self.visible_pct = visible_pct
         self.randomize = randomize
+        self.lot_size = max(1, int(lot_size))
 
     def create_plan(
         self,
@@ -248,8 +272,8 @@ class IcebergAlgorithm:
         duration_minutes: int = 120,
     ) -> ExecutionPlan:
         """Create iceberg execution plan."""
-        visible_qty = max(100, int(order.quantity * self.visible_pct))
-        visible_qty = (visible_qty // 100) * 100
+        visible_qty = max(self.lot_size, int(order.quantity * self.visible_pct))
+        visible_qty = (visible_qty // self.lot_size) * self.lot_size
 
         num_slices = max(1, order.quantity // visible_qty)
         interval = duration_minutes / num_slices
@@ -273,11 +297,15 @@ class IcebergAlgorithm:
             if self.randomize and i < num_slices - 1:
                 jitter = 1.0 + (rng.random() - 0.5) * 0.6
                 slice_qty = min(remaining, int(visible_qty * jitter))
-                slice_qty = max(100, (slice_qty // 100) * 100)
+                slice_qty = max(self.lot_size, (slice_qty // self.lot_size) * self.lot_size)
             else:
-                slice_qty = remaining
+                # The last refill must still be a whole lot; any odd-lot
+                # remainder is left unexecuted.
+                slice_qty = (remaining // self.lot_size) * self.lot_size
 
             slice_qty = min(slice_qty, remaining)
+            if slice_qty <= 0:
+                break
             remaining -= slice_qty
 
             target_time = start_time + timedelta(minutes=i * interval)
@@ -293,6 +321,7 @@ class IcebergAlgorithm:
             if remaining <= 0:
                 break
 
+        plan.num_slices = len(plan.slices)
         logger.info("Iceberg plan: %s %s x%d, visible=%d, %d slices",
                      order.side.value, order.ticker, order.quantity,
                      visible_qty, len(plan.slices))
@@ -395,3 +424,149 @@ class SmartRouter:
             start_time=datetime.now(),
             duration_minutes=params.get("duration_minutes", 60),
         )
+
+
+@dataclass
+class ExecutionReport:
+    """Result of submitting one ExecutionPlan to an order manager."""
+    plan_id: str
+    ticker: str
+    side: str
+    algorithm: str
+    requested_quantity: int
+    filled_quantity: int = 0
+    notional: float = 0.0
+    average_price: float = 0.0
+    order_ids: list[str] = field(default_factory=list)
+    fills: list[dict] = field(default_factory=list)
+    rejects: list[dict] = field(default_factory=list)
+    status: str = "pending"        # completed / partial / rejected
+
+    def to_dict(self) -> dict:
+        return {
+            "plan_id": self.plan_id,
+            "ticker": self.ticker,
+            "side": self.side,
+            "algorithm": self.algorithm,
+            "requested_quantity": self.requested_quantity,
+            "filled_quantity": self.filled_quantity,
+            "average_price": round(self.average_price, 6),
+            "order_ids": self.order_ids,
+            "fills": self.fills,
+            "rejects": self.rejects,
+            "status": self.status,
+        }
+
+
+class PlanExecutor:
+    """Execute an ExecutionPlan slice by slice through an OMS.
+
+    The algorithms above only produced plans. Nothing turned a slice into an
+    order, so TWAP/VWAP/Iceberg never moved a position or a unit of cash.
+    This class is that missing link: every slice becomes a real order
+    (create -> submit -> fill), so the OMS blotter, positions, T+1 and cash
+    accounting all apply.
+
+    Timing: this executes the plan immediately. ``target_time`` remains on the
+    plan for callers that want to schedule slices themselves.
+    """
+
+    def __init__(self, order_manager, price_lookup=None):
+        self.order_manager = order_manager
+        self.price_lookup = price_lookup
+
+    def execute_plan(
+        self,
+        plan: ExecutionPlan,
+        price: float | None = None,
+        price_lookup=None,
+    ) -> ExecutionReport:
+        """Submit every slice of ``plan`` as an order and fill it.
+
+        Args:
+            plan: execution plan from TWAP/VWAP/Iceberg/SmartRouter.
+            price: single execution price applied to every slice.
+            price_lookup: callable(ticker) -> price, used when ``price`` is
+                not supplied. Falls back to the executor's own lookup.
+        """
+        lookup = price_lookup or self.price_lookup
+        report = ExecutionReport(
+            plan_id=plan.plan_id,
+            ticker=plan.ticker,
+            side=plan.side,
+            algorithm=plan.algorithm,
+            requested_quantity=plan.total_quantity,
+        )
+
+        for execution_slice in plan.slices:
+            if execution_slice.quantity <= 0:
+                report.rejects.append({
+                    "slice_id": execution_slice.slice_id,
+                    "reason": "non-positive slice quantity",
+                })
+                continue
+
+            fill_price = price
+            if fill_price is None and lookup is not None:
+                fill_price = lookup(execution_slice.ticker)
+            if fill_price is None or fill_price <= 0:
+                report.rejects.append({
+                    "slice_id": execution_slice.slice_id,
+                    "reason": "no execution price",
+                })
+                continue
+
+            try:
+                child = self.order_manager.create_order(
+                    ticker=execution_slice.ticker,
+                    side=execution_slice.side,
+                    quantity=execution_slice.quantity,
+                    order_type="market",
+                    strategy=f"algo:{plan.algorithm}",
+                    notes=f"plan={plan.plan_id} slice={execution_slice.slice_id}",
+                )
+                self.order_manager.submit_order(child.order_id)
+                self.order_manager.fill_order(
+                    child.order_id,
+                    price=float(fill_price),
+                    quantity=execution_slice.quantity,
+                )
+            except (ValueError, KeyError) as exc:
+                # Business rejections (T+1 lock, invalid quantity, unknown
+                # order). Programming errors -- a signature mismatch, a
+                # missing attribute -- deliberately propagate: swallowing
+                # them is how the ExecutionService turned every order into a
+                # false "rejected".
+                report.rejects.append({
+                    "slice_id": execution_slice.slice_id,
+                    "reason": str(exc),
+                })
+                continue
+
+            filled = child.filled_quantity
+            report.order_ids.append(child.order_id)
+            report.filled_quantity += filled
+            report.notional += float(fill_price) * filled
+            report.fills.append({
+                "order_id": child.order_id,
+                "slice_id": execution_slice.slice_id,
+                "quantity": filled,
+                "price": round(float(fill_price), 6),
+            })
+
+        if report.filled_quantity > 0:
+            report.average_price = report.notional / report.filled_quantity
+        if report.filled_quantity >= report.requested_quantity and not report.rejects:
+            report.status = "completed"
+        elif report.filled_quantity > 0:
+            report.status = "partial"
+        else:
+            report.status = "rejected"
+
+        logger.info(
+            "Plan %s executed: %s %s %d/%d @ %.4f (%d slices, %d rejected)",
+            plan.plan_id, plan.side, plan.ticker, report.filled_quantity,
+            report.requested_quantity, report.average_price,
+            len(report.fills), len(report.rejects),
+        )
+        return report

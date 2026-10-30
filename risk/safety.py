@@ -53,8 +53,8 @@ class SafetySystem:
             message=f"drawdown={dd:.2%} limit={self.limits.max_drawdown:.0%}",
         ))
 
-        # 2. 单日最大亏损
-        daily_loss_ratio = abs(daily_pnl) / equity if equity > 0 else 1
+        # 2. 单日最大亏损（只有亏损触发；盈利不是风险）
+        daily_loss_ratio = max(0.0, -daily_pnl) / equity if equity > 0 else 1
         self.checks.append(SafetyCheck(
             name="max_daily_loss",
             passed=daily_loss_ratio <= self.limits.max_daily_loss,

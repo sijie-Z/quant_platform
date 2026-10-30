@@ -195,3 +195,23 @@ class TestCustomFundName:
         portal = InvestorPortal(populated_store)
         view = portal.get_investor_view()
         assert view.fund_name == "量化多因子基金"
+
+
+class TestAnnualization:
+    def test_annualized_return_uses_elapsed_time(self, store):
+        """Twelve monthly NAVs used to be treated as 12/252 years."""
+        calc = NAVCalculator(store, annual_mgmt_fee=0.0, perf_fee_rate=0.0)
+        dates = pd.date_range("2024-01-31", periods=12, freq=pd.offsets.MonthEnd())
+        for i, day in enumerate(dates):
+            nav = calc.calculate_daily_nav(
+                date=str(day.date()),
+                cash=5_000_000,
+                market_value=5_000_000 * (1 + 0.10 * i / 11),
+            )
+            calc.save_nav(nav)
+
+        view = InvestorPortal(store).get_investor_view()
+
+        # ~10% over eleven months is roughly 11% annualized; the record-count
+        # formula reported about 640%.
+        assert 0.05 < view.annualized_return < 0.20

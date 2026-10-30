@@ -17,6 +17,7 @@ import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date
 
 setup_logging()
 logger = get_logger("cost")
@@ -25,11 +26,13 @@ SIGNAL_H = 40
 HOLD_H = 80
 SELECT_PCT = 0.20
 INITIAL_CAPITAL = 10_000_000
+# Resolved at run time (QUANT_RESEARCH_END_DATE or today).
+END_DATE = resolve_end_date()
 
 
 def load():
     provider = BaostockDataProvider(cache_enabled=True)
-    pipeline = DataPipeline(provider=provider, start_date="2018-01-01", end_date="2025-12-31",
+    pipeline = DataPipeline(provider=provider, start_date="2018-01-01", end_date=END_DATE,
                             exclude_st=True, exclude_suspended=True)
     pipeline.run()
     return pipeline.returns, pipeline.get_close()
@@ -40,11 +43,17 @@ def compound(x):
 
 
 def backtest_with_cost(returns, prices, use_vol_filter=False,
-                       commission_bps=10, slippage_bps=5):
+                       commission_bps=10, slippage_bps=5,
+                       stamp_tax_bps=10):
     """80d 反转 + 成本模型.
 
-    cost per trade = commission + slippage
-    每笔交易: 买入时付一次, 卖出时付一次
+    cost per trade = commission + slippage (+ stamp tax on sells)
+    A 股印花税仅卖出征收；旧场景全部漏掉，净 Sharpe 与 VIABLE 判定被高估。
+
+    Entry is at close(i+1): the signal at row i uses pipeline forward returns
+    (data/pipeline.py shift(-1)) through i, which are only known at close i+1.
+    The old code entered at close(i), earning returns.values[i] -- the
+    signal-day forward return.
     """
     n_stocks = len(returns.columns)
     n_select = max(1, int(n_stocks * SELECT_PCT))
@@ -57,7 +66,8 @@ def backtest_with_cost(returns, prices, use_vol_filter=False,
 
     past_ret = returns.rolling(SIGNAL_H, min_periods=SIGNAL_H).apply(compound, raw=True)
 
-    cost_per_side = (commission_bps + slippage_bps) / 10000  # bps to decimal
+    cost_buy = (commission_bps + slippage_bps) / 10000  # bps to decimal
+    cost_sell = (commission_bps + slippage_bps + stamp_tax_bps) / 10000
     cash = float(INITIAL_CAPITAL)
     portfolio_log = []  # (date, value)
 
@@ -73,25 +83,21 @@ def backtest_with_cost(returns, prices, use_vol_filter=False,
         if len(valid) < n_select:
             continue
         selected = valid.head(n_select)
-        end = i + HOLD_H
-        if end >= len(dates):
+
+        entry_idx = i + 1
+        exit_idx = entry_idx + HOLD_H
+        if exit_idx >= len(dates):
             break
+        entry_date = dates[entry_idx]
+        exit_date = dates[exit_idx]
+        if entry_date not in prices.index or exit_date not in prices.index:
+            continue
 
         # 每只股票投入资金
         invest_per_stock = cash / len(selected)
 
-        # 买入价 (当日收盘)
-        if rdate not in prices.index:
-            continue
-        entry_prices = prices.loc[rdate, selected.index]
-
-        # 持有期结束日
-        exit_idx = end
-        if exit_idx >= len(dates):
-            break
-        exit_date = dates[exit_idx]
-        if exit_date not in prices.index:
-            continue
+        # 买入价 (信号次日收盘) / 卖出价 (持有期末收盘)
+        entry_prices = prices.loc[entry_date, selected.index]
         exit_prices = prices.loc[exit_date, selected.index]
 
         # 计算收益 (含成本)
@@ -105,10 +111,12 @@ def backtest_with_cost(returns, prices, use_vol_filter=False,
                 continue
 
             shares = (invest_per_stock / ep)  # 买入股数
-            cost_buy = invest_per_stock * cost_per_side  # 买入成本
+            cost_side_buy = invest_per_stock * cost_buy  # 买入成本
             gross_sale = shares * xp  # 卖出毛收入
-            cost_sell = gross_sale * cost_per_side  # 卖出成本
-            net_return = (gross_sale - cost_sell - invest_per_stock - cost_buy) / invest_per_stock
+            cost_side_sell = gross_sale * cost_sell  # 卖出成本(含印花税)
+            net_return = (
+                gross_sale - cost_side_sell - invest_per_stock - cost_side_buy
+            ) / invest_per_stock
             total_return += net_return * (invest_per_stock / cash)
 
         cash = cash * (1 + total_return)
@@ -117,8 +125,8 @@ def backtest_with_cost(returns, prices, use_vol_filter=False,
         portfolio_log.append({"date": exit_date, "value": cash})
 
     if len(portfolio_log) < 3:
-        return {"sharpe": np.nan, "ann_ret": 0, "total_return": 0, "n": len(portfolio_log),
-                "total_cost": 0}
+        return {"sharpe": np.nan, "ann_ret": 0, "total_return": 0,
+                "mdd": np.nan, "n": len(portfolio_log), "total_cost": 0}
 
     # 计算收益序列
     df = pd.DataFrame(portfolio_log)
@@ -149,13 +157,18 @@ def main():
     print("=" * 90)
 
     returns, prices = load()
+    data_start = str(returns.index.min().date())
+    data_end = str(returns.index.max().date())
+    logger.info("Data window: %s → %s (requested end %s)", data_start, data_end, END_DATE)
+    print(f"  Data window: {data_start} → {data_end} (requested end {END_DATE})")
+    print("  Sells include 10bps A-share stamp tax in every scenario.")
 
-    # 成本场景
+    # 成本场景 (comm, slippage, stamp tax; stamp applies to sells only)
     scenarios = [
-        ("理想 (无成本)", 0, 0),
-        ("低 (5+2bps)",  5, 2),
-        ("中 (10+5bps)", 10, 5),
-        ("高 (20+10bps)", 20, 10),
+        ("理想 (无成本)", 0, 0, 0),
+        ("低 (5+2bps)",  5, 2, 10),
+        ("中 (10+5bps)", 10, 5, 10),
+        ("高 (20+10bps)", 20, 10, 10),
     ]
 
     print()
@@ -163,12 +176,13 @@ def main():
     print(f"  {'─'*20} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*4}")
 
     results = []
-    for label, comm, slippage in scenarios:
+    for label, comm, slippage, stamp in scenarios:
         r = backtest_with_cost(returns, prices, use_vol_filter=True,
-                               commission_bps=comm, slippage_bps=slippage)
+                               commission_bps=comm, slippage_bps=slippage,
+                               stamp_tax_bps=stamp)
         results.append((label, r))
         print(f"  {label:<20} {r['sharpe']:>8.4f} {r['ann_ret']*100:>7.2f}% "
-              f"{r['mdd']*100:>7.2f}% {comm+slippage:>7d}bps {r['n']:>4d}")
+              f"{r['mdd']*100:>7.2f}% {comm+slippage:>5d}+{stamp:<3d}bps {r['n']:>4d}")
 
     print()
     print("=" * 90)
@@ -180,7 +194,9 @@ def main():
     print("  判定:")
     print(f"  无成本 Sharpe: {baseline:.4f}")
     print(f"  中成本 Sharpe: {mid:.4f}")
-    if mid > 0.3:
+    if not np.isfinite(mid):
+        print("  -> UNDETERMINED: too few trades to judge viability")
+    elif mid > 0.3:
         print("  -> Net Sharpe > 0.3: VIABLE (可交易)")
     elif mid > 0.2:
         print("  -> Net Sharpe 0.2-0.3: MARGINAL (边际)")

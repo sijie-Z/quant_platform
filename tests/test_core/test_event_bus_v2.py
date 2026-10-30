@@ -364,3 +364,127 @@ class TestTheBusCanBeRestarted:
 
         assert len(received) == 2, "the restarted bus never delivered the event"
         assert received[1].data["n"] == 2
+
+
+class TestProductionStart:
+    """The global bus used to be created and never started: every publish
+    fell back to inline synchronous delivery, async handlers were skipped,
+    and the DLQ retry loop never ran. `start()` is now called from the app
+    lifespan, and handlers registered afterwards get a consumer task."""
+
+    @pytest.mark.asyncio
+    async def test_is_started_reflects_the_lifecycle(self):
+        bus = AsyncEventBus(default_queue_size=100)
+        assert bus.is_started is False
+
+        await bus.start()
+        assert bus.is_started is True
+
+        await bus.stop()
+        assert bus.is_started is False
+
+    @pytest.mark.asyncio
+    async def test_handler_subscribed_after_start_is_consumed(self):
+        bus = AsyncEventBus(default_queue_size=100)
+        received = []
+
+        async def handler(event: Event):
+            received.append(event)
+
+        await bus.start()
+        bus.subscribe("late.topic", handler)
+        await asyncio.sleep(0)  # let the consumer task be scheduled
+
+        await bus.publish_async("late.topic", {"n": 1})
+        await asyncio.sleep(0.05)
+        await bus.stop()
+
+        assert len(received) == 1, "a handler subscribed after start() was never drained"
+
+
+class TestConsumerIdentity:
+    """Consumer tasks were keyed by handler *name*.
+
+    Two handlers called `on_tick` shared one registry key: the second
+    subscription never got a consumer and its events accumulated in an
+    undrained queue (eventually blocking publish on a full queue).
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_named_handlers_both_receive(self):
+        from quant_platform.core.event_bus_v2 import AsyncEventBus
+
+        bus = AsyncEventBus(default_queue_size=1000)
+        received = []
+
+        class A:
+            async def on_tick(self, event):
+                received.append(("a", event.data["n"]))
+
+        class B:
+            async def on_tick(self, event):
+                received.append(("b", event.data["n"]))
+
+        bus.subscribe("market.tick", A().on_tick)
+        bus.subscribe("market.tick", B().on_tick)
+        await bus.start()
+
+        await bus.publish_async("market.tick", {"n": 1})
+        await asyncio.sleep(0.1)
+
+        assert ("a", 1) in received
+        assert ("b", 1) in received
+
+        await bus.stop()
+
+    @pytest.mark.asyncio
+    async def test_resubscribing_after_unsubscribe_delivers_again(self):
+        from quant_platform.core.event_bus_v2 import AsyncEventBus
+
+        bus = AsyncEventBus(default_queue_size=1000)
+        received = []
+
+        async def handler(event):
+            received.append(event.data["n"])
+
+        bus.subscribe("test.topic", handler)
+        await bus.start()
+        await bus.publish_async("test.topic", {"n": 1})
+        await asyncio.sleep(0.05)
+
+        bus.unsubscribe("test.topic", handler)
+        bus.subscribe("test.topic", handler)
+        await asyncio.sleep(0.05)
+        await bus.publish_async("test.topic", {"n": 2})
+        await asyncio.sleep(0.1)
+
+        assert received == [1, 2]
+
+        await bus.stop()
+
+
+class TestWildcardSemanticsAreShared:
+    def test_tail_double_wildcard(self):
+        assert AsyncEventBus._topic_matches("order", "order.**")
+        assert AsyncEventBus._topic_matches("order.filled", "order.**")
+        assert AsyncEventBus._topic_matches("order.filled.partial", "order.**")
+        assert not AsyncEventBus._topic_matches("orderx", "order.**")
+
+    def test_single_wildcard_is_segment_aware(self):
+        assert AsyncEventBus._topic_matches("market.tick", "market.*")
+        assert not AsyncEventBus._topic_matches("market", "market.*")
+        assert not AsyncEventBus._topic_matches("market_data.tick", "market.*")
+
+    def test_legacy_bus_delivers_and_filters_the_same_way(self):
+        from quant_platform.core.events import LegacyEventBus
+
+        bus = LegacyEventBus()
+        seen = []
+        bus.subscribe("market.*", lambda event: seen.append(event.topic))
+
+        bus.publish("market.tick", {})
+        bus.publish("market", {})
+        bus.publish("market_data.tick", {})
+
+        assert seen == ["market.tick"]
+        assert [e["topic"] for e in bus.get_history("market.*")] == ["market.tick"]

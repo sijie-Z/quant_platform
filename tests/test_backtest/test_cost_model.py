@@ -2,6 +2,7 @@
 
 import logging
 
+import numpy as np
 import pandas as pd
 import pytest
 from quant_platform.backtest.cost_model import CostModel
@@ -28,6 +29,7 @@ def test_compute_costs_scalar_input_is_the_two_way_traded_value():
         two_way * 0.0003       # commission, both sides
         + one_sided * 0.001    # stamp tax, sells only
         + two_way * 0.0005     # slippage, both sides
+        + two_way * 0.00001    # transfer fee, both sides (B5)
     )
 
     assert model.compute_costs(two_way) == pytest.approx(expected)
@@ -41,8 +43,16 @@ def test_cost_model_basic():
     model = CostModel()
     turnover = pd.Series([100000, 50000], index=["A", "B"])
     costs = model.compute_costs(turnover)
-    assert len(costs) == 2
-    assert (costs > 0).all()
+
+    # commission + slippage + the both-sides transfer fee on the full
+    # notional, stamp tax on the assumed sell half of the legacy
+    # single-figure path.
+    rate = (
+        model.commission + model.slippage + model.transfer_fee
+        + model.stamp_tax / 2
+    )
+    assert costs["A"] == pytest.approx(100000 * rate)
+    assert costs["B"] == pytest.approx(50000 * rate)
 
 
 def test_cost_model_sell():
@@ -54,7 +64,12 @@ def test_cost_model_sell():
     is_buy = pd.Series([False], index=["A"])
     costs_buy = model.compute_costs(turnover, is_sell=is_buy)
 
-    # Sell should cost more due to stamp tax
+    assert costs_sell.iloc[0] == pytest.approx(
+        100000 * (model.commission + 0.001 + model.slippage + model.transfer_fee),
+    )
+    assert costs_buy.iloc[0] == pytest.approx(
+        100000 * (model.commission + model.slippage + model.transfer_fee),
+    )
     assert costs_sell.iloc[0] > costs_buy.iloc[0]
 
 
@@ -131,3 +146,499 @@ class TestSlippageModelFallbackIsNotSilent:
 
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
         assert impact_cost != pytest.approx(fixed_cost, rel=0.01)
+
+
+class TestImpactCostUnitsAndNoDoubleCharging:
+    """Regression: the impact path mixed units and charged commission twice.
+
+    `_compute_impact_cost` returned `ExecutionCostCalculator.calculate().total_cost`,
+    which already contains commission (including the CNY 5.00 minimum) and
+    stamp tax, and it adds a *per-share* impact figure to those currency
+    amounts. `compute_costs` then added commission and stamp tax again. A 30%
+    turnover rebalance therefore "cost" 5.0 -- five times the traded value --
+    instead of the few basis points the fixed-slippage path charges.
+
+    Units are pinned in `CostModel.compute_costs`: `daily_volume` is the
+    asset's average daily traded value in CNY (人民币成交额), not share count.
+    """
+
+    _RATES = dict(commission=0.0003, stamp_tax=0.001, slippage=0.0005)
+
+    def test_impact_cost_is_on_the_same_scale_as_fixed_slippage(self):
+        impact = CostModel(slippage_model="impact", **self._RATES).compute_costs(
+            0.30, daily_volume=1_000_000, volatility=0.02,
+        )
+        fixed = CostModel(slippage_model="fixed", **self._RATES).compute_costs(0.30)
+
+        assert impact < 1e-2, f"impact cost {impact} is not return-sized"
+        assert 0.1 * fixed < impact < 10 * fixed, (
+            f"impact {impact} and fixed {fixed} are not the same order of magnitude"
+        )
+
+    def test_one_million_cny_trade_impact_is_bounded(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, slippage_model="impact",
+        )
+        notional = 1_000_000.0
+        cost = model.compute_costs(
+            notional, daily_volume=10_000_000_000, volatility=0.02,
+        )
+        fraction = cost / notional
+
+        # A CNY 1m order in a name trading CNY 10bn a day must stay a
+        # bounded fraction of notional. The old code returned a flat CNY 5
+        # minimum commission (5e-6 of notional, below the lower bound) plus a
+        # per-share impact figure; multiplying by price/quantity wrongly gives
+        # tens of percent.
+        assert 1e-5 < fraction < 2e-2, (
+            f"impact on a CNY 1m trade is {fraction:.2%} of notional; "
+            "either the unit conversion or the minimum commission leaked in"
+        )
+
+    def test_impact_path_charges_commission_once(self):
+        common = dict(stamp_tax=0.0, slippage=0.0, slippage_model="impact")
+        charged = CostModel(commission=0.001, **common).compute_costs(
+            1_000_000, daily_volume=10_000_000_000, volatility=0.02,
+        )
+        uncharged = CostModel(commission=0.0, **common).compute_costs(
+            1_000_000, daily_volume=10_000_000_000, volatility=0.02,
+        )
+
+        # The only difference between the two models is the commission rate;
+        # the delta must be exactly turnover * rate (charged once, not inside
+        # the impact calculator as well).
+        assert charged - uncharged == pytest.approx(1_000_000 * 0.001)
+
+
+class TestVectorPathAlignsSeriesByLabel:
+    """The vectorised paths used to rely on pandas label alignment; converting
+    straight to numpy pairs values by position, so a volume Series in a
+    different order silently mispriced every asset."""
+
+    def test_proportional_path_aligns_by_label(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.001,
+            slippage_model="proportional",
+        )
+        turnover = pd.Series([1_000_000.0, 1_000_000.0], index=["A", "B"])
+        # Deliberately reversed order: B liquid, A illiquid.
+        volume = pd.Series([100_000_000.0, 1_000_000.0], index=["B", "A"])
+
+        cost = model.compute_costs(turnover, daily_volume=volume)
+
+        # A: 1e6 / 1e6 = 1 -> full 0.001; B: 1e6 / 1e8 -> sqrt(0.01) = 0.1x.
+        # Both sides also pay the B5 transfer fee (0.001%).
+        transfer = 1_000_000 * 0.00001
+        assert cost.loc["A"] == pytest.approx(1_000_000 * 0.001 + transfer)
+        assert cost.loc["B"] == pytest.approx(1_000_000 * 0.001 * 0.1 + transfer)
+
+    def test_impact_path_aligns_by_label(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, slippage_model="impact",
+        )
+        turnover = pd.Series([1_000_000.0, 1_000_000.0], index=["A", "B"])
+        volume = pd.Series([10_000_000_000.0, 100_000_000.0], index=["B", "A"])
+        volatility = pd.Series([0.02, 0.02], index=["A", "B"])
+
+        cost = model.compute_costs(
+            turnover, daily_volume=volume, volatility=volatility,
+        )
+
+        # The B5 transfer fee is charged on both sides of every trade.
+        assert cost.loc["A"] / 1_000_000 == pytest.approx(
+            0.02 * np.sqrt(0.01) + 0.00001
+        )
+        assert cost.loc["B"] / 1_000_000 == pytest.approx(
+            0.02 * np.sqrt(0.0001) + 0.00001
+        )
+
+
+class TestVectorPathInputShapes:
+    """`compute_costs` documents scalar/Series/array turnover; the vector
+    paths must accept all three, including a scalar trade value against a
+    per-asset volume vector (broadcast, not the single-order calculator)."""
+
+    def test_ndarray_turnover_is_supported(self):
+        model = CostModel(commission=0.001, stamp_tax=0.0, slippage=0.0)
+
+        cost = model.compute_costs(np.array([1_000_000.0, 2_000_000.0]))
+
+        # commission plus the default both-sides transfer fee (B5).
+        assert cost.tolist() == pytest.approx([1_010.0, 2_020.0])
+
+    def test_scalar_trade_against_per_asset_volume_uses_the_vector_rule(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, slippage_model="impact",
+        )
+        volume = pd.Series([10_000_000_000.0, 100_000_000.0], index=["A", "B"])
+        volatility = pd.Series([0.02, 0.02], index=["A", "B"])
+
+        cost = model.compute_costs(
+            1_000_000, daily_volume=volume, volatility=volatility,
+        )
+
+        assert isinstance(cost, pd.Series)
+        # A: participation 1e-4; B: participation 1e-2; plus the transfer fee.
+        assert cost.loc["A"] == pytest.approx(
+            1_000_000 * 0.02 * np.sqrt(1e-4) + 1_000_000 * 0.00001
+        )
+        assert cost.loc["B"] == pytest.approx(
+            1_000_000 * 0.02 * np.sqrt(1e-2) + 1_000_000 * 0.00001
+        )
+
+    def test_ndarray_buy_sell_split_is_supported(self):
+        model = CostModel(commission=0.001, stamp_tax=0.001, slippage=0.0)
+
+        cost = model.compute_costs(
+            np.array([0.5, 0.5]),
+            buy_turnover=np.array([0.5, 0.0]),
+            sell_turnover=np.array([0.0, 0.5]),
+        )
+
+        # Buy: commission + transfer. Sell: commission + full 0.1% stamp tax
+        # + transfer (B5: the transfer fee is charged on both sides).
+        assert cost.tolist() == pytest.approx([0.000505, 0.001005])
+
+
+class TestMinimumCommission:
+    """B5: the CNY 5 commission floor is per order, not per portfolio.
+
+    The audit probe: a 20,000 CNY account sending ten 2,000 CNY orders paid
+    6.00 CNY proportionally, while a broker charging ``max(notional*rate, 5)``
+    per order would charge 50.00 CNY (25 bp of the account).
+    """
+
+    def test_ten_2000_cny_orders_pay_five_yuan_each(self):
+        model = CostModel(
+            commission=0.0003, stamp_tax=0.0, slippage=0.0,
+            min_commission=5.0, transfer_fee=0.0,
+        )
+        orders = np.full(10, 2_000.0)
+        cost_fraction = model.compute_costs(
+            float(orders.sum()), buy_turnover=orders,
+            portfolio_value=20_000.0,
+        )
+
+        assert float(np.sum(cost_fraction)) == pytest.approx(50.0 / 20_000.0)
+        # Proportional commissioning alone would have charged 6.00 CNY.
+        assert float(orders.sum()) * 0.0003 == pytest.approx(6.0)
+
+    def test_without_a_portfolio_value_the_floor_cannot_be_applied(self):
+        """Documented large-account approximation: the legacy contract does
+        not know the CNY notional, so it must not invent a floor."""
+        model = CostModel(
+            commission=0.0003, stamp_tax=0.0, slippage=0.0,
+            min_commission=5.0, transfer_fee=0.0,
+        )
+        assert model.compute_costs(10_000.0) == pytest.approx(3.0)
+
+
+class TestTransferFee:
+    """B5: the A-share transfer fee is charged on both buys and sells."""
+
+    def test_buy_and_sell_pay_the_same_rate(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, min_commission=0.0,
+        )
+        notional = 1_000_000.0
+
+        buy = model.compute_costs(notional, buy_turnover=notional)
+        sell = model.compute_costs(notional, sell_turnover=notional)
+
+        assert model.transfer_fee == pytest.approx(0.00001)
+        assert buy == pytest.approx(notional * 0.00001)
+        assert sell == pytest.approx(notional * 0.00001)
+
+
+class TestStampTaxSchedule:
+    """B11: 0.1% before 2023-08-28 and 0.05% from that date, sell side only."""
+
+    def test_stamp_rate_is_0_1_percent_in_2022_and_0_05_percent_in_2024(self):
+        """R9: the schedule is selected per trade date, not pinned at load."""
+        model = CostModel(
+            commission=0.0, slippage=0.0, transfer_fee=0.0,  # stamp_tax=None
+        )
+
+        assert model._stamp_rate("2022-06-01") == pytest.approx(0.001)
+        assert model._stamp_rate("2023-08-27") == pytest.approx(0.001)
+        assert model._stamp_rate("2023-08-28") == pytest.approx(0.0005)
+        assert model._stamp_rate("2024-06-03") == pytest.approx(0.0005)
+
+        notional = 1_000_000.0
+        assert model.compute_costs(
+            notional, sell_turnover=notional, date="2022-06-01",
+        ) == pytest.approx(1_000.0)   # 0.1%
+        assert model.compute_costs(
+            notional, sell_turnover=notional, date="2024-06-03",
+        ) == pytest.approx(500.0)     # 0.05%
+
+    def test_explicit_override_applies_at_every_date(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.0002, slippage=0.0, transfer_fee=0.0,
+        )
+        assert model._stamp_rate("2022-06-01") == pytest.approx(0.0002)
+        assert model._stamp_rate("2024-06-03") == pytest.approx(0.0002)
+
+    def test_statutory_rate_cut_takes_effect_on_2023_08_28(self):
+        model = CostModel(
+            commission=0.0, slippage=0.0, transfer_fee=0.0,  # stamp_tax=None
+        )
+        notional = 1_000_000.0
+
+        before = model.compute_costs(
+            notional, sell_turnover=notional, date="2023-08-25",
+        )
+        on_cut = model.compute_costs(
+            notional, sell_turnover=notional, date="2023-08-28",
+        )
+        after = model.compute_costs(
+            notional, sell_turnover=notional, date="2024-06-03",
+        )
+
+        assert before == pytest.approx(1_000.0)   # 0.1%
+        assert on_cut == pytest.approx(500.0)     # 0.05%
+        assert after == pytest.approx(500.0)      # 0.05%
+
+    def test_buy_side_pays_no_stamp_tax(self):
+        model = CostModel(
+            commission=0.0, slippage=0.0, transfer_fee=0.0,
+        )
+        notional = 1_000_000.0
+        assert model.compute_costs(
+            notional, buy_turnover=notional, date="2024-06-03",
+        ) == pytest.approx(0.0)
+
+    def test_explicit_rate_overrides_the_schedule(self):
+        model = CostModel(
+            commission=0.0, stamp_tax=0.001, slippage=0.0, transfer_fee=0.0,
+        )
+        assert model.compute_costs(
+            1_000_000.0, sell_turnover=1_000_000.0, date="2024-06-03",
+        ) == pytest.approx(1_000.0)
+
+
+class TestCostsAreChargedExactlyOnce:
+    """Decomposition check: commission/slippage/transfer on both sides, stamp
+    tax on the sell notional only, with no component charged twice."""
+
+    def _model(self):
+        return CostModel(
+            commission=0.0003, slippage=0.001, min_commission=0.0,
+            transfer_fee=0.00001,
+        )
+
+    def test_buy_swap_and_sell_costs_decompose_exactly(self):
+        model = self._model()
+        notional = 1_000_000.0
+        common = (
+            model.commission + model.slippage + model.transfer_fee
+        )
+
+        buy = model.compute_costs(
+            notional, buy_turnover=notional, date="2024-06-03",
+        )
+        sell = model.compute_costs(
+            notional, sell_turnover=notional, date="2024-06-03",
+        )
+        swap = model.compute_costs(
+            2 * notional, buy_turnover=notional, sell_turnover=notional,
+            date="2024-06-03",
+        )
+
+        assert buy == pytest.approx(notional * common)
+        assert sell == pytest.approx(notional * (common + 0.0005))
+        assert swap == pytest.approx(buy + sell)
+
+    def test_impact_sell_cost_decomposes_exactly(self):
+        pytest.importorskip("quant_core")
+        model = CostModel(
+            commission=0.0003, slippage=0.0007, min_commission=0.0,
+            transfer_fee=0.00001, slippage_model="impact",
+        )
+        notional = 1_000_000.0
+        sell = pd.Series({"A": notional})
+
+        cost = model.compute_costs(
+            notional,
+            sell_turnover=sell,
+            daily_volume=pd.Series({"A": 100_000_000.0}),
+            volatility=pd.Series({"A": 0.02}),
+            date="2024-06-03",
+        )
+
+        expected = notional * (
+            0.0003 + 0.00001 + 0.0005 + 0.02 * np.sqrt(0.01)
+        )
+        assert cost.loc["A"] == pytest.approx(expected)
+        assert expected == pytest.approx(2_810.0)
+
+
+class TestImpactCostScalesWithParticipation:
+    """R9: with volume (CNY) and volatility supplied, impact slippage grows
+    with the participation rate and is always a cost (positive), never
+    income."""
+
+    @staticmethod
+    def _model():
+        return CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0, transfer_fee=0.0,
+            slippage_model="impact", min_commission=0.0,
+        )
+
+    def test_vector_cost_rises_with_participation(self):
+        pytest.importorskip("quant_core")
+        model = self._model()
+        notional = 1_000_000.0
+        transfers = 0.0  # transfer_fee=0
+        assert transfers == 0.0
+
+        costs = [
+            model.compute_costs(
+                pd.Series([notional], index=["A"]),
+                daily_volume=pd.Series([volume], index=["A"]),
+                volatility=pd.Series([0.02], index=["A"]),
+            ).iloc[0]
+            for volume in (1_000_000_000.0, 10_000_000.0, 1_000_000.0)
+        ]
+
+        assert all(cost > 0 for cost in costs), costs
+        assert costs[0] < costs[1] < costs[2], costs
+        # The rate uses sqrt(participation) * volatility: pin the top case.
+        assert costs[2] == pytest.approx(notional * 0.02 * np.sqrt(1.0))
+
+    def test_scalar_cost_rises_with_participation(self):
+        pytest.importorskip("quant_core")
+        model = self._model()
+        notional = 1_000_000.0
+        costs = [
+            model.compute_costs(
+                notional, daily_volume=volume, volatility=0.02,
+            )
+            for volume in (1_000_000_000.0, 10_000_000.0, 1_000_000.0)
+        ]
+        assert all(cost > 0 for cost in costs), costs
+        assert costs[0] < costs[1] < costs[2], costs
+
+    def test_missing_volume_falls_back_to_the_fixed_rate_and_warns(self, caplog):
+        common = dict(
+            commission=0.0, stamp_tax=0.0, slippage=0.0007, transfer_fee=0.0,
+            min_commission=0.0,
+        )
+        impact = CostModel(slippage_model="impact", **common)
+        fixed = CostModel(slippage_model="fixed", **common)
+
+        with caplog.at_level(logging.WARNING):
+            impact_cost = impact.compute_costs(
+                1_000_000.0, daily_volume=None, volatility=0.02,
+            )
+
+        assert impact_cost == pytest.approx(fixed.compute_costs(1_000_000.0))
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "fallback to fixed" in m and "daily_volume" in m
+            for m in messages
+        ), messages
+
+
+class TestInvalidSlippageInputsFallBack:
+    """Invalid market data uses fixed slippage per asset, never CNY-1 ADV."""
+
+    notional = 1_000_000.0
+    fixed_cost = notional * 0.0007
+
+    @staticmethod
+    def _model(model_name):
+        return CostModel(
+            commission=0.0, stamp_tax=0.0, slippage=0.0007,
+            transfer_fee=0.0, min_commission=0.0,
+            slippage_model=model_name,
+        )
+
+    @pytest.mark.parametrize("model_name", ["impact", "proportional"])
+    def test_mixed_valid_and_invalid_adv_falls_back_per_asset(self, model_name):
+        if model_name == "impact":
+            pytest.importorskip("quant_core")
+        assets = ["valid", "zero", "negative", "nan", "pos_inf", "neg_inf"]
+        traded = pd.Series(self.notional, index=assets)
+        volume = pd.Series(
+            [100_000_000.0, 0.0, -1.0, np.nan, np.inf, -np.inf],
+            index=assets,
+        )
+        kwargs = {"daily_volume": volume}
+        if model_name == "impact":
+            kwargs["volatility"] = pd.Series(0.02, index=assets)
+
+        costs = self._model(model_name).compute_costs(traded, **kwargs)
+
+        participation = self.notional / 100_000_000.0
+        if model_name == "impact":
+            expected_valid = self.notional * 0.02 * np.sqrt(participation)
+        else:
+            expected_valid = self.notional * 0.0007 * np.sqrt(participation)
+        assert costs.loc["valid"] == pytest.approx(expected_valid)
+        assert costs.loc[assets[1:]].to_numpy() == pytest.approx(
+            np.full(len(assets) - 1, self.fixed_cost)
+        )
+        assert np.isfinite(costs.to_numpy()).all()
+
+    def test_mixed_non_finite_volatility_falls_back_per_asset(self):
+        pytest.importorskip("quant_core")
+        assets = ["valid", "nan", "pos_inf", "neg_inf"]
+        traded = pd.Series(self.notional, index=assets)
+        volume = pd.Series(100_000_000.0, index=assets)
+        volatility = pd.Series([0.02, np.nan, np.inf, -np.inf], index=assets)
+
+        costs = self._model("impact").compute_costs(
+            traded, daily_volume=volume, volatility=volatility,
+        )
+
+        assert costs.loc["valid"] == pytest.approx(2_000.0)
+        assert costs.loc[assets[1:]].to_numpy() == pytest.approx(
+            np.full(3, self.fixed_cost)
+        )
+        assert np.isfinite(costs.to_numpy()).all()
+
+    @pytest.mark.parametrize("model_name", ["impact", "proportional"])
+    @pytest.mark.parametrize("bad_volume", [0.0, -1.0, np.nan, np.inf, -np.inf])
+    def test_scalar_invalid_adv_uses_fixed_slippage(self, model_name, bad_volume):
+        if model_name == "impact":
+            pytest.importorskip("quant_core")
+        cost = self._model(model_name).compute_costs(
+            self.notional, daily_volume=bad_volume, volatility=0.02,
+        )
+        assert cost == pytest.approx(self.fixed_cost)
+
+    @pytest.mark.parametrize("bad_volatility", [np.nan, np.inf, -np.inf])
+    def test_scalar_non_finite_volatility_uses_fixed_slippage(self, bad_volatility):
+        pytest.importorskip("quant_core")
+        cost = self._model("impact").compute_costs(
+            self.notional,
+            daily_volume=100_000_000.0,
+            volatility=bad_volatility,
+        )
+        assert cost == pytest.approx(self.fixed_cost)
+
+
+class TestImpactModelSelection:
+    """R9: ``impact_model`` selects the scalar-path calculator instead of
+    always instantiating the composite ensemble."""
+
+    def test_square_root_selection(self):
+        pytest.importorskip("quant_core")
+        model = CostModel(
+            slippage_model="impact", impact_model="square_root",
+            commission=0.0, stamp_tax=0.0, slippage=0.0, transfer_fee=0.0,
+        )
+        model._init_impact_calculator()
+        assert type(model._impact_calculator.impact_model).__name__ == (
+            "SquareRootModel"
+        )
+
+    def test_composite_is_the_default_selection(self):
+        pytest.importorskip("quant_core")
+        model = CostModel(slippage_model="impact")
+        model._init_impact_calculator()
+        assert type(model._impact_calculator.impact_model).__name__ == (
+            "CompositeImpactModel"
+        )
+

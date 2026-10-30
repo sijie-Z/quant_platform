@@ -1,11 +1,16 @@
 """Tests for parallel backtest engine."""
 
-
+import numpy as np
+import pandas as pd
+import pytest
 from quant_platform.backtest.distributed import (
     BacktestResult,
     ParallelBacktester,
     SweepResult,
+    _apply_config_overrides,
+    _compute_metrics,
 )
+from quant_platform.config.schema import Config
 
 
 class TestBacktestResult:
@@ -90,3 +95,98 @@ class TestParallelBacktester:
         assert "PARALLEL BACKTEST COMPARISON" in text
         assert "MVO" in text
         assert "EW" in text
+
+
+class TestWorkerMetricsMatchMainBacktest:
+    """Sweep results must be computed the same way as the main backtest.
+
+    The worker divided annual return by annual volatility with no risk-free
+    rate and no zero-volatility guard, and measured drawdown from the first
+    *return* instead of from inception. A constant-return series had a
+    floating-point standard deviation of ~3e-18, so "Sharpe" was ~1e16.
+    """
+
+    def test_constant_returns_have_zero_sharpe(self):
+        daily = pd.Series(
+            [0.001] * 252, index=pd.bdate_range("2023-01-02", periods=252),
+        )
+
+        metrics = _compute_metrics(daily)
+
+        assert metrics["sharpe_ratio"] == 0.0
+
+    def test_drawdown_is_measured_from_inception(self):
+        daily = pd.Series(
+            [-0.10, 0.0, 0.0], index=pd.bdate_range("2023-01-02", periods=3),
+        )
+
+        assert _compute_metrics(daily)["max_drawdown"] == pytest.approx(-0.10)
+
+    def test_metrics_match_the_shared_metric_functions(self):
+        from quant_platform.backtest.metrics import all_metrics
+
+        rng = np.random.default_rng(11)
+        daily = pd.Series(
+            rng.normal(0.0005, 0.01, 300),
+            index=pd.bdate_range("2022-01-03", periods=300),
+        )
+
+        metrics = _compute_metrics(daily)
+        expected = all_metrics(daily)
+
+        for key in (
+            "total_return", "annual_return", "annual_volatility",
+            "sharpe_ratio", "max_drawdown",
+        ):
+            assert metrics[key] == pytest.approx(expected[key], abs=1e-4), key
+
+
+class TestParamGridAliases:
+    """`param_grid={"optimizer": [...], "n_stocks": [...]}` is the documented
+    usage, but the worker applied every key with `setattr` on the root Config.
+    Flat keys silently created dead attributes and the sweep ran the same
+    configuration N times. Keys must be mapped to their real config paths,
+    and anything else must fail loudly.
+    """
+
+    def test_documented_flat_aliases_produce_different_configs(self):
+        first, second = Config(), Config()
+
+        _apply_config_overrides(first, {"optimizer": "equal_weight"})
+        _apply_config_overrides(second, {"optimizer": "risk_parity"})
+
+        assert first.portfolio.optimizer == "equal_weight"
+        assert second.portfolio.optimizer == "risk_parity"
+        # The old bug: `setattr(config, "optimizer", ...)` created this.
+        assert not hasattr(first, "optimizer")
+
+    def test_n_stocks_alias_reaches_the_universe(self):
+        config = Config()
+
+        _apply_config_overrides(config, {"n_stocks": 123})
+
+        assert config.universe.n_stocks == 123
+        assert not hasattr(config, "n_stocks")
+
+    def test_dotted_paths_still_work(self):
+        config = Config()
+
+        _apply_config_overrides(config, {"backtest.rebalance_frequency": "weekly"})
+
+        assert config.backtest.rebalance_frequency == "weekly"
+
+    def test_unknown_flat_key_raises(self):
+        with pytest.raises(ValueError, match="not_a_param"):
+            _apply_config_overrides(Config(), {"not_a_param": 1})
+
+    def test_unknown_dotted_path_raises(self):
+        with pytest.raises(ValueError, match="portfolio.not_a_field"):
+            _apply_config_overrides(Config(), {"portfolio.not_a_field": 1})
+
+    def test_run_sweep_rejects_unknown_keys_before_spawning(self):
+        """The validation must fire in the parent process, not turn into one
+        failed cell per combination inside the worker pool."""
+        bt = ParallelBacktester(max_workers=1)
+
+        with pytest.raises(ValueError, match="not_a_param"):
+            bt.run_sweep({"not_a_param": [1, 2]})

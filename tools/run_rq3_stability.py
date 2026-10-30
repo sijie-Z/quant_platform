@@ -7,9 +7,18 @@ Protocol-frozen experiment: Alpha 什么时候有效？
 Experiment 3.1 — Year-by-year stability (fixed windows)
 Experiment 3.2 — Market regime decomposition (Bull/Bear/Sideways)
 
+Regime convention (revised): each trading day is labelled with the regime of
+ITS OWN calendar month (month M's benchmark return on month M's trading days).
+The previous implementation forward-filled month-end labels into the following
+month, so February traded on January's label (62.7% of trading days carried a
+stale label). Labels are contemporaneous and therefore usable only for ex-post
+performance decomposition, not as a tradable signal. Days without a benchmark
+label (e.g. before the benchmark starts) are explicitly skipped and counted.
+
 只记录结果，不解释。
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -30,6 +39,11 @@ from quant_platform.factors.registry import get_registry
 from quant_platform.factors.technical import register_all as register_technical
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import (
+    resolve_end_date,
+    stamp_provenance,
+    year_windows,
+)
 
 setup_logging()
 logger = get_logger("rq3")
@@ -39,8 +53,10 @@ logger = get_logger("rq3")
 # ---------------------------------------------------------------------------
 ALPHA_STRENGTH = 0.06
 N_STOCKS = 500
+SEED = 42
 START_DATE = "2021-01-01"
-END_DATE = "2025-12-31"
+# Resolved at run time; the old hardcoded 2025-12-31 aged silently.
+END_DATE = resolve_end_date()
 INITIAL_CAPITAL = 10_000_000
 
 TOP8_FACTORS = [
@@ -58,14 +74,8 @@ CLUSTERS = {
 CLUSTER_NAMES = list(CLUSTERS.keys())
 ALL_NAME = "ALL"
 
-# Experiment 3.1: Fixed yearly windows
-YEAR_WINDOWS = [
-    ("2021", "2021-01-01", "2021-12-31"),
-    ("2022", "2022-01-01", "2022-12-31"),
-    ("2023", "2023-01-01", "2023-12-31"),
-    ("2024", "2024-01-01", "2024-12-31"),
-    ("2025", "2025-01-01", "2025-12-31"),
-]
+# Experiment 3.1: Fixed yearly windows, clipped at the resolved end date.
+YEAR_WINDOWS = year_windows(2021, END_DATE)
 
 # Experiment 3.2: Regime thresholds (protocol frozen)
 REGIME_THRESHOLDS = {
@@ -81,6 +91,7 @@ def load_data():
         n_stocks=N_STOCKS,
         start_date=START_DATE,
         end_date=END_DATE,
+        seed=SEED,
         embedded_alpha=True,
         alpha_strength=ALPHA_STRENGTH,
     )
@@ -127,8 +138,13 @@ def compute_all_factors(prices, returns, sector_map, turnover):
 
     processed = {}
     for name, factor in raw_factors.items():
+        # R79: market_cap=None means winsorize + standardize + sector
+        # neutralization only — NO size neutralization. The synthetic pipeline
+        # does expose a market-cap panel, but adding it would change this
+        # protocol-frozen experiment's universe of results, so the deviation is
+        # declared here (and in the run log) instead of being applied silently.
         processed[name] = process_factor(factor, sector_map=sector_map, market_cap=None)
-    logger.info("Computed %d factors", len(processed))
+    logger.info("Processed %d factors (sector-neutralized; market-cap neutralization NOT applied: R79)", len(processed))
     return processed
 
 
@@ -190,32 +206,112 @@ def compute_ic(signal, returns):
     return ic_summary(ic)
 
 
-def classify_regimes(benchmark_returns):
-    """Classify each month into Bull/Bear/Sideways based on benchmark returns.
+def classify_regimes(benchmark_returns, trading_days=None):
+    """Label each trading day with the regime of its OWN calendar month.
 
-    Returns: Series(index=date, value=regime_str)
+    Month M's compounded benchmark return is computed from the returns
+    *realised inside M* and applied to the trading days inside M
+    (contemporaneous, ex-post decomposition).
+
+    The pipeline benchmark is in forward convention: the value labelled t is
+    the return from close t to close t+1, so it is realised on t+1. The old
+    implementation compounded the value labelled on the last trading day of M
+    into month M although it is realised in M+1 — a one-day cross-month leak
+    in a label explicitly said to be ex-post. Each return is therefore
+    attributed to its realised date before the monthly compound (R87).
+
+    No forward-fill into the next month: that made February trade on January's
+    label and mislabelled 62.7% of trading days.
+
+    Args:
+        benchmark_returns: Series of benchmark returns in the pipeline's
+            forward convention (``benchmark[t]`` spans t -> t+1).
+        trading_days: index of actual trading days to label. Defaults to the
+            benchmark's own index. Days whose month has no benchmark data get
+            NaN and are excluded by callers.
+
+    Returns: Series(index=trading_days, value=regime_str or NaN)
     """
+    if trading_days is None:
+        trading_days = (benchmark_returns.index if benchmark_returns is not None
+                        else pd.DatetimeIndex([]))
+    trading_days = pd.DatetimeIndex(trading_days).sort_values()
+
     if benchmark_returns is None or len(benchmark_returns) == 0:
-        return pd.Series("Sideways", index=pd.date_range(START_DATE, END_DATE, freq="ME"))
+        logger.warning("No benchmark returns — regime labels unavailable")
+        return pd.Series(np.nan, index=trading_days, name="regime", dtype=object)
 
-    monthly = benchmark_returns.resample("M").apply(lambda x: (1 + x).prod() - 1)
-    regimes = {}
-    for date, ret in monthly.items():
+    benchmark_returns = benchmark_returns.sort_index()
+    if benchmark_returns.dropna().empty:
+        logger.warning("Benchmark series is empty after dropping NaN — regime labels unavailable")
+        return pd.Series(np.nan, index=trading_days, name="regime", dtype=object)
+
+    # Forward returns are realised one trading day later: shift positionally
+    # so month M's compound uses exactly the returns realised inside M.
+    # (A return labelled on the first sample day has no prior close and is
+    # dropped; the label for that day still comes from its month's compound.)
+    # Shifting happens BEFORE any dropna so an internal gap keeps its
+    # positional offset; prod(min_count=1) then skips NaNs within a month.
+    realised = benchmark_returns.shift(1)
+
+    # min_count=1 keeps an all-NaN month as NaN instead of silently compounding
+    # it to 0% (which would become a spurious "Sideways" label).
+    monthly = realised.resample(pd.offsets.MonthEnd()).apply(
+        lambda x: (1 + x).prod(min_count=1) - 1
+    ).dropna()
+
+    def _label(ret):
         if ret > REGIME_THRESHOLDS["Bull"]:
-            regimes[date] = "Bull"
-        elif ret < REGIME_THRESHOLDS["Bear"]:
-            regimes[date] = "Bear"
-        else:
-            regimes[date] = "Sideways"
+            return "Bull"
+        if ret < REGIME_THRESHOLDS["Bear"]:
+            return "Bear"
+        return "Sideways"
 
-    # Forward-fill to daily
-    regime_series = pd.Series(regimes, name="regime")
-    regime_series.index = pd.DatetimeIndex(regime_series.index)
-    daily_regime = regime_series.reindex(
-        pd.date_range(START_DATE, END_DATE, freq="D"),
-        method="ffill"
-    )
-    return daily_regime
+    labels_by_month = {idx.to_period("M"): _label(ret) for idx, ret in monthly.items()}
+    day_labels = [labels_by_month.get(period, np.nan)
+                  for period in trading_days.to_period("M")]
+    return pd.Series(day_labels, index=trading_days, name="regime", dtype=object)
+
+
+def regime_shares(daily_regime):
+    """Percentage of *labelled* trading days in each regime (sums to 100).
+
+    Unlabelled days (NaN, e.g. before the benchmark starts) are excluded from
+    the denominator and must be reported separately.
+    """
+    labelled = daily_regime.dropna()
+    if labelled.empty:
+        return pd.Series(dtype=float)
+    return labelled.value_counts(normalize=True) * 100.0
+
+
+def regime_pct_time(regime_dates, daily_regime):
+    """``%Time`` for one regime: share of labelled trading days, in percent.
+
+    The denominator is the number of trading days carrying a regime label —
+    never calendar days. This is the single expression used by the report so
+    the displayed shares cannot drift from :func:`regime_shares`.
+    """
+    total_labelled = int(daily_regime.notna().sum())
+    if total_labelled == 0:
+        return 0.0
+    return len(regime_dates) / total_labelled * 100.0
+
+
+def regime_return_subset(daily_returns, regime_dates):
+    """Portfolio returns realised on ``regime_dates`` (R87 alignment).
+
+    Backtest daily returns follow the pipeline's forward convention: the value
+    labelled t spans t -> t+1 and is realised on t+1. The monthly regime label
+    now refers to the month in which its return was realised, so the return
+    series is shifted onto realised dates before filtering. Without this, the
+    last trading day of a month contributed a return realised in the NEXT
+    month to the previous month's regime statistics — the same one-day
+    cross-month displacement as the month-label compound.
+    """
+    series = pd.Series(daily_returns).sort_index()
+    realised = series.shift(1)
+    return realised[realised.index.isin(regime_dates)].dropna()
 
 
 def print_yearly_results(results):
@@ -259,6 +355,9 @@ if __name__ == "__main__":
     # Load data
     logger.info("[1/5] Loading data...")
     prices, returns, benchmark, sector_map, turnover = load_data()
+    data_start = str(prices.index[0].date())
+    data_end = str(prices.index[-1].date())
+    logger.info("Data window: %s → %s (requested end %s)", data_start, data_end, END_DATE)
 
     # Compute factors
     logger.info("[2/5] Computing factors...")
@@ -291,20 +390,24 @@ if __name__ == "__main__":
             ic_s = compute_ic(year_sig, year_returns)
 
             # Backtest
+            status, error = "ok", ""
             try:
                 bt = run_backtest(year_sig, year_prices, year_returns, benchmark, sector_map)
                 summary = bt.get("summary", {})
-                sharpe = summary.get("sharpe_ratio", 0)
-                mdd = summary.get("max_drawdown", 0)
+                sharpe = summary.get("sharpe_ratio", np.nan)
+                mdd = summary.get("max_drawdown", np.nan)
             except Exception as e:
                 logger.warning("  Backtest failed for %s %s: %s", sig_name, year_name, e)
-                sharpe = 0
-                mdd = 0
+                # NaN, never 0: a failed calculation must not read as "no edge".
+                sharpe = np.nan
+                mdd = np.nan
+                status, error = "failed", f"{type(e).__name__}: {e}"
 
             row = {
                 "Cluster": sig_name, "Year": year_name,
-                "IC": ic_s.get("mean_ic", 0), "ICIR": ic_s.get("icir", 0),
+                "IC": ic_s.get("mean_ic", np.nan), "ICIR": ic_s.get("icir", np.nan),
                 "Sharpe": sharpe, "MDD": mdd,
+                "Status": status, "Error": error,
             }
             yearly_records.append(row)
             logger.info("    %-18s → IC=%.4f  ICIR=%.4f  Sharpe=%.4f",
@@ -318,18 +421,40 @@ if __name__ == "__main__":
     # ==================================================================
     logger.info("[5/5] Running Experiment 3.2 — Regime decomposition...")
 
-    # Classify regimes
-    daily_regime = classify_regimes(benchmark)
-    regime_counts = daily_regime.value_counts()
-    total_days = len(daily_regime)
-    logger.info("  Regime distribution: %s", {k: f"{v/total_days*100:.1f}%" for k, v in regime_counts.items()})
+    # Classify regimes on the actual trading calendar. Each month's own
+    # return labels that month's trading days — no forward-fill into the
+    # next month (the old behaviour put January's label on February).
+    daily_regime = classify_regimes(benchmark, trading_days=returns.index)
+    labelled_days = daily_regime.dropna()
+    n_unlabelled = int(daily_regime.isna().sum())
+    total_trading_days = len(labelled_days)
+    logger.info("  Regime labels: %d/%d trading days labelled; %d unlabelled skipped",
+                total_trading_days, len(daily_regime), n_unlabelled)
+    if n_unlabelled:
+        unlabelled_index = daily_regime.index[daily_regime.isna()]
+        logger.info("  Unlabelled (skipped) days span %s → %s (no benchmark data for their month)",
+                    unlabelled_index.min().date(), unlabelled_index.max().date())
+    if total_trading_days == 0:
+        logger.warning("  No regime labels available — Experiment 3.2 will be empty")
+    else:
+        shares = regime_shares(labelled_days)
+        logger.info("  Regime distribution (%% of labelled trading days): %s",
+                    {k: f"{v:.1f}%" for k, v in shares.items()})
 
     regime_records = []
 
     for regime_name in ["Bull", "Bear", "Sideways"]:
-        # Get dates for this regime
-        regime_dates = daily_regime[daily_regime == regime_name].index
-        regime_dates_str = regime_dates.strftime("%Y-%m-%d")
+        # Dates carrying this regime label (NaN days are never matched)
+        regime_dates = daily_regime.index[daily_regime == regime_name]
+
+        # IC is computed at the signal date, but its forward return is
+        # realised one trading day later. Label each signal date with the
+        # regime of its realised date (the next trading day) so the IC is
+        # attributed to the month the return actually belongs to (R87).
+        next_day_regime = daily_regime.sort_index().shift(-1)
+        signal_regime_dates = next_day_regime.index[
+            next_day_regime == regime_name
+        ]
 
         # Filter returns/prices to regime dates
         # IC: compute only on regime dates
@@ -341,11 +466,16 @@ if __name__ == "__main__":
             sig = all_signals[sig_name]
             returns_aligned = returns
 
-            # IC: subset to regime dates that exist in returns
-            common_dates = sorted(set(sig.index) & set(returns_aligned.index) & set(regime_dates))
+            # IC: subset to regime dates that exist in returns. The signal
+            # date is paired with the regime of the day its return is
+            # realised on (see `signal_regime_dates`).
+            common_dates = sorted(
+                set(sig.index) & set(returns_aligned.index) & set(signal_regime_dates)
+            )
             if len(common_dates) < 10:
-                logger.info("    %-18s %-10s → too few dates (%d), skipping",
-                            sig_name, regime_name, len(common_dates))
+                logger.info("    %-18s %-10s → too few dates (%d), skipping (regime covers %.1f%% of labelled days)",
+                            sig_name, regime_name, len(common_dates),
+                            regime_pct_time(regime_dates, daily_regime))
                 continue
 
             regime_sig = sig.loc[common_dates]
@@ -353,25 +483,39 @@ if __name__ == "__main__":
             ic_s = compute_ic(regime_sig, regime_ret)
 
             # For Sharpe: run full backtest but extract returns only on regime dates
+            status, error = "ok", ""
             try:
                 bt = run_backtest(sig, prices, returns_aligned, benchmark, sector_map)
                 bt_returns = bt.get("daily_returns", pd.Series(dtype=float))
-                # Filter to regime dates
-                regime_bt = bt_returns[bt_returns.index.isin(regime_dates)]
+                # Attribute each return to its realised date before filtering
+                # by regime (R87), so a month's last t -> t+1 return is not
+                # counted under the previous month's regime.
+                regime_bt = regime_return_subset(bt_returns, regime_dates)
                 if len(regime_bt) < 5:
-                    sharpe = 0
+                    sharpe = np.nan
                 else:
-                    regime_metrics = all_metrics(regime_bt, benchmark)
-                    sharpe = regime_metrics.get("sharpe_ratio", 0)
+                    # Regime subsets are daily returns on a sparse calendar;
+                    # infer_periods_per_year would infer ~20-82 from the
+                    # filtered span. State the daily basis explicitly.
+                    regime_metrics = all_metrics(
+                        regime_bt, benchmark, periods_per_year=252
+                    )
+                    sharpe = regime_metrics.get("sharpe_ratio", np.nan)
+                    if not regime_metrics:
+                        sharpe = np.nan
             except Exception as e:
                 logger.warning("  Regime BT failed for %s %s: %s", sig_name, regime_name, e)
-                sharpe = 0
+                sharpe = np.nan
+                status, error = "failed", f"{type(e).__name__}: {e}"
 
-            pct_time = len(common_dates) / total_days * 100
+            # Denominator is actual *labelled* trading days, not calendar days
+            # (the old 1826-day denominator made regime shares sum to ~70%).
+            pct_time = regime_pct_time(common_dates, daily_regime)
             row = {
                 "Cluster": sig_name, "Regime": regime_name,
-                "IC": ic_s.get("mean_ic", 0), "ICIR": ic_s.get("icir", 0),
+                "IC": ic_s.get("mean_ic", np.nan), "ICIR": ic_s.get("icir", np.nan),
                 "Sharpe": sharpe, "%Time": round(pct_time, 1),
+                "Status": status, "Error": error,
             }
             regime_records.append(row)
             logger.info("    %-18s %-10s → IC=%.4f  ICIR=%.4f  Sharpe=%.4f  (%4.1f%% of days)",
@@ -380,12 +524,37 @@ if __name__ == "__main__":
     df_regime = pd.DataFrame(regime_records)
     print_regime_results(regime_records)
 
-    # Save raw data
-    output_dir = Path("results")
+    # Save raw data. Outputs are anchored to the repo root (not the cwd) and
+    # stamped with the as-of window and provider so a stale artifact is
+    # distinguishable from a current one.
+    output_dir = _project_root / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    df_yearly = stamp_provenance(df_yearly, data_start, data_end)
+    df_regime = stamp_provenance(df_regime, data_start, data_end)
+    for frame in (df_yearly, df_regime):
+        frame["provider"] = "synthetic"
+        frame["alpha_strength"] = ALPHA_STRENGTH
+        frame["seed"] = SEED
     df_yearly.to_csv(output_dir / "rq3_yearly_stability.csv", index=False)
     df_regime.to_csv(output_dir / "rq3_regime_decomposition.csv", index=False)
+    manifest = {
+        "script": "run_rq3_stability.py",
+        "generated_at": pd.Timestamp.now("UTC").isoformat(),
+        "provider": "synthetic",
+        "seed": SEED,
+        "alpha_strength": ALPHA_STRENGTH,
+        "n_stocks": N_STOCKS,
+        "requested_end": END_DATE,
+        "data_start": data_start,
+        "data_end": data_end,
+        "regime_label_convention": "contemporaneous month; %Time over labelled trading days; "
+                                   "returns attributed to realised dates",
+        "artifacts": ["rq3_yearly_stability.csv", "rq3_regime_decomposition.csv"],
+    }
+    (output_dir / "rq3_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
 
     # Print raw data
     print()

@@ -49,13 +49,14 @@ class TestBuildChartData:
         assert mr.years == ["2020", "2021", "2022", "2023"]
         assert len(mr.data) == len(mr.years)
 
-    def test_months_without_observations_are_nan_not_missing(self):
+    def test_months_without_observations_are_null_not_missing(self):
         """The heatmap indexes data[year][month] positionally, so an absent
-        month must still occupy its slot."""
+        month must still occupy its slot. It is `null` rather than NaN:
+        Starlette's JSON encoder rejects NaN and returned a 500."""
         mr = _build_chart_data(_series(400)).monthly_returns
         assert len(mr.months) == 12
-        nanos = [v for row in mr.data for v in row if math.isnan(v)]
-        assert nanos, "expected some months with no observation in a 400-day series"
+        missing = [v for row in mr.data for v in row if v is None]
+        assert missing, "expected some months with no observation in a 400-day series"
 
 
 class TestMonthlyReturnsShape:
@@ -88,3 +89,51 @@ class TestMonthlyReturnsShape:
         # `data` is a list of lists, not a list of floats.
         assert isinstance(produced["data"][0], list)
         assert not isinstance(produced["data"][0], float)
+
+
+def test_partial_year_grid_uses_none_instead_of_nan():
+    """A mid-year start used to leave NaN cells, which Starlette refuses to
+    serialise (GET /api/run/{id}/result returned 500)."""
+    series = _series(300, start="2024-06-03")
+
+    chart = _build_chart_data(series)
+
+    assert chart.monthly_returns is not None
+    cells = [value for row in chart.monthly_returns.data for value in row]
+    assert any(value is None for value in cells)
+    assert not any(
+        isinstance(value, float) and math.isnan(value) for value in cells
+    )
+
+
+def test_scatter_and_attribution_use_the_asset_return_panel():
+    """Passing the portfolio-return Series made both panels silently empty.
+
+    `_compute_factor_scatter`/`_compute_attribution` need a date x asset
+    forward-return panel; calling `.loc[d]` on a Series raised and was
+    swallowed, so every real run rendered "No scatter/attribution data".
+    """
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2024-01-01", periods=140)
+    assets = [f"S{i:02d}" for i in range(20)]
+    factors = {
+        "f1": pd.DataFrame(rng.normal(size=(140, 20)), index=dates, columns=assets),
+        "f2": pd.DataFrame(rng.normal(size=(140, 20)), index=dates, columns=assets),
+    }
+    returns = pd.DataFrame(rng.normal(0, 0.01, (140, 20)), index=dates, columns=assets)
+    signal = factors["f1"].rank(axis=1, pct=True) - 0.5
+    weights = pd.Series(1.0 / len(assets), index=assets)
+    weights_history = {dates[70]: weights, dates[110]: weights}
+    strategy_returns = returns.mean(axis=1)
+
+    chart = _build_chart_data(
+        strategy_returns,
+        weights_history=weights_history,
+        processed_factors=factors,
+        signal=signal,
+        asset_returns=returns,
+    )
+
+    assert chart.factor_scatter, "factor scatter must not be empty"
+    assert chart.attribution, "attribution must not be empty"
+    assert all(item.factor in factors for item in chart.attribution)

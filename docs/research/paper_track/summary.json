@@ -1,0 +1,53 @@
+{
+  "annualization_periods_per_year": 252,
+  "as_of": "2025-06-30",
+  "benchmark": {
+    "annualized_return": 0.28489704815065586,
+    "annualized_volatility": 0.14683909122471378,
+    "definition": "equal-weight daily-rebalanced mean of the cached universe's pct_chg close-to-close returns over the same window; stale observations are excluded from that session",
+    "max_drawdown": -0.06757198652891483,
+    "sharpe_ratio": 1.735893664450542,
+    "total_return": 0.13353299385181372
+  },
+  "benchmark_definition": "equal-weight daily-rebalanced mean of the cached universe's pct_chg close-to-close returns over the same window; stale observations are excluded from that session",
+  "cache_last_date": "2025-12-31",
+  "capital": 2000000.0,
+  "cash_weight_at_build": 1.1170999998366682e-06,
+  "cost_mode": "impact",
+  "costs": {
+    "pct_of_capital": 0.000586939103,
+    "total_cny": 1173.878206
+  },
+  "disclaimer": "paper tracking only; style-tilt demo, not validated alpha",
+  "execution_date": "2025-07-01",
+  "first_ledger_date": "2025-07-01",
+  "last_ledger_date": "2025-12-31",
+  "ledger_version": 2,
+  "max_stale_sessions": 20,
+  "n_purchased_assets": 21,
+  "n_sessions": 126,
+  "n_target_assets": 21,
+  "return_basis": "pct_chg/100 (Baostock ex-rights preclose); raw close is used only for volume x price cost conversion and the stale liquidation reference",
+  "risk_free_rate": 0.03,
+  "since_inception": {
+    "annualized_return": 0.2934509170395154,
+    "annualized_volatility": 0.13309232911356236,
+    "final_nav": 2274599.672093,
+    "max_drawdown": -0.042763127007762414,
+    "max_drawdown_peak": "2025-08-29",
+    "max_drawdown_trough": "2025-09-26",
+    "n_stale_days": 1,
+    "sharpe_ratio": 1.979459814056776,
+    "total_return": 0.13729983604649987
+  },
+  "stale_policy": "a session is stale when close, pct_chg or volume is missing/invalid or the volume is zero; hold at the last valid close (return 0, flagged stale); when the price returns the resume-day pct_chg carries the gap return; after max_stale_sessions consecutive stale sessions, liquidate at the last valid close with no extra trade cost (no tradable price exists) and hold the proceeds as cash",
+  "target_file": "docs/research/paper_track/target_demo_2025-06-30.json",
+  "target_sha256": "e27f9510b239b8ae7ed1eba5fa29eb0944cd564b3db89b6c2d02e6c161190017",
+  "tracking": {
+    "difference": 0.0037668421946861486,
+    "tracking_error": 0.07611396581184664
+  },
+  "tradable_gate": "execution buys require close > 0, finite pct_chg, volume > 0 (R9 tradable_mask) and pct_chg <= 9.8% (R19a limit-up approximation); blocked weight stays in cash with a warning",
+  "volatility_basis": "rolling(20, min_periods=5).std() of pct_chg/100 through the execution close, masking suspension and resume-day gap returns as data/pipeline.py does; short histories fall back to 2% daily",
+  "warnings": []
+}

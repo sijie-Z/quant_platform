@@ -1,9 +1,193 @@
 import axios from 'axios'
 
+// ── Backend base URL ─────────────────────────────────────────────────────────
+//
+// Settings persists the operator's backend URL under `quant_settings.apiBase`.
+// Historically nothing read it: axios was pinned to `/api` and the socket to
+// `location.host`, so pointing the UI at another backend silently kept talking
+// to the same origin. The base URL is now read at request time (so a change
+// applies immediately, without a rebuild) and again on every WebSocket
+// connect, and the saved value survives reloads via localStorage.
+
+const DEFAULT_API_BASE = '/api'
+const SETTINGS_KEY = 'quant_settings'
+
+function readSavedSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch (_) {
+    return {}
+  }
+}
+
+// Accepts `http://host:8000`, `http://host:8000/api`, `/api`, `/proxy/api/`
+// and returns a base URL whose path ends in `/api` and has no trailing slash.
+// Anything unsafe or malformed (spaces, query strings, fragments, non-http(s)
+// schemes, missing host, `http:/api`, `https:///api`) falls back to `/api`.
+export function normalizeApiBase(value) {
+  let base = String(value == null ? '' : value).trim()
+  if (!base) return DEFAULT_API_BASE
+  if (!isValidApiBase(base)) return DEFAULT_API_BASE
+  base = base.replace(/\/+$/, '')
+  if (/\/api$/i.test(base)) base = base.replace(/\/api$/i, '/api')
+  else base = `${base}/api`
+  if (/^https?:\/\//i.test(base)) {
+    const url = new URL(base)
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`
+  }
+  return base
+}
+
+export function isValidApiBase(value) {
+  const raw = String(value == null ? '' : value).trim()
+  if (!raw) return true
+  if (/[\s?#]/.test(raw)) return false
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) {
+    // Require an explicit http(s) authority with a non-empty host. This
+    // rejects `http:/api` (single slash) and `https:///api` (empty authority),
+    // which WHATWG URL otherwise parses as host `api`.
+    if (!/^https?:\/\//i.test(raw)) return false
+    if (/^https?:\/\/[/\\]/.test(raw)) return false
+    try {
+      const url = new URL(raw)
+      return !!url.hostname && (url.protocol === 'http:' || url.protocol === 'https:')
+    } catch (_) {
+      return false
+    }
+  }
+  // Relative paths must start with `/`; a bare `api` would otherwise silently
+  // become `/api/api`. Protocol-relative `//host` is rejected: it is neither a
+  // path the server can route nor an absolute URL the socket factory handles.
+  return raw.startsWith('/') && !raw.startsWith('//')
+}
+
+export function getApiBase() {
+  const settings = readSavedSettings()
+  return normalizeApiBase(settings.apiBase)
+}
+
+// Derive the status-stream URL from the same base. An absolute backend URL
+// keeps its host (so a UI served from another origin can reach the API), and a
+// relative base stays on the page's origin.
+export function getWsUrl() {
+  const base = getApiBase()
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(base)) {
+    try {
+      const url = new URL(base)
+      const proto = url.protocol === 'https:' ? 'wss:' : 'ws:'
+      const path = url.pathname.replace(/\/+$/, '')
+      return `${proto}//${url.host}${path}/ws`
+    } catch (_) {
+      // fall through to the relative form
+    }
+  }
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  // A server bound to 127.0.0.1 does not accept the browser's IPv6-first
+  // `localhost` resolution for WebSockets (HTTP falls back, WS does not), so
+  // the shipped local UI would loop on reconnect. Prefer the IPv4 loopback
+  // host when the page itself was opened via localhost.
+  const host = location.hostname === 'localhost'
+    ? `127.0.0.1${location.port ? `:${location.port}` : ''}`
+    : location.host
+  return `${proto}//${host}${base.replace(/\/+$/, '')}/ws`
+}
+
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: getApiBase(),
   timeout: 300000, // 5 min for long pipeline runs
 })
+
+// The analysis/monitor GETs build a heavy research context on first use; if
+// the two analytics workers are busy the backend answers 429 + Retry-After.
+// Retry those safe reads twice instead of leaving a panel blank until reload.
+api.interceptors.response.use(undefined, async (error) => {
+  const cfg = error && error.config
+  const status = error && error.response && error.response.status
+  const method = String((cfg && cfg.method) || 'get').toLowerCase()
+  if (status === 429 && cfg && method === 'get') {
+    cfg.__rateRetries = (cfg.__rateRetries || 0) + 1
+    if (cfg.__rateRetries <= 4) {
+      const retryAfter = Number(
+        (error.response.headers && error.response.headers['retry-after']) || 5,
+      )
+      // A first context build can hold an analytics slot for ~a minute;
+      // back off exponentially instead of burning every retry in 15 s.
+      const waitMs = Math.min(
+        20000,
+        Math.max(1000, retryAfter * 1000 * (2 ** (cfg.__rateRetries - 1))),
+      )
+      await new Promise((resolve) => setTimeout(resolve, waitMs))
+      return api.request(cfg)
+    }
+  }
+  return Promise.reject(error)
+})
+
+// Optional bearer token, mirroring the backend's QUANT_API_TOKEN mode.
+//
+// Read at request time from localStorage, NOT from import.meta.env: a
+// VITE_-prefixed value is inlined into the public bundle, so every visitor
+// to the served UI would receive the long-lived token. Users set it in
+// Settings (stored only in this browser).
+export function getApiToken() {
+  try {
+    return localStorage.getItem('quant_api_token') || ''
+  } catch (_) {
+    return ''
+  }
+}
+
+api.interceptors.request.use((config) => {
+  // Re-read on every request so a URL saved in Settings takes effect
+  // immediately (and after a reload, when the instance is rebuilt).
+  config.baseURL = getApiBase()
+  // Trim consistently with the WebSocket path: a token pasted with trailing
+  // whitespace must not authenticate on the socket but fail on REST.
+  const token = getApiToken().trim()
+  if (token) {
+    config.headers = config.headers || {}
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// Turn the backend's two error shapes into one readable string. FastAPI
+// `HTTPException` sends `detail` as a string, but `RequestValidationError`
+// sends a list of `{loc, msg}` objects; components that interpolated `detail`
+// printed `[object Object]`.
+export function getApiErrorMessage(error, fallback = 'Request failed') {
+  const data = error?.response?.data
+  let detail = data?.detail
+  if (Array.isArray(detail)) {
+    detail = detail
+      .map((item) => {
+        if (item == null) return ''
+        if (typeof item === 'string') return item
+        const loc = Array.isArray(item.loc)
+          ? item.loc.filter((part) => part !== 'body').join('.')
+          : ''
+        const msg = item.msg || item.message || JSON.stringify(item)
+        return loc ? `${loc}: ${msg}` : msg
+      })
+      .filter(Boolean)
+      .join('; ')
+  }
+  if (typeof detail === 'string' && detail.trim()) return detail.trim()
+  if (typeof data?.message === 'string' && data.message.trim()) return data.message.trim()
+  if (typeof data?.error === 'string' && data.error.trim()) return data.error.trim()
+  return error?.message || fallback
+}
+
+export function importPortfolioHoldings(data) {
+  return api.post('/portfolio/import', { data }).then(r => r.data)
+}
+
+export function getLivePortfolio() {
+  return api.get('/portfolio/live').then(r => r.data)
+}
 
 export function getConfig() {
   return api.get('/config').then(r => r.data)
@@ -42,7 +226,15 @@ export function getRuns() {
 }
 
 export function healthCheck() {
-  return api.get('/health').then(r => r.data)
+  return api.get('/health', { timeout: 10000 }).then(r => r.data)
+}
+
+// Dead-man switch. Returns the 503 payload instead of throwing so callers can
+// render the per-check reasons; transport failures still reject.
+export function getReadiness() {
+  return api
+    .get('/readiness', { timeout: 10000, validateStatus: s => s === 200 || s === 503 })
+    .then(r => r.data)
 }
 
 // OMS endpoints
@@ -200,6 +392,29 @@ export function getMarketSnapshot() {
   return api.get('/market/snapshot').then(r => r.data)
 }
 
+// WebSocket quote feed / Level 2 provider control.
+// These endpoints change server-side provider state, so the backend accepts
+// POST only; a GET is answered with 405 and performs nothing.
+export function startWsQuotes() {
+  return api.post('/ws-quotes/start').then(r => r.data)
+}
+
+export function stopWsQuotes() {
+  return api.post('/ws-quotes/stop').then(r => r.data)
+}
+
+export function getWsQuotes() {
+  return api.get('/ws-quotes').then(r => r.data)
+}
+
+export function startLevel2() {
+  return api.post('/l2/start').then(r => r.data)
+}
+
+export function stopLevel2() {
+  return api.post('/l2/stop').then(r => r.data)
+}
+
 export function getMarketGainers() {
   return api.get('/market/gainers').then(r => r.data)
 }
@@ -218,7 +433,9 @@ export function getBaostockHealth() {
 }
 
 export function getBaostockStock(code) {
-  return api.get(`/market/baostock/stock/${code}`).then(r => r.data)
+  // User-entered tickers go into the path; `#`, `?`, `/` or spaces would
+  // corrupt the request instead of yielding a clean 404.
+  return api.get(`/market/baostock/stock/${encodeURIComponent(code)}`).then(r => r.data)
 }
 
 // Core Architecture Monitoring
@@ -295,31 +512,142 @@ export function triggerMonitorKillSwitch(params) {
   return api.post('/monitor/kill-switch', params).then(r => r.data)
 }
 
-// WebSocket for real-time pipeline status
-export function createStatusSocket(onMessage, onError) {
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const ws = new WebSocket(`${protocol}//${location.host}/api/ws`)
+// ── WebSocket for real-time pipeline status ─────────────────────────────────
+//
+// Returns a handle whose close() permanently stops reconnection.
+//
+// Token transport: browsers cannot set handshake headers, so the token travels
+// as the `bearer.<token>` WebSocket subprotocol (never in the URL, which
+// uvicorn's access log records). A WebSocket subprotocol must be an HTTP token
+// (RFC 7230): tokens containing `=` or `/` cannot be sent at all. The legacy
+// `?token=` query fallback was removed because it leaked the token into access
+// logs; such a token is rejected locally with an auth error until
+// QUANT_API_TOKEN is changed to RFC-7230-safe characters.
+// The token is re-read on every connect, so changing it in
+// Settings applies to the next reconnect.
+//
+// Lifecycle: exponential backoff with jitter, capped at 30 s, reset on a
+// successful open. Policy-violation closes (1008, 4401) mean the token was
+// rejected — retrying cannot help, so reconnection stops and the caller is
+// told via onError({ type: 'auth' }).
 
-  ws.onmessage = (event) => {
+const RECONNECT_BASE_MS = 1000
+const RECONNECT_MAX_MS = 30000
+const AUTH_CLOSE_CODES = new Set([1008, 4401])
+// RFC 7230 token characters. `bearer.<token>` must match this to be a legal
+// subprotocol.
+const WS_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+
+function buildSocketTarget() {
+  const url = getWsUrl()
+  const token = getApiToken().trim()
+  if (!token) return { url, protocols: [] }
+  if (WS_TOKEN_RE.test(token)) {
+    return { url, protocols: [`bearer.${token}`] }
+  }
+  return { url, protocols: [], invalidToken: true }
+}
+
+export function createStatusSocket(onMessage, onError) {
+  let socket = null
+  let timer = null
+  let disposed = false
+  let attempt = 0
+
+  const notify = (info) => {
     try {
-      const data = JSON.parse(event.data)
-      if (onMessage) onMessage(data)
+      if (onError) onError(info)
     } catch (_) {}
   }
 
-  ws.onerror = (err) => {
-    if (onError) onError(err)
+  const scheduleReconnect = () => {
+    if (disposed) return
+    const exp = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, attempt))
+    attempt = Math.min(attempt + 1, 10)
+    const delay = Math.max(500, Math.round(exp * (0.7 + Math.random() * 0.6)))
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(connect, delay)
   }
 
-  ws.onclose = () => {
-    // Auto-reconnect after 3s
-    setTimeout(() => {
+  function connect() {
+    if (disposed) return
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+    const target = buildSocketTarget()
+    if (target.invalidToken) {
+      // There is no safe transport for this token shape: the legacy query
+      // fallback leaked it into access logs and was removed.
+      disposed = true
+      notify({
+        type: 'auth',
+        message:
+          'API token contains characters not allowed in a WebSocket ' +
+          'subprotocol; use an RFC 7230 token (letters, digits, -._~) or ' +
+          'leave QUANT_API_TOKEN unset',
+      })
+      return
+    }
+    let ws
+    try {
+      ws = target.protocols.length
+        ? new WebSocket(target.url, target.protocols)
+        : new WebSocket(target.url)
+    } catch (_) {
+      // Constructing the socket failed (e.g. an illegal subprotocol slip
+      // through); never surface the URL, which may carry the legacy token.
+      notify({ type: 'construct', message: 'WebSocket could not be created' })
+      scheduleReconnect()
+      return
+    }
+    socket = ws
+
+    ws.onopen = () => {
+      attempt = 0
+    }
+
+    ws.onmessage = (event) => {
       try {
-        const ws2 = createStatusSocket(onMessage, onError)
-        return ws2
+        const data = JSON.parse(event.data)
+        if (onMessage) onMessage(data)
       } catch (_) {}
-    }, 3000)
+    }
+
+    ws.onerror = () => {
+      notify({ type: 'error', message: 'WebSocket connection error' })
+    }
+
+    ws.onclose = (event) => {
+      if (disposed) return
+      socket = null
+      if (AUTH_CLOSE_CODES.has(event.code)) {
+        disposed = true
+        notify({
+          type: 'auth',
+          code: event.code,
+          message: 'WebSocket authentication failed; reconnection stopped',
+        })
+        return
+      }
+      scheduleReconnect()
+    }
   }
 
-  return ws
+  connect()
+
+  return {
+    get socket() { return socket },
+    // True once close() ran or an auth close stopped reconnection. Callers use
+    // this to recreate the stream instead of trusting a stale handle.
+    get disposed() { return disposed },
+    close() {
+      disposed = true
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      try { if (socket) socket.close() } catch (_) {}
+    },
+  }
 }

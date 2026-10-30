@@ -24,6 +24,23 @@ WARN_PIT = (
 )
 
 
+def _affected_by(run: dict) -> list[str]:
+    try:
+        causes = json.loads(run.get("affected_by") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [str(c) for c in causes] if isinstance(causes, list) else []
+
+
+def _stored_warnings(run: dict) -> list[str]:
+    """Explicit warnings persisted on the run record (e.g. traceback excerpt)."""
+    try:
+        items = json.loads(run.get("warnings") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [str(w) for w in items] if isinstance(items, list) else []
+
+
 def _warnings_from_meta(run: dict) -> list[str]:
     """Build WARNING lines purely from Registry fields — no hardcoding here."""
     warns = []
@@ -33,9 +50,30 @@ def _warnings_from_meta(run: dict) -> list[str]:
     except json.JSONDecodeError:
         umeta, dmeta = {}, {}
 
+    # Validity honesty: a run whose result is no longer trusted must say so at
+    # the top of its own report. The old generator read neither `validity` nor
+    # `affected_by`, so an invalidated run produced a clean-looking report.
+    validity = run.get("validity") or "valid"
+    causes = _affected_by(run)
+    if validity != "valid":
+        detail = f" (affected_by: {', '.join(causes)})" if causes else ""
+        warns.append(
+            f"RUN VALIDITY = {validity}{detail}. "
+            "This result is not trusted; do not use it as-is."
+        )
+    elif causes:
+        warns.append(
+            f"Run carries affected_by={', '.join(causes)} despite validity="
+            f"{validity!r}; inspect before use."
+        )
+
     provider = umeta.get("provider", "unknown")
     pit = umeta.get("pit")
-    biases = ", ".join(umeta.get("bias_warning", [])) or "unknown bias"
+    bias_list = umeta.get("bias_warning") or []
+    if isinstance(bias_list, list):
+        biases = ", ".join(str(b) for b in bias_list) or "unknown bias"
+    else:
+        biases = str(bias_list)
 
     # PIT honesty
     if pit is False:
@@ -48,7 +86,8 @@ def _warnings_from_meta(run: dict) -> list[str]:
             "Treat results as unverified."
         )
 
-    # Adjustment honesty
+    # Adjustment honesty. The canonical key is `adjust_basis`; older runs used
+    # `basis`, so read both instead of silently printing "unknown".
     adjust = dmeta.get("adjust")
     if adjust in (None, "none"):
         warns.append(
@@ -56,7 +95,7 @@ def _warnings_from_meta(run: dict) -> list[str]:
             "Corporate actions inject mechanical fake returns."
         )
     elif adjust == "front":
-        basis = dmeta.get("basis", "unknown")
+        basis = dmeta.get("adjust_basis") or dmeta.get("basis") or "unknown"
         warns.append(
             f"Front-adjusted prices (basis={basis}). Free-source front-adj "
             "uses a per-stock basis date; fine for cross-sectional ranking, "
@@ -69,6 +108,12 @@ def _warnings_from_meta(run: dict) -> list[str]:
             f"RUN FAILED: {run.get('reason') or 'unspecified reason'}. "
             "No valid evaluation result — retained for negative knowledge."
         )
+
+    # Warnings that were explicitly persisted on the record (traceback
+    # excerpts, data-gap notes). They used to be dropped on the floor.
+    for warning in _stored_warnings(run):
+        if warning not in warns:
+            warns.append(warning)
 
     return warns
 
@@ -91,6 +136,8 @@ def generate_report(run: dict, out_dir: str = "data/reports") -> str:
         f"- **Slice**: {run.get('slice', '?')}",
         f"- **Timestamp**: {run.get('timestamp', '?')}",
         f"- **Status**: {run.get('status', '?')}",
+        f"- **Validity**: {run.get('validity') or 'valid'}",
+        f"- **Affected by**: {', '.join(_affected_by(run)) or '(none)'}",
         f"- **Factor**: {run.get('factor', '?')}",
         f"- **Input hash (reproducibility)**: {run.get('input_hash', '?')}",
         "",

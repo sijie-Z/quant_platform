@@ -79,6 +79,55 @@ class TestApplyFill:
         assert order.avg_fill_price == 10.7  # (30*10 + 70*11) / 100
 
 
+class TestApplyFillValidation:
+    """apply_fill must reject fills that conflict with the order's state.
+
+    Before this check, a second overfill was appended to `order.fills` and
+    flipped a FILLED order's state machine, and a fill on a pending order
+    bypassed the SUBMITTED gate entirely.
+    """
+
+    def test_fill_on_pending_order_is_rejected(self):
+        order = Order(quantity=100, status=OrderStatus.PENDING)
+        with pytest.raises(ValueError):
+            apply_fill(order, Fill(price=10.0, quantity=100))
+        assert order.fills == []
+        assert order.status == OrderStatus.PENDING
+
+    @pytest.mark.parametrize("qty", [0, -50])
+    def test_non_positive_fill_quantity_is_rejected(self, qty):
+        order = Order(quantity=100, status=OrderStatus.SUBMITTED)
+        with pytest.raises(ValueError):
+            apply_fill(order, Fill(price=10.0, quantity=qty))
+        assert order.fills == []
+
+    def test_overfill_beyond_remaining_is_rejected(self):
+        order = Order(quantity=100, status=OrderStatus.SUBMITTED)
+        with pytest.raises(ValueError):
+            apply_fill(order, Fill(price=10.0, quantity=101))
+        assert order.fills == []
+
+    def test_fill_on_terminal_order_is_rejected(self):
+        order = Order(quantity=100, status=OrderStatus.FILLED)
+        with pytest.raises(ValueError):
+            apply_fill(order, Fill(price=10.0, quantity=1))
+        assert order.fills == []
+
+    def test_process_fill_rejects_overfill_without_touching_positions(self):
+        engine = ExecutionEngine()
+        order = engine.create_order("600519", OrderSide.BUY, 100)
+        engine.submit_order(order)
+        engine.process_fill(order, price=150.0, quantity=100)
+
+        with pytest.raises(ValueError):
+            engine.process_fill(order, price=151.0, quantity=1)
+
+        assert order.filled_quantity == 100
+        position = engine.get_position("600519")
+        assert position is not None
+        assert position.quantity == 100
+
+
 class TestUpdatePosition:
     def test_buy_updates_position(self):
         pos = Position(ticker="600519")

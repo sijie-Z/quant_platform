@@ -22,7 +22,7 @@
     <div v-else-if="!runs.length" class="empty-state">
       <div class="empty-icon">&#9201;</div>
       <h3>{{ locale === 'zh-CN' ? '暂无运行记录' : 'No runs yet' }}</h3>
-      <p>{{ locale === 'zh-CN' ? '请先在仪表盘标签页运行流水线，查看结果。' : 'Start a pipeline run from the Dashboard tab to see results here.' }}</p>
+      <p>{{ locale === 'zh-CN' ? '请先在终端标签页运行流水线，查看结果。' : 'Start a pipeline run from the Terminal tab to see results here.' }}</p>
     </div>
 
     <div v-else class="run-list">
@@ -100,7 +100,8 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { getRuns, getRunResult } from '../api/index.js'
+import { getRuns, getRunResult, getApiErrorMessage } from '../api/index.js'
+import { parseBackendTime, formatBackendTime } from '../utils/time.js'
 import { useI18n } from '../i18n/index.js'
 
 const emit = defineEmits(['toast'])
@@ -127,14 +128,17 @@ const detailMetrics = computed(() => {
 })
 
 function formatTime(iso) {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  // Backend timestamps are naive Asia/Shanghai; parse them as UTC+8 and
+  // localize the display (it was hard-coded to zh-CN).
+  return formatBackendTime(iso, locale.value)
 }
 
 function formatDuration(start, end) {
   if (!start || !end) return ''
-  const ms = new Date(end) - new Date(start)
+  const startDate = parseBackendTime(start)
+  const endDate = parseBackendTime(end)
+  if (!startDate || !endDate) return ''
+  const ms = endDate - startDate
   if (ms < 1000) return ms + 'ms'
   return (ms / 1000).toFixed(1) + 's'
 }
@@ -146,7 +150,7 @@ async function refresh() {
     const data = await getRuns()
     runs.value = data.runs || []
   } catch (e) {
-    error.value = e.response?.data?.detail || e.message
+    error.value = getApiErrorMessage(e)
   } finally {
     loading.value = false
   }
@@ -164,7 +168,7 @@ async function inspectRun(run) {
   try {
     detailData.value = await getRunResult(run.run_id)
   } catch (e) {
-    detailError.value = e.response?.data?.detail || e.message
+    detailError.value = getApiErrorMessage(e)
   } finally {
     detailLoading.value = false
   }

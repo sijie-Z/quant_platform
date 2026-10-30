@@ -7,7 +7,8 @@ export default {
   kpi: {
     totalReturn: '总收益', annualizedReturn: '年化收益', volatility: '波动率', sharpe: '夏普比',
     maxDrawdown: '最大回撤', calmar: '卡玛比', winRate: '胜率', profitLossRatio: '盈亏比',
-    turnover: '换手率', alpha: 'Alpha', beta: 'Beta', informationRatio: '信息比'
+    turnover: '换手率', alpha: 'Alpha', beta: 'Beta', informationRatio: '信息比',
+    sortino: '索提诺比', var: '风险价值(VaR)'
   },
   // 终端仪表盘
   terminal: {
@@ -73,7 +74,7 @@ export default {
     killSwitch: '紧急熔断', armed: '已就绪', triggered: '已触发',
   },
   // 面板通用
-  panel: { loading: '加载中...', error: '加载失败', empty: '暂无数据', retry: '重试' },
+  panel: { loading: '加载中...', error: '加载失败', empty: '暂无数据', retry: '重试', maximize: '最大化', restore: '还原' },
   // 通用
   common: {
     confirm: '确认', cancel: '取消', ok: '确定', close: '关闭', yes: '是', no: '否',

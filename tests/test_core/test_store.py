@@ -49,8 +49,15 @@ class TestStorePositions:
 
     def test_delete_position(self, store):
         store.save_position({"code": "600519", "quantity": 100, "avg_cost": 1800.0})
-        store.delete_position("600519")
+        store.delete_position("600519", tenant_id="default")
         assert len(store.get_positions()) == 0
+
+    def test_delete_position_requires_a_tenant(self, store):
+        """An unscoped delete used to remove every tenant's row."""
+        store.save_position({"code": "600519", "quantity": 100, "avg_cost": 1800.0})
+        with pytest.raises(ValueError):
+            store.delete_position("600519")
+        assert len(store.get_positions()) == 1
 
     def test_update_position(self, store):
         store.save_position({"code": "600519", "quantity": 100, "avg_cost": 1800.0})
@@ -81,6 +88,135 @@ class TestStoreTrades:
         store.save_trade({"trade_id": "t2", "order_id": "o2", "code": "B",
                           "side": "buy", "quantity": 100, "price": 10})
         assert len(store.get_trades(code="A")) == 1
+
+
+class TestTradeQuantityForOrder:
+    """R13: the live engine books broker fills as a delta, so it needs the
+    persisted quantity of one order, summed across partial prints."""
+
+    def test_sums_multiple_trades_of_one_order(self, store):
+        store.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 10, "status": "filled"})
+        for trade_id, qty in (("t1", 40), ("t2", 60)):
+            store.save_trade({
+                "trade_id": trade_id, "order_id": "o1", "code": "600519",
+                "side": "buy", "quantity": qty, "price": 10,
+            })
+        assert store.get_trade_quantity_for_order("o1") == 100
+
+    def test_unknown_order_is_zero(self, store):
+        assert store.get_trade_quantity_for_order("missing") == 0
+        assert store.get_trade_quantity_for_order("") == 0
+
+    def test_tenant_filter_scopes_the_sum(self, store):
+        for tenant, qty in (("default", 40), ("other", 60)):
+            store.save_trade({
+                "trade_id": f"{tenant}-t", "tenant_id": tenant,
+                "order_id": "o1", "code": "600519", "side": "buy",
+                "quantity": qty, "price": 10,
+            })
+        assert store.get_trade_quantity_for_order("o1") == 100
+        assert store.get_trade_quantity_for_order("o1", "default") == 40
+        assert store.get_trade_quantity_for_order("o1", "other") == 60
+        assert store.get_trade_quantity_for_order("o1", "missing") == 0
+
+    def test_orders_do_not_leak_into_each_other(self, store):
+        for order_id, qty in (("o1", 40), ("o2", 60)):
+            store.save_trade({
+                "trade_id": f"{order_id}-t", "order_id": order_id,
+                "code": "600519", "side": "buy", "quantity": qty,
+                "price": 10,
+            })
+        assert store.get_trade_quantity_for_order("o1") == 40
+        assert store.get_trade_quantity_for_order("o2") == 60
+
+    def test_order_id_lookup_is_indexed(self, store):
+        import sqlite3
+
+        conn = sqlite3.connect(store._db_path)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'trades'"
+            ).fetchall()
+        finally:
+            conn.close()
+        names = {name for (name,) in rows}
+        assert "idx_trades_order" in names
+
+
+class TestTradeQuantityForBrokerOrder:
+    """R13: QMT regenerates the local order_id after a restart; the broker's
+    wire id is the only stable key, scoped by day/asset/side."""
+
+    def _book(self, store, order_id, broker_id, qty, *, code="600519",
+              side="buy", created_at="2026-10-23T09:30:00",
+              tenant="default"):
+        store.save_order({
+            "order_id": order_id, "tenant_id": tenant, "code": code,
+            "side": side, "quantity": qty, "price": 10.0,
+            "filled_quantity": qty, "status": "filled",
+            "broker_order_id": broker_id, "created_at": created_at,
+        })
+        store.save_trade({
+            "trade_id": f"{order_id}:t", "tenant_id": tenant,
+            "order_id": order_id, "code": code, "side": side,
+            "quantity": qty, "price": 10.0,
+        })
+
+    def test_sums_across_regenerated_local_ids(self, store):
+        self._book(store, "old-local", "9001", 40)
+        self._book(store, "new-local", "9001", 60)
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", code="600519", side="buy", since="2026-10-23",
+        ) == 100
+
+    def test_scope_prevents_cross_day_and_cross_asset_matches(self, store):
+        self._book(store, "old-day", "9001", 100,
+                   created_at="2026-10-22T09:30:00")
+        self._book(store, "other-code", "9001", 100, code="000001")
+        self._book(store, "other-side", "9001", 100, side="sell")
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", code="600519", side="buy", since="2026-10-23",
+        ) == 0
+
+    def test_tenant_filter_scopes_the_sum(self, store):
+        self._book(store, "a", "9001", 40, tenant="default")
+        self._book(store, "b", "9001", 60, tenant="other")
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", tenant_id="default", code="600519", side="buy",
+            since="2026-10-23",
+        ) == 40
+
+    def test_unknown_and_empty_broker_id_are_zero(self, store):
+        assert store.get_trade_quantity_for_broker_order("missing") == 0
+        assert store.get_trade_quantity_for_broker_order("") == 0
+
+    def test_exclude_order_id_prevents_self_double_count(self, store):
+        """N0: the engine adds this sum to the current order's own trades."""
+        self._book(store, "current", "9001", 40)
+        self._book(store, "older", "9001", 10)
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", code="600519", side="buy", since="2026-10-23",
+            exclude_order_id="current",
+        ) == 10
+        assert store.get_trade_quantity_for_broker_order(
+            "9001", code="600519", side="buy", since="2026-10-23",
+        ) == 50
+
+    def test_broker_id_lookup_is_indexed(self, store):
+        import sqlite3
+
+        conn = sqlite3.connect(store._db_path)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'orders'"
+            ).fetchall()
+        finally:
+            conn.close()
+        names = {name for (name,) in rows}
+        assert "idx_orders_broker_id" in names
 
 
 class TestStorePnL:
@@ -341,3 +477,533 @@ class TestThePrimaryKeyMigration:
         reopened = Store(db)
 
         assert len(reopened.get_positions()) == 2
+
+
+class TestEngineState:
+    def test_round_trip(self, store):
+        state = {"version": 1, "cash": 1.0, "positions": [{"asset": "A"}]}
+        store.save_engine_state(state, "strategy-a")
+        assert store.get_engine_state("strategy-a") == state
+
+    def test_missing_returns_none(self, store):
+        assert store.get_engine_state("does-not-exist") is None
+
+    def test_overwrite_keeps_one_row(self, store):
+        store.save_engine_state({"v": 1}, "s")
+        store.save_engine_state({"v": 2}, "s")
+        assert store.get_engine_state("s") == {"v": 2}
+
+    def test_survives_reopen(self, tmp_path):
+        db = str(tmp_path / "state.db")
+        Store(db).save_engine_state({"v": 3}, "s")
+        assert Store(db).get_engine_state("s") == {"v": 3}
+
+
+class TestPartialOrderSavesKeepTheRestOfTheRow:
+    """A broker fill DTO carries only the fields the broker knows about.
+
+    `save_order` used `INSERT OR REPLACE`, which deletes the row and
+    reinserts it from the incoming dict, so every column absent from a
+    later partial save was reset to its default. `OrderResult.to_dict()`
+    (trading/broker.py) has no strategy_id/signal_id/broker_order_id, so a
+    fill silently erased the attribution written when the order was
+    submitted.
+    """
+
+    @staticmethod
+    def _submitted(store, **overrides):
+        order = {
+            "order_id": "o1", "code": "600519", "side": "buy",
+            "quantity": 100, "price": 1800.0, "status": "submitted",
+            "strategy_id": "momentum", "signal_id": "sig-1",
+            "broker_order_id": "broker-9", "tenant_id": "fund_a",
+            "created_at": "2026-01-05T09:30:00",
+        }
+        order.update(overrides)
+        store.save_order(order)
+
+    @staticmethod
+    def _fill_dto(**overrides):
+        """The shape `trading/broker.py:OrderResult.to_dict()` returns."""
+        dto = {
+            "order_id": "o1", "code": "600519", "side": "buy",
+            "order_type": "limit", "quantity": 100, "price": 1800.0,
+            "filled_quantity": 100, "filled_price": 1800.0,
+            "status": "filled", "commission": 5.4, "tax": 0.0,
+            "slippage": 0.0, "error_msg": "",
+            "created_at": "2026-01-05T09:30:00",
+            "updated_at": "2026-01-05T15:00:00",
+        }
+        dto.update(overrides)
+        return dto
+
+    def test_a_fill_does_not_blank_the_attribution_columns(self, store):
+        self._submitted(store)
+
+        store.save_order(self._fill_dto())
+
+        row = store.get_orders()[0]
+        assert row["strategy_id"] == "momentum"
+        assert row["signal_id"] == "sig-1"
+        assert row["broker_order_id"] == "broker-9"
+
+    def test_supplied_columns_still_overwrite(self, store):
+        self._submitted(store)
+
+        store.save_order(self._fill_dto())
+
+        row = store.get_orders()[0]
+        assert row["status"] == "filled"
+        assert row["filled_quantity"] == 100
+        assert row["commission"] == 5.4
+        assert row["updated_at"] == "2026-01-05T15:00:00"
+
+    def test_a_missing_tenant_does_not_rewrite_the_row_tenant(self, store):
+        self._submitted(store)
+
+        store.save_order(self._fill_dto())  # no tenant_id in the DTO
+
+        assert store.get_orders()[0]["tenant_id"] == "fund_a"
+
+    def test_created_at_survives_an_update_that_omits_it(self, store):
+        self._submitted(store)
+
+        store.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0,
+                          "filled_quantity": 100, "status": "filled"})
+
+        assert store.get_orders()[0]["created_at"] == "2026-01-05T09:30:00"
+
+    def test_a_first_insert_uses_the_sql_defaults_it_does_not_supply(self, store):
+        store.save_order({"order_id": "o2", "code": "000001", "side": "sell",
+                          "quantity": 200, "price": 10.0})
+
+        row = store.get_orders()[0]
+        assert row["tenant_id"] == "default"
+        assert row["order_type"] == "limit"
+        assert row["status"] == "pending"
+        assert row["filled_quantity"] == 0
+        assert row["strategy_id"] == ""
+        assert row["created_at"], "created_at has no SQL default and must be set"
+        assert row["updated_at"]
+
+
+class TestMultipleFillsForOneOrder:
+    """`trade_id` used to default to `order_id`.
+
+    An order filled in several prints got one UNIQUE conflict per extra
+    print: by then `save_order` had already replaced the order row, and the
+    trade (and its audit event) were lost.
+    """
+
+    def _order(self, store):
+        store.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0, "status": "submitted"})
+
+    def test_two_fills_are_both_recorded(self, store):
+        self._order(store)
+        base = {"order_id": "o1", "code": "600519", "side": "buy", "quantity": 50}
+
+        store.save_trade({**base, "price": 1800.0})
+        store.save_trade({**base, "price": 1801.0})
+
+        trades = store.get_trades()
+        assert len(trades) == 2
+        assert len({t["trade_id"] for t in trades}) == 2
+        assert sorted(t["price"] for t in trades) == [1800.0, 1801.0]
+
+    def test_an_explicit_trade_id_is_kept(self, store):
+        self._order(store)
+        store.save_trade({"trade_id": "t1", "order_id": "o1", "code": "600519",
+                          "side": "buy", "quantity": 50, "price": 1800.0})
+
+        assert store.get_trades()[0]["trade_id"] == "t1"
+
+
+class TestSaveOrderWithTrade:
+    def test_writes_the_order_and_the_trade_together(self, store):
+        store.save_order_with_trade(
+            {"order_id": "o1", "code": "600519", "side": "buy",
+             "quantity": 100, "price": 1800.0, "status": "filled"},
+            {"order_id": "o1", "code": "600519", "side": "buy",
+             "quantity": 100, "price": 1800.0},
+        )
+
+        assert len(store.get_orders()) == 1
+        assert len(store.get_trades()) == 1
+        assert store.get_trades()[0]["trade_id"] != "o1", "uuid4, not the order id"
+
+    def test_a_bad_trade_rolls_the_order_back(self, store):
+        """One transaction: no half-written order when the fill is invalid."""
+        with pytest.raises(KeyError):
+            store.save_order_with_trade(
+                {"order_id": "o1", "code": "600519", "side": "buy",
+                 "quantity": 100, "price": 1800.0, "status": "filled"},
+                {"order_id": "o1", "code": "600519", "side": "buy"},  # no quantity
+            )
+
+        assert store.get_orders() == []
+        assert store.get_trades() == []
+
+    def test_a_second_fill_updates_the_order_and_appends_the_trade(self, store):
+        order = {"order_id": "o1", "code": "600519", "side": "buy",
+                 "quantity": 100, "price": 1800.0, "status": "partially_filled",
+                 "strategy_id": "momentum"}
+        store.save_order_with_trade(
+            order,
+            {"order_id": "o1", "code": "600519", "side": "buy",
+             "quantity": 50, "price": 1800.0},
+        )
+        store.save_order_with_trade(
+            {**order, "status": "filled", "filled_quantity": 100},
+            {"order_id": "o1", "code": "600519", "side": "buy",
+             "quantity": 50, "price": 1801.0},
+        )
+
+        assert len(store.get_orders()) == 1
+        assert len(store.get_trades()) == 2
+        row = store.get_orders()[0]
+        assert row["status"] == "filled"
+        assert row["strategy_id"] == "momentum"
+
+
+class TestEodReconciliationMarker:
+    def test_marker_round_trip(self, store):
+        assert store.has_eod_reconciliation("2026-10-20") is False
+
+        store.mark_eod_reconciliation("2026-10-20", "2026-10-20T15:30:00")
+
+        assert store.has_eod_reconciliation("2026-10-20") is True
+        assert store.has_eod_reconciliation("2026-10-19") is False
+
+    def test_marking_the_same_day_twice_keeps_one_row(self, tmp_path):
+        db = str(tmp_path / "eod.db")
+        store = Store(db)
+        store.mark_eod_reconciliation("2026-10-20", "first")
+        store.mark_eod_reconciliation("2026-10-20", "second")
+
+        import sqlite3
+        conn = sqlite3.connect(db)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM eod_reconciliation").fetchone()[0]
+        finally:
+            conn.close()
+        assert count == 1
+
+    def test_an_existing_database_gains_the_table(self, tmp_path):
+        """Databases written before the table existed must migrate on open."""
+        import sqlite3
+
+        db = str(tmp_path / "legacy.db")
+        first = Store(db)
+        first.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0})
+        first.close()
+
+        # Simulate a database created before the eod_reconciliation table.
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE eod_reconciliation")
+        conn.commit()
+        conn.close()
+
+        reopened = Store(db)
+        assert reopened.has_eod_reconciliation("2026-10-20") is False
+        reopened.mark_eod_reconciliation("2026-10-20")
+
+        assert reopened.has_eod_reconciliation("2026-10-20") is True
+        assert len(reopened.get_orders()) == 1, "existing rows are untouched"
+
+
+class TestDailyReconciliationResults:
+    """R11: the books-vs-broker outcome is persisted, one row per date."""
+
+    @staticmethod
+    def _result(**overrides):
+        result = {
+            "date": "2026-10-20",
+            "timestamp": "2026-10-20T15:05:00",
+            "status": "failed",
+            "n_positions": 2,
+            "n_mismatched": 1,
+            "cash_diff": -125.5,
+            "total_mismatch_value": 500.0,
+            "details": [
+                {"asset": "600519", "expected_shares": 100,
+                 "actual_shares": 90, "diff": 10, "is_matched": False},
+            ],
+            "tolerances": {"shares": 0, "cash": 1000.0,
+                           "cash_bps": 0, "materiality": 0},
+        }
+        result.update(overrides)
+        return result
+
+    def test_round_trip(self, store):
+        store.save_reconciliation_result(self._result())
+
+        row = store.get_reconciliation_result("2026-10-20")
+
+        assert row["status"] == "failed"
+        assert row["n_positions"] == 2
+        assert row["n_mismatched"] == 1
+        assert row["cash_diff"] == pytest.approx(-125.5)
+        assert row["total_mismatch_value"] == pytest.approx(500.0)
+        assert row["details"][0]["asset"] == "600519"
+        assert row["details"][0]["diff"] == 10
+        assert row["tolerances"]["cash"] == pytest.approx(1000.0)
+
+    def test_one_row_per_date(self, store):
+        store.save_reconciliation_result(self._result())
+        store.save_reconciliation_result(self._result(status="passed"))
+
+        import sqlite3
+        conn = sqlite3.connect(store._db_path)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM reconciliation_results").fetchone()[0]
+        finally:
+            conn.close()
+        assert count == 1
+        assert store.get_reconciliation_result("2026-10-20")["status"] == "passed"
+
+    def test_unknown_keeps_nulls_instead_of_zero(self, store):
+        """An unknown comparison must not persist as a zero diff."""
+        store.save_reconciliation_result(self._result(
+            status="unknown", cash_diff=None,
+            total_mismatch_value=None, details=[],
+        ))
+
+        row = store.get_reconciliation_result("2026-10-20")
+        assert row["status"] == "unknown"
+        assert row["cash_diff"] is None
+        assert row["total_mismatch_value"] is None
+
+    def test_an_unknown_status_is_rejected(self, store):
+        with pytest.raises(ValueError, match="status"):
+            store.save_reconciliation_result(self._result(status="maybe"))
+
+    def test_last_reconciliation_is_the_newest_date(self, store):
+        assert store.get_last_reconciliation() is None
+
+        store.save_reconciliation_result(self._result(date="2026-10-19"))
+        store.save_reconciliation_result(self._result(date="2026-10-20"))
+
+        assert store.get_last_reconciliation()["date"] == "2026-10-20"
+        assert store.get_reconciliation_result("2026-10-18") is None
+
+    def test_an_existing_database_gains_the_table(self, tmp_path):
+        import sqlite3
+
+        db = str(tmp_path / "legacy_r11.db")
+        first = Store(db)
+        first.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0})
+        first.close()
+
+        # Simulate a database created before reconciliation_results existed.
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE reconciliation_results")
+        conn.commit()
+        conn.close()
+
+        reopened = Store(db)
+        assert reopened.get_last_reconciliation() is None
+        reopened.save_reconciliation_result(self._result())
+
+        assert reopened.get_reconciliation_result(
+            "2026-10-20")["status"] == "failed"
+        assert len(reopened.get_orders()) == 1, "existing rows are untouched"
+
+    def test_basis_is_persisted(self, store):
+        """R12: the expected-side basis travels with the durable result."""
+        store.save_reconciliation_result(self._result())
+        assert store.get_reconciliation_result(
+            "2026-10-20")["basis"] == "trade_ledger"
+
+        store.save_reconciliation_result(
+            self._result(date="2026-10-21", basis="direct"),
+        )
+        assert store.get_reconciliation_result("2026-10-21")["basis"] == "direct"
+
+    def test_an_existing_results_table_gains_the_basis_column(self, tmp_path):
+        """CREATE TABLE IF NOT EXISTS cannot add a column, so an R11-era
+        database must be migrated in place -- and its old rows must stay
+        unlabelled (their basis was not the trade ledger)."""
+        import sqlite3
+
+        db = str(tmp_path / "legacy_basis.db")
+        conn = sqlite3.connect(db)
+        conn.execute("""
+            CREATE TABLE reconciliation_results (
+                date TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                status TEXT NOT NULL,
+                n_positions INTEGER DEFAULT 0,
+                n_mismatched INTEGER DEFAULT 0,
+                cash_diff REAL,
+                total_mismatch_value REAL,
+                details TEXT DEFAULT '[]',
+                tolerances TEXT DEFAULT '{}'
+            )
+        """)
+        conn.execute(
+            "INSERT INTO reconciliation_results (date, timestamp, status) "
+            "VALUES ('2026-10-19', '2026-10-19T15:05:00', 'passed')",
+        )
+        conn.commit()
+        conn.close()
+
+        reopened = Store(db)
+
+        legacy = reopened.get_reconciliation_result("2026-10-19")
+        assert legacy["basis"] is None, (
+            "an R11-era outcome must not be relabelled as trade_ledger"
+        )
+
+        reopened.save_reconciliation_result(self._result(
+            date="2026-10-20", status="passed",
+        ))
+
+        assert reopened.get_reconciliation_result(
+            "2026-10-20")["basis"] == "trade_ledger"
+
+
+class TestLedgerBaselines:
+    """R12: append-only broker baselines the trade ledger derives from."""
+
+    @staticmethod
+    def _baseline(**overrides):
+        baseline = {
+            "created_at": "2026-10-20T09:00:00",
+            "tenant_id": "default",
+            "engine_state_key": "live_engine:default",
+            "cash": 100_000.0,
+            "positions_json": {
+                "600519": {"quantity": 100, "avg_cost": 45.0},
+            },
+            "note": "test",
+        }
+        baseline.update(overrides)
+        return baseline
+
+    def test_round_trip(self, store):
+        row_id = store.save_ledger_baseline(self._baseline())
+
+        baseline = store.get_latest_ledger_baseline(
+            "default", "live_engine:default",
+        )
+
+        assert baseline["id"] == row_id
+        assert baseline["cash"] == pytest.approx(100_000.0)
+        assert baseline["positions"]["600519"]["quantity"] == 100
+        assert baseline["created_at"] == "2026-10-20T09:00:00"
+        assert baseline["engine_state_key"] == "live_engine:default"
+        assert baseline["note"] == "test"
+
+    def test_restarts_append_and_the_newest_id_wins(self, store):
+        first_id = store.save_ledger_baseline(self._baseline())
+        # Same created_at on purpose: ordering must be by insert id.
+        second_id = store.save_ledger_baseline(self._baseline(
+            cash=99_000.0, positions_json={},
+        ))
+
+        latest = store.get_latest_ledger_baseline()
+
+        assert second_id > first_id
+        assert latest["id"] == second_id
+        assert latest["cash"] == pytest.approx(99_000.0)
+
+    def test_filters_by_tenant_and_engine_state_key(self, store):
+        store.save_ledger_baseline(self._baseline())
+        store.save_ledger_baseline(self._baseline(
+            tenant_id="other", engine_state_key="live_engine:other", cash=1.0,
+        ))
+
+        assert store.get_latest_ledger_baseline(
+            "default", "live_engine:default")["cash"] == pytest.approx(100_000.0)
+        assert store.get_latest_ledger_baseline(
+            "other", "live_engine:other")["cash"] == pytest.approx(1.0)
+        assert store.get_latest_ledger_baseline("missing", "") is None
+        # An empty filter leaves that column unscoped.
+        assert store.get_latest_ledger_baseline(
+            "", "live_engine:other")["cash"] == pytest.approx(1.0)
+        assert store.get_latest_ledger_baseline(
+            "other", "")["cash"] == pytest.approx(1.0)
+
+    def test_cash_is_required_and_must_be_finite(self, store):
+        missing = self._baseline()
+        del missing["cash"]
+        with pytest.raises(ValueError, match="cash"):
+            store.save_ledger_baseline(missing)
+
+        with pytest.raises(ValueError, match="finite"):
+            store.save_ledger_baseline(self._baseline(cash=float("nan")))
+
+    def test_created_at_is_required(self, store):
+        """Defaulting it would silently mix the exchange clock with the
+        host-clock fill stamps the ledger compares against."""
+        missing = self._baseline()
+        del missing["created_at"]
+        with pytest.raises(ValueError, match="created_at"):
+            store.save_ledger_baseline(missing)
+
+        with pytest.raises(ValueError, match="created_at"):
+            store.save_ledger_baseline(self._baseline(created_at=""))
+
+        with pytest.raises(ValueError, match="created_at"):
+            store.save_ledger_baseline(self._baseline(created_at="   "))
+
+    def test_positions_may_be_json_text(self, store):
+        store.save_ledger_baseline(
+            self._baseline(positions_json='{"600519": 100}'),
+        )
+        assert store.get_latest_ledger_baseline()["positions"] == {
+            "600519": 100,
+        }
+
+    def test_malformed_positions_are_rejected(self, store):
+        with pytest.raises(ValueError, match="JSON"):
+            store.save_ledger_baseline(self._baseline(positions_json="{nope"))
+        with pytest.raises(ValueError, match="positions"):
+            store.save_ledger_baseline(self._baseline(positions_json=[1, 2]))
+
+    def test_an_existing_database_gains_the_table(self, tmp_path):
+        import sqlite3
+
+        db = str(tmp_path / "legacy_baseline.db")
+        first = Store(db)
+        first.save_order({"order_id": "o1", "code": "600519", "side": "buy",
+                          "quantity": 100, "price": 1800.0})
+        first.close()
+
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE ledger_baselines")
+        conn.commit()
+        conn.close()
+
+        reopened = Store(db)
+        assert reopened.get_latest_ledger_baseline() is None
+        reopened.save_ledger_baseline(self._baseline())
+
+        assert reopened.get_latest_ledger_baseline()["cash"] == pytest.approx(
+            100_000.0,
+        )
+        assert len(reopened.get_orders()) == 1, "existing rows are untouched"
+
+    def test_unreadable_positions_json_raises(self, store):
+        """Degrading to {} could 'pass' a flat broker account."""
+        import sqlite3
+
+        conn = sqlite3.connect(store._db_path)
+        conn.execute(
+            "INSERT INTO ledger_baselines "
+            "(created_at, tenant_id, engine_state_key, cash, positions_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("2026-10-20T09:00:00", "default", "", 1.0, "{nope"),
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(ValueError, match="unreadable"):
+            store.get_latest_ledger_baseline()
+

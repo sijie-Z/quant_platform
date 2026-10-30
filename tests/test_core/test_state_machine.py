@@ -93,3 +93,15 @@ class TestStateMachine:
         assert self.sm.state_str == "init"
         self.sm.transition(PortfolioState.READY, "")
         assert self.sm.state_str == "ready"
+
+
+class TestTransitionObserver:
+    def test_a_registered_callback_sees_each_transition(self):
+        sm = PortfolioStateMachine()
+        seen = []
+        sm.set_transition_callback(seen.append)
+
+        sm.transition(PortfolioState.READY, "observer test")
+
+        assert [r.to_state for r in seen] == ["ready"]
+        assert seen[0].from_state == "init"
