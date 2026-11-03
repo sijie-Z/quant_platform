@@ -41,6 +41,8 @@ FROZEN = {
     "backtest/metrics.py": "49399a9141d95171",
     "utils/exchange_calendar.py": "00260b954308468a",
     "tools/fetch_valuation.py": "a286f5449fba5bc7",
+    "docs/research/EVALUATION_SPEC_2026-11.md": "b849fef8b00af136",
+    "tools/forward_evaluation.py": "91fdda4410d4c396",
     ".cache/baostock/industry_map.parquet": "5da906a2e4bca0c0",
     "docs/research/paper_track/forward_targets/turnover/target_2026-10-23.json":
         "bdfb3e7c814aa3b7",
