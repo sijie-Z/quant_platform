@@ -55,7 +55,7 @@
       <div v-if="config.broker === 'qmt'" class="lt-config-row">
         <div class="lt-field lt-field-wide">
           <label>{{ locale === 'zh-CN' ? 'QMT路径' : 'QMT Path' }}</label>
-          <input v-model="config.qmt_path" placeholder="C:\国金证券QMT\UserData_mini" />
+          <input v-model="config.server" :placeholder="locale === 'zh-CN' ? 'QMT服务地址 host:port' : 'QMT server host:port'" />
         </div>
         <div class="lt-field">
           <label>{{ locale === 'zh-CN' ? '账户ID' : 'Account ID' }}</label>
@@ -165,8 +165,8 @@
       <div class="lt-risk-grid">
         <div class="lt-risk-item">
           <span class="lt-risk-label">{{ locale === 'zh-CN' ? '紧急熔断' : 'Kill Switch' }}</span>
-          <span :class="riskStatus.kill_switch_active ? 'neg' : 'pos'">
-            {{ riskStatus.kill_switch_active ? (locale === 'zh-CN' ? '已激活' : 'ACTIVE') : (locale === 'zh-CN' ? '关闭' : 'OFF') }}
+          <span :class="riskStatus.kill_switch ? 'neg' : 'pos'">
+            {{ riskStatus.kill_switch ? (locale === 'zh-CN' ? '已激活' : 'ACTIVE') : (locale === 'zh-CN' ? '关闭' : 'OFF') }}
           </span>
         </div>
         <div class="lt-risk-item">
@@ -185,17 +185,17 @@
         </div>
         <div class="lt-risk-item">
           <span class="lt-risk-label">{{ locale === 'zh-CN' ? '最大回撤限额' : 'Max Drawdown Limit' }}</span>
-          <span class="mono">{{ ((riskStatus.limits?.max_drawdown_pct || 0.15) * 100).toFixed(0) }}%</span>
+          <span class="mono">{{ ((riskStatus.limits?.max_drawdown || 0.15) * 100).toFixed(0) }}%</span>
         </div>
         <div class="lt-risk-item">
           <span class="lt-risk-label">{{ locale === 'zh-CN' ? '仓位上限' : 'Max Position Limit' }}</span>
-          <span class="mono">{{ ((riskStatus.limits?.max_single_position_pct || 0.05) * 100).toFixed(0) }}%</span>
+          <span class="mono">{{ ((riskStatus.limits?.max_single_position || 0.05) * 100).toFixed(0) }}%</span>
         </div>
       </div>
-      <div v-if="riskStatus.breaches?.length" class="lt-breaches">
-        <div v-for="(b, i) in riskStatus.breaches.slice(-5)" :key="i" class="lt-breach"
+      <div v-if="riskStatus.recent_breaches?.length" class="lt-breaches">
+        <div v-for="(b, i) in riskStatus.recent_breaches.slice(-5)" :key="i" class="lt-breach"
           :class="'breach-' + (b.severity || 'yellow')">
-          <span class="lt-breach-type">{{ b.breach_type }}</span>
+          <span class="lt-breach-type">{{ b.type }}</span>
           <span class="lt-breach-msg">{{ b.message }}</span>
           <span class="lt-breach-time">{{ fmtTime(b.timestamp) }}</span>
         </div>
@@ -264,7 +264,7 @@
           <div class="lt-stock-change">{{ (s['涨跌幅'] || 0).toFixed(2) }}%</div>
         </div>
       </div>
-      <div v-else class="lt-empty">{{ locale === 'zh-CN' ? '加载行情数据...' : 'Loading market data...' }}</div>
+      <div v-else class="lt-empty">{{ marketError || (locale === 'zh-CN' ? '加载行情数据...' : 'Loading market data...') }}</div>
     </div>
   </div>
 </template>
@@ -277,9 +277,9 @@ import {
   getTradingPositions, getTradingAccount, getTradingCycles,
   runTradingCycle, getMarketSnapshot,
   getCoreState, getCoreAudit, getCoreRisk, toggleCoreKillSwitch,
-  createStatusSocket
+  createStatusSocket, getApiErrorMessage
 } from '../api/index.js'
-
+import { formatBackendClock } from '../utils/time.js'
 const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
@@ -294,6 +294,7 @@ const positions = ref([])
 const cycles = ref([])
 const marketStocks = ref([])
 const marketTime = ref('')
+const marketError = ref('')
 const refreshing = ref(false)
 
 // Core architecture data
@@ -310,16 +311,18 @@ const config = reactive({
   initial_cash: 1000000,
   n_stocks: 30,
   rebalance_interval: 300,
-  qmt_path: '',
+  server: '127.0.0.1:58610',
   account_id: '',
 })
 
 let pollTimer = null
 let ws = null
+let unmounted = false
 
 async function start() {
   try {
     await startTrading(config)
+    if (unmounted) return
     engineStatus.value = 'running'
     emit('toast', { message: locale.value === 'zh-CN' ? '实盘交易引擎已启动' : 'Live trading engine started', type: 'success' })
     startPolling()
@@ -404,8 +407,14 @@ async function fetchMarket() {
   try {
     const r = await getMarketSnapshot()
     marketStocks.value = (r.stocks || []).slice(0, 30)
-    marketTime.value = r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : ''
-  } catch (_) {}
+    marketError.value = ''
+    const time = formatBackendClock(r.timestamp, locale.value)
+    marketTime.value = time ? (r.stale ? `stale ${time}` : time) : ''
+  } catch (e) {
+    // Previously swallowed: an unavailable feed (503) or server error left
+    // the panel on "Loading market data..." forever.
+    marketError.value = getApiErrorMessage(e, 'Market data unavailable')
+  }
 }
 
 async function fetchState() {
@@ -432,7 +441,10 @@ async function fetchRisk() {
 }
 
 function connectWS() {
-  if (ws) return
+  // `ws` may be a self-disposed handle (auth close stopped reconnection);
+  // a truthy-but-dead handle used to block every later reconnect.
+  if (ws && !ws.disposed) return
+  ws = null
   try {
     ws = createStatusSocket(
       (data) => {
@@ -441,7 +453,19 @@ function connectWS() {
           if (wsEvents.value.length > 100) wsEvents.value = wsEvents.value.slice(0, 50)
         }
       },
-      () => {}
+      (err) => {
+        // The socket factory stops reconnecting on 1008/4401 (rejected token)
+        // instead of looping forever; surface that once so the operator can
+        // fix the token in Settings.
+        if (err?.type === 'auth') {
+          emit('toast', {
+            message: locale.value === 'zh-CN'
+              ? '实时事件流认证失败（WebSocket 1008），已停止重连。请在设置中检查 API Token。'
+              : 'Realtime event stream authentication failed (WS 1008); reconnection stopped. Check the API token in Settings.',
+            type: 'error',
+          })
+        }
+      }
     )
   } catch (_) {}
 }
@@ -473,16 +497,19 @@ function fmtMoney(v) {
 }
 
 function fmtTime(t) {
-  if (!t) return ''
-  return new Date(t).toLocaleTimeString()
+  // Backend timestamps are naive Asia/Shanghai strings; parse as UTC+8 so a
+  // browser outside China does not shift them.
+  return formatBackendClock(t, locale.value)
 }
 
 onMounted(async () => {
   await fetchStatus()
+  if (unmounted) return
   await fetchMarket()
   await fetchState()
   await fetchAudit()
   await fetchRisk()
+  if (unmounted) return
   if (engineStatus.value === 'running') {
     startPolling()
     connectWS()
@@ -490,6 +517,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  unmounted = true
   stopPolling()
   if (ws) { ws.close(); ws = null }
 })

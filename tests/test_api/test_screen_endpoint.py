@@ -42,7 +42,9 @@ def test_screen_reaches_the_data_load_guard(client):
 
 
 def test_screen_passes_request_config_path_through(monkeypatch):
-    """The request's `config` field is forwarded to the loader."""
+    """A config under the server config/ directory is forwarded (resolved)."""
+    from pathlib import Path
+
     seen = {}
 
     def _record(config_path=None):
@@ -54,9 +56,13 @@ def test_screen_passes_request_config_path_through(monkeypatch):
 
     app = FastAPI()
     app.include_router(routes.router)
-    TestClient(app).post("/api/screen", json={**VALID_BODY, "config": "custom.yaml"})
+    TestClient(app).post(
+        "/api/screen",
+        json={**VALID_BODY, "config": "config/default.yaml"},
+    )
 
-    assert seen["config_path"] == "custom.yaml"
+    expected = (Path(routes.__file__).resolve().parent.parent / "config" / "default.yaml")
+    assert Path(seen["config_path"]).resolve() == expected.resolve()
 
 
 def test_screen_rejects_malformed_rules(client):

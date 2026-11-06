@@ -54,3 +54,50 @@ def test_run_does_not_write_into_the_real_data_tree(isolated_paths):
 
     after = {p.name for p in real_reports.glob("run_*.md")} if real_reports.exists() else set()
     assert after == before
+
+
+def test_zero_ic_observations_is_not_a_success(isolated_paths):
+    """R5: momentum_12m needs 252+21 days; a 120-day panel produced
+    n_ic_obs=0 but was recorded as status=success in the live registry."""
+    import json
+
+    run_id = run_synthetic_factor(
+        "momentum_12m", n_stocks=3, n_days=120, seed=1, **isolated_paths
+    )
+    store = RunStore(str(isolated_paths["db_path"]))
+    row = store.get_run(run_id)
+
+    evaluation = json.loads(row["evaluation"])
+    assert evaluation["n_ic_obs"] == 0
+    assert row["status"] == "failed"
+    assert "insufficient_ic_observations" in (row["reason"] or "")
+    assert store.is_trusted(run_id) is False
+
+    report = (isolated_paths["out_dir"] / f"{run_id}.md").read_text(encoding="utf-8")
+    assert "RUN FAILED" in report
+    assert "insufficient_ic_observations" in report
+
+
+def test_synthetic_run_records_lineage(isolated_paths):
+    """R26: synthetic runs used to carry NULL data_meta/universe_meta."""
+    import json
+
+    run_id = run_synthetic_factor(
+        "momentum_12m", n_stocks=5, n_days=500, seed=3, **isolated_paths
+    )
+    store = RunStore(str(isolated_paths["db_path"]))
+    row = store.get_run(run_id)
+
+    data_meta = json.loads(row["data_meta"])
+    universe_meta = json.loads(row["universe_meta"])
+    assert row["data_source"] == "synthetic"
+    assert row["factor"] == "momentum_12m"
+    assert data_meta["provider"] == "synthetic"
+    assert data_meta["seed"] == 3
+    assert data_meta["panel_start"] and data_meta["panel_end"]
+    assert universe_meta["pit"] is False
+    assert "synthetic_data_not_market_data" in universe_meta["bias_warning"]
+
+    evaluation = json.loads(row["evaluation"])
+    assert evaluation["n_ic_obs"] >= 20
+    assert row["status"] == "success"

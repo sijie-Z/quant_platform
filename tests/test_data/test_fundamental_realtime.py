@@ -48,14 +48,15 @@ class TestFundamentalDataProvider:
         assert fd._cache_ttl == 300
 
     def test_get_fundamentals_synthetic(self):
-        """Should return synthetic data when API unavailable."""
+        """Should return synthetic data, flagged as synthetic, when API fails."""
         fd = FundamentalDataProvider(cache_ttl=1)
-        # Mock the API calls to fail, triggering synthetic fallback
         with patch.object(fd, '_fetch_eastmoney', side_effect=Exception("no API")):
-            with patch.object(fd, '_fetch_sina', side_effect=Exception("no API")):
-                m = fd.get_fundamentals("600519")
-                assert m.code == "600519"
-                assert m.pe_ttm > 0
+            m = fd.get_fundamentals("600519")
+            assert m.code == "600519"
+            assert m.pe_ttm > 0
+            assert m.is_synthetic is True
+            assert m.source == "synthetic"
+            assert fd.stats["synthetic_count"] == 1
 
     def test_cache_hit(self):
         fd = FundamentalDataProvider(cache_ttl=60)
@@ -73,19 +74,17 @@ class TestFundamentalDataProvider:
         fd._cache["600519"] = (time.time() - 10, m)  # Expired
 
         with patch.object(fd, '_fetch_eastmoney', side_effect=Exception("no API")):
-            with patch.object(fd, '_fetch_sina', side_effect=Exception("no API")):
-                result = fd.get_fundamentals("600519")
-                assert result.code == "600519"
-                assert fd._cache_misses >= 1
+            result = fd.get_fundamentals("600519")
+            assert result.code == "600519"
+            assert fd._cache_misses >= 1
 
     def test_get_bulk(self):
         fd = FundamentalDataProvider(cache_ttl=60)
         with patch.object(fd, '_fetch_eastmoney', side_effect=Exception("no API")):
-            with patch.object(fd, '_fetch_sina', side_effect=Exception("no API")):
-                result = fd.get_bulk(["600519", "000001"])
-                assert len(result) == 2
-                assert "600519" in result
-                assert "000001" in result
+            result = fd.get_bulk(["600519", "000001"])
+            assert len(result) == 2
+            assert "600519" in result
+            assert "000001" in result
 
     def test_get_bulk_partial_cache(self):
         fd = FundamentalDataProvider(cache_ttl=60)
@@ -93,18 +92,16 @@ class TestFundamentalDataProvider:
         fd._cache["600519"] = (time.time(), m)
 
         with patch.object(fd, '_fetch_eastmoney', side_effect=Exception("no API")):
-            with patch.object(fd, '_fetch_sina', side_effect=Exception("no API")):
-                result = fd.get_bulk(["600519", "000001"])
-                assert result["600519"].pe_ttm == 33.5  # From cache
-                assert result["000001"].pe_ttm != 0  # Freshly fetched
+            result = fd.get_bulk(["600519", "000001"])
+            assert result["600519"].pe_ttm == 33.5  # From cache
+            assert result["000001"].pe_ttm != 0  # Freshly fetched
 
     def test_get_as_dataframe(self):
         fd = FundamentalDataProvider(cache_ttl=60)
         with patch.object(fd, '_fetch_eastmoney', side_effect=Exception("no API")):
-            with patch.object(fd, '_fetch_sina', side_effect=Exception("no API")):
-                df = fd.get_as_dataframe(["600519", "000001"])
-                assert isinstance(df, pd.DataFrame)
-                assert len(df) == 2
+            df = fd.get_as_dataframe(["600519", "000001"])
+            assert isinstance(df, pd.DataFrame)
+            assert len(df) == 2
 
     def test_clear_cache(self):
         fd = FundamentalDataProvider()
@@ -119,6 +116,59 @@ class TestFundamentalDataProvider:
         assert "cached" in stats
         assert "cache_ttl" in stats
         assert "request_count" in stats
+        assert stats["synthetic_count"] == 0
+        assert stats["live_count"] == 0
+
+    def test_eastmoney_fields_are_mapped_and_scaled(self, monkeypatch):
+        """`stock/get` exposes PE/PB as f162/f167 scaled by 100.
+
+        The old request asked for f9/f23 (fields of a different endpoint), so
+        PE and PB were always 0.0 while the call looked successful.
+        """
+        import json
+
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def read(self):
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        payload = json.dumps({"data": {
+            "f58": "贵州茅台", "f162": 1860, "f167": 659,
+            "f116": 1.65e12, "f117": 1.65e12,
+        }}).encode()
+
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda req, timeout=5: _Resp(payload),
+        )
+
+        m = FundamentalDataProvider()._fetch_eastmoney("600519")
+
+        assert m.pe_ttm == pytest.approx(18.60)
+        assert m.pb == pytest.approx(6.59)
+        assert m.market_cap == pytest.approx(1.65e12)
+        assert m.name == "贵州茅台"
+        assert m.source == "eastmoney"
+        assert m.is_synthetic is False
+
+    def test_synthetic_values_are_stable_across_instances(self):
+        """`hash()` is salted per process: the same code reported different
+        fundamentals after every restart."""
+        m1 = FundamentalDataProvider()._generate_synthetic("600519")
+        m2 = FundamentalDataProvider()._generate_synthetic("600519")
+        m3 = FundamentalDataProvider()._generate_synthetic("000001")
+
+        assert m1.pe_ttm == m2.pe_ttm
+        assert m1.market_cap == m2.market_cap
+        assert m1.pe_ttm != m3.pe_ttm
 
     def test_generate_synthetic(self):
         fd = FundamentalDataProvider()
@@ -193,6 +243,20 @@ class TestFundamentalScreener:
     def test_screen_none_pass(self, screener):
         result = screener.screen(["600519", "000001", "300750"], pe_max=1)
         assert len(result) == 0
+
+    def test_unknown_metrics_do_not_pass_filters(self, screener):
+        """A missing PE arrives as 0.0. Treating it as a value made
+        `pe_max=20` pass every stock and `pb_min=1` reject every stock."""
+        screener._provider._cache["999999"] = (
+            time.time(), FundamentalMetrics(code="999999"),
+        )
+
+        assert "999999" not in screener.screen(
+            ["600519", "999999"], pe_max=20,
+        )
+        assert "999999" not in screener.screen(
+            ["600519", "999999"], pb_min=1,
+        )
 
     def test_rank_by_roe(self, screener):
         ranked = screener.rank_by(["600519", "000001", "300750"], metric="roe")

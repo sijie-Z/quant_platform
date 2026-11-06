@@ -2,7 +2,8 @@
 
 Orchestrates the complete daily trading workflow:
 1. Morning health check (data, cash, positions, risk limits)
-2. Multi-factor signal generation (momentum + volatility + RSI + MACD)
+2. Multi-factor signal generation (shared 7-factor equal-weight composite:
+   1/3/6-month momentum + 20/60-day volatility + RSI + MACD)
 3. Pre-trade risk validation (RiskMonitor)
 4. Order execution via broker (QMT sim or Paper)
 5. Parallel Paper Broker execution for TCA calibration
@@ -25,13 +26,18 @@ Usage:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
+import pandas as pd
 
-from quant_platform.core.audit import AuditLog
+from quant_platform.core.audit import AuditAction, AuditLog
 from quant_platform.core.events import get_event_bus
+from quant_platform.core.instrument import normalize_symbol
 from quant_platform.core.state_machine import PortfolioStateMachine
 from quant_platform.core.store import Store
 from quant_platform.execution.paper_broker import (
@@ -39,7 +45,7 @@ from quant_platform.execution.paper_broker import (
     PaperBroker,
     PaperBrokerMetrics,
 )
-from quant_platform.risk.circuit_breaker import RiskMonitor
+from quant_platform.risk.circuit_breaker import RiskMonitor, get_risk_monitor
 from quant_platform.trading.broker import (
     Order,
     OrderSide,
@@ -47,9 +53,33 @@ from quant_platform.trading.broker import (
     SimulatedBroker,
     create_broker,
 )
+from quant_platform.trading.live_engine import (
+    ensure_raw_price_basis,
+    normalize_corporate_action_feed,
+    summarize_corporate_action_events,
+    working_order_codes,
+)
+from quant_platform.trading.signals import (
+    DEFAULT_MIN_SIGNAL_SCORE,
+    SIGNAL_HISTORY_SESSIONS,
+    composite_signal,
+    rank_symbols,
+)
+from quant_platform.utils.exchange_calendar import is_trading_day, trading_days
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_EXCHANGE_TZ = ZoneInfo("Asia/Shanghai")
+
+#: RiskLevel enum -> numeric value used by the Grafana "Risk Level" panel.
+_RISK_LEVEL_VALUES = {
+    "green": 0.0,
+    "yellow": 1.0,
+    "orange": 2.0,
+    "red": 3.0,
+    "kill": 4.0,
+}
 
 
 # ── Data Models ──
@@ -72,6 +102,7 @@ class DailyReport:
     risk_level: str = "GREEN"
     drawdown_pct: float = 0.0
     paper_metrics: dict | None = None
+    price_basis: str = "raw"
 
     def to_dict(self) -> dict:
         return {
@@ -88,6 +119,12 @@ class DailyReport:
             "total_slippage": round(self.total_slippage, 4),
             "risk_level": self.risk_level,
             "drawdown_pct": round(self.drawdown_pct, 4),
+            # Every runner price is a broker/exchange quote (traded CNY), so
+            # the equity/P&L figures are on a raw basis (D15/D41).
+            "price_basis": self.price_basis,
+            # The dual-track PaperBroker metrics were computed every cycle
+            # and then dropped here, so the TCA comparison never surfaced.
+            "paper_metrics": self.paper_metrics,
         }
 
 
@@ -109,7 +146,14 @@ class SessionReport:
     avg_daily_volume: float
     paper_metrics: PaperBrokerMetrics | None = None
     broker_type: str = ""
+    status: str = "completed"
+    failed_cycles: int = 0
     daily_reports: list[dict] = field(default_factory=list)
+    price_basis: str = "raw"
+    #: Run-report provenance for the paper book: ``{"count", "last_ex_date",
+    #: "source"}`` from :func:`summarize_corporate_action_events`.  An empty
+    #: feed reports ``count == 0`` rather than disappearing from the report.
+    corporate_actions_applied: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -127,6 +171,10 @@ class SessionReport:
             "max_drawdown_pct": round(self.max_drawdown_pct, 4),
             "avg_daily_volume": round(self.avg_daily_volume, 2),
             "broker_type": self.broker_type,
+            "price_basis": self.price_basis,
+            "status": self.status,
+            "failed_cycles": self.failed_cycles,
+            "corporate_actions_applied": self.corporate_actions_applied,
         }
 
 
@@ -151,26 +199,58 @@ class LiveRunner:
         broker_type: str = "simulated",
         initial_cash: float = 10_000_000,
         dual_track: bool = True,
+        risk_monitor: RiskMonitor | None = None,
+        store: Store | None = None,
+        broker: Any | None = None,
+        min_signal_score: float = DEFAULT_MIN_SIGNAL_SCORE,
+        max_positions: int = 50,
         **broker_kwargs,
     ):
         self._initial_cash = initial_cash
         self._dual_track = dual_track
         self._session_id = ""
         self._broker_type_name = broker_type
-
-        # Primary broker
-        try:
-            self._broker = create_broker(broker_type, initial_cash=initial_cash, **broker_kwargs)
-            self._broker.connect()
-        except Exception as e:
-            logger.error("Failed to create/connect broker '%s': %s", broker_type, e)
-            if broker_type in ("qmt", "qmt_sim", "qmt_live"):
-                logger.warning("QMT unavailable — falling back to SimulatedBroker")
-                self._broker = create_broker("simulated", initial_cash=initial_cash)
-                self._broker.connect()
-                self._broker_type_name = "simulated"
-            else:
+        # Entry threshold on the shared composite's [0, 1] percentile scale
+        # (the same default the web LiveTradingEngine uses).
+        self._min_signal_score = float(min_signal_score)
+        # Cap on how many top-ranked names are targeted (the engine's
+        # `n_stocks`). Selection count is configuration; the scores and their
+        # order come from the shared `rank_symbols`.
+        self._max_positions = max(int(max_positions), 0)
+        # A real broker never falls back to the simulated book: a QMT outage
+        # that silently becomes paper trading is indistinguishable from a
+        # successful live run. connect() returning False is a hard failure.
+        if broker is not None:
+            self._broker = broker
+            if not self._broker.connect():
+                raise RuntimeError(
+                    f"Broker '{type(broker).__name__}' failed to connect. "
+                    "Refusing to continue (fail closed)."
+                )
+        else:
+            try:
+                self._broker = create_broker(
+                    broker_type, initial_cash=initial_cash, **broker_kwargs,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to create broker '%s': %s", broker_type, e,
+                )
                 raise
+            if not self._broker.connect():
+                raise RuntimeError(
+                    f"Broker '{broker_type}' failed to connect. "
+                    "Refusing to continue (fail closed)."
+                )
+        self._is_simulated = isinstance(self._broker, SimulatedBroker)
+        # Market-data feed for real brokers. It must return fresh quotes;
+        # synthetic random-walk prices are only allowed for the paper broker.
+        self._price_provider: Callable[[list[str]], dict[str, float]] | None = None
+        # Historical daily closes for real brokers, used to warm up the
+        # shared composite (>= 127 sessions so 3/6-month momentum is live).
+        self._history_provider: (
+            Callable[[list[str], int], dict[str, list[float]]] | None
+        ) = None
 
         # Paper broker (for TCA comparison)
         self._paper_broker: PaperBroker | None = None
@@ -181,12 +261,31 @@ class LiveRunner:
                 partial_fill_rate=0.10,
             )
 
-        # Core infrastructure
-        self._store = Store()
+        # Core infrastructure. `store` is injectable so tests (and callers
+        # wanting an isolated ledger) do not have to write to the default
+        # data/trading.db.
+        self._store = store or Store()
         self._bus = get_event_bus()
         self._audit = AuditLog(self._store, self._bus)
+        # Paper books apply splits/dividends locally.  Store-backed markers
+        # are wired when an *explicit* feed is set (see
+        # `set_corporate_actions`), not at construction: `LiveRunner` always
+        # builds a fresh broker book and never restores positions, so a
+        # marker row from a previous run must not suppress actions in a new
+        # account.  The synthetic demo feed (fresh book, generated per run)
+        # deliberately keeps its markers in memory only.
         self._sm = PortfolioStateMachine()
-        self._risk = RiskMonitor()
+        if getattr(self._sm, "_on_transition", None) is None:
+            self._sm.set_transition_callback(
+                lambda record: self._audit.log_state_change(
+                    record.from_state, record.to_state, record.reason,
+                )
+            )
+        # Same singleton the API kill switch mutates. A private instance made
+        # the dashboard's kill switch invisible to this runner. Tests inject a
+        # fresh monitor so one module's order-rate window cannot leak into the
+        # next.
+        self._risk = risk_monitor or get_risk_monitor()
 
         # Universe
         self._universe: list[str] = []
@@ -200,87 +299,317 @@ class LiveRunner:
         self._trade_count = 0
         self._peak_equity = initial_cash
         self._current_date = ""
+        self._day_start_equity: float | None = None
+        self._session_status = "active"
+        self._failed_cycles = 0
 
         # Reports
         self._daily_reports: list[DailyReport] = []
         self._session_report: SessionReport | None = None
+        # Last observed cumulative totals for delta-based counters.
+        self._metric_state: dict[str, float] = {}
+        # Basis of every quote this runner accepts; live/paper marks are raw
+        # traded CNY prices only (D15).
+        self._price_basis: str = "raw"
+        # Corporate-action provenance for the run report.  Events are the
+        # paper book's applied audit dicts, one per (asset, ex_date) group.
+        self._corporate_action_events: list[dict] = []
+        self._corporate_actions_source: str = ""
+        self._corporate_action_feed_set = False
+        # Simulated runs: ex-date -> {code: [components]} and a matching
+        # price adjustment applied to the random walk.  Populated by
+        # :meth:`_install_simulated_corporate_actions`.
+        self._simulated_action_adjustments: dict[str, dict[str, list[dict]]] = {}
 
     # ── Setup ──
 
     def set_universe(self, codes: list[str]):
-        """Set the trading universe."""
-        self._universe = [c for c in codes if isinstance(c, str) and c.strip()]
+        """Set the trading universe in canonical ``CODE.EXCHANGE`` form.
+
+        Normalizing at the boundary means ``600519`` and ``600519.SH`` are
+        one position, not two, and Beijing/board rules see the right
+        exchange.  Quote keys fed through :meth:`set_prices` are normalized
+        the same way, so lookups always agree.
+        """
+        canonical = []
+        for code in codes:
+            if not isinstance(code, str) or not code.strip():
+                continue
+            normalized = normalize_symbol(code)
+            if normalized not in canonical:
+                canonical.append(normalized)
+        self._universe = canonical
         logger.info("Universe set: %d stocks", len(self._universe))
 
-    def set_prices(self, prices: dict[str, float]):
-        """Feed market prices for the current cycle."""
-        self._current_prices.update(prices)
-        for code, price in prices.items():
-            if code not in self._price_history:
-                self._price_history[code] = []
-            self._price_history[code].append(price)
+    def set_price_provider(self, provider: Callable[[list[str]], dict[str, float]]):
+        """Set the fresh-quote feed for a real broker.
+
+        ``provider(codes)`` must return ``{code: price}`` with current market
+        prices. The runner refuses to run a real broker without one: feeding
+        synthetic random-walk prices into live orders would send real orders
+        at invented prices.
+        """
+        self._price_provider = provider
+
+    def set_history_provider(
+        self,
+        provider: Callable[[list[str], int], dict[str, list[float]]],
+    ):
+        """Set the historical daily-close feed used to warm up the signal.
+
+        ``provider(codes, sessions)`` must return ``{code: [close, ...]}``
+        with trailing daily closes (oldest first), ending at the session
+        before the one being traded: the current cycle's quote is appended by
+        :meth:`set_prices`, so including it here would count it twice. The
+        runner requests ``SIGNAL_HISTORY_SESSIONS`` (127) sessions so the full
+        seven-factor composite -- including 3/6-month momentum -- is
+        computable on the first live cycle, matching the web engine's window.
+        A live broker without this feed falls back to whatever quotes its
+        cycles accumulate and logs a warning that the long-horizon factors
+        are unavailable.
+        """
+        self._history_provider = provider
+
+    def set_price_history(
+        self,
+        history: dict[str, list[float]],
+        price_basis: str = "raw",
+    ):
+        """Preload trailing daily closes used by the shared composite signal.
+
+        Replaces the stored history for each supplied symbol (later
+        :meth:`set_prices` calls keep appending to it). Only the trailing
+        ``SIGNAL_HISTORY_SESSIONS`` rows are kept, the same window the web
+        engine scores. Values must be raw traded prices. Do not include the
+        session that :meth:`set_prices` will also append, or that close is
+        counted twice.
+        """
+        basis = ensure_raw_price_basis(
+            price_basis, context="LiveRunner signal history",
+        )
+        self._price_basis = basis if basis != "unknown" else "raw"
+        for code, values in history.items():
+            cleaned: list[float] = []
+            for value in values:
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(price) and price > 0:
+                    cleaned.append(price)
+            if not cleaned:
+                continue
+            normalized = normalize_symbol(code)
+            self._price_history[normalized] = cleaned[-SIGNAL_HISTORY_SESSIONS:]
+            if len(cleaned) < SIGNAL_HISTORY_SESSIONS:
+                logger.info(
+                    "Signal history for %s has %d sessions (< %d); the "
+                    "3/6-month factors will be NaN for it",
+                    normalized, len(cleaned), SIGNAL_HISTORY_SESSIONS,
+                )
+
+    def set_prices(
+        self, prices: dict[str, float], price_basis: str = "raw",
+    ):
+        """Feed market prices for the current cycle.
+
+        Prices must be raw (traded CNY) quotes; an explicitly adjusted basis
+        is refused.  Keys are normalized to canonical form so a provider that
+        returns ``600519`` and a universe set as ``600519.SH`` still agree.
+        """
+        basis = ensure_raw_price_basis(
+            price_basis, context="LiveRunner marks/fills",
+        )
+        self._price_basis = basis if basis != "unknown" else "raw"
+        normalized: dict[str, float] = {}
+        for code, raw_price in prices.items():
+            try:
+                price = float(raw_price)
+            except (TypeError, ValueError):
+                logger.warning("Dropping non-numeric price for %s: %r", code, raw_price)
+                continue
+            # Same gate as the web engine's quote fetch: a NaN/inf/zero price
+            # would poison equity and every trailing factor window.
+            if not np.isfinite(price) or price <= 0:
+                logger.warning("Dropping invalid price for %s: %r", code, raw_price)
+                continue
+            normalized[normalize_symbol(code)] = price
+        self._current_prices.update(normalized)
+        for code, price in normalized.items():
+            history = self._price_history.setdefault(code, [])
+            history.append(price)
+            # Keep the same trailing window the web engine scores.
+            if len(history) > SIGNAL_HISTORY_SESSIONS:
+                del history[:-SIGNAL_HISTORY_SESSIONS]
+
+    def set_corporate_actions(
+        self, actions, source: str = "manual", persist_markers: bool = True,
+    ) -> bool:
+        """Load the paper book's cash/split feed (ex-date entitlement).
+
+        The primary book applies actions locally only for the simulated
+        broker; a real broker (QMT/XTP) performs them on the broker side, so
+        feeding a local book there would double-count.  The dual-track
+        comparison book is always a paper book and always receives the feed.
+
+        ``persist_markers`` wires Store-backed ``(asset, ex_date)`` marker
+        persistence for the primary paper book.  Explicit/caller feeds keep
+        the restart semantics from the corporate-actions wave.  The synthetic
+        demo feed passes ``False``: it is generated for a fresh book on every
+        run, so markers from a previous run (same Store) must not suppress
+        its actions (the price path is adjusted regardless).
+
+        Returns True when at least one paper book accepted the feed.
+        """
+        accepted = False
+        # Pin tz-aware ex-dates to naive exchange days once, so both books
+        # compare them consistently with the runner's date strings.
+        frame = normalize_corporate_action_feed(actions)
+        if self._is_simulated:
+            setter = getattr(self._broker, "set_corporate_actions", None)
+            if callable(setter):
+                if persist_markers:
+                    configure = getattr(
+                        self._broker,
+                        "configure_corporate_action_persistence", None,
+                    )
+                    if callable(configure):
+                        configure(self._store)
+                setter(frame)
+                accepted = True
+        if self._paper_broker is not None:
+            try:
+                self._paper_broker.set_corporate_actions(frame)
+                accepted = True
+            except Exception as exc:
+                logger.error(
+                    "Dual-track paper book rejected the corporate-action "
+                    "feed: %s", exc,
+                )
+        if not accepted:
+            logger.warning(
+                "Broker %s settles corporate actions remotely; feed not "
+                "applied locally", type(self._broker).__name__,
+            )
+            return False
+        if not self._is_simulated:
+            logger.info(
+                "Broker %s settles corporate actions remotely; the feed is "
+                "applied only to the dual-track paper book",
+                type(self._broker).__name__,
+            )
+        self._corporate_action_feed_set = True
+        self._corporate_actions_source = str(source or "manual")
+        return True
+
+    def _advance_exchange_day(self, date: str, *, first_cycle: bool = False) -> None:
+        """Roll the paper broker to ``date`` and apply that day's actions.
+
+        On a date change the broker releases T+1 locks and applies every
+        action with ``ex_date <= date`` exactly once (markers persisted in the
+        Store).  The first cycle after a restart does not release locks (the
+        restored ``available`` already reflects the snapshot), but it does
+        catch up any ex-date that passed while the process was down.  Real
+        brokers only get the no-op rollover.  The dual-track TCA shadow is a
+        paper book and follows the same schedule.
+        """
+        applied: list[dict] = []
+        if self._is_simulated:
+            if first_cycle:
+                apply = getattr(self._broker, "apply_corporate_actions", None)
+                if callable(apply):
+                    applied = apply(ex_date=date) or []
+            else:
+                try:
+                    applied = self._broker.new_trading_day(date=date) or []
+                except TypeError:  # compatible custom broker signature
+                    self._broker.new_trading_day()
+                    applied = []
+            self._record_corporate_actions(applied)
+        elif not first_cycle:
+            self._broker.new_trading_day()
+
+        if self._paper_broker is not None:
+            try:
+                if first_cycle:
+                    self._paper_broker.apply_corporate_actions(ex_date=date)
+                else:
+                    self._paper_broker.new_trading_day(date=date)
+            except Exception as exc:
+                logger.error(
+                    "Dual-track paper-book corporate-action rollover failed: %s",
+                    exc,
+                )
+
+    def _record_corporate_actions(self, applied: list[dict]) -> None:
+        """Persist applied-action events for reconciliation (best effort)."""
+        for event in applied or []:
+            self._corporate_action_events.append(dict(event))
+            try:
+                self._store.log_event({
+                    "event_id": uuid.uuid4().hex[:12],
+                    "topic": "corporate_action",
+                    "data": event,
+                    "source": "live_runner",
+                    "timestamp": datetime.now().timestamp(),
+                })
+            except Exception as exc:
+                logger.error(
+                    "Failed to persist corporate-action event %s: %s",
+                    event.get("asset"), exc,
+                )
+
+    def get_corporate_actions_applied(self) -> dict:
+        """Run-report provenance: count, latest ex-date and feed source."""
+        return summarize_corporate_action_events(
+            self._corporate_action_events,
+            source=self._corporate_actions_source,
+        )
 
     # ── Signal Generation ──
+
+    def _score_prices(self, price_history=None):
+        """Score the price history with the shared causal composite signal.
+
+        Defaults to the runner's accumulated ``_price_history`` for the
+        current universe; a ``(dates x symbols)`` DataFrame or
+        ``{symbol: prices}`` mapping may be passed explicitly (tests and
+        callers sharing one history with the web engine).
+
+        Returns a ``pd.Series`` on the [0, 1] percentile scale, NaN for
+        symbols without enough history.
+        """
+        if price_history is None:
+            price_history = {
+                code: self._price_history.get(code, [])
+                for code in self._universe
+            }
+        return composite_signal(price_history)
 
     def _generate_signals(self) -> list[dict]:
         """Generate multi-factor trading signals.
 
-        Uses 4-factor composite: momentum + volatility + RSI + MACD.
-        Returns list of {code, side, target_pct, strength, reason}.
+        Scores come from :func:`quant_platform.trading.signals.composite_signal`
+        -- the same causal 7-factor equal-weight composite the web
+        ``LiveTradingEngine`` uses (1/3/6-month momentum + 20/60-day
+        volatility + RSI + MACD), on a [0, 1] cross-sectional percentile
+        scale. Symbols without enough history are excluded (no synthetic
+        fallback: an invented score is not a signal).
+
+        Returns list of {code, side, target_value|quantity, strength, reason}.
         """
         signals = []
         if not self._universe or not self._current_prices:
             return signals
 
-        # Compute factor scores for each stock
-        scores = {}
-        rng = np.random.default_rng(42 + self._cycle_count)
-
-        for code in self._universe:
-            prices = self._price_history.get(code, [])
-            if len(prices) < 20:
-                # Use synthetic score for stocks with insufficient history
-                scores[code] = float(rng.normal(0.02, 0.08))
-                continue
-
-            arr = np.array(prices[-60:], dtype=np.float64)
-            current = arr[-1]
-
-            # Momentum (12-month, skip last month) — weight 0.35
-            if len(arr) >= 42:
-                mom = (arr[-21] - arr[0]) / max(arr[0], 1e-8)
-            else:
-                mom = 0.0
-
-            # Volatility (low vol premium) — weight 0.25
-            rets = np.diff(arr[-21:]) / arr[-21:-1]
-            vol = float(np.std(rets)) if len(rets) > 0 else 0.0
-            vol_score = -vol  # prefer low vol
-
-            # RSI reversal — weight 0.20
-            gains = np.maximum(np.diff(arr[-14:]), 0)
-            losses = -np.minimum(np.diff(arr[-14:]), 0)
-            avg_gain = float(np.mean(gains)) if len(gains) > 0 else 0
-            avg_loss = float(np.mean(losses)) if len(losses) > 0 else 1e-8
-            rs = avg_gain / max(avg_loss, 1e-8)
-            rsi = 100 - 100 / (1 + rs)
-            rsi_score = (50 - rsi) / 50  # prefer low RSI (reversal)
-
-            # MACD — weight 0.20
-            if len(arr) >= 26:
-                ema12 = self._ema(arr, 12)
-                ema26 = self._ema(arr, 26)
-                macd = float(ema12 - ema26)
-                macd_score = np.tanh(macd / max(current, 1e-8) * 100)
-            else:
-                macd_score = 0.0
-
-            composite = 0.35 * mom + 0.25 * vol_score + 0.20 * rsi_score + 0.20 * macd_score
-            scores[code] = float(composite)
-
-        # Rank and select top N long / bottom N short (if not long-only)
-        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
-        top_n = min(50, len(sorted_scores))
+        scores = self._score_prices()
+        ranked = rank_symbols(
+            scores,
+            limit=self._max_positions,
+            min_score=self._min_signal_score,
+        )
+        if not ranked:
+            return signals
 
         current_equity = self._get_equity()
         target_value_per_stock = current_equity * 0.04  # 4% per position
@@ -292,12 +621,27 @@ class LiveRunner:
         # cash per cycle and no position could ever be exited. Cash went
         # 1M -> 927k -> 873k -> 839k over three cycles with three positions
         # held throughout.
-        held = {p.code: p for p in self._broker.get_positions()}
-        wanted = {code for code, score in sorted_scores[:top_n] if score > 0.005}
+        held = {
+            normalize_symbol(p.code): p for p in self._broker.get_positions()
+        }
+        try:
+            authoritative = getattr(self._broker, "get_orders_authoritative", None)
+            orders = (authoritative() if callable(authoritative)
+                      else self._broker.get_orders())
+        except Exception as exc:
+            logger.error("Order book unavailable; refusing new signals: %s", exc)
+            return []
+        if orders is None:
+            logger.error("Order book unavailable; refusing new signals")
+            return []
+        working = working_order_codes(
+            orders, include_partial=not isinstance(self._broker, SimulatedBroker),
+        )
+        wanted = {code for code, _score in ranked}
 
         # Exit anything that has dropped out of the target set.
         for ticker, pos in held.items():
-            if ticker in wanted or pos.quantity <= 0:
+            if ticker in wanted or ticker in working or pos.quantity <= 0:
                 continue
             signals.append({
                 "code": ticker,
@@ -308,8 +652,8 @@ class LiveRunner:
             })
 
         # Buy only the shortfall on names we want, not the whole target again.
-        for code, score in sorted_scores[:top_n]:
-            if score <= 0.005:  # threshold
+        for code, score in ranked:
+            if normalize_symbol(code) in working:
                 continue
             price = self._current_prices.get(code, 0)
             if price <= 0:
@@ -328,15 +672,6 @@ class LiveRunner:
             })
 
         return signals
-
-    @staticmethod
-    def _ema(arr: np.ndarray, period: int) -> np.ndarray:
-        alpha = 2.0 / (period + 1)
-        result = np.zeros_like(arr)
-        result[0] = arr[0]
-        for i in range(1, len(arr)):
-            result[i] = alpha * arr[i] + (1 - alpha) * result[i - 1]
-        return result[-1]
 
     # ── Execution ──
 
@@ -372,6 +707,14 @@ class LiveRunner:
             logger.warning("Order blocked: %s %s", code, [b.message for b in breaches])
             return None
 
+        # Include the approved-but-unfilled exposure in the checks for the
+        # remaining signals of this cycle.
+        if hasattr(self._risk, "project_order"):
+            self._risk.project_order({
+                "ticker": code, "side": sig["side"],
+                "quantity": qty, "price": price,
+            })
+
         order = Order(
             code=code, side=side,
             order_type=OrderType.LIMIT,
@@ -380,8 +723,14 @@ class LiveRunner:
         result = self._broker.place_order(order)
         return result.to_dict()
 
-    def _execute_signal_paper(self, sig: dict):
-        """Execute same signal through PaperBroker for TCA comparison."""
+    def _execute_signal_paper(self, sig: dict, primary: dict | None = None):
+        """Execute same signal through PaperBroker for TCA comparison.
+
+        D10: the PaperBroker's book started empty for every symbol, so no
+        paper order could ever fill and the TCA comparison was always empty.
+        Before placing, seed a deterministic ladder from this cycle's quote,
+        sized by the primary broker's fill so the comparison is meaningful.
+        """
         if not self._paper_broker:
             return None
         code = sig["code"]
@@ -397,6 +746,16 @@ class LiveRunner:
         if qty <= 0:
             return None
 
+        reference_quantity = qty
+        if primary:
+            try:
+                primary_filled = int(primary.get("filled_quantity") or 0)
+            except (TypeError, ValueError):
+                primary_filled = 0
+            if primary_filled > 0:
+                reference_quantity = max(qty, primary_filled)
+        self._seed_paper_liquidity(code, price, reference_quantity)
+
         order = Order(
             code=code,
             side=OrderSide.BUY if sig["side"] == "buy" else OrderSide.SELL,
@@ -406,6 +765,70 @@ class LiveRunner:
         )
         return self._paper_broker.place_order(order)
 
+    def _seed_paper_liquidity(self, symbol: str, price: float,
+                              reference_quantity: int = 0) -> None:
+        """Seed the dual-track PaperBroker's book around the cycle quote.
+
+        `seed_book_from_snapshot` is the public, deterministic entry point of
+        PaperBroker; the seeded levels are passive, so only our order trades
+        against them. Depth scales with the primary fill's quantity.
+        """
+        if self._paper_broker is None or price <= 0:
+            return
+        tick = 0.01
+        base_quantity = max(100, int(reference_quantity or 10_000))
+        bids: list[list] = []
+        asks: list[list] = []
+        for level in range(5):
+            level_quantity = max(100, base_quantity // (level + 1))
+            step = tick * level
+            bids.append([round(max(tick, price - step), 2), level_quantity])
+            asks.append([round(price + step, 2), level_quantity])
+        try:
+            self._paper_broker.seed_book_from_snapshot(
+                symbol, {"bids": bids, "asks": asks},
+            )
+        except Exception as exc:
+            logger.error("Failed to seed paper liquidity for %s: %s", symbol, exc)
+
+    def _record_order_result(self, result: dict, reason: str = "") -> None:
+        """Persist an executed order (and its fill) plus an audit event (D8).
+
+        The runner used to write only P&L and session rows, so a run that
+        executed real broker orders left zero order/trade rows for compliance
+        and reconciliation. A fill is persisted as order+trade atomically
+        with a deterministic trade id before the best-effort audit event.
+        """
+        status = str(result.get("status", "")).lower()
+        filled_quantity = int(result.get("filled_quantity", 0) or 0)
+        filled = status in ("filled", "partial") and filled_quantity > 0
+        try:
+            if filled:
+                self._store.save_order_with_trade(result, {
+                    "trade_id": f"{result['order_id']}:fill",
+                    "order_id": result["order_id"],
+                    "code": result["code"],
+                    "side": result["side"],
+                    "quantity": filled_quantity,
+                    "price": result.get("filled_price") or result.get("price") or 0.0,
+                    "commission": result.get("commission", 0),
+                    "tax": result.get("tax", 0),
+                })
+            else:
+                self._store.save_order(result)
+        except Exception as exc:
+            logger.error("Failed to persist order %s: %s", result.get("order_id"), exc)
+        if filled:
+            action = AuditAction.ORDER_FILLED
+        elif status == "rejected":
+            action = AuditAction.ORDER_REJECTED
+        else:
+            action = AuditAction.ORDER_SUBMITTED
+        try:
+            self._audit.log(action, "broker", details=result, reason=reason)
+        except Exception as exc:
+            logger.error("Audit write failed for order %s: %s", result.get("order_id"), exc)
+
     # ── Main Cycle ──
 
     def run_once(self, date: str = "", prices: dict[str, float] | None = None) -> DailyReport:
@@ -414,13 +837,26 @@ class LiveRunner:
             self._start_session()
 
         self._cycle_count += 1
+        previous_date = self._current_date
         self._current_date = date or datetime.now().strftime("%Y-%m-%d")
+        if self._current_date != previous_date:
+            # A new trading day releases T+1-locked shares and applies the
+            # ex-date's corporate actions (paper book only).  The first cycle
+            # only catches up pending actions; it must not release locks that
+            # were restored from a same-day snapshot.
+            self._advance_exchange_day(
+                self._current_date, first_cycle=not previous_date,
+            )
+            if previous_date:
+                self._day_start_equity = None
 
         if prices:
             self.set_prices(prices)
 
         # Mark to market before anything reads equity.
         self._mark_to_market()
+        self._update_risk_state()
+        self._publish_runtime_metrics()
 
         # Generate and execute signals
         signals = self._generate_signals()
@@ -430,10 +866,30 @@ class LiveRunner:
         total_tax = 0.0
         total_slippage = 0.0
 
+        # D8: every generated signal is persisted (signal row + audit event)
+        # before execution; nothing used to be written.
         for sig in signals:
+            # Signals may arrive from strategy code using a native symbol
+            # form; normalize once so order/position keys stay canonical.
+            if isinstance(sig.get("code"), str):
+                sig["code"] = normalize_symbol(sig["code"])
+            try:
+                self._audit.log_signal(
+                    sig["code"], sig["side"], float(sig.get("strength", 0) or 0),
+                    strategy="live_runner",
+                    factors={"reason": sig.get("reason", "")},
+                )
+            except Exception as exc:
+                logger.error("Failed to persist signal %s: %s", sig.get("code"), exc)
+
+        for sig in sorted(
+            signals, key=lambda s: 0 if s["side"] == "sell" else 1,
+        ):
             result = self._execute_signal(sig)
             if result:
                 orders.append(result)
+                # D8: order/trade rows + audit for every execution.
+                self._record_order_result(result, reason=sig.get("reason", ""))
                 total_commission += result.get("commission", 0)
                 total_tax += result.get("tax", 0)
                 total_slippage += result.get("slippage", 0)
@@ -441,7 +897,7 @@ class LiveRunner:
                     self._trade_count += 1
 
             if self._dual_track:
-                paper_record = self._execute_signal_paper(sig)
+                paper_record = self._execute_signal_paper(sig, primary=result)
                 if paper_record:
                     paper_records.append(paper_record)
 
@@ -482,20 +938,26 @@ class LiveRunner:
             daily_pnl=daily_pnl,
             daily_return_pct=daily_return,
             n_positions=self._get_n_positions(),
-            n_orders=len(signals),
-            n_fills=len(orders),
+            # `n_orders` used to be the signal count and `n_fills` every
+            # returned order including rejected/unfilled ones.
+            n_orders=len(orders),
+            n_fills=sum(
+                1 for order in orders
+                if order.get("status") in ("filled", "partial")
+            ),
             total_commission=total_commission,
             total_tax=total_tax,
             total_slippage=total_slippage,
             risk_level=self._risk.get_status().get("risk_level", "GREEN"),
             drawdown_pct=drawdown,
             paper_metrics=paper_metrics,
+            price_basis=self._price_basis,
         )
         self._daily_reports.append(report)
 
         # Save P&L
         self._store.save_pnl_snapshot({
-            "timestamp": f"{self._current_date}T15:00:00",
+            "timestamp": self._pnl_timestamp(),
             "total_equity": equity,
             "cash": report.cash,
             "market_value": equity - report.cash,
@@ -504,42 +966,318 @@ class LiveRunner:
 
         return report
 
-    def run(self, days: int = 30, seed: int = 42):
-        """Run a multi-day simulation.
+    def _pnl_timestamp(self) -> str:
+        """P&L timestamp: close-of-day for simulated history, now for live.
 
-        Generates synthetic price paths for the universe and
-        executes daily cycles.
+        The old code always wrote ``<date>T15:00:00`` with a back-dated
+        calendar date, so a run at 10:00 created a P&L row for a session that
+        had not happened yet.
+        """
+        if self._is_simulated:
+            return f"{self._current_date}T15:00:00"
+        return datetime.now(_EXCHANGE_TZ).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def run(
+        self,
+        days: int = 30,
+        seed: int = 42,
+        simulate_corporate_actions: bool = False,
+    ):
+        """Run the trading loop over exchange sessions.
+
+        Simulated/paper brokers replay the last ``days`` *exchange* sessions
+        (weekends and closures skipped) with a reproducible random walk.
+        With ``simulate_corporate_actions`` (used by ``main.py trade`` for
+        simulated/paper brokers) a deterministic demo feed of splits and cash
+        dividends is generated for the run window and the synthetic price
+        path is adjusted on each ex-date, so the equity curve and the
+        factor history stay continuous.  An explicitly supplied feed
+        (``set_corporate_actions``) always wins.
+
+        Real brokers (QMT/XTP) execute a single live exchange day and require
+        a fresh quote feed (``set_price_provider`` or ``broker.get_quotes``):
+        synthetic prices are never fed into real orders, and no corporate
+        action feed is ever applied locally for them.
         """
         if not self._universe:
             raise ValueError("Universe not set. Call set_universe() first.")
+        days = int(days)
+        if days < 1:
+            raise ValueError(f"days must be >= 1, got {days}")
+
+        if not self._is_simulated:
+            today = datetime.now(_EXCHANGE_TZ).date()
+            if not is_trading_day(today):
+                raise RuntimeError(
+                    f"Exchange is closed on {today}; refusing to run a live cycle."
+                )
+            if days != 1:
+                raise ValueError(
+                    "Real brokers support one exchange day per run; use --days 1."
+                )
+            if self._price_provider is None and not callable(
+                getattr(self._broker, "get_quotes", None)
+            ):
+                raise RuntimeError(
+                    f"Real broker '{self._broker_type_name}' requires a market-data "
+                    "feed (set_price_provider() or broker.get_quotes()). Refusing to "
+                    "feed synthetic prices into live orders."
+                )
+            dates = [str(today)]
+        else:
+            dates = self._run_dates(days)
 
         self._start_session()
         rng = np.random.default_rng(seed)
 
-        # Generate synthetic price paths
+        # Synthetic base prices (simulated broker only)
         base_prices = {}
         for code in self._universe:
-            int(code[0:3]) if code.isdigit() else hash(code) % 1000
             base_prices[code] = 10.0 + rng.uniform(5, 195)
 
-        for d in range(days):
-            date = (datetime.now() - timedelta(days=days - d)).strftime("%Y-%m-%d")
-            prices = {}
-            for code in self._universe:
-                # Random walk with 15% annual vol
-                daily_ret = rng.normal(0.0003, 0.01)
-                base_prices[code] *= (1 + daily_ret)
-                base_prices[code] = max(base_prices[code], 0.5)
-                prices[code] = round(base_prices[code], 2)
-            self.run_once(date=date, prices=prices)
+        # Warm up the signal window before the first traded session: the
+        # shared composite needs 126 daily returns for six-month momentum, so
+        # a run that starts cold never scores the long-horizon factors.
+        if self._is_simulated:
+            self._warmup_simulated_history(base_prices, rng)
+            if simulate_corporate_actions and not self._corporate_action_feed_set:
+                self._install_simulated_corporate_actions(
+                    dates, seed, base_prices,
+                )
+        else:
+            self._load_signal_history()
 
-        self._end_session()
+        failed_cycles = 0
+        # D9: one broker/execution failure used to abort the entire multi-day
+        # run and leave the session `active` with `_running=True` forever.
+        # Failures are now isolated to the affected day and `_end_session()`
+        # always runs.
+        try:
+            for date in dates:
+                try:
+                    if self._is_simulated:
+                        prices = {}
+                        for code in self._universe:
+                            # Random walk with 15% annual vol
+                            daily_ret = rng.normal(0.0003, 0.01)
+                            base_prices[code] *= (1 + daily_ret)
+                            base_prices[code] = max(base_prices[code], 0.5)
+                            # A split/dividend replaces the pre-action level
+                            # with the exchange's adjusted reference; the
+                            # paper book applies the matching share/cash
+                            # change on the same day.
+                            self._apply_simulated_action_to_path(
+                                code, date, base_prices,
+                            )
+                            prices[code] = round(base_prices[code], 2)
+                    else:
+                        prices = self._fresh_prices()
+                    self.run_once(date=date, prices=prices)
+                except Exception as e:
+                    failed_cycles += 1
+                    logger.error(
+                        "Trading day %s aborted: %s", date, e, exc_info=True,
+                    )
+                    self._bus.publish("system.error", {
+                        "error": str(e), "date": date,
+                    }, source="live_runner")
+                    continue
+        finally:
+            fills = sum(report.n_fills for report in self._daily_reports)
+            # Never claim a session succeeded when nothing filled.
+            self._end_session(status="completed" if fills > 0 else "failed")
+
+        self._failed_cycles = failed_cycles
         return self.generate_report()
+
+    def _run_dates(self, days: int) -> list[str]:
+        """The last ``days`` exchange sessions ending today (Shanghai time).
+
+        Calendar days included weekends and exchange holidays and shifted the
+        P&L rows by the run length; sessions now match the scheduler's
+        calendar.
+        """
+        today = datetime.now(_EXCHANGE_TZ).date()
+        start = today - timedelta(days=max(days * 2 + 10, 30))
+        sessions = trading_days(start, today)
+        return [str(ts.date()) for ts in sessions[-days:]]
+
+    def _warmup_simulated_history(
+        self, base_prices: dict[str, float], rng: np.random.Generator,
+    ) -> None:
+        """Replay synthetic sessions before the first traded date.
+
+        The shared composite requires ``SIGNAL_HISTORY_SESSIONS`` (127) closes
+        for six-month momentum. These rows are strictly past data -- they are
+        generated before the first ``run_once`` and never include a traded
+        date -- so the simulated run exercises the same 7-factor score the
+        live engine uses instead of a short-horizon subset. Skipped when the
+        caller already supplied a history buffer.
+        """
+        if self._price_history:
+            return
+        for _ in range(SIGNAL_HISTORY_SESSIONS):
+            for code in self._universe:
+                daily_ret = rng.normal(0.0003, 0.01)
+                base_prices[code] = max(base_prices[code] * (1 + daily_ret), 0.5)
+            self.set_prices({
+                code: round(base_prices[code], 2) for code in self._universe
+            })
+
+    def _install_simulated_corporate_actions(
+        self,
+        dates: list[str],
+        seed: int,
+        base_prices: dict[str, float],
+    ) -> int:
+        """Generate the simulated run's demo split/dividend feed.
+
+        Real A-share action rates are low, but ``main.py trade`` should show
+        the wiring: each stock-session draws an action with p=0.02 from a
+        *dedicated* RNG stream, so the existing price path for a given seed
+        is identical unless an action is drawn.  A split uses 2:1/3:1/3:2 and
+        a cash dividend pays 0.3%-2% of the then-current synthetic price.
+        Returns 1 when a feed was installed, 0 otherwise.
+        """
+        if not dates or not self._universe:
+            return 0
+        rng = np.random.default_rng((int(seed) + 104_729) % (2**32))
+        rows: list[dict] = []
+        adjustments: dict[str, dict[str, list[dict]]] = {}
+        for code in self._universe:
+            for date in dates:
+                if rng.random() >= 0.02:
+                    continue
+                if rng.random() < 0.5:
+                    ratio = float(rng.choice([2.0, 3.0, 1.5]))
+                    rows.append({
+                        "ex_date": date, "asset": code, "kind": "split",
+                        "cash_per_share": 0.0, "split_ratio": ratio,
+                    })
+                    adjustments.setdefault(date, {}).setdefault(
+                        code, [],
+                    ).append({"kind": "split", "ratio": ratio})
+                else:
+                    price = max(float(base_prices.get(code, 10.0)), 0.5)
+                    cash = max(
+                        0.01,
+                        round(
+                            price * float(rng.uniform(0.003, 0.02)), 2,
+                        ),
+                    )
+                    rows.append({
+                        "ex_date": date, "asset": code, "kind": "cash",
+                        "cash_per_share": cash, "split_ratio": 1.0,
+                    })
+                    adjustments.setdefault(date, {}).setdefault(
+                        code, [],
+                    ).append({"kind": "cash", "cash_per_share": cash})
+        if not rows:
+            return 0
+        self._simulated_action_adjustments = adjustments
+        accepted = self.set_corporate_actions(
+            pd.DataFrame(rows), source="synthetic", persist_markers=False,
+        )
+        logger.info(
+            "Simulated corporate-action feed: %d event(s) over %d session(s)",
+            len(rows), len(dates),
+        )
+        return 1 if accepted else 0
+
+    def _apply_simulated_action_to_path(
+        self,
+        code: str,
+        date: str,
+        base_prices: dict[str, float],
+    ) -> None:
+        """Apply the ex-date price adjustment to the synthetic path.
+
+        A split divides the synthetic price by the ratio and a cash dividend
+        subtracts the per-share amount, exactly as the exchange adjusts the
+        raw reference on the ex-date.  The stored signal history is
+        back-adjusted by the same factor, so a split does not appear as a
+        -50% return to the momentum factors (the research convention: raw
+        prices for fills/marks, adjusted history for scores).
+        """
+        components = self._simulated_action_adjustments.get(date, {}).get(code)
+        if not components:
+            return
+        history = self._price_history.get(code)
+        for component in components:
+            if component["kind"] == "split":
+                ratio = float(component["ratio"])
+                if not (ratio > 0):
+                    continue
+                base_prices[code] = max(base_prices[code] / ratio, 0.01)
+                if history:
+                    self._price_history[code] = [
+                        value / ratio for value in history
+                    ]
+            else:
+                cash = float(component["cash_per_share"])
+                base_prices[code] = max(base_prices[code] - cash, 0.01)
+                if history:
+                    self._price_history[code] = [
+                        max(value - cash, 0.0) for value in history
+                    ]
+
+    def _load_signal_history(self) -> None:
+        """Preload daily closes for a real-broker run via the history feed.
+
+        The web engine keeps a rolling quote buffer; a live runner only sees
+        one quote per cycle, so without a history preload its 3/6-month
+        factors would stay NaN indefinitely. The provider is asked for the
+        same window the engine scores.
+        """
+        if self._history_provider is not None:
+            try:
+                history = self._history_provider(
+                    list(self._universe), SIGNAL_HISTORY_SESSIONS,
+                ) or {}
+            except Exception as exc:
+                logger.error("Signal history provider failed: %s", exc)
+                history = {}
+            if history:
+                self.set_price_history(history)
+                return
+        shortest = min(
+            (len(self._price_history.get(code, [])) for code in self._universe),
+            default=0,
+        )
+        logger.warning(
+            "No signal history preloaded (shortest history %d < %d sessions); "
+            "3/6-month factors stay NaN until enough daily closes accumulate",
+            shortest, SIGNAL_HISTORY_SESSIONS,
+        )
+
+    def _fresh_prices(self) -> dict[str, float]:
+        """Fetch fresh quotes for a real-broker cycle, or raise."""
+        raw: dict[str, Any] = {}
+        if self._price_provider is not None:
+            raw = self._price_provider(list(self._universe)) or {}
+        else:
+            getter = getattr(self._broker, "get_quotes", None)
+            if callable(getter):
+                raw = getter(list(self._universe)) or {}
+        prices: dict[str, float] = {}
+        for code, value in (raw or {}).items():
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if price > 0 and np.isfinite(price):
+                prices[normalize_symbol(code)] = price
+        if not prices:
+            raise RuntimeError(
+                "market data feed returned no fresh quotes; cycle skipped"
+            )
+        return prices
 
     # ── Session Management ──
 
     def _start_session(self):
         self._running = True
+        self._session_status = "active"
         self._session_id = uuid.uuid4().hex[:12]
         self._store.save_session({
             "session_id": self._session_id,
@@ -548,11 +1286,12 @@ class LiveRunner:
             "started_at": datetime.now().isoformat(),
         })
 
-    def _end_session(self):
+    def _end_session(self, status: str = "completed"):
         self._running = False
+        self._session_status = status
         self._store.save_session({
             "session_id": self._session_id,
-            "status": "completed",
+            "status": status,
             "stopped_at": datetime.now().isoformat(),
             "total_trades": self._trade_count,
         })
@@ -584,6 +1323,116 @@ class LiveRunner:
         if isinstance(self._broker, SimulatedBroker) and self._current_prices:
             self._broker.update_market_prices(self._current_prices)
 
+    def _update_risk_state(self) -> None:
+        """Feed the shared risk monitor the current book.
+
+        The runner used to create a private RiskMonitor and never call
+        `update_portfolio_state`, so `portfolio_value` stayed 0 and every
+        position, daily-loss and drawdown check early-returned None: a 50%
+        single-name position sailed through.
+        """
+        account = self._broker.get_account()
+        equity = float(account.get("total_equity", 0) or 0)
+        if self._day_start_equity is None:
+            self._day_start_equity = equity
+
+        positions = {}
+        sector_weights = {}
+        for pos in self._broker.get_positions():
+            weight = pos.market_value / equity if equity > 0 else 0.0
+            sector = getattr(pos, "sector", "") or "Unknown"
+            positions[normalize_symbol(pos.code)] = {
+                "value": pos.market_value,
+                "weight": weight,
+                "sector": sector,
+            }
+            sector_weights[sector] = sector_weights.get(sector, 0.0) + weight
+
+        self._risk.update_portfolio_state(
+            portfolio_value=equity,
+            daily_pnl=equity - self._day_start_equity,
+            positions=positions,
+            sector_weights=sector_weights,
+        )
+
+    # ── Metrics (Grafana producers) ──
+
+    def _publish_runtime_metrics(self) -> None:
+        """Emit the trading/risk/EventBus/store series the dashboard queries.
+
+        Every gauge is read from the live objects (broker account, risk
+        monitor status, EventBus counters, Store stats) -- no fabricated
+        values. Failures are swallowed: monitoring must not abort a cycle.
+        """
+        try:
+            from quant_platform.utils.metrics import get_metrics
+
+            m = get_metrics()
+            broker_kind = type(self._broker).__name__
+
+            account = self._broker.get_account() or {}
+            n_positions = account.get("n_positions", 0) or 0
+            pnl = account.get("total_pnl")
+            if pnl is None:
+                pnl = float(account.get("total_equity", self._initial_cash) or 0) - self._initial_cash
+            m.gauge(
+                "trading_active_positions",
+                labels={"broker": broker_kind},
+                help="Open positions reported by the broker",
+            ).set(float(n_positions))
+            m.gauge(
+                "trading_portfolio_pnl",
+                labels={"broker": broker_kind},
+                help="Portfolio P&L reported by the broker (CNY)",
+            ).set(float(pnl or 0.0))
+
+            status = self._risk.get_status() or {}
+            level = str(status.get("risk_level", "green")).lower()
+            m.gauge(
+                "risk_level",
+                labels={"source": "risk_monitor"},
+                help="Risk level: 0=GREEN 1=YELLOW 2=ORANGE 3=RED 4=KILL",
+            ).set(_RISK_LEVEL_VALUES.get(level, 0.0))
+            m.gauge(
+                "risk_kill_switch_active",
+                labels={"source": "risk_monitor"},
+                help="1 when the kill switch is active",
+            ).set(1.0 if status.get("kill_switch") else 0.0)
+
+            bus_metrics = self._bus.get_metrics() or {}
+            dlq = bus_metrics.get("dead_letter_queue") or {}
+            self._emit_delta_counter(
+                m, "eventbus_events_published_total",
+                float(bus_metrics.get("published", 0) or 0),
+            )
+            self._emit_delta_counter(
+                m, "eventbus_events_delivered_total",
+                float(bus_metrics.get("delivered", 0) or 0),
+            )
+            self._emit_delta_counter(
+                m, "eventbus_dead_letters_total",
+                float(dlq.get("total_enqueued", bus_metrics.get("dead_letters", 0)) or 0),
+            )
+
+            stats = self._store.get_stats() or {}
+            self._emit_delta_counter(
+                m, "store_orders_total", float(stats.get("orders", 0) or 0),
+            )
+            self._emit_delta_counter(
+                m, "store_trades_total", float(stats.get("trades", 0) or 0),
+            )
+        except Exception as exc:  # monitoring must never break trading
+            logger.debug("Runtime metric publish failed: %s", exc)
+
+    def _emit_delta_counter(self, metrics, name: str, total: float) -> None:
+        """Increment a Prometheus counter by the delta of a cumulative total."""
+        previous = self._metric_state.get(name, 0.0)
+        delta = total - previous
+        counter = metrics.counter(name)
+        if delta > 0:
+            counter.inc(delta)
+        self._metric_state[name] = max(previous, total)
+
     def _get_cash(self) -> float:
         acct = self._broker.get_account()
         return acct.get("cash", 0)
@@ -606,6 +1455,10 @@ class LiveRunner:
                 total_return_pct=0, annualized_return_pct=0,
                 sharpe_ratio=0, max_drawdown_pct=0,
                 avg_daily_volume=0, broker_type=self._broker_type_name,
+                status=self._session_status,
+                failed_cycles=self._failed_cycles,
+                price_basis=self._price_basis,
+                corporate_actions_applied=self.get_corporate_actions_applied(),
             )
 
         # Calculate metrics
@@ -651,7 +1504,11 @@ class LiveRunner:
             max_drawdown_pct=max_dd * 100,
             avg_daily_volume=round(avg_volume, 2),
             broker_type=self._broker_type_name,
+            status=self._session_status,
+            failed_cycles=self._failed_cycles,
             daily_reports=[r.to_dict() for r in self._daily_reports],
+            price_basis=self._price_basis,
+            corporate_actions_applied=self.get_corporate_actions_applied(),
         )
 
     def get_state(self) -> dict:
@@ -664,4 +1521,6 @@ class LiveRunner:
             "dual_track": self._dual_track,
             "broker": type(self._broker).__name__,
             "risk_level": self._risk.get_status().get("risk_level", "GREEN"),
+            "price_basis": self._price_basis,
+            "corporate_actions_applied": self.get_corporate_actions_applied(),
         }

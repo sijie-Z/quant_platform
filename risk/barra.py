@@ -64,6 +64,28 @@ CROSS_ASSET_FACTORS = [
     "open_interest",  # open interest change (0 for equities)
 ]
 
+# Barra factor name -> platform factor names that can proxy it. The first
+# available candidate wins. These vocabularies never overlapped before
+# (``momentum`` vs ``momentum_12m``, ``size`` vs ``log_market_cap``), so the
+# API fitted the model on an all-zero exposure matrix and every decomposition
+# reported zero factor risk.
+BARRA_FACTOR_PROXIES: dict[str, tuple[str, ...]] = {
+    "size": ("log_market_cap", "size"),
+    "value": ("pb_ratio", "value"),
+    "momentum": ("momentum_12m", "momentum_6m", "momentum_3m", "momentum"),
+    "volatility": ("volatility_60d", "volatility_20d", "volatility"),
+    "quality": ("roe", "quality"),
+    "growth": ("asset_growth", "growth"),
+    "liquidity": ("turnover_20d", "liquidity"),
+    "leverage": (),          # derived from the financial statements
+    "beta": (),              # estimated from returns vs the benchmark
+    "residual_vol": (),      # estimated from return residuals
+}
+
+# Barra's value factor is book-to-price; the platform's ``pb_ratio`` is
+# price-to-book, so the sign is inverted when it is used as the proxy.
+BARRA_PROXY_SIGN = {"value": -1.0}
+
 
 @dataclass
 class BarraFactorReturn:
@@ -113,6 +135,9 @@ class BarraModel:
         self.factor_returns_history: list[BarraFactorReturn] = []
         self.factor_covariance: np.ndarray | None = None
         self.specific_risk: pd.Series | None = None
+        self._residual_history: list[pd.Series] = []
+        self._last_residuals: pd.Series | None = None
+        self._last_regression_ok = False
         self._fitted = False
 
     @classmethod
@@ -132,6 +157,160 @@ class BarraModel:
             ])
         return cls(**kwargs)
 
+    # ── Exposure construction ──
+
+    def build_exposures(
+        self,
+        prices: pd.DataFrame,
+        returns: pd.DataFrame,
+        benchmark: pd.Series | pd.DataFrame | None = None,
+        financials: pd.DataFrame | None = None,
+        platform_factors: dict[str, pd.DataFrame] | None = None,
+        beta_window: int = 60,
+    ) -> dict[str, pd.DataFrame]:
+        """Build the (date x asset) exposure panel for every Barra factor.
+
+        The platform's factor panel uses names like ``momentum_12m`` and
+        ``log_market_cap``; Barra expects ``momentum`` and ``size``. Without
+        this translation the model substituted a zero panel for every factor
+        and the API returned zero exposures and zero factor risk.
+
+        Seven factors are proxied from the processed factor panel, the
+        leverage exposure comes from the financial statements, and beta /
+        residual volatility are estimated from returns against the benchmark.
+        Every panel is cross-sectionally z-scored per date so one unit of any
+        exposure means the same thing in the regression.
+
+        Args:
+            prices: (date x asset) price panel (unused today, kept so callers
+                can pass the full data tuple).
+            returns: (date x asset) daily returns.
+            benchmark: benchmark return series (or a one-column frame).
+            financials: long-format financial statements indexed by
+                (date, asset), or an already-unstacked panel.
+            platform_factors: dict of processed factor name -> (date x asset)
+                panel, as returned by ``main._compute_factors``.
+            beta_window: trailing window used for beta and residual vol.
+
+        Returns:
+            dict of Barra factor name -> (date x asset) z-scored exposures.
+        """
+        assets = returns.columns
+        dates = returns.index
+        factors = platform_factors or {}
+
+        benchmark_returns = None
+        if benchmark is not None:
+            if isinstance(benchmark, pd.DataFrame):
+                benchmark_returns = benchmark.iloc[:, 0] if not benchmark.empty else None
+            else:
+                benchmark_returns = benchmark
+            if benchmark_returns is not None:
+                benchmark_returns = benchmark_returns.reindex(dates).astype(float)
+
+        beta_panel = self._rolling_beta(returns, benchmark_returns, beta_window)
+        residual_vol_panel = self._residual_volatility(
+            returns, benchmark_returns, beta_panel, beta_window,
+        )
+        leverage_panel = self._leverage_panel(financials, dates, assets)
+
+        exposures: dict[str, pd.DataFrame] = {}
+        for name in self.factor_names:
+            panel: pd.DataFrame | None = None
+
+            for candidate in BARRA_FACTOR_PROXIES.get(name, ()):
+                candidate_panel = factors.get(candidate)
+                if candidate_panel is not None and not candidate_panel.empty:
+                    panel = candidate_panel.reindex(index=dates, columns=assets)
+                    break
+
+            if panel is None:
+                if name == "leverage":
+                    panel = leverage_panel
+                elif name == "beta":
+                    panel = beta_panel
+                elif name == "residual_vol":
+                    panel = residual_vol_panel
+
+            if panel is None:
+                logger.warning("No source for Barra factor '%s'; using zeros", name)
+                panel = pd.DataFrame(0.0, index=dates, columns=assets)
+
+            zscored = self._zscore(panel)
+            exposures[name] = zscored * BARRA_PROXY_SIGN.get(name, 1.0)
+
+        return exposures
+
+    @staticmethod
+    def _zscore(panel: pd.DataFrame) -> pd.DataFrame:
+        """Cross-sectional z-score per date, with missing values as neutral 0."""
+        panel = panel.astype(float)
+        mean = panel.mean(axis=1)
+        std = panel.std(axis=1, ddof=0)
+        return panel.sub(mean, axis=0).div(std.replace(0.0, np.nan), axis=0).fillna(0.0)
+
+    @staticmethod
+    def _rolling_beta(
+        returns: pd.DataFrame,
+        benchmark: pd.Series | None,
+        window: int,
+    ) -> pd.DataFrame:
+        """Trailing market beta, shifted one day so it is known before use."""
+        if benchmark is None:
+            return pd.DataFrame(0.0, index=returns.index, columns=returns.columns)
+
+        min_periods = max(2, window // 2)
+        bench = benchmark.fillna(0.0)
+        bench_mean = bench.rolling(window, min_periods=min_periods).mean()
+        asset_mean = returns.rolling(window, min_periods=min_periods).mean()
+        covariance = returns.mul(bench, axis=0).rolling(
+            window, min_periods=min_periods,
+        ).mean().sub(asset_mean.mul(bench_mean, axis=0))
+        variance = bench.rolling(window, min_periods=min_periods).var(ddof=0)
+        beta = covariance.div(variance.replace(0.0, np.nan), axis=0)
+        return beta.shift(1).fillna(0.0)
+
+    @staticmethod
+    def _residual_volatility(
+        returns: pd.DataFrame,
+        benchmark: pd.Series | None,
+        beta_panel: pd.DataFrame,
+        window: int,
+    ) -> pd.DataFrame:
+        """Trailing volatility of returns net of the market component."""
+        if benchmark is None:
+            return pd.DataFrame(0.0, index=returns.index, columns=returns.columns)
+
+        predicted = beta_panel.mul(benchmark.fillna(0.0), axis=0)
+        residual = returns.sub(predicted)
+        volatility = residual.rolling(
+            window, min_periods=max(2, window // 2),
+        ).std(ddof=0)
+        return volatility.shift(1).fillna(0.0)
+
+    @staticmethod
+    def _leverage_panel(
+        financials: pd.DataFrame | None,
+        dates: pd.DatetimeIndex,
+        assets: pd.Index,
+    ) -> pd.DataFrame:
+        """Debt-to-equity exposure from the financial statements."""
+        empty = pd.DataFrame(0.0, index=dates, columns=assets)
+        if financials is None:
+            return empty
+        required = {"total_assets", "net_assets"}
+        if not required.issubset(financials.columns):
+            return empty
+
+        leverage = (
+            (financials["total_assets"] - financials["net_assets"])
+            / financials["net_assets"].replace(0.0, np.nan)
+        )
+        if isinstance(leverage.index, pd.MultiIndex) and "asset" in leverage.index.names:
+            leverage = leverage.unstack("asset")
+        leverage = leverage.reindex(index=dates, columns=assets).ffill()
+        return leverage
+
     def _cross_sectional_regression(
         self,
         returns: pd.Series,
@@ -148,17 +327,34 @@ class BarraModel:
         Returns:
             BarraFactorReturn with estimated factor returns
         """
+        self._last_regression_ok = False
         # Align data
         common = returns.index.intersection(exposures.index)
         if len(common) < 30:
+            self._last_regression_ok = False
             return BarraFactorReturn(
                 date=str(returns.name) if hasattr(returns, 'name') else "",
                 factor_returns={f: 0.0 for f in self.factor_names},
                 n_assets=len(common),
             )
 
-        y = returns.loc[common].values
-        X = exposures.loc[common].values
+        # A suspended stock has a NaN return but a valid exposure row. Passing
+        # it to lstsq made every factor return NaN for that day; with routine
+        # A-share suspensions that meant the entire factor covariance was NaN
+        # (100/100 entries) and both Barra endpoints returned 500.
+        y_full = returns.loc[common].to_numpy(dtype=float)
+        X_full = exposures.loc[common].to_numpy(dtype=float)
+        valid = np.isfinite(y_full) & np.all(np.isfinite(X_full), axis=1)
+        common = common[valid]
+        if len(common) < 30:
+            self._last_regression_ok = False
+            return BarraFactorReturn(
+                date=str(returns.name) if hasattr(returns, 'name') else "",
+                factor_returns={f: 0.0 for f in self.factor_names},
+                n_assets=len(common),
+            )
+        y = y_full[valid]
+        X = X_full[valid]
 
         # Add intercept
         X_with_intercept = np.column_stack([np.ones(len(X)), X])
@@ -167,6 +363,7 @@ class BarraModel:
         try:
             beta, residuals, rank, sv = np.linalg.lstsq(X_with_intercept, y, rcond=None)
         except np.linalg.LinAlgError:
+            self._last_regression_ok = False
             return BarraFactorReturn(
                 date=str(returns.name) if hasattr(returns, 'name') else "",
                 factor_returns={f: 0.0 for f in self.factor_names},
@@ -190,6 +387,11 @@ class BarraModel:
         # Residual std
         residual_std = float(np.std(y - y_pred)) if len(y) > len(beta) else 0
 
+        # Keep the per-asset residuals: specific risk is the volatility of
+        # each asset's own residual, not one panel-wide average.
+        self._last_residuals = pd.Series(y - y_pred, index=common)
+        self._last_regression_ok = True
+
         return BarraFactorReturn(
             date=str(returns.name) if hasattr(returns, 'name') else "",
             factor_returns=factor_returns,
@@ -212,6 +414,8 @@ class BarraModel:
         # Build exposure matrix per date
         dates = returns.index
         self.factor_returns_history = []
+        self._residual_history = []
+        self._last_residuals = None
 
         # Convert factor_exposures dict to aligned matrices
         factor_dfs = []
@@ -222,29 +426,39 @@ class BarraModel:
                 logger.warning("Factor '%s' not in exposures, using zeros", name)
                 factor_dfs.append(pd.DataFrame(0, index=dates, columns=returns.columns))
 
-        for date in dates:
-            # Build (asset x factor) exposure matrix for this date
-            exposure_rows = {}
-            for asset in returns.columns:
-                row = []
-                for fdf in factor_dfs:
-                    if date in fdf.index and asset in fdf.columns:
-                        val = fdf.loc[date, asset]
-                        row.append(val if not np.isnan(val) else 0)
-                    else:
-                        row.append(0)
-                exposure_rows[asset] = row
+        # Stack the exposure panels once. The old loop did ten scalar pandas
+        # lookups per asset per date (~5.5M at the default panel size), which
+        # dominated the cost of a Barra request.
+        stacked = np.stack(
+            [
+                frame.reindex(index=dates, columns=returns.columns)
+                .to_numpy(dtype=float)
+                for frame in factor_dfs
+            ],
+            axis=2,
+        )
+        stacked = np.nan_to_num(stacked, nan=0.0)
 
+        for i, date in enumerate(dates):
             exposures = pd.DataFrame(
-                exposure_rows.values(),
-                index=exposure_rows.keys(),
-                columns=self.factor_names,
+                stacked[i], index=returns.columns, columns=self.factor_names,
             )
 
-            daily_returns = returns.loc[date]
+            daily_returns = returns.iloc[i]
             result = self._cross_sectional_regression(daily_returns, exposures)
             result.date = str(date)
+            if not self._last_regression_ok:
+                # Failed cross-section (fewer than 30 valid assets, or a
+                # singular design). The old code appended an all-zero
+                # factor-return row anyway, and the covariance averaged those
+                # rows in: early/short-universe dates diluted factor risk and
+                # induced spurious low correlations. Skip them entirely.
+                self._last_residuals = None
+                continue
             self.factor_returns_history.append(result)
+            if self._last_residuals is not None:
+                self._residual_history.append(self._last_residuals)
+                self._last_residuals = None
 
         # Estimate factor covariance matrix
         self._estimate_factor_covariance()
@@ -257,7 +471,15 @@ class BarraModel:
                      len(dates), len(self.factor_names))
 
     def _estimate_factor_covariance(self):
-        """Estimate factor covariance with exponential decay weighting."""
+        """Estimate factor covariance with exponential weights and Bartlett HAC.
+
+        The weighted covariance is Newey-West corrected with the configured
+        ``newey_west_lags`` using a Bartlett kernel; with ``newey_west_lags=0``
+        (or a single observation) the estimator reduces to the plain weighted
+        covariance.  Failed cross-sections (fewer than 30 valid assets) are
+        not in ``factor_returns_history`` at all, so they cannot dilute the
+        covariance with all-zero rows.
+        """
         if not self.factor_returns_history:
             return
 
@@ -274,6 +496,9 @@ class BarraModel:
         for i, fr in enumerate(self.factor_returns_history):
             for j, name in enumerate(self.factor_names):
                 returns_matrix[i, j] = fr.factor_returns.get(name, 0)
+        # Older/odd regressions may have produced non-finite factor returns;
+        # one NaN poisons the weighted mean and every covariance entry.
+        returns_matrix = np.nan_to_num(returns_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Weighted covariance
         weighted_mean = np.average(returns_matrix, weights=weights, axis=0)
@@ -283,6 +508,21 @@ class BarraModel:
         for i in range(n_factors):
             for j in range(n_factors):
                 cov[i, j] = np.average(centered[:, i] * centered[:, j], weights=weights)
+
+        # Newey-West / Bartlett HAC lag terms. The constructor always stored
+        # `newey_west_lags` and the module docstring promised HAC, but the
+        # parameter was never used: autocorrelated factor returns produced an
+        # understated covariance. gamma_l[t] = w_t * e_t e_{t-l}' (the weight
+        # of the later observation), with the Bartlett taper
+        # (1 - l/(L+1)) applied to gamma_l + gamma_l'.
+        n_lags = max(0, int(self.newey_west_lags))
+        n_lags = min(n_lags, max(0, n - 1))
+        for lag in range(1, n_lags + 1):
+            taper = 1.0 - lag / (n_lags + 1.0)
+            gamma_l = (
+                centered[lag:] * weights[lag:, np.newaxis]
+            ).T @ centered[:-lag]
+            cov += taper * (gamma_l + gamma_l.T)
 
         # Shrinkage toward identity
         if self.shrinkage_target == "identity":
@@ -295,7 +535,15 @@ class BarraModel:
         self.factor_covariance = cov
 
     def _ledoit_wolf_shrinkage(self, X: np.ndarray, weights: np.ndarray) -> float:
-        """Compute Ledoit-Wolf optimal shrinkage intensity."""
+        """Compute Ledoit-Wolf optimal shrinkage intensity.
+
+        ``delta = (pi_hat - rho_hat) / (n_eff * gamma_hat)`` with
+        ``n_eff = 1 / sum(w^2)`` the effective sample size.  The estimator
+        used to divide by ``n*n``, which for uniform weights is exactly ``n``
+        times too weak (a measured 2.4e-5 instead of 0.077 on a 1500-day
+        exponential-weight sample): the "shrunk" factor covariance was
+        effectively the raw sample covariance.
+        """
         n, p = X.shape
         if n < 2:
             return 0.5
@@ -319,7 +567,8 @@ class BarraModel:
             xk = centered[k]
             sum_sq += weights[k] * np.sum((np.outer(xk, xk) - S) ** 2)
 
-        delta = sum_sq / (n * n)
+        n_eff = 1.0 / max(float(np.sum(weights ** 2)), 1e-300)
+        delta = sum_sq / n_eff
         gamma = np.sum((S - F) ** 2)
 
         if gamma == 0:
@@ -329,19 +578,20 @@ class BarraModel:
         return float(shrinkage)
 
     def _estimate_specific_risk(self, returns: pd.DataFrame):
-        """Estimate specific (idiosyncratic) risk per asset."""
-        if not self.factor_returns_history:
+        """Estimate specific (idiosyncratic) risk per asset.
+
+        The old implementation assigned one panel-wide average residual std to
+        every asset, so a portfolio's specific risk did not depend on which
+        stocks it held. The residuals from each cross-sectional regression are
+        now kept, and each asset gets its own residual volatility.
+        """
+        if not self._residual_history:
             return
 
-        for fr in self.factor_returns_history:
-            # We don't have the actual residuals here, estimate from factor model
-            pass
-
-        # Simple approach: use residual_std from regressions
-        avg_residual_std = np.mean([fr.residual_std for fr in self.factor_returns_history])
-        self.specific_risk = pd.Series(
-            {asset: avg_residual_std for asset in returns.columns}
-        )
+        residuals = pd.DataFrame(self._residual_history)
+        specific = residuals.std(ddof=0)
+        fallback = float(specific.mean()) if np.isfinite(specific.mean()) else 0.0
+        self.specific_risk = specific.reindex(returns.columns).fillna(fallback)
 
     def decompose_risk(
         self,
@@ -389,10 +639,10 @@ class BarraModel:
         else:
             specific_var = 0
 
-        total_var = factor_var + specific_var
+        total_var = max(factor_var + specific_var, 0.0)
         total_risk = np.sqrt(total_var) * np.sqrt(252)  # Annualized
-        factor_risk = np.sqrt(factor_var) * np.sqrt(252)
-        specific_risk_ann = np.sqrt(specific_var) * np.sqrt(252)
+        factor_risk = np.sqrt(max(factor_var, 0.0)) * np.sqrt(252)
+        specific_risk_ann = np.sqrt(max(specific_var, 0.0)) * np.sqrt(252)
 
         # Factor contributions
         if self.factor_covariance is not None:

@@ -314,11 +314,11 @@ class TestQMTBroker:
         result = broker.connect(blocking=False)
         assert not result
 
-    def test_place_order_not_connected(self):
-        broker = QMTBroker(account="test")
+    def test_place_order_not_connected_fails_closed(self):
+        broker = QMTBroker(account="test", sleep_fn=lambda _delay: None)
         order = Order(code="600519", side=OrderSide.BUY, quantity=100, price=1800)
-        result = broker.place_order(order)
-        assert result.status == OrderStatus.REJECTED
+        with pytest.raises(QMTBroker.BrokerConnectionError):
+            broker.place_order(order)
 
     def test_to_xt_code_shanghai(self):
         from quant_platform.trading.qmt_utils import to_qmt_code
@@ -474,3 +474,60 @@ class TestCashCannotGoNegative:
 
         assert order.status == OrderStatus.REJECTED
         assert broker.get_account()["cash"] == pytest.approx(1001.00)
+
+
+class TestSimulatedBookLifecycle:
+    """Orders must not rest after an IOC rejection, and quotes must track the market."""
+
+    def _broker(self) -> SimulatedBroker:
+        broker = SimulatedBroker(initial_cash=1_000_000)
+        broker.connect()
+        return broker
+
+    def test_market_buy_fills_at_the_reference_price(self):
+        broker = self._broker()
+        broker._get_or_create_book("600519", 10.0)
+
+        order = Order(
+            code="600519", side=OrderSide.BUY,
+            order_type=OrderType.MARKET, quantity=100,
+        )
+        filled = broker.place_order(order)
+
+        assert filled.status == OrderStatus.FILLED
+        assert filled.filled_price == pytest.approx(10.0, abs=0.05)
+
+    def test_unfilled_sell_is_removed_from_the_book(self):
+        broker = self._broker()
+        broker._get_or_create_book("600519", 10.0)
+        buy = Order(
+            code="600519", side=OrderSide.BUY,
+            order_type=OrderType.LIMIT, quantity=100, price=10.0,
+        )
+        assert broker.place_order(buy).status == OrderStatus.FILLED
+        broker.new_trading_day()
+
+        sell = Order(
+            code="600519", side=OrderSide.SELL,
+            order_type=OrderType.LIMIT, quantity=100, price=999.0,
+        )
+        result = broker.place_order(sell)
+
+        assert result.status == OrderStatus.REJECTED
+        book = broker._order_books["600519"]
+        assert book.get_order(sell.order_id) is None
+
+    def test_book_is_repriced_when_the_market_moves(self):
+        broker = self._broker()
+        broker._get_or_create_book("600519", 10.0)
+        broker.update_market_prices({"600519": 20.0})
+
+        buy = Order(
+            code="600519", side=OrderSide.BUY,
+            order_type=OrderType.LIMIT, quantity=100, price=20.0,
+        )
+        result = broker.place_order(buy)
+
+        assert result.status == OrderStatus.FILLED
+        # Stale seeding would have filled around 10.
+        assert result.filled_price > 15.0

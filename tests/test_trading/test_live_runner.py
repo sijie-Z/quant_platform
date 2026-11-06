@@ -114,8 +114,9 @@ class TestLiveRunnerUniverse:
     def test_set_prices(self):
         self.runner.set_universe(["600519", "000001"])
         self.runner.set_prices({"600519": 1800.0, "000001": 15.0})
-        assert self.runner._current_prices["600519"] == 1800.0
-        assert "000001" in self.runner._price_history
+        # Quote keys are canonicalized to CODE.EXCHANGE at the boundary.
+        assert self.runner._current_prices["600519.SH"] == 1800.0
+        assert "000001.SZ" in self.runner._price_history
 
 
 class TestLiveRunnerSignalGeneration:
@@ -246,3 +247,17 @@ class TestLiveRunnerState:
         s = runner.get_state()
         assert s["cycles"] == 3
         assert s["universe_size"] == 1
+
+
+@pytest.fixture(autouse=True)
+def _fresh_risk_monitor(monkeypatch):
+    """Isolate the order-rate window between test modules.
+
+    LiveRunner shares the process-wide RiskMonitor in production so the
+    dashboard kill switch reaches it; in tests a module that places >50
+    orders in one second must not block the next module's first orders.
+    """
+    import quant_platform.trading.live_runner as live_runner_mod
+    from quant_platform.risk.circuit_breaker import RiskMonitor
+
+    monkeypatch.setattr(live_runner_mod, "get_risk_monitor", lambda: RiskMonitor())

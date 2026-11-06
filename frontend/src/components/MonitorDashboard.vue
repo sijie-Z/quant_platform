@@ -4,33 +4,43 @@
     <div class="metrics-grid monitor-kpi">
       <div class="metric-card">
         <div class="metric-label">{{ locale === 'zh-CN' ? '总资产净值' : 'Total NAV' }}</div>
-        <div class="metric-value text-accent">{{ formatNum(riskOverview.portfolio_value, 0) }}</div>
+        <div class="metric-value text-accent" :title="riskReason">{{ riskAvailable ? formatNum(riskOverview.portfolio_value, 0) : '—' }}</div>
+        <div v-if="!riskAvailable" class="metric-sub" :title="riskReason">{{ shortReason(riskReason) }}</div>
       </div>
       <div class="metric-card">
         <div class="metric-label">{{ locale === 'zh-CN' ? '日盈亏' : 'Daily P&L' }}</div>
-        <div class="metric-value" :class="riskOverview.daily_pnl >= 0 ? 'text-green' : 'text-red'">
-          {{ formatNum(riskOverview.daily_pnl, 0) }}
+        <div class="metric-value" :class="!riskAvailable ? '' : (riskOverview.daily_pnl >= 0 ? 'text-green' : 'text-red')" :title="riskReason">
+          {{ riskAvailable ? formatNum(riskOverview.daily_pnl, 0) : '—' }}
         </div>
       </div>
       <div class="metric-card">
         <div class="metric-label">{{ locale === 'zh-CN' ? '风险等级' : 'Risk Level' }}</div>
-        <div class="metric-value" :style="{ color: riskColor(riskOverview.risk_level) }">
-          {{ riskOverview.risk_level || (locale === 'zh-CN' ? '无' : 'N/A') }}
+        <div class="metric-value" :style="{ color: riskAvailable ? riskColor(riskOverview.risk_level) : 'var(--text-dim)' }" :title="riskReason">
+          {{ riskAvailable ? (riskOverview.risk_level || (locale === 'zh-CN' ? '无' : 'N/A')) : 'N/A' }}
         </div>
       </div>
       <div class="metric-card">
         <div class="metric-label">{{ locale === 'zh-CN' ? '回撤' : 'Drawdown' }}</div>
-        <div class="metric-value text-orange">-{{ (riskOverview.current_drawdown * 100).toFixed(2) }}%</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">{{ locale === 'zh-CN' ? '容量使用率' : 'Capacity Use' }}</div>
-        <div class="metric-value" :class="capacityGauge.usage_pct > 80 ? 'text-red' : 'text-green'">
-          {{ capacityGauge.usage_pct.toFixed(1) }}%
+        <div class="metric-value text-orange" :title="riskReason">
+          {{ riskAvailable ? '-' + (Number(riskOverview.current_drawdown || 0) * 100).toFixed(2) + '%' : '—' }}
         </div>
       </div>
       <div class="metric-card">
+        <div class="metric-label">{{ locale === 'zh-CN' ? '容量使用率' : 'Capacity Use' }}</div>
+        <div class="metric-value" :class="!capacityAvailable ? '' : (capacityGauge.usage_pct > 80 ? 'text-red' : 'text-green')" :title="capacityReason">
+          {{ capacityAvailable ? formatPct1(capacityGauge.usage_pct) : '—' }}
+        </div>
+        <div v-if="capacityAvailable && capacityGauge.as_of" class="metric-sub">{{ locale === 'zh-CN' ? '截至' : 'as of' }} {{ capacityGauge.as_of }}</div>
+        <div v-else-if="!capacityAvailable" class="metric-sub" :title="capacityReason">{{ shortReason(capacityReason) }}</div>
+      </div>
+      <div class="metric-card">
         <div class="metric-label">{{ locale === 'zh-CN' ? '平均IS成本' : 'Avg IS Cost' }}</div>
-        <div class="metric-value text-purple">{{ tcaSummary.mean_is_bps.toFixed(1) }} <span class="metric-unit">bps</span></div>
+        <div class="metric-value text-purple" :title="tcaReason">
+          <template v-if="tcaAvailable">{{ formatBps(tcaSummary.mean_is_bps) }} <span class="metric-unit">bps</span></template>
+          <template v-else>—</template>
+        </div>
+        <div v-if="tcaAvailable && tcaSummary.as_of" class="metric-sub">{{ locale === 'zh-CN' ? '截至' : 'as of' }} {{ tcaSummary.as_of }}</div>
+        <div v-else-if="!tcaAvailable" class="metric-sub" :title="tcaReason">{{ shortReason(tcaReason) }}</div>
       </div>
     </div>
 
@@ -40,17 +50,28 @@
       <div class="card monitor-card">
         <div class="card-header">
           <span class="card-title"><span class="card-title-dot" style="background:#4da6ff"></span> {{ locale === 'zh-CN' ? '风险仪表盘' : 'Risk Dashboard' }}</span>
-          <span class="tag" :style="{ background: riskColor(riskOverview.risk_level) + '22', color: riskColor(riskOverview.risk_level) }">
-            {{ riskOverview.risk_level || (locale === 'zh-CN' ? '绿色' : 'GREEN') }}
+          <span class="tag" :style="riskAvailable ? { background: riskColor(riskOverview.risk_level) + '22', color: riskColor(riskOverview.risk_level) } : { background: 'rgba(139,157,192,0.12)', color: '#8b9dc0' }">
+            {{ riskAvailable ? (riskOverview.risk_level || (locale === 'zh-CN' ? '无' : 'UNKNOWN')) : 'N/A' }}
           </span>
         </div>
         <div class="card-body">
-          <!-- Factor Exposure Radar -->
-          <div class="chart-title">{{ locale === 'zh-CN' ? 'Barra因子暴露' : 'Barra Factor Exposures' }}</div>
-          <div ref="riskRadarRef" class="chart-container-sm"></div>
-          <!-- Sector Concentration -->
-          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '行业集中度' : 'Sector Concentration' }}</div>
-          <div ref="sectorBarRef" class="chart-container-sm"></div>
+          <div v-if="riskOverview.available === false" class="chart-unavailable" style="min-height:auto;justify-content:flex-start;text-align:left;padding-bottom:0">
+            {{ riskOverview.reason || (locale === 'zh-CN' ? '风控状态不可用' : 'Risk state unavailable') }}
+          </div>
+          <!-- v-show (not v-if) keeps the chart DOM alive so the cached ECharts
+               instances stay valid when availability toggles. -->
+          <div v-show="riskOverview.available !== false">
+            <!-- Factor Exposure Radar -->
+            <div class="chart-title">{{ locale === 'zh-CN' ? 'Barra因子暴露' : 'Barra Factor Exposures' }}</div>
+            <div
+              v-if="riskOverview.factor_exposures_available === false"
+              class="chart-unavailable"
+            >{{ riskOverview.factor_exposures_reason || (locale === 'zh-CN' ? '暂无因子暴露数据' : 'No factor exposures available') }}</div>
+            <div v-show="riskOverview.factor_exposures_available !== false" ref="riskRadarRef" class="chart-container-sm"></div>
+            <!-- Sector Concentration -->
+            <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '行业集中度' : 'Sector Concentration' }}</div>
+            <div ref="sectorBarRef" class="chart-container-sm"></div>
+          </div>
         </div>
       </div>
 
@@ -58,13 +79,21 @@
       <div class="card monitor-card">
         <div class="card-header">
           <span class="card-title"><span class="card-title-dot" style="background:#fb923c"></span> {{ locale === 'zh-CN' ? '交易成本监控' : 'TCA Monitor' }}</span>
-          <span class="tag tag-orange">{{ tcaSummary.n_orders }} {{ locale === 'zh-CN' ? '笔订单' : 'orders' }}</span>
+          <span class="tag tag-orange">
+            {{ tcaAvailable ? tcaSummary.n_orders : '—' }} {{ locale === 'zh-CN' ? '笔订单' : 'orders' }}
+            <template v-if="tcaAvailable && tcaSummary.as_of">· {{ locale === 'zh-CN' ? '截至' : 'as of' }} {{ tcaSummary.as_of }}</template>
+          </span>
         </div>
         <div class="card-body">
-          <div class="chart-title">{{ locale === 'zh-CN' ? '实现缺口趋势' : 'Implementation Shortfall Trend' }}</div>
-          <div ref="tcaLineRef" class="chart-container-sm"></div>
-          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '成本分解' : 'Cost Decomposition' }}</div>
-          <div ref="tcaBarRef" class="chart-container-sm"></div>
+          <div v-if="tcaSummary.available === false" class="chart-unavailable">
+            {{ tcaSummary.reason || (locale === 'zh-CN' ? '暂无成交记录，无法计算 TCA' : 'No trades recorded; TCA unavailable') }}
+          </div>
+          <div v-show="tcaSummary.available !== false">
+            <div class="chart-title">{{ locale === 'zh-CN' ? '实现缺口趋势' : 'Implementation Shortfall Trend' }}</div>
+            <div ref="tcaLineRef" class="chart-container-sm"></div>
+            <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '成本分解' : 'Cost Decomposition' }}</div>
+            <div ref="tcaBarRef" class="chart-container-sm"></div>
+          </div>
         </div>
       </div>
 
@@ -77,10 +106,15 @@
           </span>
         </div>
         <div class="card-body">
-          <div class="chart-title">{{ locale === 'zh-CN' ? '滚动IC（60天）' : 'Rolling IC (60d)' }}</div>
-          <div ref="factorICRef" class="chart-container-sm"></div>
-          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '因子归因（bps）' : 'Factor Attribution (bps)' }}</div>
-          <div ref="factorAttrRef" class="chart-container-sm"></div>
+          <div v-if="factorStatus.available === false" class="chart-unavailable">
+            {{ factorStatus.reason || (locale === 'zh-CN' ? '暂无因子 IC 数据' : 'No factor IC data available') }}
+          </div>
+          <div v-show="factorStatus.available !== false">
+            <div class="chart-title">{{ locale === 'zh-CN' ? '滚动IC（60天）' : 'Rolling IC (60d)' }}</div>
+            <div ref="factorICRef" class="chart-container-sm"></div>
+            <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '因子归因（bps）' : 'Factor Attribution (bps)' }}</div>
+            <div ref="factorAttrRef" class="chart-container-sm"></div>
+          </div>
         </div>
       </div>
 
@@ -88,13 +122,21 @@
       <div class="card monitor-card">
         <div class="card-header">
           <span class="card-title"><span class="card-title-dot" style="background:#34d399"></span> {{ locale === 'zh-CN' ? '容量仪表盘' : 'Capacity Gauge' }}</span>
-          <span class="tag tag-green">{{ formatNum(capacityGauge.current_aum, 0) }} {{ locale === 'zh-CN' ? '管理规模' : 'AUM' }}</span>
+          <span class="tag tag-green">
+            {{ capacityAvailable ? formatNum(capacityGauge.current_aum, 0) : '—' }} {{ locale === 'zh-CN' ? '管理规模' : 'AUM' }}
+            <template v-if="capacityAvailable && capacityGauge.as_of">· {{ locale === 'zh-CN' ? '截至' : 'as of' }} {{ capacityGauge.as_of }}</template>
+          </span>
         </div>
         <div class="card-body">
-          <div class="chart-title">{{ locale === 'zh-CN' ? '容量使用率' : 'Capacity Usage' }}</div>
-          <div ref="capacityGaugeRef" class="chart-container-sm"></div>
-          <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '规模 vs 夏普衰减' : 'AUM vs Sharpe Decay' }}</div>
-          <div ref="capacityCurveRef" class="chart-container-sm"></div>
+          <div v-if="capacityGauge.available === false" class="chart-unavailable">
+            {{ capacityGauge.reason || (locale === 'zh-CN' ? '暂无持仓数据，无法估算容量' : 'No positions; capacity unavailable') }}
+          </div>
+          <div v-show="capacityGauge.available !== false">
+            <div class="chart-title">{{ locale === 'zh-CN' ? '容量使用率' : 'Capacity Usage' }}</div>
+            <div ref="capacityGaugeRef" class="chart-container-sm"></div>
+            <div class="chart-title mt-2">{{ locale === 'zh-CN' ? '规模 vs 夏普衰减' : 'AUM vs Sharpe Decay' }}</div>
+            <div ref="capacityCurveRef" class="chart-container-sm"></div>
+          </div>
         </div>
       </div>
 
@@ -106,20 +148,20 @@
         <div class="card-body">
           <div class="config-form">
             <div class="form-row">
-              <label class="config-label">{{ locale === 'zh-CN' ? '最大仓位%' : 'Max Position %' }}</label>
-              <input type="number" v-model.number="configForm.max_position_pct" min="0.01" max="0.20" step="0.01" class="config-input" />
+              <label class="config-label">{{ locale === 'zh-CN' ? '最大仓位（小数 0–1）' : 'Max Position (fraction 0–1)' }}</label>
+              <input type="number" v-model.number="configForm.max_position_pct" min="0.01" max="0.20" step="0.01" class="config-input" @input="configDirty = true" />
             </div>
             <div class="form-row">
-              <label class="config-label">{{ locale === 'zh-CN' ? '最大行业%' : 'Max Sector %' }}</label>
-              <input type="number" v-model.number="configForm.max_sector_pct" min="0.05" max="0.50" step="0.05" class="config-input" />
+              <label class="config-label">{{ locale === 'zh-CN' ? '最大行业（小数 0–1）' : 'Max Sector (fraction 0–1)' }}</label>
+              <input type="number" v-model.number="configForm.max_sector_pct" min="0.05" max="0.50" step="0.05" class="config-input" @input="configDirty = true" />
             </div>
             <div class="form-row">
-              <label class="config-label">{{ locale === 'zh-CN' ? '回撤暂停%' : 'Drawdown Halt %' }}</label>
-              <input type="number" v-model.number="configForm.max_drawdown_pct" min="0.01" max="0.30" step="0.01" class="config-input" />
+              <label class="config-label">{{ locale === 'zh-CN' ? '回撤暂停（小数 0–1）' : 'Drawdown Halt (fraction 0–1)' }}</label>
+              <input type="number" v-model.number="configForm.max_drawdown_pct" min="0.01" max="0.30" step="0.01" class="config-input" @input="configDirty = true" />
             </div>
             <div class="form-row">
-              <label class="config-label">{{ locale === 'zh-CN' ? '日亏损限额%' : 'Daily Loss Limit %' }}</label>
-              <input type="number" v-model.number="configForm.max_daily_loss_pct" min="0.005" max="0.10" step="0.005" class="config-input" />
+              <label class="config-label">{{ locale === 'zh-CN' ? '日亏损限额（小数 0–1）' : 'Daily Loss Limit (fraction 0–1)' }}</label>
+              <input type="number" v-model.number="configForm.max_daily_loss_pct" min="0.005" max="0.10" step="0.005" class="config-input" @input="configDirty = true" />
             </div>
             <div class="config-actions">
               <button class="btn btn-primary btn-sm" @click="submitConfig" :disabled="configSaving">
@@ -155,7 +197,10 @@
           <span class="card-title"><span class="card-title-dot" style="background:#f87171"></span> {{ locale === 'zh-CN' ? '因子告警' : 'Factor Alerts' }}</span>
         </div>
         <div class="card-body">
-          <div class="table-container">
+          <div v-if="factorStatus.available === false" class="chart-unavailable" style="min-height:auto;justify-content:flex-start;text-align:left;padding-bottom:0">
+            {{ factorStatus.reason || (locale === 'zh-CN' ? '暂无因子 IC 数据' : 'No factor IC data available') }}
+          </div>
+          <div v-else class="table-container">
             <table>
               <thead>
                 <tr>
@@ -169,8 +214,8 @@
               <tbody>
                 <tr v-for="f in factorStatus.factors" :key="f.name">
                   <td class="text-mono">{{ f.name }}</td>
-                  <td :class="f.current_ic > 0 ? 'text-green' : 'text-red'">{{ f.current_ic.toFixed(4) }}</td>
-                  <td>{{ f.icir.toFixed(3) }}</td>
+                  <td :class="factorIc(f) > 0 ? 'text-green' : 'text-red'">{{ formatIc(factorIc(f)) }}</td>
+                  <td>{{ formatIcir(f.icir) }}</td>
                   <td>
                     <span :class="f.trend === 'up' ? 'text-green' : 'text-red'">
                       {{ f.trend === 'up' ? '&#9650;' : '&#9660;' }}
@@ -178,6 +223,11 @@
                   </td>
                   <td>
                     <span class="tag" :class="alertTagClass(f.alert)">{{ f.alert }}</span>
+                  </td>
+                </tr>
+                <tr v-if="!factorStatus.factors.length">
+                  <td colspan="5" class="text-muted text-sm" style="text-align:center;padding:12px;">
+                    {{ locale === 'zh-CN' ? '无因子告警记录' : 'No factor alerts' }}
                   </td>
                 </tr>
               </tbody>
@@ -219,7 +269,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import {
   getMonitorRiskOverview,
@@ -228,6 +278,7 @@ import {
   getMonitorCapacityGauge,
   updateMonitorConfig,
   triggerMonitorKillSwitch,
+  getApiErrorMessage,
 } from '../api/index.js'
 import { useI18n } from '../i18n/index.js'
 
@@ -236,23 +287,29 @@ const { $t, locale } = useI18n()
 
 // ── State ──
 const riskOverview = reactive({
+  available: null, reason: '',
   factor_exposures: {}, sector_concentration: {}, current_drawdown: 0,
-  volatility: 0, var_95: 0, cvar_95: 0, risk_level: 'GREEN',
+  volatility: 0, var_95: 0, cvar_95: 0, risk_level: 'UNKNOWN',
   portfolio_value: 0, daily_pnl: 0, n_positions: 0,
+  kill_switch: false, limits: {},
+  factor_exposures_available: null, factor_exposures_reason: '',
 })
 
 const tcaSummary = reactive({
+  available: null, reason: '',
   n_orders: 0, mean_is_bps: 0, mean_delay_bps: 0, mean_impact_bps: 0,
   mean_timing_bps: 0, mean_arrival_bps: 0, median_is_bps: 0,
   daily_trend: [], cost_breakdown: [], by_ticker: {},
 })
 
 const factorStatus = reactive({
+  available: null, reason: '',
   factors: [], rolling_ic: {}, ic_dates: [], attribution: [],
   decay_alerts: [], disabled_factors: [],
 })
 
 const capacityGauge = reactive({
+  available: null, reason: '',
   current_aum: 0, capacity_aum: 0, usage_pct: 0,
   participation_rate: 0, sharpe_at_capacity: 0, aum_curve: [],
 })
@@ -262,7 +319,29 @@ const configForm = reactive({
   max_drawdown_pct: 0.15, max_daily_loss_pct: 0.03,
 })
 
+// Transport-level failures per endpoint. `available === false` covers the
+// backend saying "I cannot compute this"; these cover "the request itself
+// failed". Both must render as —/N/A with a reason, never as measured zeros.
+const loadErrors = reactive({ risk: '', tca: '', factor: '', capacity: '' })
+
+const riskAvailable = computed(() => riskOverview.available === true)
+const tcaAvailable = computed(() => tcaSummary.available === true)
+const capacityAvailable = computed(() => capacityGauge.available === true)
+
+const riskReason = computed(() => loadErrors.risk || riskOverview.reason || '')
+const tcaReason = computed(() => loadErrors.tca || tcaSummary.reason || '')
+const capacityReason = computed(() => loadErrors.capacity || capacityGauge.reason || '')
+
+function shortReason(reason) {
+  const text = String(reason || '').trim()
+  if (!text) return ''
+  return text.length > 48 ? `${text.slice(0, 45)}…` : text
+}
+
 const configSaving = ref(false)
+// While the operator is editing, a 15 s poll must not overwrite the form with
+// the server limits (edits used to be silently reverted mid-typing).
+const configDirty = ref(false)
 const configLog = ref([])
 const showKillModal = ref(false)
 const killSwitchActive = ref(false)
@@ -279,6 +358,7 @@ const capacityGaugeRef = ref(null)
 const capacityCurveRef = ref(null)
 
 let chartInstances = []
+const chartsByEl = new Map()
 let resizeObservers = []
 let pollTimer = null
 
@@ -294,7 +374,17 @@ const colors = ['#4da6ff', '#34d399', '#f87171', '#fb923c', '#a78bfa', '#22d3ee'
 
 function initChart(refEl, opts = {}) {
   if (!refEl) return null
+  // The dashboard polls every 15s, and every render used to call
+  // `echarts.init` again on the same DOM node. Each call leaves the previous
+  // instance alive and un-disposed, so one open tab accumulated a new set of
+  // eight charts (and their canvases) every poll. Reuse the instance for the
+  // element; the DOM ref changes only when v-show/v-if recreates the subtree.
+  const cached = chartsByEl.get(refEl)
+  if (cached && !cached.isDisposed() && cached.getDom() === refEl) {
+    return cached
+  }
   const chart = echarts.init(refEl, null, { renderer: 'canvas' })
+  chartsByEl.set(refEl, chart)
   chartInstances.push(chart)
   if (window.ResizeObserver) {
     const ro = new ResizeObserver(() => chart.resize())
@@ -304,23 +394,85 @@ function initChart(refEl, opts = {}) {
   return chart
 }
 
+// When a successful poll returns an empty series, render functions that just
+// `return` leave the previous chart pixels on screen as if current. Clear the
+// cached instance instead of showing stale bars/lines.
+function clearChart(refEl) {
+  if (!refEl) return
+  const cached = chartsByEl.get(refEl)
+  if (cached && !cached.isDisposed()) cached.clear()
+}
+
 // ── Data Fetching ──
 async function fetchAll() {
-  try {
-    const [risk, tca, factor, cap] = await Promise.all([
-      getMonitorRiskOverview().catch(() => ({})),
-      getMonitorTCASummary().catch(() => ({})),
-      getMonitorFactorStatus().catch(() => ({})),
-      getMonitorCapacityGauge().catch(() => ({})),
-    ])
+  // Settle each endpoint independently: a failing request must mark its own
+  // panel unavailable (with a reason) instead of being swallowed into `{}`,
+  // which left the reactive defaults (zeros) on screen as if measured.
+  const [riskR, tcaR, factorR, capR] = await Promise.allSettled([
+    getMonitorRiskOverview(),
+    getMonitorTCASummary(),
+    getMonitorFactorStatus(),
+    getMonitorCapacityGauge(),
+  ])
+
+  if (riskR.status === 'fulfilled') {
+    const risk = riskR.value || {}
+    loadErrors.risk = ''
+    // The backend emits lowercase enum values (`green`..`kill`); the colour
+    // map and KPI tags are keyed uppercase, so RED/KILL books used to render
+    // grey. Normalize at the boundary.
+    if (risk.risk_level) risk.risk_level = String(risk.risk_level).toUpperCase()
     Object.assign(riskOverview, risk)
-    Object.assign(tcaSummary, tca)
-    Object.assign(factorStatus, factor)
-    Object.assign(capacityGauge, cap)
-    nextTick(() => renderAllCharts())
-  } catch (e) {
-    emit('toast', { message: locale.value === 'zh-CN' ? '监控数据获取失败' : 'Monitor fetch failed', type: 'error' })
+    // Seed the kill switch and the live limits from the shared RiskMonitor;
+    // otherwise the dashboard always shows ACTIVATE and default limits even
+    // after the engine tripped the switch.
+    if (risk.available === true) {
+      if (risk.kill_switch !== undefined) killSwitchActive.value = !!risk.kill_switch
+      if (!configDirty.value && risk.limits && Object.keys(risk.limits).length) {
+        configForm.max_position_pct = risk.limits.max_single_position ?? configForm.max_position_pct
+        configForm.max_sector_pct = risk.limits.max_sector ?? configForm.max_sector_pct
+        configForm.max_drawdown_pct = risk.limits.max_drawdown ?? configForm.max_drawdown_pct
+        configForm.max_daily_loss_pct = risk.limits.max_daily_loss ?? configForm.max_daily_loss_pct
+      }
+    }
+  } else {
+    loadErrors.risk = getApiErrorMessage(riskR.reason, 'request failed')
+    riskOverview.available = false
+    riskOverview.reason = `${locale.value === 'zh-CN' ? '请求失败' : 'request failed'}: ${loadErrors.risk}`
+    riskOverview.risk_level = 'UNKNOWN'
   }
+
+  if (tcaR.status === 'fulfilled') {
+    loadErrors.tca = ''
+    Object.assign(tcaSummary, tcaR.value || {})
+  } else {
+    loadErrors.tca = getApiErrorMessage(tcaR.reason, 'request failed')
+    tcaSummary.available = false
+    tcaSummary.reason = `${locale.value === 'zh-CN' ? '请求失败' : 'request failed'}: ${loadErrors.tca}`
+  }
+
+  if (factorR.status === 'fulfilled') {
+    loadErrors.factor = ''
+    Object.assign(factorStatus, factorR.value || {})
+  } else {
+    loadErrors.factor = getApiErrorMessage(factorR.reason, 'request failed')
+    factorStatus.available = false
+    factorStatus.reason = `${locale.value === 'zh-CN' ? '请求失败' : 'request failed'}: ${loadErrors.factor}`
+    factorStatus.factors = []
+    factorStatus.decay_alerts = []
+    factorStatus.disabled_factors = []
+  }
+
+  if (capR.status === 'fulfilled') {
+    loadErrors.capacity = ''
+    Object.assign(capacityGauge, capR.value || {})
+  } else {
+    loadErrors.capacity = getApiErrorMessage(capR.reason, 'request failed')
+    capacityGauge.available = false
+    capacityGauge.reason = `${locale.value === 'zh-CN' ? '请求失败' : 'request failed'}: ${loadErrors.capacity}`
+  }
+
+  nextTick(() => renderAllCharts())
 }
 
 // ── Chart Rendering ──
@@ -337,11 +489,13 @@ function renderAllCharts() {
 }
 
 function renderRiskRadar() {
-  const chart = initChart(riskRadarRef.value)
-  if (!chart) return
+  if (riskOverview.available === false) { clearChart(riskRadarRef.value); return }
   const factors = Object.keys(riskOverview.factor_exposures)
   const values = Object.values(riskOverview.factor_exposures)
-  if (!factors.length) return
+  if (riskOverview.factor_exposures_available === false) { clearChart(riskRadarRef.value); return }
+  const chart = initChart(riskRadarRef.value)
+  if (!chart) return
+  if (!factors.length) { chart.clear(); return }
   chart.setOption({
     tooltip: { ...tooltipBase },
     radar: {
@@ -367,18 +521,29 @@ function renderRiskRadar() {
 }
 
 function renderSectorBar() {
+  // Fraction weights (market_value / total_mv) scaled to percent. The old
+  // xAxis max of 1 clipped every sector >= 1% at the right edge, and the value
+  // labels landed outside the grid.
+  if (riskOverview.available === false) { clearChart(sectorBarRef.value); return }
+  const sectors = Object.entries(riskOverview.sector_concentration || {})
+    .map(([name, weight]) => [name, Number(weight) * 100])
+    .filter(([, pct]) => Number.isFinite(pct))
   const chart = initChart(sectorBarRef.value)
   if (!chart) return
-  const sectors = Object.entries(riskOverview.sector_concentration)
-  if (!sectors.length) return
+  if (!sectors.length) { chart.clear(); return }
   chart.setOption({
-    tooltip: { ...tooltipBase, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    grid: { ...gridBase, left: 80 },
-    xAxis: { type: 'value', max: 1, axisLabel: { color: '#556882', formatter: v => (v * 100) + '%' }, splitLine: { lineStyle: { color: '#152035' } } },
+    tooltip: { ...tooltipBase, trigger: 'axis', valueFormatter: v => `${Number(v).toFixed(1)}%`, axisPointer: { type: 'shadow' } },
+    grid: { ...gridBase, left: 80, right: 44 },
+    xAxis: {
+      type: 'value',
+      max: 100,
+      axisLabel: { color: '#556882', formatter: v => v + '%' },
+      splitLine: { lineStyle: { color: '#152035' } },
+    },
     yAxis: { type: 'category', data: sectors.map(s => s[0]).reverse(), axisLabel: { color: '#8b9dc0', fontSize: 10 }, axisLine: { lineStyle: { color: '#1c2d4a' } } },
     series: [{
       type: 'bar',
-      data: sectors.map(s => (s[1] * 100).toFixed(1)).reverse(),
+      data: sectors.map(s => Number(s[1].toFixed(1))).reverse(),
       itemStyle: { color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [{ offset: 0, color: '#4da6ff' }, { offset: 1, color: '#22d3ee' }]), borderRadius: [0, 3, 3, 0] },
       barWidth: 14,
       label: { show: true, position: 'right', color: '#8b9dc0', fontSize: 10, formatter: '{c}%' },
@@ -387,10 +552,11 @@ function renderSectorBar() {
 }
 
 function renderTCALine() {
+  if (tcaSummary.available === false) { clearChart(tcaLineRef.value); return }
+  const trend = tcaSummary.daily_trend
   const chart = initChart(tcaLineRef.value)
   if (!chart) return
-  const trend = tcaSummary.daily_trend
-  if (!trend.length) return
+  if (!trend.length) { chart.clear(); return }
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis' },
     grid: gridBase,
@@ -409,10 +575,11 @@ function renderTCALine() {
 }
 
 function renderTCABar() {
+  if (tcaSummary.available === false) { clearChart(tcaBarRef.value); return }
+  const cb = tcaSummary.cost_breakdown
   const chart = initChart(tcaBarRef.value)
   if (!chart) return
-  const cb = tcaSummary.cost_breakdown
-  if (!cb.length) return
+  if (!cb.length) { chart.clear(); return }
   const last10 = cb.slice(-10)
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis', axisPointer: { type: 'shadow' } },
@@ -429,11 +596,12 @@ function renderTCABar() {
 }
 
 function renderFactorIC() {
-  const chart = initChart(factorICRef.value)
-  if (!chart) return
+  if (factorStatus.available === false) { clearChart(factorICRef.value); return }
   const dates = factorStatus.ic_dates.map(d => d.slice(5))
   const factors = Object.keys(factorStatus.rolling_ic)
-  if (!factors.length || !dates.length) return
+  const chart = initChart(factorICRef.value)
+  if (!chart) return
+  if (!factors.length || !dates.length) { chart.clear(); return }
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis' },
     grid: gridBase,
@@ -444,14 +612,15 @@ function renderFactorIC() {
       name: f, type: 'line', data: factorStatus.rolling_ic[f],
       smooth: true, lineStyle: { color: colors[i], width: 1.5 }, itemStyle: { color: colors[i] }, symbol: 'none',
     })),
-  })
+  }, { notMerge: true })
 }
 
 function renderFactorAttr() {
+  if (factorStatus.available === false) { clearChart(factorAttrRef.value); return }
+  const attr = factorStatus.attribution
   const chart = initChart(factorAttrRef.value)
   if (!chart) return
-  const attr = factorStatus.attribution
-  if (!attr.length) return
+  if (!attr.length) { chart.clear(); return }
   const sorted = [...attr].sort((a, b) => b.contribution_bps - a.contribution_bps)
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis', axisPointer: { type: 'shadow' } },
@@ -471,6 +640,7 @@ function renderFactorAttr() {
 }
 
 function renderCapacityGauge() {
+  if (capacityGauge.available === false) { clearChart(capacityGaugeRef.value); return }
   const chart = initChart(capacityGaugeRef.value)
   if (!chart) return
   chart.setOption({
@@ -498,10 +668,11 @@ function renderCapacityGauge() {
 }
 
 function renderCapacityCurve() {
+  if (capacityGauge.available === false) { clearChart(capacityCurveRef.value); return }
+  const curve = capacityGauge.aum_curve
   const chart = initChart(capacityCurveRef.value)
   if (!chart) return
-  const curve = capacityGauge.aum_curve
-  if (!curve.length) return
+  if (!curve.length) { chart.clear(); return }
   chart.setOption({
     tooltip: { ...tooltipBase, trigger: 'axis' },
     grid: gridBase,
@@ -537,6 +708,7 @@ async function submitConfig() {
       message: (locale.value === 'zh-CN' ? '已更新：' : 'Updated: ') + result.updated.join(', '),
     })
     if (configLog.value.length > 10) configLog.value.pop()
+    configDirty.value = false
     emit('toast', { message: locale.value === 'zh-CN' ? '配置已更新' : 'Config updated', type: 'success' })
   } catch (e) {
     emit('toast', { message: locale.value === 'zh-CN' ? '配置更新失败' : 'Config update failed', type: 'error' })
@@ -568,16 +740,47 @@ async function executeKillSwitch() {
 }
 
 // ── Helpers ──
+function isFiniteNumber(v) {
+  return v != null && v !== '' && Number.isFinite(Number(v))
+}
+
 function formatNum(v, decimals = 2) {
-  if (v == null) return '0'
-  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M'
-  if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + 'K'
-  return Number(v).toFixed(decimals)
+  if (!isFiniteNumber(v)) return '—'
+  const n = Number(v)
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M'
+  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K'
+  return n.toFixed(decimals)
+}
+
+function formatPct1(v) {
+  if (!isFiniteNumber(v)) return '—'
+  return Number(v).toFixed(1) + '%'
+}
+
+function formatBps(v) {
+  if (!isFiniteNumber(v)) return '—'
+  return Number(v).toFixed(1)
+}
+
+// Factor rows are documented as {name, ic, icir, trend, alert}; an older
+// shape used current_ic. Accept both, and never call .toFixed on undefined.
+function factorIc(f) {
+  if (f == null) return NaN
+  const value = f.ic ?? f.current_ic
+  return isFiniteNumber(value) ? Number(value) : NaN
+}
+
+function formatIc(v) {
+  return Number.isFinite(v) ? Number(v).toFixed(4) : '—'
+}
+
+function formatIcir(v) {
+  return isFiniteNumber(v) ? Number(v).toFixed(3) : '—'
 }
 
 function riskColor(level) {
-  const map = { GREEN: '#34d399', YELLOW: '#fbbf24', ORANGE: '#fb923c', RED: '#f87171', KILL: '#ff0040' }
-  return map[level] || '#34d399'
+  const map = { GREEN: '#34d399', YELLOW: '#fbbf24', ORANGE: '#fb923c', RED: '#f87171', KILL: '#ff0040', UNKNOWN: '#8b9dc0' }
+  return map[level] || '#8b9dc0'
 }
 
 function alertTagClass(alert) {
@@ -585,15 +788,20 @@ function alertTagClass(alert) {
 }
 
 // ── Lifecycle ──
+let unmounted = false
+
 onMounted(async () => {
   await fetchAll()
+  if (unmounted) return
   pollTimer = setInterval(fetchAll, 15000)
 })
 
 onBeforeUnmount(() => {
+  unmounted = true
   if (pollTimer) clearInterval(pollTimer)
   chartInstances.forEach(c => { try { c.dispose() } catch (_) {} })
   chartInstances = []
+  chartsByEl.clear()
   resizeObservers.forEach(o => { try { o.disconnect() } catch (_) {} })
   resizeObservers = []
 })
@@ -607,6 +815,24 @@ onBeforeUnmount(() => {
 .monitor-kpi {
   margin-bottom: var(--space-4);
 }
+
+.metric-sub {
+  font-size: 8px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Utility classes used by this component's template but never defined in
+   style.css (pre-existing gaps: Avg IS Cost was not purple, unit/space/bold
+   hints were ignored). */
+.text-purple { color: #a78bfa; }
+.metric-unit { font-size: 9px; color: var(--text-dim); }
+.font-bold { font-weight: 700; }
+.mr-1 { margin-right: 4px; }
 
 .monitor-grid {
   display: grid;
@@ -632,6 +858,18 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 160px;
   flex-shrink: 0;
+}
+
+.chart-unavailable {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+  padding: var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-align: center;
 }
 
 .chart-title {

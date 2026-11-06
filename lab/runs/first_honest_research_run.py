@@ -9,7 +9,9 @@ report WARNINGs. A failed run that still records is also a success (criterion #6
 Pipeline (Builder mode minimum, single new path, does NOT touch the 4万行 legacy):
     AkShare (后复权 hfq)  →  CSI300 current constituents (pit=false)
     →  Momentum_12m (skip 21d)  →  cross-sectional rank IC / ICIR
-    →  DSR / BH-FDR (research/validation)  →  RunStore  →  Markdown report
+    →  RunStore  →  Markdown report
+    (DSR / BH-FDR are NOT run here: with a single factor there is nothing to
+    correct and the evaluation records ``insufficient_trials`` honestly.)
 
 Trust decisions, machine-recorded into Registry:
     - adjust = "back" (hfq): back-adjusted; per-stock basis = ipo date (uniform),
@@ -43,8 +45,10 @@ from quant_platform.factors.evaluation import ic_summary  # noqa: E402
 from quant_platform.factors.technical import Momentum12M  # noqa: E402
 from quant_platform.lab.registry import DEFAULT_DB, RunStore  # noqa: E402
 from quant_platform.lab.reports import generate_report  # noqa: E402
+from quant_platform.utils.research_window import resolve_end_date  # noqa: E402
 
 SLICE = "first_honest_research_run"
+MIN_IC_OBS = 20  # R5: below this the run has not been evaluated
 
 # ---- Trust metadata (machine-recorded, not README) --------------------------
 DATA_META = {
@@ -129,11 +133,15 @@ def _fetch_prices(codes: list[str], start: str, end) -> pd.DataFrame:
 
 def run() -> str:
     store = RunStore(DEFAULT_DB)
+    # The end date is resolved at run time (QUANT_RESEARCH_END_DATE or today),
+    # never a hardcoded date that silently ages.
+    start, end = "2016-01-01", resolve_end_date()
+    data_meta = dict(DATA_META, requested_start=start, requested_end=end)
     # inputs fingerprint for reproducibility / lineage
     inputs = {
         "slice": SLICE,
         "data_source": "akshare",
-        "data_meta": DATA_META,
+        "data_meta": data_meta,
         "universe_provider": UNIVERSE_META["provider"],
         "universe_meta": UNIVERSE_META,
         "factor": FACTOR_PARAMS["name"],
@@ -148,11 +156,16 @@ def run() -> str:
             raise RuntimeError(f"CSI300 fetch too few members: {len(codes)}")
         print(f"[{SLICE}] CSI300 members: {len(codes)}", flush=True)
 
-        start, end = "2016-01-01", "2026-05-23"
         prices = _fetch_prices(codes, start, end)
-        print(f"[{SLICE}] price panel: {prices.shape}")
+        print(f"[{SLICE}] price panel: {prices.shape}", flush=True)
         if prices.shape[1] < 50:
             raise RuntimeError(f"price panel too narrow: {prices.shape}")
+        # Record the window actually returned, not just the one requested.
+        data_meta["data_start"] = str(prices.index[0].date())
+        data_meta["data_end"] = str(prices.index[-1].date())
+        data_meta["requested_end"] = end
+        print(f"[{SLICE}] data window: {data_meta['data_start']} → "
+              f"{data_meta['data_end']} (requested end {end})", flush=True)
 
         # Factor: Momentum_12m (skip 21d). Returns date×asset cumulative return.
         factor_panel = Momentum12M().compute(prices)
@@ -215,16 +228,29 @@ def run() -> str:
             "ic_positive_ratio": round(float(ic_stats.get("ic_positive_ratio", float("nan"))), 4) if ic_stats else None,
             "dsr": dsr_dict,
             "bh_fdr": "n/a (single factor; BH-FDR requires multiple factors)",
+            "data_start": data_meta["data_start"],
+            "data_end": data_meta["data_end"],
+            "requested_end": end,
         }
+
+        # A run with too few IC observations has no measurable result; it must
+        # not be recorded as success (R5).
+        status = "success" if len(ic_series) >= MIN_IC_OBS else "failed"
+        status_reason = None if status == "success" else (
+            f"insufficient_ic_observations: n_ic_obs={len(ic_series)} < {MIN_IC_OBS}"
+        )
+        status_warnings = [status_reason] if status_reason else []
 
         # Persist evaluation, then generate report from the FULL persisted record
         # so the report's trust fields come straight out of the Registry.
-        store.finish_run(run_id, status="success", evaluation=evaluation,
-                         report_path=None, warnings=[])
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=None, reason=status_reason,
+                         warnings=status_warnings, data_meta=data_meta)
         final_run = store.get_run(run_id)
         report_path = generate_report(final_run, out_dir="data/reports")
-        store.finish_run(run_id, status="success", evaluation=evaluation,
-                         report_path=report_path, warnings=[])
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=report_path, reason=status_reason,
+                         warnings=status_warnings, data_meta=data_meta)
 
         print(f"[{SLICE}] SUCCESS run_id={run_id}", flush=True)
         print(f"[{SLICE}] IC={evaluation.get('ic_mean')} ICIR={evaluation.get('icir')}", flush=True)
@@ -236,10 +262,11 @@ def run() -> str:
         tb = traceback.format_exc()
         reason = f"{type(e).__name__}: {e}"
         store.finish_run(run_id, status="failed", reason=reason,
-                         warnings=[f"traceback_excerpt: {tb[-400:]}"])
+                         warnings=[f"traceback_excerpt: {tb[-400:]}"],
+                         data_meta=data_meta)
         report_path = generate_report(store.get_run(run_id), out_dir="data/reports")
         store.finish_run(run_id, status="failed", reason=reason,
-                         report_path=report_path)
+                         report_path=report_path, data_meta=data_meta)
         print(f"[{SLICE}] FAILED (recorded) run_id={run_id}: {e}", flush=True)
         print(f"[{SLICE}] failure report: {report_path}", flush=True)
         raise

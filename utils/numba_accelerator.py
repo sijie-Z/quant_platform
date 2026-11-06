@@ -68,9 +68,10 @@ def _rolling_cumret_numba(returns: np.ndarray, period: int) -> np.ndarray:
     result = np.full((n_dates, n_assets), np.nan)
 
     for j in prange(n_assets):
-        for t in range(period, n_dates):
-            # Check if any NaN in window
-            window = returns[t - period:t, j]
+        # rolling(period) at row t includes row t; the old window ended at
+        # t-1, so the accelerated path was one day staler than pandas.
+        for t in range(period - 1, n_dates):
+            window = returns[t - period + 1:t + 1, j]
             valid = True
             cumret = 1.0
             for k in range(period):
@@ -132,20 +133,24 @@ def _max_drawdown_numba(cumulative: np.ndarray) -> tuple:
 
 
 def max_drawdown_pandas(returns: pd.Series) -> tuple:
-    """Pandas version."""
-    cumulative = (1 + returns).cumprod().values
+    """Pandas version, measured from inception."""
+    cumulative = np.concatenate(
+        ([1.0], (1 + returns.dropna()).cumprod().to_numpy())
+    )
     running_max = np.maximum.accumulate(cumulative)
     drawdown = (cumulative - running_max) / running_max
     max_dd = drawdown.min()
     trough_idx = drawdown.argmin()
     peak_idx = running_max[:trough_idx + 1].argmax()
-    return float(max_dd), peak_idx, trough_idx
+    return float(max_dd), int(peak_idx), int(trough_idx)
 
 
 def max_drawdown_numba(returns: pd.Series) -> tuple:
-    """Numba-accelerated version."""
+    """Numba-accelerated version, measured from inception."""
     if HAS_NUMBA:
-        cumulative = (1 + returns.dropna()).cumprod().values
+        cumulative = np.concatenate(
+            ([1.0], (1 + returns.dropna()).cumprod().to_numpy())
+        )
         return _max_drawdown_numba(cumulative.astype(np.float64))
     return max_drawdown_pandas(returns)
 
@@ -183,6 +188,12 @@ def _winsorize_numba(data: np.ndarray, lower: float, upper: float) -> np.ndarray
         hi_hi = sorted_valid[min(int(hi_idx) + 1, n - 1)]
         hi = hi_lo + (hi_idx - int(hi_idx)) * (hi_hi - hi_lo)
 
+        # A degenerate cross-section (e.g. a binary event factor that fires
+        # for 0.5% of names) has lo == hi == 0; clipping then erases every
+        # non-zero value and the factor carries no information at all.
+        if hi <= lo:
+            continue
+
         # Clip
         for j in range(n_cols):
             if not np.isnan(row[j]):
@@ -204,6 +215,9 @@ def winsorize_pandas(factor: pd.DataFrame, lower: float, upper: float) -> pd.Dat
             continue
         lo = valid.quantile(lower)
         hi = valid.quantile(upper)
+        if hi <= lo:
+            # Sparse/binary cross-section: clipping would flatten the signal.
+            continue
         result.loc[date] = row.clip(lower=lo, upper=hi)
     return result
 
@@ -222,27 +236,54 @@ def winsorize_numba(factor: pd.DataFrame, lower: float, upper: float) -> pd.Data
 # ======================================================================
 
 @jit(nopython=True, cache=True)
-def _spearman_rank_ic(factor_row: np.ndarray, ret_row: np.ndarray) -> float:
-    """Numba JIT: Spearman rank correlation for one cross-section."""
+def _average_rank(values: np.ndarray) -> np.ndarray:
+    """Ranks with ties averaged, matching pandas' default ``rank``."""
+    n = len(values)
+    order = np.argsort(values)
+    sorted_values = values[order]
+    ranks_sorted = np.empty(n)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sorted_values[j + 1] == sorted_values[i]:
+            j += 1
+        average = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks_sorted[k] = average
+        i = j + 1
+
+    ranks = np.empty(n)
+    for idx in range(n):
+        ranks[order[idx]] = ranks_sorted[idx]
+    return ranks
+
+
+@jit(nopython=True, cache=True)
+def _spearman_rank_ic(
+    factor_row: np.ndarray, ret_row: np.ndarray, min_assets: int,
+) -> float:
+    """Numba JIT: Spearman rank correlation for one cross-section.
+
+    ``min_assets`` is the cross-section breadth floor for this panel, supplied
+    by the caller from the shared rule in
+    :func:`quant_platform.factors.evaluation.min_assets_for_ic`. The kernel
+    only sees the aligned arrays, so the rule must not be hardcoded here.
+    """
     # Find valid pairs
     mask = ~(np.isnan(factor_row) | np.isnan(ret_row))
     n_valid = mask.sum()
-    if n_valid < 30:
+    if n_valid < min_assets:
         return np.nan
 
     f = factor_row[mask]
     r = ret_row[mask]
 
-    # Rank (use argsort twice for ranking)
-    f_rank = np.zeros(n_valid)
-    r_rank = np.zeros(n_valid)
-
-    f_order = np.argsort(f)
-    r_order = np.argsort(r)
-
-    for i in range(n_valid):
-        f_rank[f_order[i]] = i + 1
-        r_rank[r_order[i]] = i + 1
+    # Average ranks for ties. Assigning 1..N via argsort gave tied values
+    # arbitrary distinct ranks, so this path disagreed with pandas and its
+    # result depended on column order (discrete factors such as
+    # breakout_ignition are affected in production).
+    f_rank = _average_rank(f)
+    r_rank = _average_rank(r)
 
     # Pearson correlation of ranks
     f_mean = f_rank.mean()
@@ -274,10 +315,15 @@ def rank_ic_numba(
         from quant_platform.factors.evaluation import rank_ic
         return rank_ic(factor, forward_returns)
 
+    from quant_platform.factors.evaluation import min_assets_for_ic
+
     dates = factor.index.intersection(forward_returns.index)
     assets = factor.columns.intersection(forward_returns.columns)
     factor = factor.reindex(index=dates, columns=assets)
     forward_returns = forward_returns.reindex(index=dates, columns=assets)
+    # Shared breadth rule (imported lazily like the pandas fallback above, so
+    # `factors.evaluation` and this module never import each other at load).
+    min_assets = min_assets_for_ic(len(assets))
 
     f_arr = factor.values.astype(np.float64)
     r_arr = forward_returns.values.astype(np.float64)
@@ -286,7 +332,7 @@ def rank_ic_numba(
     results = []
     dates = []
     for i in range(n_rows):
-        ic = _spearman_rank_ic(f_arr[i], r_arr[i])
+        ic = _spearman_rank_ic(f_arr[i], r_arr[i], min_assets)
         if not np.isnan(ic):
             results.append(ic)
             dates.append(factor.index[i])
@@ -300,96 +346,128 @@ def rank_ic_numba(
 
 @jit(nopython=True, cache=True)
 def _ledoit_wolf_shrinkage_numba(returns: np.ndarray) -> np.ndarray:
-    """Numba JIT: Ledoit-Wolf covariance shrinkage with optimal intensity.
-
-    Shrinks sample covariance toward a structured target (constant correlation).
-    Uses the analytical optimal shrinkage intensity from Ledoit & Wolf (2004).
+    """Numba JIT: Ledoit-Wolf shrinkage toward a constant-correlation target.
 
     Reference:
-        Ledoit, O., & Wolf, M. (2004). "A well-conditioned estimator for
-        large-dimensional covariance matrices." Journal of Multivariate Analysis.
+        Ledoit, O., & Wolf, M. (2004). "Honey, I shrunk the sample
+        covariance matrix." Journal of Portfolio Management.
+
+    The previous kernel called `returns.mean(axis=0)`, which numba 0.63's
+    `array_mean` overload does not support: the kernel failed to compile for
+    every call with >=5 assets, `estimate_covariance` raised, and the
+    backtest engine swallowed it and ran with `cov=None` (MVO on an identity
+    matrix; risk parity on its equal-weight fallback). It also computed only
+    the diagonal part of rho_hat, which saturated the shrinkage at 1.0.
     """
     n, p = returns.shape
+    if n < 2 or p < 2:
+        raise ValueError("Ledoit-Wolf needs at least 2 observations and 2 assets")
+
+    # Means without `mean(axis=...)` (unsupported by numba's overload).
+    mean_ret = np.zeros(p)
+    for t in range(n):
+        for j in range(p):
+            mean_ret[j] += returns[t, j]
+    for j in range(p):
+        mean_ret[j] /= n
+
+    demeaned = np.empty((n, p))
+    for t in range(n):
+        for j in range(p):
+            demeaned[t, j] = returns[t, j] - mean_ret[j]
 
     # Sample covariance
-    mean_ret = returns.mean(axis=0)
-    demeaned = returns - mean_ret
-    sample_cov = (demeaned.T @ demeaned) / (n - 1)
+    sample_cov = np.zeros((p, p))
+    for i in range(p):
+        for j in range(i, p):
+            s = 0.0
+            for t in range(n):
+                s += demeaned[t, i] * demeaned[t, j]
+            s /= (n - 1)
+            sample_cov[i, j] = s
+            sample_cov[j, i] = s
 
-    # Target: constant correlation matrix
-    stds = np.sqrt(np.diag(sample_cov))
+    stds = np.zeros(p)
+    for i in range(p):
+        stds[i] = np.sqrt(sample_cov[i, i])
 
-    # Average pairwise correlation
+    # Average off-diagonal correlation
     avg_corr = 0.0
     count = 0
     for i in range(p):
         for j in range(i + 1, p):
             if stds[i] > 1e-10 and stds[j] > 1e-10:
-                corr = sample_cov[i, j] / (stds[i] * stds[j])
-                avg_corr += corr
+                avg_corr += sample_cov[i, j] / (stds[i] * stds[j])
                 count += 1
-    if count > 0:
-        avg_corr /= count
-    else:
-        avg_corr = 0.0
+    avg_corr = avg_corr / count if count > 0 else 0.0
 
-    # Build target matrix
-    target = np.zeros((p, p))
+    # Constant-correlation target
+    target = np.empty((p, p))
     for i in range(p):
         for j in range(p):
             if i == j:
-                target[i, j] = sample_cov[i, j]
+                target[i, j] = sample_cov[i, i]
             else:
                 target[i, j] = avg_corr * stds[i] * stds[j]
 
-    # --- Optimal shrinkage intensity ---
-    # γ̂ = Σᵢⱼ (f_{ij} - s_{ij})²
+    # pi_hat = sum over all (i,j) of var(s_ij); theta[i] = pi_ii
+    pi_hat = 0.0
+    theta = np.zeros(p)
+    for i in range(p):
+        for j in range(i, p):
+            v = 0.0
+            for t in range(n):
+                dev = demeaned[t, i] * demeaned[t, j] - sample_cov[i, j]
+                v += dev * dev
+            v /= n
+            if i == j:
+                theta[i] = v
+                pi_hat += v
+            else:
+                pi_hat += 2.0 * v
+
+    theta_hat = 0.0
+    for i in range(p):
+        theta_hat += theta[i]
+
+    # rho_hat = sum_i pi_ii + sum_{i != j} (r/2)(...). Summing each
+    # unordered pair once with the two symmetric terms equals the ordered sum.
+    rho_hat = theta_hat
+    for i in range(p):
+        for j in range(i + 1, p):
+            if stds[i] <= 1e-10 or stds[j] <= 1e-10:
+                continue
+            theta_ii_ij = 0.0
+            theta_jj_ij = 0.0
+            for t in range(n):
+                dev_ij = demeaned[t, i] * demeaned[t, j] - sample_cov[i, j]
+                theta_ii_ij += (
+                    demeaned[t, i] * demeaned[t, i] - sample_cov[i, i]
+                ) * dev_ij
+                theta_jj_ij += (
+                    demeaned[t, j] * demeaned[t, j] - sample_cov[j, j]
+                ) * dev_ij
+            theta_ii_ij /= n
+            theta_jj_ij /= n
+            rho_hat += avg_corr * (
+                np.sqrt(sample_cov[j, j] / sample_cov[i, i]) * theta_ii_ij
+                + np.sqrt(sample_cov[i, i] / sample_cov[j, j]) * theta_jj_ij
+            )
+
+    # gamma_hat = ||target - sample||_F^2
     gamma_hat = 0.0
     for i in range(p):
         for j in range(p):
             diff = target[i, j] - sample_cov[i, j]
             gamma_hat += diff * diff
 
-    # π̂ = Σᵢⱼ var(s_{ij}) — summed over all entries
-    # For each entry, var(s_{ij}) ≈ (1/n) * Σₜ [(xₜᵢ-μᵢ)(xₜⱼ-μⱼ) - s_{ij}]²
-    pi_hat = 0.0
-    for i in range(p):
-        for j in range(p):
-            var_ij = 0.0
-            for t in range(n):
-                dev = demeaned[t, i] * demeaned[t, j] - sample_cov[i, j]
-                var_ij += dev * dev
-            pi_hat += var_ij / n
-
-    # ρ̂ = Σᵢⱼ cov(s_{ij}, f_{ij})
-    # Under constant correlation target, f_{ij} depends on sᵢᵢ, sⱼⱼ, and avg_corr
-    # We use the asymptotic approximation: ρ̂ = Σᵢⱼ var(f_{ij})
-    # which simplifies for the constant correlation target.
-    rho_hat = 0.0
-    for i in range(p):
-        for j in range(p):
-            if i == j:
-                # fᵢᵢ = sᵢᵢ, so var(fᵢᵢ) = var(sᵢᵢ)
-                var_ii = 0.0
-                for t in range(n):
-                    dev = demeaned[t, i] * demeaned[t, i] - sample_cov[i, i]
-                    var_ii += dev * dev
-                rho_hat += var_ii / n
-            else:
-                # fᵢⱼ = avg_corr * stdᵢ * stdⱼ
-                # The asymptotic covariance is approximately θ * fᵢⱼ where
-                # θ = var(avg_corr) / avg_corr + ...
-                # For simplicity, approximate as 0 (target is near-deterministic
-                # for large n relative to p, and the shrinkage formula is robust)
-                pass
-
-    # κ̂ = π̂ - ρ̂
-    kappa = max(0.0, pi_hat - rho_hat)
-
-    # δ* = max(0, min(1, κ̂ / (n × γ̂)))
-    denom = n * max(gamma_hat, 1e-10)
-    shrinkage = kappa / denom
-    shrinkage = max(0.0, min(1.0, shrinkage))
+    if gamma_hat < 1e-12:
+        # The target already equals the sample covariance.
+        shrinkage = 0.0
+    else:
+        kappa = max(0.0, pi_hat - rho_hat)
+        shrinkage = kappa / (n * gamma_hat)
+        shrinkage = max(0.0, min(1.0, shrinkage))
 
     return (1 - shrinkage) * sample_cov + shrinkage * target
 
@@ -418,7 +496,9 @@ def covariance_numba(returns: pd.DataFrame) -> pd.DataFrame:
 def _zscore_numba(data: np.ndarray) -> np.ndarray:
     """Numba JIT: cross-sectional zscore standardization.
 
-    For each row (date), computes (x - mean) / std.
+    For each row (date), computes (x - mean) / std with the **population**
+    standard deviation (``ddof=0``). This is the documented convention for
+    both the accelerated and the pure-pandas path; see :func:`zscore_numba`.
     """
     n_rows, n_cols = data.shape
     result = data.copy()
@@ -443,7 +523,15 @@ def _zscore_numba(data: np.ndarray) -> np.ndarray:
 
 
 def zscore_numba(factor: pd.DataFrame) -> pd.DataFrame:
-    """Numba-accelerated zscore standardization with auto-fallback."""
+    """Numba-accelerated zscore standardization with auto-fallback.
+
+    Both paths divide by the **population** standard deviation
+    (``ddof=0``), matching :func:`_zscore_numba`. The pandas fallback used
+    ``Series.std()`` (``ddof=1``), so the two paths disagreed by
+    ``sqrt(n/(n-1))`` -- 5.1% at a 10-asset cross-section -- whenever the
+    accelerated kernel was unavailable. The population convention keeps
+    production factor values unchanged on the accelerated path.
+    """
     if HAS_NUMBA and factor.shape[1] >= 10:
         arr = factor.values.astype(np.float64)
         result = _zscore_numba(arr)
@@ -457,7 +545,7 @@ def zscore_numba(factor: pd.DataFrame) -> pd.DataFrame:
         if len(valid) < 10:
             continue
         mu = valid.mean()
-        sigma = valid.std()
+        sigma = valid.std(ddof=0)
         if sigma < 1e-10:
             result.loc[date] = 0.0
         else:

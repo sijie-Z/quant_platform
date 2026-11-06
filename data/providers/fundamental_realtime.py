@@ -1,9 +1,9 @@
 """Real-time fundamental data provider.
 
-Fetches real-time PE/PB/ROE and other fundamental metrics from public APIs:
-- 东方财富 (East Money) public API
-- 新浪财经 (Sina Finance) API
-- Tushare (if token available)
+Fetches real-time PE/PB and market-cap data from the public East Money API.
+When the API is unreachable, the provider falls back to synthetic values and
+**marks them** (`source="synthetic"`, `is_synthetic=True`) so callers and the
+API can tell fabricated numbers from real ones.
 
 Includes:
 - In-memory cache with configurable TTL
@@ -13,15 +13,15 @@ Includes:
 Usage:
     fd = FundamentalDataProvider()
     metrics = fd.get_fundamentals("600519")
-    # {'pe_ttm': 33.5, 'pb': 11.2, 'roe': 31.5, 'market_cap': 2.1e12, ...}
-
-    bulk = fd.get_bulk(["600519", "000001", "300750"])
+    # {'pe_ttm': 33.5, 'pb': 11.2, 'market_cap': 2.1e12, ...}
 """
 
 from __future__ import annotations
 
+import math
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -34,7 +34,12 @@ logger = get_logger(__name__)
 
 @dataclass
 class FundamentalMetrics:
-    """Real-time fundamental metrics for a stock."""
+    """Real-time fundamental metrics for a stock.
+
+    `source` names where the numbers came from ("eastmoney" or "synthetic");
+    `is_synthetic` is the machine-readable flag. Unavailable ratios stay at
+    0.0, which consumers must treat as unknown rather than as a real zero.
+    """
     code: str
     name: str = ""
     pe_ttm: float = 0.0
@@ -57,6 +62,8 @@ class FundamentalMetrics:
     net_profit: float = 0.0
     eps: float = 0.0
     bvps: float = 0.0
+    source: str = ""
+    is_synthetic: bool = False
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> dict:
@@ -65,16 +72,28 @@ class FundamentalMetrics:
     def to_series(self) -> pd.Series:
         return pd.Series(self.to_dict())
 
+    def to_frame(self) -> pd.DataFrame:
+        """One-row frame that **keeps** provenance (``source``/``is_synthetic``).
+
+        Dropping those columns made fabricated fallback values
+        indistinguishable from live data once they left the dataclass.
+        """
+        return pd.DataFrame([self.to_dict()])
+
 
 class FundamentalDataProvider:
     """Real-time fundamental data provider with caching and rate limiting.
 
-    Fetches PE/PB/ROE from public APIs. No API key required.
+    Fetches PE/PB and market cap from the public East Money API. No API key
+    required. When the API fails, synthetic values are returned with
+    `source="synthetic"` and `is_synthetic=True`.
 
     Args:
         cache_ttl: Cache time-to-live in seconds
         rate_limit: Minimum seconds between API calls per source
-        source: Preferred data source ("eastmoney", "sina")
+        source: Preferred data source (only "eastmoney" is implemented)
+        strict: When True, an unavailable live API raises instead of
+            returning flagged synthetic values (fail closed).
     """
 
     def __init__(
@@ -82,10 +101,12 @@ class FundamentalDataProvider:
         cache_ttl: int = 300,
         rate_limit: float = 0.5,
         source: str = "eastmoney",
+        strict: bool = False,
     ):
         self._cache_ttl = cache_ttl
         self._rate_limit = rate_limit
         self._source = source
+        self._strict = bool(strict)
 
         self._cache: dict[str, tuple[float, FundamentalMetrics]] = {}
         self._lock = threading.Lock()
@@ -93,6 +114,9 @@ class FundamentalDataProvider:
         self._request_count = 0
         self._cache_hits = 0
         self._cache_misses = 0
+        self._live_count = 0
+        self._synthetic_count = 0
+        self._last_source = ""
 
     def get_fundamentals(self, code: str) -> FundamentalMetrics:
         """Get real-time fundamental metrics for a stock.
@@ -156,16 +180,24 @@ class FundamentalDataProvider:
         return result
 
     def get_as_dataframe(self, codes: list[str]) -> pd.DataFrame:
-        """Get fundamentals as a DataFrame (stocks x metrics)."""
+        """Get fundamentals as a DataFrame (stocks x metrics).
+
+        Provenance columns (``source``/``is_synthetic``, plus ``name`` and
+        ``timestamp``) are preserved so callers can tell live numbers from
+        synthetic fallbacks; they are not coerced to numeric.
+        """
         metrics = self.get_bulk(codes)
         data = {code: m.to_dict() for code, m in metrics.items()}
         df = pd.DataFrame(data).T
         df.index.name = "code"
-        # Drop non-numeric columns
-        for col in ["name", "timestamp"]:
-            if col in df.columns:
-                df = df.drop(columns=[col])
-        return df.apply(pd.to_numeric, errors="coerce")
+        provenance_cols = [
+            col for col in ("name", "timestamp", "source", "is_synthetic")
+            if col in df.columns
+        ]
+        numeric_cols = [col for col in df.columns if col not in provenance_cols]
+        if numeric_cols:
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        return df
 
     def clear_cache(self):
         """Clear the cache."""
@@ -176,8 +208,12 @@ class FundamentalDataProvider:
     def stats(self) -> dict:
         return {
             "source": self._source,
+            "last_source": self._last_source,
+            "live_count": self._live_count,
+            "synthetic_count": self._synthetic_count,
             "cached": len(self._cache),
             "cache_ttl": self._cache_ttl,
+            "strict": self._strict,
             "request_count": self._request_count,
             "cache_hits": self._cache_hits,
             "cache_misses": self._cache_misses,
@@ -205,36 +241,48 @@ class FundamentalDataProvider:
         self._last_request_time = time.time()
 
     def _fetch_from_api(self, code: str) -> FundamentalMetrics:
-        """Fetch fundamental data from API.
+        """Fetch fundamental data, falling back to *flagged* synthetic values.
 
-        In production, this would make HTTP requests to East Money/Sina.
-        For the demo, we generate realistic synthetic data.
+        The fallback used to be indistinguishable from live data: the object
+        carried no provenance and `stats` still reported the configured
+        source. Every caller now receives `is_synthetic=True` when the numbers
+        were generated.
         """
         self._request_count += 1
 
-        # Try real API first
         try:
-            return self._fetch_eastmoney(code)
+            metrics = self._fetch_eastmoney(code)
+            self._live_count += 1
+            self._last_source = metrics.source
+            return metrics
         except Exception as e:
             logger.debug("East Money API failed for %s: %s", code, e)
+            if self._strict:
+                # Fail closed: never fabricate ratios in strict mode.
+                raise RuntimeError(
+                    f"live fundamentals unavailable for {code} (strict mode): {e}"
+                ) from e
 
-        try:
-            return self._fetch_sina(code)
-        except Exception as e:
-            logger.debug("Sina API failed for %s: %s", code, e)
-
-        # Fallback: generate synthetic fundamentals
-        return self._generate_synthetic(code)
+        logger.info("Using synthetic fundamentals for %s (live API unavailable)", code)
+        metrics = self._generate_synthetic(code)
+        self._synthetic_count += 1
+        self._last_source = metrics.source
+        return metrics
 
     def _fetch_eastmoney(self, code: str) -> FundamentalMetrics:
-        """Fetch from East Money public API.
+        """Fetch from East Money's `qt/stock/get` endpoint.
 
-        Endpoint: http://push2.eastmoney.com/api/qt/stock/get
+        Field ids: f58 name, f162 PE(TTM), f167 PB, f116 total market cap,
+        f117 circulating market cap. Prices/ratios in this endpoint are
+        scaled by 100 (f162=1860 means 18.60), market caps are in yuan.
+
+        The previous request asked for f9/f23, which belong to the unrelated
+        `clist` endpoint: `stock/get` never returns them, so PE and PB were
+        always 0.0 while the response looked successful.
         """
         import json
         import urllib.request
 
-        # Determine market prefix
         if code.startswith("6"):
             secid = f"1.{code}"
         else:
@@ -243,7 +291,7 @@ class FundamentalDataProvider:
         url = (
             f"http://push2.eastmoney.com/api/qt/stock/get"
             f"?secid={secid}"
-            f"&fields=f9,f23,f115,f114,f116,f117"
+            f"&fields=f58,f162,f167,f116,f117"
         )
 
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -254,50 +302,38 @@ class FundamentalDataProvider:
             raise ValueError("No data returned")
 
         d = data["data"]
-        return FundamentalMetrics(
-            code=code,
-            pe_ttm=float(d.get("f9", 0) or 0),
-            pb=float(d.get("f23", 0) or 0),
-            roe=float(d.get("f115", 0) or 0),
-            gross_margin=float(d.get("f114", 0) or 0),
-            net_margin=float(d.get("f116", 0) or 0),
-            revenue_growth=float(d.get("f117", 0) or 0),
-        )
 
-    def _fetch_sina(self, code: str) -> FundamentalMetrics:
-        """Fetch from Sina Finance API.
+        def _num(key: str) -> float:
+            value = d.get(key)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return 0.0
+            return value if math.isfinite(value) else 0.0
 
-        Endpoint: http://hq.sinajs.cn/list=sh600519
-        """
-        import urllib.request
-
-        prefix = "sh" if code.startswith("6") else "sz"
-        url = f"http://hq.sinajs.cn/list={prefix}{code}"
-
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "http://finance.sina.com.cn",
-        })
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            text = resp.read().decode("gbk")
-
-        # Parse Sina format: var hq_str_sh600519="name,open,prev_close,..."
-        parts = text.split('"')[1].split(",")
-        if len(parts) < 32:
-            raise ValueError("Invalid Sina response")
+        pe_ttm = _num("f162") / 100.0
+        pb = _num("f167") / 100.0
+        if pe_ttm == 0.0 and pb == 0.0:
+            raise ValueError("East Money returned no valuation fields")
 
         return FundamentalMetrics(
             code=code,
-            name=parts[0],
-            open=float(parts[1] or 0),
-            prev_close=float(parts[2] or 0),
+            name=str(d.get("f58") or ""),
+            pe_ttm=pe_ttm,
+            pb=pb,
+            market_cap=_num("f116"),
+            circulating_cap=_num("f117"),
+            source="eastmoney",
         )
 
     def _generate_synthetic(self, code: str) -> FundamentalMetrics:
-        """Generate realistic synthetic fundamental data."""
+        """Generate stable synthetic fundamentals, flagged as such."""
         import numpy as np
 
-        rng = np.random.default_rng(hash(code) % 2**32)
+        # `hash(code)` is salted per process, so the same stock reported
+        # different PE/PB after every server restart. crc32 is stable.
+        seed = zlib.crc32(code.encode("utf-8"))
+        rng = np.random.default_rng(seed)
 
         # Realistic ranges for A-share stocks
         pe = max(1, rng.lognormal(3, 0.8))  # median ~20, range ~3-200
@@ -327,7 +363,26 @@ class FundamentalDataProvider:
             net_profit=round(market_cap * rng.uniform(0.02, 0.15), 0),
             eps=round(rng.uniform(0.5, 10), 2),
             bvps=round(rng.uniform(3, 50), 2),
+            source="synthetic",
+            is_synthetic=True,
         )
+
+
+def _known(value: float | None) -> bool:
+    """Whether a metric is real rather than the dataclass's "unavailable" 0.
+
+    A listed company cannot have a PE, PB, ROE, market cap or debt ratio of
+    exactly zero; 0.0 is what the provider leaves behind when the API did not
+    supply the field. Screening used to treat those zeros as values, so
+    `pe_max=20` passed every stock and `pb_min=1` rejected every stock.
+    """
+    if value is None:
+        return False
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and value != 0.0
 
 
 class FundamentalScreener:
@@ -375,25 +430,33 @@ class FundamentalScreener:
         passed = []
 
         for code, m in metrics.items():
-            if pe_min is not None and m.pe_ttm < pe_min:
+            if pe_min is not None and not (_known(m.pe_ttm) and m.pe_ttm >= pe_min):
                 continue
-            if pe_max is not None and m.pe_ttm > pe_max:
+            if pe_max is not None and not (_known(m.pe_ttm) and m.pe_ttm <= pe_max):
                 continue
-            if pb_min is not None and m.pb < pb_min:
+            if pb_min is not None and not (_known(m.pb) and m.pb >= pb_min):
                 continue
-            if pb_max is not None and m.pb > pb_max:
+            if pb_max is not None and not (_known(m.pb) and m.pb <= pb_max):
                 continue
-            if roe_min is not None and m.roe < roe_min:
+            if roe_min is not None and not (_known(m.roe) and m.roe >= roe_min):
                 continue
-            if roe_max is not None and m.roe > roe_max:
+            if roe_max is not None and not (_known(m.roe) and m.roe <= roe_max):
                 continue
-            if market_cap_min is not None and m.market_cap < market_cap_min:
+            if market_cap_min is not None and not (
+                _known(m.market_cap) and m.market_cap >= market_cap_min
+            ):
                 continue
-            if market_cap_max is not None and m.market_cap > market_cap_max:
+            if market_cap_max is not None and not (
+                _known(m.market_cap) and m.market_cap <= market_cap_max
+            ):
                 continue
-            if dividend_yield_min is not None and m.dividend_yield < dividend_yield_min:
+            if dividend_yield_min is not None and not (
+                _known(m.dividend_yield) and m.dividend_yield >= dividend_yield_min
+            ):
                 continue
-            if debt_ratio_max is not None and m.debt_ratio > debt_ratio_max:
+            if debt_ratio_max is not None and not (
+                _known(m.debt_ratio) and m.debt_ratio <= debt_ratio_max
+            ):
                 continue
             passed.append(code)
 
@@ -422,8 +485,8 @@ class FundamentalScreener:
         ranked = []
         for code, m in metrics.items():
             value = getattr(m, metric, None)
-            if value is not None:
-                ranked.append((code, value))
+            if _known(value):
+                ranked.append((code, float(value)))
 
         ranked.sort(key=lambda x: x[1], reverse=not ascending)
         if top_n:

@@ -72,9 +72,13 @@ function pct(v) {
 }
 
 function shortScenario(s) {
+  // Match the labels `risk/stress.py` actually emits; the old list used the
+  // demo-only "2020 COVID-19 Shock" and left real rows unshortened.
   return s
+    .replace('2008 Global Financial Crisis', '2008 Crisis')
     .replace('2008 Financial Crisis', '2008 Crisis')
     .replace('2015 A-Share Crash', '2015 Crash')
+    .replace('2020 COVID-19 Crash', '2020 COVID')
     .replace('2020 COVID-19 Shock', '2020 COVID')
 }
 

@@ -29,7 +29,7 @@
         </div>
         <div class="fs-stat">
           <span class="fs-stat-label">Significance</span>
-          <span :class="['fs-stat-value', sigClass(activeItem.t_stat)]">{{ significance(activeItem.t_stat) }}</span>
+          <span :class="['fs-stat-value', tStatClass(activeItem.t_stat)]">{{ significance(activeItem.t_stat) }}</span>
         </div>
       </div>
     </template>
@@ -145,6 +145,9 @@ function renderChart() {
   })
 
   if (window.ResizeObserver) {
+    // The chart is disposed/re-created on every data change; drop the previous
+    // observer instead of accumulating one per render.
+    if (resizeObserver) resizeObserver.disconnect()
     resizeObserver = new ResizeObserver(() => chartInstance?.resize())
     resizeObserver.observe(chartRef.value)
   }
@@ -157,7 +160,9 @@ function computeRegressionLine(points) {
   for (const p of points) {
     sx += p.x; sy += p.y; sxy += p.x * p.y; sx2 += p.x * p.x
   }
-  const slope = (n * sxy - sx * sy) / (n * sxy - sx * sx || 1)
+  // OLS slope denominator is n*Σx² − (Σx)²; using sxy here drew a wrong
+  // dashed trend line whenever Σxy ≠ Σx².
+  const slope = (n * sxy - sx * sy) / (n * sx2 - sx * sx || 1)
   const intercept = (sy - slope * sx) / n
   const minX = Math.min(...points.map(p => p.x))
   const maxX = Math.max(...points.map(p => p.x))

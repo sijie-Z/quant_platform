@@ -5,13 +5,15 @@ pipeline raised on the way to storing its result, so every run was marked
 `failed` and `/api/run/{id}/result` returned 404.
 """
 
+import asyncio
 import inspect
 import json
 
 import pytest
+from fastapi import HTTPException
 
 from quant_platform.api import routes
-from quant_platform.api.schemas import RunRequest, RunResult
+from quant_platform.api.schemas import RiskDecomposeRequest, RunRequest, RunResult
 
 
 class TestThePipelineCompletes:
@@ -41,6 +43,18 @@ class TestThePipelineCompletes:
         assert status["status"] == "completed", status.get("error")
         assert completed_run in routes._run_store
 
+    def test_the_data_quality_report_is_retained(self, completed_run):
+        """The run record does not keep the price panel; the panel endpoint
+        used to 422 for every completed run."""
+        record = routes._run_store[completed_run]
+        report = record["data_quality"]
+
+        assert report["total_checks"] > 0
+        assert "pass_rate" in report
+
+        served = routes.data_quality_check({"run_id": completed_run})
+        assert served["total_checks"] == report["total_checks"]
+
     def test_the_stored_record_is_plain_python(self, completed_run):
         """Not Pydantic models. Every consumer reads it as a dict of dicts --
         `result.get("chart_data", {}).get("equity", [])` in the Monte Carlo,
@@ -61,16 +75,33 @@ class TestThePipelineCompletes:
                 yield path, type(obj).__name__
 
         assert list(offenders(record)) == [], "the run store holds model objects"
-        json.dumps(record)  # must be serialisable without a custom encoder
+        # allow_nan=False mirrors Starlette's strict JSON encoder: a single
+        # NaN in the record turned GET /result and GET /factors into 500.
+        json.dumps(record, allow_nan=False)
 
     def test_every_consumer_of_the_store_runs(self, completed_run):
         record = routes._run_store[completed_run]
 
-        routes._decompose_risk(record)
-        routes._detect_regime(record)
-        routes._run_monte_carlo(record, {})
+        # Risk decomposition and walk-forward no longer read stored runs:
+        # they compute from the research context (see test_endpoint_wiring).
+        # Their run_id gate still behaves for an unknown id.
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(routes.decompose_risk(RiskDecomposeRequest(run_id="nope")))
+        assert exc.value.status_code == 400
 
-        RunResult(
+        regime = routes._detect_regime(record)
+        assert "error" not in regime, regime.get("error")
+        assert regime["overall_regime"] in {
+            "risk_on", "neutral", "cautious", "risk_off",
+        }
+        assert isinstance(regime["history"], list)
+
+        mc = routes._run_monte_carlo(record, {})
+        assert "error" not in mc, mc.get("error")
+        assert mc["n_simulations"] == 1000
+        assert len(mc["terminal_values"]) > 0
+
+        result = RunResult(
             run_id=completed_run,
             performance=record.get("performance"),
             risk=record.get("risk"),
@@ -79,6 +110,8 @@ class TestThePipelineCompletes:
             exposure=record.get("exposure"),
             chart_data=record.get("chart_data"),
         )
+        assert result.run_id == completed_run
+        assert result.performance is not None
 
 
 class TestRiskDecompositionIsNotInvented:
@@ -87,31 +120,24 @@ class TestRiskDecompositionIsNotInvented:
     The numbers were internally consistent, so a test written against its
     output would have passed -- `total_risk` was the literal 15.2, a factor's
     risk share was `icir * 15`, its beta `0.5 + icir * 0.3`, and its
-    t-statistic `icir * sqrt(252)`.
+    t-statistic `icir * sqrt(252)`. It now fits the Barra model (shared with
+    POST /api/barra/decompose) on the research context.
     """
 
-    def test_it_reports_unavailable(self):
-        record = {"factors": [{"name": "momentum_3m", "mean_ic": 0.02, "icir": 0.4}],
-                  "chart_data": {"equity": [1.2], "dates": ["2024-01-01"]}}
-        out = routes._decompose_risk(record)
-
-        assert out["available"] is False
-        assert out["factors"] == []
-        assert out["total_risk_pct"] is None
-        assert "factor panel" in out["reason"]
-
     def test_the_invented_constants_are_gone(self):
-        body = inspect.getsource(routes._decompose_risk).split('"""')[2]
+        body = inspect.getsource(routes._decompose_risk)
         assert "15.2" not in body, "the hardcoded total risk is back"
         assert "icir * 15" not in body, "risk shares derived from ICIR are back"
         assert "0.5 + icir" not in body, "betas derived from ICIR are back"
 
-    def test_it_no_longer_raises_on_the_stored_shape(self):
-        """The original crash: the stored factor entries are read with `.get`."""
-        record = {"factors": [{"name": "roe", "mean_ic": 0.01, "std_ic": 0.03,
-                               "icir": 0.33, "ic_positive_ratio": 0.5}],
-                  "chart_data": {}}
-        assert routes._decompose_risk(record)["available"] is False
+    def test_it_uses_the_shared_barra_fit(self):
+        body = inspect.getsource(routes._decompose_risk)
+        assert "_barra_decomposition" in body, (
+            "risk decomposition duplicated the Barra math instead of sharing it"
+        )
+        assert "_run_store" not in body, (
+            "risk decomposition still reads stored IC summaries"
+        )
 
 
 class TestNoPandasTruthinessInThePipeline:

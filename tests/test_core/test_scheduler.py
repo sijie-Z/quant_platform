@@ -1,5 +1,7 @@
 """Tests for core.scheduler — Trading scheduler."""
 
+from datetime import UTC
+
 import pytest
 
 from quant_platform.core.events import EventBus
@@ -24,3 +26,220 @@ class TestTradingScheduler:
         session = scheduler.get_market_session()
         assert session is not None
         assert hasattr(session, 'status')
+
+
+class TestMarketClock:
+    """`datetime.now()` on a UTC host (the shipped Docker image) put the
+    session seven hours off, and every weekday holiday was treated as a
+    trading day."""
+
+    def test_a_utc_host_is_read_as_shanghai_time(self, scheduler):
+        from datetime import datetime, timezone
+
+        # 01:35 UTC == 09:35 Beijing on a normal Monday.
+        session = scheduler.get_market_session(
+            now=datetime(2026, 10, 19, 1, 35, tzinfo=UTC)
+        )
+
+        assert session.status == "trading_am"
+        assert session.is_trading_day is True
+
+    def test_national_day_is_closed(self, scheduler):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        session = scheduler.get_market_session(
+            now=datetime(2026, 10, 1, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+
+        assert session.is_trading_day is False
+        assert session.status == "closed_holiday"
+
+    def test_spring_festival_is_closed(self, scheduler):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        session = scheduler.get_market_session(
+            now=datetime(2026, 2, 17, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+
+        assert session.status == "closed_holiday"
+
+    def test_a_normal_monday_after_the_holiday_is_open(self, scheduler):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        session = scheduler.get_market_session(
+            now=datetime(2026, 10, 8, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+
+        assert session.status == "trading_am"
+
+    def test_extra_holidays_can_be_configured(self, scheduler, monkeypatch):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        monkeypatch.setenv("QUANT_EXCHANGE_HOLIDAYS", "2026-11-02")
+        session = scheduler.get_market_session(
+            now=datetime(2026, 11, 2, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+
+        assert session.status == "closed_holiday"
+
+
+class TestClosingAuctionAndEodTiming:
+    """P6: the 14:57-15:00 closing call auction is part of the session.
+
+    The scheduler used to declare `post_market` (and run EOD reconciliation)
+    at 14:57, three minutes before the close, so `is_market_open()` was False
+    while the exchange was still trading.
+    """
+
+    @staticmethod
+    def _at(scheduler, hour, minute):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        return scheduler.get_market_session(
+            now=datetime(2026, 10, 20, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+
+    @pytest.mark.parametrize(("hour", "minute"), [(14, 57), (14, 58), (14, 59)])
+    def test_closing_auction_is_trading_time(self, scheduler, hour, minute):
+        session = self._at(scheduler, hour, minute)
+        assert session.status == "trading_pm"
+        assert session.is_trading_day is True
+
+    @pytest.mark.parametrize(("hour", "minute"), [(15, 0), (15, 15), (15, 29)])
+    def test_post_market_starts_at_1500(self, scheduler, hour, minute):
+        assert self._at(scheduler, hour, minute).status == "post_market"
+
+    def test_after_post_market_window_is_closed(self, scheduler):
+        assert self._at(scheduler, 15, 30).status == "closed"
+
+    @staticmethod
+    def _trading_scheduler(tmp_path):
+        from quant_platform.core.scheduler import TradingScheduler
+        from quant_platform.core.state_machine import (
+            PortfolioState,
+            PortfolioStateMachine,
+        )
+
+        store = Store(str(tmp_path / "eod_timing.db"))
+        sm = PortfolioStateMachine()
+        scheduler = TradingScheduler(state_machine=sm, store=store, bus=EventBus())
+        # S2: EOD no longer fabricates a 1,000,000 equity. Seed a persisted
+        # engine snapshot (the same row the live engine writes) so these
+        # timing tests exercise the state machine, not the equity fallback.
+        store.save_engine_state(
+            {"portfolio_value": 1_000_000.0, "cash": 1_000_000.0, "positions": []},
+            "live_engine:test",
+        )
+        sm.transition(PortfolioState.READY, "test")
+        sm.transition(PortfolioState.TRADING, "test")
+        return scheduler, store
+
+    def test_eod_reconciliation_does_not_run_during_the_closing_auction(
+        self, tmp_path, monkeypatch,
+    ):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from quant_platform.core.state_machine import PortfolioState
+
+        scheduler, store = self._trading_scheduler(tmp_path)
+        tz = ZoneInfo("Asia/Shanghai")
+        now = [datetime(2026, 10, 20, 14, 58, tzinfo=tz)]
+        monkeypatch.setattr(scheduler, "_now", lambda: now[0])
+
+        scheduler._tick()
+
+        assert store.has_eod_reconciliation("2026-10-20") is False
+        assert scheduler._sm.state == PortfolioState.TRADING
+
+        # One tick after the close: transition and reconcile.
+        now[0] = datetime(2026, 10, 20, 15, 0, tzinfo=tz)
+        scheduler._tick()
+
+        assert scheduler._sm.state == PortfolioState.POST_MARKET
+        assert store.has_eod_reconciliation("2026-10-20") is True
+
+
+class TestEodReconciliationIsIdempotent:
+    """`_do_eod_reconciliation` had no marker.
+
+    A scheduler restarted after the close ran it again and appended a second
+    P&L snapshot for the same day, double-counting that day in history.
+    """
+
+    @staticmethod
+    def _scheduler(tmp_path):
+        from quant_platform.core.scheduler import TradingScheduler
+        from quant_platform.core.state_machine import PortfolioStateMachine
+
+        store = Store(str(tmp_path / "eod.db"))
+        scheduler = TradingScheduler(
+            state_machine=PortfolioStateMachine(), store=store, bus=EventBus()
+        )
+        # S2: EOD requires a real equity source. Persist an engine snapshot so
+        # the assertions below stay about idempotency, not the (tested
+        # separately) skip-when-unavailable path.
+        store.save_engine_state(
+            {"portfolio_value": 1_000_000.0, "cash": 1_000_000.0, "positions": []},
+            "live_engine:test",
+        )
+        return scheduler, store
+
+    def test_two_runs_in_one_day_write_one_snapshot(self, tmp_path, monkeypatch):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        scheduler, store = self._scheduler(tmp_path)
+        # Pin the clock: a run straddling exchange-local midnight would
+        # otherwise be two different days.
+        monkeypatch.setattr(
+            scheduler, "_now",
+            lambda: datetime(2026, 10, 20, 15, 35, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        scheduler._do_eod_reconciliation()
+        scheduler._do_eod_reconciliation()
+
+        history = store.get_pnl_history(start_date="2026-10-01",
+                                        end_date="2026-10-31")
+        assert len(history) == 1
+
+    def test_today_is_marked_when_the_run_completes(self, tmp_path, monkeypatch):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        scheduler, store = self._scheduler(tmp_path)
+        monkeypatch.setattr(
+            scheduler, "_now",
+            lambda: datetime(2026, 10, 20, 15, 35, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        scheduler._do_eod_reconciliation()
+
+        assert store.has_eod_reconciliation("2026-10-20") is True
+
+    def test_a_new_day_gets_its_own_snapshot(self, tmp_path, monkeypatch):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        scheduler, store = self._scheduler(tmp_path)
+        tz = ZoneInfo("Asia/Shanghai")
+        now = [datetime(2026, 10, 20, 15, 35, tzinfo=tz)]
+        # _do_eod_reconciliation calls _now() twice per run; keep it fixed.
+        monkeypatch.setattr(scheduler, "_now", lambda: now[0])
+
+        scheduler._do_eod_reconciliation()
+        now[0] = datetime(2026, 10, 21, 15, 35, tzinfo=tz)
+        scheduler._do_eod_reconciliation()
+
+        history = store.get_pnl_history(start_date="2026-10-01",
+                                        end_date="2026-10-31")
+        assert len(history) == 2
+        assert store.has_eod_reconciliation("2026-10-20") is True
+        assert store.has_eod_reconciliation("2026-10-21") is True
+

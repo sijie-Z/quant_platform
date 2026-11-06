@@ -74,6 +74,11 @@ def exposure_report(
 
     if sector_map is not None:
         se = sector_exposure(weights, sector_map)
+        # The per-sector map was computed but never returned, so every
+        # consumer that reads `sector_exposure` (API ExposureInfo, CLI HTML
+        # report, dashboard) got an empty dict and the sector block silently
+        # disappeared on real runs while demo data hardcoded sectors.
+        report["sector_exposure"] = se
         report["max_sector_exposure"] = se.iloc[0] if len(se) > 0 else 0.0
         report["top_sector"] = se.index[0] if len(se) > 0 else None
         report["n_sectors"] = int((se > 1e-6).sum())

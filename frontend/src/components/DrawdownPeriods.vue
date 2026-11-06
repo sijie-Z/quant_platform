@@ -57,7 +57,12 @@ function depthClass(depth) {
 }
 
 function severityPct(depth) {
-  return Math.min(Math.abs(depth) * 100 / 0.35 * 100, 100)
+  // `depth` is a fraction (e.g. -0.05 = -5%). The old formula multiplied by
+  // 100/0.35*100, so every row deeper than ~0.35% rendered a full bar and the
+  // column carried no information. Scale a 35% drawdown to a full bar.
+  const abs = Math.abs(Number(depth))
+  if (!Number.isFinite(abs)) return 0
+  return Math.min(abs / 0.35 * 100, 100)
 }
 </script>
 

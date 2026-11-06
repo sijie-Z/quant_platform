@@ -95,6 +95,40 @@ class TestAMisalignedFactorIsDropped:
         assert "broken" not in aligned
         assert set(aligned) == {"f1", "f2", "f3"}
 
+
+class TestPartialNaNCoverage:
+    """A missing cell in one factor must not blank the asset."""
+
+    def test_one_missing_cell_does_not_blank_the_asset(self):
+        factors = _make_factors(n_dates=10, n_assets=5)
+        factors["f1"].iloc[0, 0] = np.nan
+
+        result = combine_equal_weight(factors)
+
+        # Missing = 0 (the cross-sectional mean of a z-scored factor); the
+        # denominator stays sum(|w|) = 1, so f1 contributes 0, not a
+        # renormalisation of the other two factors.
+        expected = (factors["f2"].iloc[0, 0] + factors["f3"].iloc[0, 0]) / 3
+        assert result.iloc[0, 0] == pytest.approx(expected)
+
+    def test_an_all_nan_factor_does_not_empty_the_signal(self):
+        factors = _make_factors(n_dates=10, n_assets=5)
+        factors["f1"][:] = np.nan
+
+        result = combine_equal_weight(factors)
+
+        assert result.shape == factors["f2"].shape
+        assert result.notna().all().all()
+
+    def test_disjoint_nan_masks_cover_the_union(self):
+        factors = _make_factors(n_dates=10, n_assets=6)
+        factors["f1"].iloc[:, :3] = np.nan
+        factors["f2"].iloc[:, 3:] = np.nan
+
+        result = combine_equal_weight(factors)
+
+        assert result.notna().all().all()
+
     def test_a_factor_with_a_stray_column_is_aligned_to_the_universe(self):
         factors = _make_factors()
         widened = factors["f3"].copy()
@@ -126,3 +160,57 @@ class TestAnEmptyCrossSectionDoesNotEraseTheRow:
         assert row is not None
         assert row.notna().any()
         assert set(row.dropna().index) == set(assets)
+
+
+class TestMissingFactorIsZeroNotARenormalisation:
+    """A missing factor must not change the scale of the signal.
+
+    The mask-aware denominator removed a missing factor from *both* numerator
+    and denominator, so under 0.8/0.2 weights an asset missing the dominant
+    factor was scored on the 0.2 factor alone (renormalised to 1.0) and could
+    outrank an asset that had both. Missing values are now filled with 0 --
+    the mean of a z-scored factor -- and the denominator is the fixed
+    ``sum(abs(w))``.
+    """
+
+    @staticmethod
+    def _aligned():
+        dates = pd.date_range("2023-01-02", periods=3, freq="B")
+        idx = dates[0]
+        main = pd.DataFrame(
+            {"A": [1.0, 1.0, 1.0], "B": [np.nan, np.nan, np.nan]}, index=dates
+        )
+        secondary = pd.DataFrame(
+            {"A": [1.0, 1.0, 1.0], "B": [1.2, 1.2, 1.2]}, index=dates
+        )
+        return _align_factors({"main": main, "secondary": secondary}), idx
+
+    def test_build_row_does_not_reward_the_missing_dominant_factor(self):
+        aligned, date = self._aligned()
+
+        row = _build_row(aligned, {"main": 0.8, "secondary": 0.2}, date)
+
+        # Old behaviour: A = 1.0, B = 1.2 -> B ranked above A.
+        # New: A = (0.8*1 + 0.2*1) / 1.0 = 1.0; B = (0 + 0.2*1.2) / 1.0 = 0.24.
+        assert row["A"] == pytest.approx(1.0)
+        assert row["B"] == pytest.approx(0.24)
+        assert row["A"] > row["B"]
+
+    def test_weighted_sum_uses_the_fixed_denominator(self):
+        aligned, date = self._aligned()
+
+        result = combine_equal_weight(dict(aligned))
+
+        # Equal weights 0.5 each, denominator 1.0 for every asset.
+        assert result.loc[date, "A"] == pytest.approx(1.0)
+        assert result.loc[date, "B"] == pytest.approx(0.6)
+
+    def test_full_coverage_is_unaffected(self):
+        dates = pd.date_range("2023-01-02", periods=2, freq="B")
+        aligned = _align_factors({
+            "f1": pd.DataFrame({"A": [1.0, 2.0], "B": [3.0, 4.0]}, index=dates),
+            "f2": pd.DataFrame({"A": [5.0, 6.0], "B": [7.0, 8.0]}, index=dates),
+        })
+        row = _build_row(aligned, {"f1": 0.8, "f2": 0.2}, dates[0])
+        assert row["A"] == pytest.approx(0.8 * 1.0 + 0.2 * 5.0)
+        assert row["B"] == pytest.approx(0.8 * 3.0 + 0.2 * 7.0)
