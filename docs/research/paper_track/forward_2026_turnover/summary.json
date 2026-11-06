@@ -1,232 +1,232 @@
 {
   "annualization_periods_per_year": 252,
   "benchmark": {
-    "annualized_return": -0.14489638077364342,
-    "annualized_volatility": 0.3679580228654352,
+    "annualized_return": -0.4345019342839067,
+    "annualized_volatility": 0.3566708732687073,
     "definition": "equal-weight daily-rebalanced mean of the cached universe's pct_chg close-to-close returns over the same window; stale observations are excluded from that session",
     "max_drawdown": -0.06509368718060005,
-    "sharpe_ratio": -0.4753161227785057,
-    "total_return": -0.005574853412512959
+    "sharpe_ratio": -1.302326511909937,
+    "total_return": -0.022367032664985853
   },
   "benchmark_definition": "equal-weight daily-rebalanced mean of the cached universe's pct_chg close-to-close returns over the same window; stale observations are excluded from that session",
   "book": {
-    "as_of": "2026-11-05",
+    "as_of": "2026-11-06",
     "cash": 0.0,
     "positions": [
       {
         "code": "000543",
-        "reference_price": 7.197563152405473,
-        "shares": 8019.938030380498,
-        "value": 57724.010452042
+        "reference_price": 7.370996871082011,
+        "shares": 7982.186819683391,
+        "value": 58836.67407227834
       },
       {
         "code": "000631",
-        "reference_price": 2.785029716778856,
-        "shares": 23660.445430799504,
-        "value": 65895.04363700112
+        "reference_price": 2.923212405796774,
+        "shares": 23428.398471140663,
+        "value": 68486.18505878856
       },
       {
         "code": "000726",
-        "reference_price": 5.977891053494221,
-        "shares": 1545.9319288237543,
-        "value": 9241.412646626586
+        "reference_price": 5.968831987200368,
+        "shares": 1543.0223312123194,
+        "value": 9210.041047504574
       },
       {
         "code": "000755",
-        "reference_price": 4.828674758586464,
-        "shares": 19035.733025224763,
-        "value": 91917.36357009357
+        "reference_price": 4.841966284726208,
+        "shares": 19061.761032032544,
+        "value": 92296.40424460942
       },
       {
         "code": "000801",
-        "reference_price": 10.420414491480033,
-        "shares": 1549.945860864014,
-        "value": 16151.078309556866
+        "reference_price": 10.400184843612635,
+        "shares": 1542.5348419744691,
+        "value": 16042.647484247285
       },
       {
         "code": "000883",
-        "reference_price": 4.290417260039875,
-        "shares": 23417.558342355147,
-        "value": 100471.09650003129
+        "reference_price": 4.2865291196014,
+        "shares": 23491.6888358477,
+        "value": 100697.80826347627
       },
       {
         "code": "000948",
-        "reference_price": 13.561302118662415,
-        "shares": 2794.3559679661093,
-        "value": 37895.10550867576
+        "reference_price": 13.481668635284375,
+        "shares": 2761.492420487819,
+        "value": 37229.52575186616
       },
       {
         "code": "001256",
-        "reference_price": 18.25502550774858,
-        "shares": 1009.5310010811218,
-        "value": 18429.014175598837
+        "reference_price": 18.063669346631386,
+        "shares": 1002.2245307594576,
+        "value": 18103.85253472164
       },
       {
         "code": "002025",
-        "reference_price": 49.99960037265322,
-        "shares": 231.3103582544365,
-        "value": 11565.425474777072
+        "reference_price": 50.45785013950088,
+        "shares": 238.23422624051813,
+        "value": 12020.786885744012
       },
       {
         "code": "002262",
-        "reference_price": 22.942679513726965,
-        "shares": 4538.354294543737,
-        "value": 104122.00809946338
+        "reference_price": 22.93588810038556,
+        "shares": 4504.350558252665,
+        "value": 103311.28036899236
       },
       {
         "code": "002310",
-        "reference_price": 2.096697946564596,
-        "shares": 20740.788316260725,
-        "value": 43487.168272834824
+        "reference_price": 2.2537072218878698,
+        "shares": 21214.630465869,
+        "value": 47811.56589061138
       },
       {
         "code": "002508",
-        "reference_price": 16.010731586424715,
-        "shares": 6248.301129410753,
-        "value": 100039.87225414996
+        "reference_price": 16.1755033727801,
+        "shares": 6200.045393451427,
+        "value": 100288.85517316328
       },
       {
         "code": "002698",
-        "reference_price": 10.936528785205516,
-        "shares": 4873.679681717593,
-        "value": 53301.13812897571
+        "reference_price": 10.817983249278814,
+        "shares": 4836.092674723664,
+        "value": 52316.76954712057
       },
       {
         "code": "002920",
-        "reference_price": 80.62526710676157,
-        "shares": 173.81934897720564,
-        "value": 14014.231439610607
+        "reference_price": 79.78199963974777,
+        "shares": 172.3848427487617,
+        "value": 13753.207462079683
       },
       {
         "code": "002986",
-        "reference_price": 10.170954776397936,
-        "shares": 9092.155586931467,
-        "value": 92475.90329465379
+        "reference_price": 10.035366354996054,
+        "shares": 9025.217619029923,
+        "value": 90571.36524053049
       },
       {
         "code": "003018",
-        "reference_price": 33.168711598423535,
-        "shares": 847.0949171029558,
-        "value": 28097.047001878433
+        "reference_price": 31.113775025146534,
+        "shares": 846.0292432250826,
+        "value": 26323.163538400197
       },
       {
         "code": "003035",
-        "reference_price": 5.078698103386339,
-        "shares": 17522.907207715773,
+        "reference_price": 5.081052683566684,
+        "shares": 17514.78702227728,
         "value": 88993.5556016409
       },
       {
         "code": "300105",
-        "reference_price": 6.578750106774949,
-        "shares": 201.68811046676313,
-        "value": 1326.8556782684557
+        "reference_price": 6.504197304775136,
+        "shares": 200.90968288733512,
+        "value": 1306.7562179390325
       },
       {
         "code": "300559",
-        "reference_price": 10.492570192747777,
-        "shares": 4061.8411381178416,
-        "value": 42619.153253491975
+        "reference_price": 10.185725182828099,
+        "shares": 4100.614410989121,
+        "value": 41767.7314710797
       },
       {
         "code": "300636",
-        "reference_price": 6.642791372666767,
-        "shares": 15277.005355366737,
-        "value": 101481.95937481415
+        "reference_price": 6.6500060065610125,
+        "shares": 14990.690630148858,
+        "value": 99688.1827329878
       },
       {
         "code": "300888",
-        "reference_price": 30.624826981337392,
-        "shares": 3320.8197951402667,
+        "reference_price": 30.730989796996482,
+        "shares": 3309.347740967023,
         "value": 101699.53166237095
       },
       {
         "code": "301236",
-        "reference_price": 34.058588601305274,
-        "shares": 489.7058201479549,
-        "value": 16678.68906408399
+        "reference_price": 33.45597990698708,
+        "shares": 483.98391600519363,
+        "value": 16192.156169174681
       },
       {
         "code": "301356",
-        "reference_price": 21.36200845515494,
-        "shares": 508.6318169935075,
-        "value": 10865.397175176127
+        "reference_price": 21.49180567022962,
+        "shares": 507.42507159688313,
+        "value": 10905.481030962565
       },
       {
         "code": "600094",
-        "reference_price": 4.513454985780121,
-        "shares": 1209.8549140313173,
-        "value": 5460.625693805228
+        "reference_price": 4.587995302556107,
+        "shares": 1205.6557484978478,
+        "value": 5531.542910607893
       },
       {
         "code": "600388",
-        "reference_price": 17.163552004302428,
-        "shares": 6012.729477431994,
-        "value": 103199.79507370619
+        "reference_price": 17.55180166132425,
+        "shares": 5927.397193964528,
+        "value": 104036.49991635531
       },
       {
         "code": "600436",
-        "reference_price": 134.05924538094146,
-        "shares": 783.8920610664877,
-        "value": 105087.97816668423
+        "reference_price": 136.20234961106428,
+        "shares": 775.3773410218901,
+        "value": 105608.21568236088
       },
       {
         "code": "600579",
-        "reference_price": 6.7368832785902475,
-        "shares": 6252.9744620337415,
-        "value": 42125.55909472696
+        "reference_price": 6.713136561633761,
+        "shares": 6210.96118024138,
+        "value": 41695.030581966384
       },
       {
         "code": "600817",
-        "reference_price": 8.852295888671359,
-        "shares": 11411.658046956669,
-        "value": 101019.37361199794
+        "reference_price": 8.841194916991187,
+        "shares": 11348.098121993766,
+        "value": 100330.74743368852
       },
       {
         "code": "600872",
-        "reference_price": 19.981511387721426,
-        "shares": 4982.754671175934,
-        "value": 99562.96920432405
+        "reference_price": 20.235191948670053,
+        "shares": 4974.23614828973,
+        "value": 100654.62325865589
       },
       {
         "code": "601058",
-        "reference_price": 12.690470806562677,
-        "shares": 8645.217519704298,
-        "value": 109711.88055019159
+        "reference_price": 12.578936173155224,
+        "shares": 8564.31325225486,
+        "value": 107729.94976702132
       },
       {
         "code": "601100",
-        "reference_price": 91.17464897413082,
-        "shares": 1163.4327552931982,
-        "value": 106075.57306886319
+        "reference_price": 89.4226246747869,
+        "shares": 1153.4603351125581,
+        "value": 103145.45062402422
       },
       {
         "code": "603060",
-        "reference_price": 4.977333037894395,
-        "shares": 8182.202135197247,
-        "value": 40725.54501024732
+        "reference_price": 4.969473268329964,
+        "shares": 8146.627294917702,
+        "value": 40484.44656914077
       },
       {
         "code": "603380",
-        "reference_price": 25.387459907341412,
-        "shares": 337.15509925452733,
-        "value": 8559.511564880027
+        "reference_price": 24.51274968341072,
+        "shares": 337.79047385528776,
+        "value": 8280.173331055363
       },
       {
         "code": "603580",
-        "reference_price": 58.440157457717916,
-        "shares": 134.65825016304194,
-        "value": 7869.44934250894
+        "reference_price": 56.79397990848367,
+        "shares": 132.4604355758972,
+        "value": 7522.955316766502
       },
       {
         "code": "603726",
-        "reference_price": 21.887652792691753,
-        "shares": 4503.265093546942,
-        "value": 98565.90280100402
+        "reference_price": 21.389768262594085,
+        "shares": 4478.363779436215,
+        "value": 95791.16343773565
       }
     ],
-    "positions_value": 2036456.223758756
+    "positions_value": 2028664.3262796686
   },
-  "cache_last_date": "2026-11-05",
+  "cache_last_date": "2026-11-06",
   "capital": 2000000.0,
   "cost_mode": "impact",
   "costs": {
@@ -235,12 +235,12 @@
   },
   "disclaimer": "paper tracking only; style-tilt demo, not validated alpha",
   "first_ledger_date": "2026-10-26",
-  "last_ledger_date": "2026-11-05",
+  "last_ledger_date": "2026-11-06",
   "max_stale_sessions": 20,
   "mode": "rolling",
   "n_pending_targets": 0,
   "n_rebalances": 2,
-  "n_sessions": 9,
+  "n_sessions": 10,
   "n_targets": 2,
   "pending_targets": [],
   "raw_price_mode": "amount_over_volume",
@@ -278,15 +278,15 @@
   "risk_free_rate": 0.03,
   "roll_ledger_version": 1,
   "since_inception": {
-    "annualized_return": 0.6582970463049944,
-    "annualized_volatility": 0.23480910075436934,
-    "final_nav": 2036456.223759,
+    "annualized_return": 0.4313338873529895,
+    "annualized_volatility": 0.2233745012324481,
+    "final_nav": 2028664.32628,
     "max_drawdown": -0.030400944986499923,
     "max_drawdown_peak": null,
     "max_drawdown_trough": "2026-10-30",
     "n_stale_days": 0,
-    "sharpe_ratio": 2.675778086481612,
-    "total_return": 0.01822811187950002
+    "sharpe_ratio": 1.7966862159228871,
+    "total_return": 0.014332163139999965
   },
   "stale_policy": "a session is stale when the raw price amount/volume, pct_chg or volume is missing/invalid or the volume is zero; hold at the last valid raw price (return 0, flagged stale); when the price returns the resume-day pct_chg carries the gap return; after max_stale_sessions consecutive stale sessions, liquidate at the last valid raw price with no extra trade cost (no tradable price exists) and hold the proceeds as cash",
   "target_files": [
@@ -307,8 +307,8 @@
   ],
   "targets_sha256": "e643b1d80e93e43137243d9ca8209927b9d9375c17a39248ad17dff3f7c45002",
   "tracking": {
-    "difference": 0.02380296529201298,
-    "tracking_error": 0.1941757576615975
+    "difference": 0.03669919580498582,
+    "tracking_error": 0.19060792438508897
   },
   "tradable_gate": "execution buys require raw price amount/volume > 0, finite pct_chg, volume > 0 (R9 tradable_mask) and pct_chg <= 9.8% (R19a limit-up approximation); blocked weight stays in cash with a warning; at a rebalance, limit-down blocks the sell and limit-up blocks the buy",
   "turnover": {
