@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -48,7 +49,8 @@ def test_metrics_cumulative_matches_daily_compounding(evaluation):
     )
     # Initial capital is the first drawdown peak, so a first-day loss counts.
     first_day_only_loss = evaluation.metrics(pd.Series(
-        [1_990_000.0], index=pd.to_datetime(["2026-10-26"]),
+        [1_990_000.0, 1_990_000.0],
+        index=pd.to_datetime(["2026-10-26", "2026-10-27"]),
     ))
     assert first_day_only_loss["max_drawdown"] == pytest.approx(-0.005)
 
@@ -59,6 +61,42 @@ def test_metrics_rejects_non_finite_nav(evaluation):
             [2_000_000.0, float("nan")],
             index=pd.to_datetime(["2026-10-26", "2026-10-27"]),
         ))
+
+
+def test_metrics_reports_hac_interval_and_autocorrelation(evaluation):
+    returns = np.array([0.001, -0.002, 0.003, -0.001, 0.002, -0.003] * 4)
+    nav = pd.Series(
+        2_000_000.0 * np.cumprod(1.0 + returns),
+        index=pd.bdate_range("2026-10-26", periods=len(returns)),
+    )
+    result = evaluation.metrics(nav)
+    assert result["hac_lags"] >= 1
+    assert np.isfinite(result["sharpe_95ci_hac"]).all()
+    assert result["sharpe_95ci_hac"][0] < result["sharpe_rf0"] < result["sharpe_95ci_hac"][1]
+    assert result["ac1"] is not None
+
+
+def test_sharpe_ci_uses_lo_formula_with_years(evaluation):
+    returns = np.array([0.001, -0.002, 0.003, -0.001, 0.002, -0.003] * 4)
+    nav = pd.Series(
+        2_000_000.0 * np.cumprod(1.0 + returns),
+        index=pd.bdate_range("2026-10-26", periods=len(returns)),
+    )
+    result = evaluation.metrics(nav)
+    sr = result["sharpe_rf0"]
+    n = result["n_days"]
+    expected = np.sqrt(252.0 * (1.0 + 0.5 * sr ** 2) / n)
+    half_width = (result["sharpe_95ci"][1] - result["sharpe_95ci"][0]) / 2
+    assert half_width == pytest.approx(1.96 * expected, rel=1e-9)
+
+
+def test_metrics_rejects_zero_volatility(evaluation):
+    flat = pd.Series(
+        [2_000_000.0] * 5,
+        index=pd.bdate_range("2026-10-26", periods=5),
+    )
+    with pytest.raises(RuntimeError, match="zero or non-finite volatility"):
+        evaluation.metrics(flat)
 
 
 def test_st_cache_requires_coverage_through_evaluation_end(

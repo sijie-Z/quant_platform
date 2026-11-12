@@ -52,6 +52,20 @@ def load_nav(path: Path) -> pd.DataFrame:
     return frame
 
 
+def newey_west_se(returns: pd.Series) -> tuple[float, int]:
+    """Newey-West HAC standard error of the mean daily return."""
+    r = returns.to_numpy(dtype=float)
+    n = len(r)
+    lags = max(0, int(np.floor(4.0 * (n / 100.0) ** (2.0 / 9.0))))
+    mu = r.mean()
+    variance = float(np.mean((r - mu) ** 2))
+    for k in range(1, lags + 1):
+        weight = 1.0 - k / (lags + 1.0)
+        gamma = float(np.mean((r[k:] - mu) * (r[:-k] - mu)))
+        variance += 2.0 * weight * gamma
+    return float(np.sqrt(max(variance, 0.0) / n)), lags
+
+
 def metrics(nav: pd.Series) -> dict:
     if nav.empty or not np.isfinite(nav.astype(float)).all() or (nav <= 0).any():
         raise RuntimeError("NAV contains empty, non-finite, or non-positive values")
@@ -65,14 +79,20 @@ def metrics(nav: pd.Series) -> dict:
             f"daily returns compound to {compounded}, not cumulative NAV {cum}"
         )
     ann = (1.0 + cum) ** (252.0 / n) - 1.0
-    vol = returns.std(ddof=1) * np.sqrt(252.0)
+    sd = float(returns.std(ddof=1))
+    if not np.isfinite(sd) or sd <= 0:
+        raise RuntimeError("daily returns have zero or non-finite volatility")
+    vol = sd * np.sqrt(252.0)
     sharpe = np.sqrt(252.0) * returns.mean() / returns.std(ddof=1)
     sharpe_rf3 = np.sqrt(252.0) * (returns.mean() - 0.03 / 252.0) / returns.std(ddof=1)
     nav_path = pd.concat([
         pd.Series([CAPITAL], index=[nav.index[0] - pd.Timedelta(days=1)]), nav,
     ])
     drawdown = (nav_path / nav_path.cummax() - 1.0).min()
-    se = np.sqrt((1.0 + 0.5 * sharpe ** 2) / n)
+    # Lo (2002): SE(SR_annual) = sqrt((1 + SR^2/2) / T), T in years.
+    se = np.sqrt(252.0 * (1.0 + 0.5 * sharpe ** 2) / n)
+    se_hac_mu, hac_lags = newey_west_se(returns)
+    se_hac = float(np.sqrt(252.0) * se_hac_mu / returns.std(ddof=1))
     return {
         "n_days": int(n),
         "cum_return": float(cum),
@@ -81,6 +101,9 @@ def metrics(nav: pd.Series) -> dict:
         "sharpe_rf0": float(sharpe),
         "sharpe_rf3": float(sharpe_rf3),
         "sharpe_95ci": [float(sharpe - 1.96 * se), float(sharpe + 1.96 * se)],
+        "sharpe_95ci_hac": [float(sharpe - 1.96 * se_hac), float(sharpe + 1.96 * se_hac)],
+        "hac_lags": int(hac_lags),
+        "ac1": float(returns.autocorr(1)) if n > 2 else None,
         "max_drawdown": float(drawdown),
         "daily_returns": returns,
     }
