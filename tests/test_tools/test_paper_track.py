@@ -1188,13 +1188,17 @@ def test_roll_strictly_later_target_append_preserves_identity_prefix(
 ):
     close, volume, pct = make_panel({"A": [10.0] * 8, "B": [10.0] * 8})
     dates = close.index
+    short_cache = write_cache(
+        tmp_path / "cache_short.parquet",
+        close.iloc[:5], volume.iloc[:5], pct.iloc[:5],
+    )
     cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
     target_dir = tmp_path / "targets"
     write_target_files(target_dir, [
         (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
     ])
     out_dir = tmp_path / "out"
-    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    assert run_roll_tool(tool, short_cache, out_dir, targets_dir=target_dir) == 0
     initial = read_summary(out_dir)
     assert len(initial["target_identities"]) == 1
 
@@ -1214,6 +1218,30 @@ def test_roll_strictly_later_target_append_preserves_identity_prefix(
     assert summary["rebalances"][1]["execution_date"] == dates[5].strftime(
         "%Y-%m-%d"
     )
+
+
+def test_roll_refuses_target_append_inside_recorded_window(tool, tmp_path, capsys):
+    close, volume, pct = make_panel({"A": [10.0] * 8, "B": [10.0] * 8})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    nav_bytes = (out_dir / "nav.csv").read_bytes()
+
+    # A later as_of whose execution date falls inside the recorded window
+    # would rewrite already-published rows: the append-only barrier refuses.
+    write_target(
+        target_dir / "target_01.json", dates[4].strftime("%Y-%m-%d"),
+        {"A": 0.25, "B": 0.25},
+    )
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 2
+    stderr = capsys.readouterr().err
+    assert "append-only" in stderr
+    assert (out_dir / "nav.csv").read_bytes() == nav_bytes
 
 
 def test_roll_duplicate_as_of_names_both_files(tool, tmp_path, capsys):
@@ -1961,3 +1989,32 @@ def test_existing_ledger_refuses_a_different_raw_price_mode(
     ) == 2
     stderr = capsys.readouterr().err
     assert "raw price mode" in stderr
+
+
+def test_roll_refuses_to_rewrite_recorded_nav_rows(tool, tmp_path, capsys):
+    """A revised price history must never silently rewrite the ledger."""
+    close, volume, pct = make_panel({"A": [10.0] * 8, "B": [10.0] * 8})
+    dates = close.index
+    cache = write_cache(tmp_path / "cache.parquet", close, volume, pct)
+    target_dir = tmp_path / "targets"
+    write_target_files(target_dir, [
+        (dates[0].strftime("%Y-%m-%d"), {"A": 0.5}),
+    ])
+    out_dir = tmp_path / "out"
+    assert run_roll_tool(tool, cache, out_dir, targets_dir=target_dir) == 0
+    nav_bytes = (out_dir / "nav.csv").read_bytes()
+    summary_bytes = (out_dir / "summary.json").read_bytes()
+
+    revised_close, revised_volume, revised_pct = make_panel(
+        {"A": [10.0, 10.0, 10.0, 11.0, 11.0, 11.0, 11.0, 11.0],
+         "B": [10.0] * 8},
+    )
+    revised_cache = write_cache(
+        tmp_path / "cache_revised.parquet",
+        revised_close, revised_volume, revised_pct,
+    )
+    assert run_roll_tool(tool, revised_cache, out_dir, targets_dir=target_dir) == 2
+    stderr = capsys.readouterr().err
+    assert "append-only" in stderr
+    assert (out_dir / "nav.csv").read_bytes() == nav_bytes
+    assert (out_dir / "summary.json").read_bytes() == summary_bytes

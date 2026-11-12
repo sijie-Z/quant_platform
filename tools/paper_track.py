@@ -2160,6 +2160,38 @@ def _assert_roll_target_prefix(
             refuse("every appended target must have a strictly later as_of")
 
 
+def _assert_roll_history_preserved(
+    nav_path: Path, new_lines: list[str],
+) -> None:
+    """Refuse to rewrite any already-recorded rolling NAV row.
+
+    The ledger is rebuilt from the price cache on every run. A vendor price
+    revision, a calendar shift, or a target whose execution date lands inside
+    the recorded window would silently change history. Compare every existing
+    data row byte-for-byte against the rebuild and refuse on any difference;
+    appending strictly later rows is the only permitted change.
+    """
+    if not nav_path.is_file():
+        return
+    existing = nav_path.read_text(encoding="utf-8").splitlines()
+    existing_rows = [line.strip() for line in existing[1:] if line.strip()]
+    if len(new_lines) < len(existing_rows):
+        raise PaperTrackError(
+            f"{nav_path}: rebuild would drop "
+            f"{len(existing_rows) - len(new_lines)} recorded session(s); "
+            "refusing to rewrite ledger history"
+        )
+    for old, new in zip(existing_rows, new_lines):
+        if old != new.strip():
+            date = old.split(",", 1)[0]
+            raise PaperTrackError(
+                f"{nav_path}: rebuild would change the recorded {date} row; "
+                "the rolling ledger is append-only. If this is a deliberate "
+                "data repair, archive the existing ledger and rebuild it "
+                "explicitly instead of overwriting history."
+            )
+
+
 def run_roll(
     target_paths: list[Path],
     cache_path: Path,
@@ -2253,6 +2285,7 @@ def run_roll(
                 "matching --raw-price-mode"
             )
     out_dir.mkdir(parents=True, exist_ok=True)
+    _assert_roll_history_preserved(nav_path, lines)
     _atomic_write_text(
         nav_path,
         ",".join(ROLL_NAV_COLUMNS) + "\n" + "\n".join(lines) + "\n",
