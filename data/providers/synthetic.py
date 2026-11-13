@@ -27,8 +27,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from quant_platform.data.providers.base import DataProvider
+from quant_platform.data.providers.base import (
+    CORPORATE_ACTION_COLUMNS,
+    DataProvider,
+    empty_corporate_actions,
+)
 from quant_platform.data.schema import SECTOR_WEIGHTS, SECTORS
+from quant_platform.utils.exchange_calendar import trading_days
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -36,6 +41,14 @@ logger = get_logger(__name__)
 
 class SyntheticDataProvider(DataProvider):
     """Generates a complete synthetic A-share dataset.
+
+    Price basis: the stored ``close``/OHLCV are the **raw** traded prices;
+    a corporate action scales the raw path by ``adj_factor`` (a divisor) and
+    the pipeline's ``close / adj_factor`` is the generated continuous path
+    (``qfq``-style, anchored at the sample start).  This is the same data
+    contract the real providers follow, so money paths can use ``close`` and
+    research can use ``close_adj`` without either silently borrowing the
+    other's levels.
 
     Alpha strength levels (configurable via alpha_strength):
         - 0.00: Pure noise. No predictable patterns. For research validation.
@@ -48,6 +61,21 @@ class SyntheticDataProvider(DataProvider):
         alpha[t] affects return[t+1] (not return[t]).
         This means factor[t] naturally correlates with future returns[t+1].
     """
+
+    #: ``close`` is the raw traded price; ``adj_factor`` is the divisor that
+    #: produces the return-generating continuous series.
+    price_adjustment = "raw"
+    adjusted_price_basis = "qfq"
+    adjustment_factor_available = True
+    #: The generator emits an explicit cash/split feed consistent with the
+    #: ``adj_factor`` divisor (see :meth:`get_corporate_actions`).
+    corporate_actions_available = True
+
+    #: Synthetic data is regenerated deterministically for the requested
+    #: range; there is no cached panel to append to, and regenerating is
+    #: both cheap and exact. The incremental CLI path therefore warns and
+    #: performs a full fetch (never a silent no-op that leaves data stale).
+    supports_incremental = False
 
     def __init__(
         self,
@@ -80,11 +108,22 @@ class SyntheticDataProvider(DataProvider):
         self._financials: pd.DataFrame | None = None
         self._benchmark: pd.Series | None = None
         self._metadata: pd.DataFrame | None = None
+        # Created in `_generate_all`; initialised here so public accessors do
+        # not raise AttributeError on a fresh instance.
+        self._st_timeseries: pd.DataFrame | None = None
 
         # Derived data
         self._dates: pd.DatetimeIndex | None = None
         self._assets: list[str] | None = None
         self._sector_map: dict[str, str] | None = None
+        self._industry_changes_cache: pd.DataFrame | None = None
+        # asset -> generated corporate-action dates (diagnostics for tests)
+        self._corporate_action_days: dict[str, set[pd.Timestamp]] = {}
+        #: Explicit cash/split feed generated alongside ``adj_factor``.
+        self._corporate_actions_frame: pd.DataFrame | None = None
+        #: Pre-adjustment continuous close (the generated research path),
+        #: exposed for consistency tests; never part of the data contract.
+        self._continuous_close: pd.DataFrame | None = None
 
     # ------------------------------------------------------------------
     # Public interface (DataProvider contract)
@@ -102,7 +141,15 @@ class SyntheticDataProvider(DataProvider):
             pd.Timestamp(start_date):pd.Timestamp(end_date)
         ]
         if fields:
-            df = df[fields]
+            unknown = [col for col in fields if col not in df.columns]
+            if unknown:
+                raise ValueError(f"Unknown price fields: {unknown}")
+            df = df[list(fields)]
+        df.attrs.update({
+            "price_basis": "raw",
+            "adjusted_price_basis": self.adjusted_price_basis,
+            "adjustment_factor_available": True,
+        })
         return df
 
     def get_financials(
@@ -132,6 +179,29 @@ class SyntheticDataProvider(DataProvider):
             self._generate_all()
         return self._metadata
 
+    def get_corporate_actions(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """Cash dividends and splits consistent with the generated ``adj_factor``.
+
+        The generator draws ~5% action-events per asset-year.  Each event is
+        either a cash dividend (0.3%-2.5% of the pre-event raw price, rounded
+        to the cent) or a split (2:1, 3:1 or 3:2).  The raw close is adjusted
+        on the ex-date (``quantity * ratio`` shares, price ``/ ratio``; cash
+        dividend subtracted from the raw price) and the ``adj_factor`` divisor
+        absorbs exactly the same event, so ``close / adj_factor`` -- the
+        research path -- stays continuous.  Fully deterministic per seed.
+        """
+        if self._prices is None or self._corporate_actions_frame is None:
+            self._generate_all()
+        frame = self._corporate_actions_frame
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+        mask = (frame["ex_date"] >= start) & (frame["ex_date"] <= end)
+        return frame.loc[mask].reset_index(drop=True).copy()
+
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
@@ -140,7 +210,17 @@ class SyntheticDataProvider(DataProvider):
         logger.info("Generating synthetic A-share data: %d stocks, %s to %s",
                      self.n_stocks, self.start_date.date(), self.end_date.date())
 
-        self._dates = pd.bdate_range(self.start_date, self.end_date, name="date")
+        # Exchange sessions, not business days: ~7.5% of weekdays are
+        # exchange holidays (Spring Festival, National Day, ...). A
+        # business-day grid put prices, the benchmark and financial
+        # visibility dates on days the live scheduler correctly treats as
+        # closed, so research and live disagreed on the trading calendar.
+        self._dates = trading_days(self.start_date, self.end_date)
+        if len(self._dates) == 0:
+            raise ValueError(
+                f"Synthetic sample {self.start_date.date()}..{self.end_date.date()} "
+                "contains no exchange trading days"
+            )
         self._assets = [f"{i:06d}.SH" if i % 3 != 0 else f"{i:06d}.SZ"
                         for i in range(1, self.n_stocks + 1)]
 
@@ -176,12 +256,20 @@ class SyntheticDataProvider(DataProvider):
             p=[0.10, 0.30, 0.60],
         )
 
-        # Listing dates: some stocks list during the period
+        # Listing dates: some stocks list during the period. The offset is
+        # clamped to the sample: `integers(30, n_dates // 2)` raises
+        # `ValueError: low >= high` when a short research window (e.g. one
+        # quarter, ~60 sessions) has fewer than ~60 days.
         listing_dates = pd.Series(self.start_date, index=range(n))
         late_listers = self.rng.choice(n, size=int(n * 0.15), replace=False)
-        for i in late_listers:
-            offset = self.rng.integers(30, len(self._dates) // 2)
-            listing_dates.iloc[i] = self._dates[offset]
+        n_dates = len(self._dates)
+        if n_dates >= 2:
+            offset_low = min(30, max(1, n_dates // 4))
+            offset_high = max(offset_low + 1, n_dates // 2)
+            for i in late_listers:
+                offset = int(self.rng.integers(offset_low, offset_high))
+                offset = min(offset, n_dates - 1)
+                listing_dates.iloc[i] = self._dates[offset]
 
         # ST status (~3% of stocks, random assignment)
         is_st = self.rng.choice([True, False], size=n, p=[0.03, 0.97])
@@ -339,13 +427,23 @@ class SyntheticDataProvider(DataProvider):
         init_prices = np.exp(self.rng.uniform(np.log(5), np.log(200), size=n_assets))
 
         # Close prices: cumulative product of (1 + r)
+        listing = self._metadata["listing_date"].values
         close_prices = np.zeros((n_dates, n_assets))
         close_prices[0] = init_prices * (1 + returns.iloc[0].values)
+        # Pre-listing days must be missing from the very first row. Setting
+        # them only inside the loop left day 0 priced, and the 30-day
+        # forward-fill then invented up to 30 pre-listing closes from it.
+        close_prices[0, self._dates[0] < listing] = np.nan
 
         for t in range(1, n_dates):
-            # Handle listing: stocks not yet listed have NaN
-            mask = self._dates[t] >= self._metadata["listing_date"].values
-            close_prices[t] = close_prices[t - 1] * (1 + returns.iloc[t].values)
+            mask = self._dates[t] >= listing
+            previous = close_prices[t - 1].copy()
+            # A stock listing today has no previous close; seed it from its
+            # initial price. Multiplying the previous row's NaN made the
+            # stock NaN for the rest of the sample.
+            newly_listed = mask & np.isnan(previous)
+            previous[newly_listed] = init_prices[newly_listed]
+            close_prices[t] = previous * (1 + returns.iloc[t].values)
             close_prices[t, ~mask] = np.nan
 
         # Open, High, Low: intraday randomness
@@ -355,7 +453,11 @@ class SyntheticDataProvider(DataProvider):
         open_prices = close_prices * open_ratio
         # For t>0, open is based on prior close with gap
         for t in range(1, n_dates):
-            open_prices[t] = close_prices[t - 1] * open_ratio[t]
+            previous = close_prices[t - 1].copy()
+            newly_listed = (self._dates[t] >= listing) & np.isnan(previous)
+            previous[newly_listed] = init_prices[newly_listed]
+            open_prices[t] = previous * open_ratio[t]
+        open_prices[np.isnan(close_prices)] = np.nan
 
         high_prices = np.maximum(open_prices, close_prices) * (1 + intraday_range / 2)
         low_prices = np.minimum(open_prices, close_prices) * (1 - intraday_range / 2)
@@ -375,18 +477,112 @@ class SyntheticDataProvider(DataProvider):
         # VWAP: average of OHLC
         vwap = (open_prices + high_prices + low_prices + close_prices) / 4
 
-        # Adj factor (random corporate actions: ~5% of stocks per year)
-        adj_factor = np.ones((n_dates, n_assets))
+        # Corporate actions: discrete splits and cash dividends.
+        #
+        # The action *dates* are drawn exactly as before (same RNG draws in
+        # the same order), so existing seeds keep their schedules.  Event
+        # parameters use a dedicated RNG: adding them must not shift the
+        # benchmark/financials random streams that follow this method.
+        action_days: dict[int, np.ndarray] = {}
         for i in range(n_assets):
             n_actions = self.rng.poisson(0.05 * n_dates / 252)
             if n_actions > 0:
                 action_dates = self.rng.choice(n_dates, size=n_actions, replace=False)
                 action_dates.sort()
-                factor = 1.0
-                for d in range(n_dates):
-                    if d in action_dates:
-                        factor *= self.rng.uniform(0.8, 1.2)
-                    adj_factor[d, i] = factor
+                action_days[i] = action_dates.astype(int)
+                # Preserve the legacy RNG stream: the pre-explicit-action
+                # generator drew one ``uniform(0.8, 1.2)`` per action date
+                # inside this loop.  Those draws are gone, but every later
+                # generator (suspension sampling, benchmark, financials) must
+                # see the same stream or seed-pinned expectations shift.
+                self.rng.uniform(0.8, 1.2, size=len(action_dates))
+
+        # The pre-adjustment close matrix is the generated continuous path;
+        # `adj_factor` is exactly the divisor that maps it to the raw price.
+        self._continuous_close = pd.DataFrame(
+            close_prices.copy(), index=self._dates, columns=self._assets,
+        )
+
+        adj_factor = np.ones((n_dates, n_assets))
+        # Diagnostic ledger of the generated action dates, keyed by asset.
+        # Used by regression tests that need to know when an action fell on a
+        # suspension day; it does not affect any generated value.
+        self._corporate_action_days = {}
+        action_rows: list[dict] = []
+        rng_actions = np.random.default_rng(self.seed + 977)
+        for i in sorted(action_days):
+            asset = self._assets[i]
+            factor = 1.0
+            days = action_days[i]
+            cursor = 0
+            for d in range(n_dates):
+                if cursor < len(days) and d == int(days[cursor]):
+                    cursor += 1
+                    continuation = close_prices[d, i]
+                    # Pre-listing rows have no price; an action before the
+                    # listing date is meaningless and is skipped (the date
+                    # also stays out of the diagnostic ledger).
+                    if np.isfinite(continuation) and continuation > 0:
+                        ex_date = self._dates[d]
+                        if rng_actions.random() < 0.55:
+                            # Cash dividend: subtract the per-share amount
+                            # from the raw close.  The amount is a fraction
+                            # of the pre-event raw price, rounded to cents,
+                            # and the divisor falls by exactly cash / C_d so
+                            # close_adj = close / adj_factor stays continuous.
+                            pre_raw = float(continuation) * factor
+                            cash = round(
+                                pre_raw * float(rng_actions.uniform(0.003, 0.025)),
+                                2,
+                            )
+                            cash = max(cash, 0.01)
+                            factor = factor - cash / float(continuation)
+                            action_rows.append({
+                                "ex_date": ex_date,
+                                "asset": asset,
+                                "kind": "cash",
+                                "cash_per_share": cash,
+                                "split_ratio": 1.0,
+                            })
+                        else:
+                            # Split: raw price divides by the ratio and the
+                            # divisor divides by the same ratio.
+                            ratio = float(rng_actions.choice(
+                                [2.0, 3.0, 1.5], p=[0.6, 0.15, 0.25],
+                            ))
+                            factor = factor / ratio
+                            action_rows.append({
+                                "ex_date": ex_date,
+                                "asset": asset,
+                                "kind": "split",
+                                "cash_per_share": 0.0,
+                                "split_ratio": ratio,
+                            })
+                        self._corporate_action_days.setdefault(asset, set()).add(
+                            ex_date
+                        )
+                adj_factor[d, i] = factor
+
+        self._corporate_actions_frame = (
+            pd.DataFrame(action_rows, columns=list(CORPORATE_ACTION_COLUMNS))
+            if action_rows else empty_corporate_actions()
+        )
+        if not self._corporate_actions_frame.empty:
+            self._corporate_actions_frame = (
+                self._corporate_actions_frame
+                .sort_values(["ex_date", "asset", "kind"], kind="stable")
+                .reset_index(drop=True)
+            )
+
+        # A corporate action must move the RAW price path by the adjustment
+        # factor: P_adj = P_raw / adj_factor. Previously only adj_factor moved,
+        # so the pipeline's close/adj_factor series jumped by up to ±20% on a
+        # random date -- fake returns and fake limit-up/down flags.
+        open_prices = open_prices * adj_factor
+        high_prices = high_prices * adj_factor
+        low_prices = low_prices * adj_factor
+        close_prices = close_prices * adj_factor
+        vwap = vwap * adj_factor
 
         # Build MultiIndex DataFrame
         arrays = []
@@ -407,16 +603,81 @@ class SyntheticDataProvider(DataProvider):
         )
         df = df.set_index(["date", "asset"]).sort_index()
 
-        # Apply suspension: ~2% of stock-days are suspended (NaN prices)
+        # Apply suspension: ~2% of tradable stock-days are suspended (NaN
+        # prices). Only rows that actually have a price are eligible -- marking
+        # a pre-listing NaN row as "suspended" would have no stale close to
+        # forward-fill from.
         n_total = n_dates * n_assets
-        suspended = self.rng.choice(n_total, size=int(n_total * 0.02), replace=False)
+        eligible = np.flatnonzero(df["close"].notna().to_numpy())
+        suspended = self.rng.choice(eligible, size=int(n_total * 0.02), replace=False)
         # We do this via the underlying arrays for efficiency
         flat_idx = np.array(suspended)
         for col in ["open", "high", "low", "close", "volume", "turnover", "vwap"]:
             df.iloc[flat_idx, df.columns.get_loc(col)] = np.nan
 
+        # The adjustment factor is part of the stale mark.  Start by freezing
+        # it on every suspended row (a forward-filled close must pair with the
+        # factor it was carried over with, or close_adj jumps: e.g. 65.50 ->
+        # 76.56).  Action rows are then restored with a compensating raw-price
+        # scale below, which keeps close_adj continuous *and* gives the paper
+        # book a post-action stale mark.
+        df.iloc[flat_idx, df.columns.get_loc("adj_factor")] = np.nan
+        df["adj_factor"] = df.groupby("asset")["adj_factor"].ffill()
+
         # Forward-fill suspension gaps (max 30 days)
         df = df.groupby("asset").ffill(limit=30)
+
+        # A corporate action whose ex-date is suspended: the stale RAW mark
+        # must be the *post-action* level (previous traded raw * F_action /
+        # F_previous) while `close / adj_factor` stays at the last clean
+        # close.  Freezing the action factor (the old behaviour) left the raw
+        # price at its pre-action level; a paper book that then doubles the
+        # share count values the position at twice its worth until the resume
+        # session (and a cash dividend leaves the mark un-reduced while the
+        # cash is credited).  Restore the action factor on those rows and
+        # scale the forwarded raw prices by the same ratio.
+        if (
+            self._corporate_actions_frame is not None
+            and not self._corporate_actions_frame.empty
+        ):
+            asset_index = {asset: i for i, asset in enumerate(self._assets)}
+            date_index = {date: d for d, date in enumerate(self._dates)}
+            suspended_grid = np.zeros((n_dates, n_assets), dtype=bool)
+            for position in flat_idx:
+                row_date, row_asset = df.index[int(position)]
+                suspended_grid[
+                    date_index[pd.Timestamp(row_date)], asset_index[row_asset]
+                ] = True
+            for _, action in self._corporate_actions_frame.iterrows():
+                d = date_index.get(pd.Timestamp(action["ex_date"]))
+                i = asset_index.get(action["asset"])
+                if d is None or i is None or not suspended_grid[d, i]:
+                    continue
+                traded_before = [
+                    t for t in range(d) if not suspended_grid[t, i]
+                ]
+                if not traded_before:
+                    continue
+                factor_reference = adj_factor[traded_before[-1], i]
+                factor_action = adj_factor[d, i]
+                if not (factor_reference > 0 and factor_action > 0):
+                    continue
+                scale = factor_action / factor_reference
+                row_position = int(df.index.get_loc(
+                    (self._dates[d], self._assets[i]),
+                ))
+                for column in ("open", "high", "low", "close", "vwap"):
+                    df.iloc[row_position, df.columns.get_loc(column)] *= scale
+                df.iloc[
+                    row_position, df.columns.get_loc("adj_factor")
+                ] = factor_action
+
+        # Mark the stale rows. Forward-filling keeps the price path realistic,
+        # but downstream return computation must not difference across the
+        # fill: doing so fabricates a zero return followed by a multi-day move
+        # -- a fake reversal signal (issue #58).
+        df["is_suspended"] = False
+        df.iloc[flat_idx, df.columns.get_loc("is_suspended")] = True
 
         return df
 
@@ -443,9 +704,20 @@ class SyntheticDataProvider(DataProvider):
         """
         n_assets = len(self._assets)
 
-        # Find quarter-end dates in our date range
+        # Find quarter-end trading days in our date range. The last exchange
+        # session of each calendar quarter is the report date (the old
+        # business-day grid behaved the same way). Deriving it from
+        # `is_quarter_end` broke once the date index was filtered through the
+        # exchange calendar: pandas' `is_quarter_end` is frequency-aware, and
+        # a filtered index has no business-day frequency, so quarter ends
+        # that fell on a weekend (e.g. 2023-09-30) silently stopped producing
+        # reports.
         all_dates = pd.DatetimeIndex(self._dates)
-        quarter_ends = all_dates[all_dates.is_quarter_end]
+        if len(all_dates):
+            quarter_of = all_dates.to_period("Q")
+            quarter_ends = all_dates[~quarter_of.duplicated(keep="last")]
+        else:
+            quarter_ends = all_dates
         n_quarters = len(quarter_ends)
 
         # Base financial characteristics (cross-sectional)
@@ -529,7 +801,36 @@ class SyntheticDataProvider(DataProvider):
         # back to the start of the sample.
         pit = df.reset_index()
         pit["fiscal_period_end"] = pit["date"]
-        pit["date"] = pit["publish_date"]
+        pit["publish_date"] = pd.to_datetime(pit["publish_date"])
+
+        # A publication date is a calendar date; the panel only has trading
+        # days. Reindexing straight onto `publish_date` silently dropped every
+        # report published on a weekend/holiday (the (date, asset) key simply
+        # did not exist), leaving 14-16 of 20 quarters. Map each report to the
+        # first trading day on/after its publication instead: the information
+        # was public by then, and no report is lost.
+        publish_values = pit["publish_date"].to_numpy()
+        positions = all_dates.searchsorted(publish_values, side="left")
+
+        # A report published after the last trading day in the sample is not
+        # visible in-sample at all; publishing it on the last day would be a
+        # look-ahead. Drop it explicitly (with a count) instead of letting
+        # reindex lose it silently.
+        in_sample = positions < len(all_dates)
+        dropped = int((~in_sample).sum())
+        if dropped:
+            logger.debug(
+                "Financials: %d asset-reports published after the last "
+                "trading day (%s) are outside the sample",
+                dropped, all_dates[-1].date(),
+            )
+        pit = pit.loc[in_sample].copy()
+        pit["date"] = all_dates[positions[in_sample]]
+
+        # A later report for the same asset/day wins; quarters are ~91 days
+        # apart so this should never trigger, but duplicate index labels would
+        # make reindex raise.
+        pit = pit.drop_duplicates(subset=["date", "asset"], keep="last")
         pit = pit.set_index(["date", "asset"]).sort_index()
 
         # Forward-fill to daily frequency by joining with all dates
@@ -567,9 +868,20 @@ class SyntheticDataProvider(DataProvider):
 
             # ST events: 1-2 episodes per ST stock
             n_episodes = self.rng.integers(1, 3)
+            n_dates = len(self._dates)
+            # The trigger draw used to be `integers(60, n_dates - 60)`,
+            # which raises `ValueError: low >= high` on short research
+            # windows (any sample under ~120 sessions). Clamp the window to
+            # the sample; skip ST entirely when there is no room for a
+            # meaningful episode (a one- or two-day sample).
+            if n_dates < 5:
+                continue
+            trigger_low = min(60, max(1, n_dates // 4))
+            trigger_high = max(trigger_low + 1, n_dates - 60)
             for _ in range(n_episodes):
                 # Random trigger date
-                trigger_idx = self.rng.integers(60, len(self._dates) - 60)
+                trigger_idx = int(self.rng.integers(trigger_low, trigger_high))
+                trigger_idx = min(trigger_idx, n_dates - 1)
                 trigger_date = self._dates[trigger_idx]
 
                 # Announcement lag: 1-3 trading days after trigger
@@ -591,7 +903,11 @@ class SyntheticDataProvider(DataProvider):
                 })
 
         if not records:
-            return pd.DataFrame(columns=["asset", "announce_date", "is_st"])
+            # Always expose the full contract columns, even when empty: the
+            # pipeline's `_has_usable_st_timeseries` checks for `end_date`.
+            return pd.DataFrame(
+                columns=["asset", "trigger_date", "announce_date", "end_date", "is_st"]
+            )
 
         return pd.DataFrame(records)
 
@@ -619,10 +935,25 @@ class SyntheticDataProvider(DataProvider):
         Returns:
             DataFrame with columns: asset, industry, effective_date
         """
+        if self._industry_changes_cache is not None:
+            return self._industry_changes_cache.copy()
+        if self._sector_map is None:
+            self._generate_all()
+
+        # A dedicated RNG: industry changes must not depend on how many times
+        # this method is called or on other draws from the shared generator,
+        # otherwise two `DataPipeline.run()` calls on the same provider saw
+        # different classifications (and different PIT neutralization).
+        rng = np.random.default_rng(self.seed + 101)
         records = []
         all_dates = pd.DatetimeIndex(self._dates)
+        if len(all_dates):
+            quarter_of = all_dates.to_period("Q")
+            quarter_ends = all_dates[~quarter_of.duplicated(keep="last")]
+        else:
+            quarter_ends = all_dates
         # Industry changes happen at semi-annual boundaries
-        semi_annual = all_dates[all_dates.is_quarter_end][::2]  # Every other quarter end
+        semi_annual = quarter_ends[::2]  # Every other quarter end
 
         for i, asset in enumerate(self._assets):
             current_industry = self._sector_map[asset]
@@ -635,8 +966,8 @@ class SyntheticDataProvider(DataProvider):
 
             # ~5% chance of reclassification per semi-annual period
             for change_date in semi_annual:
-                if self.rng.random() < 0.05:
-                    new_industry = self.rng.choice(
+                if rng.random() < 0.05:
+                    new_industry = rng.choice(
                         [s for s in SECTORS if s != current_industry]
                     )
                     records.append({
@@ -646,4 +977,6 @@ class SyntheticDataProvider(DataProvider):
                     })
                     current_industry = new_industry
 
-        return pd.DataFrame(records)
+        frame = pd.DataFrame(records)
+        self._industry_changes_cache = frame
+        return frame.copy()

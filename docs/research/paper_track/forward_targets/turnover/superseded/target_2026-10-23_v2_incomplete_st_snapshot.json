@@ -1,0 +1,175 @@
+{
+  "as_of": "2026-10-23",
+  "data_end": "2026-10-23",
+  "factors": [
+    "turnover20d"
+  ],
+  "weights": {
+    "000543": 0.0331654551,
+    "000631": 0.0319288819,
+    "000726": 0.0038531979,
+    "000755": 0.0497984736,
+    "000801": 0.0104153286,
+    "000883": 0.0499999995,
+    "000902": 0.0047336803,
+    "000948": 0.0213737222,
+    "000989": 0.0040524521,
+    "001256": 0.0173376859,
+    "002025": 0.0041932869,
+    "002262": 0.0499999992,
+    "002310": 0.0197857115,
+    "002508": 0.0499999997,
+    "002698": 0.0249202325,
+    "002920": 0.0110216358,
+    "003018": 0.0152202587,
+    "003035": 0.0499998764,
+    "300105": 0.0051380271,
+    "300559": 0.0265184352,
+    "300636": 0.0499999963,
+    "300888": 0.0499997455,
+    "301236": 0.0072034475,
+    "301356": 0.0059236258,
+    "600094": 0.0044883607,
+    "600288": 0.0011602266,
+    "600388": 0.0499999866,
+    "600436": 0.0499999997,
+    "600579": 0.0233600646,
+    "600817": 0.0499999991,
+    "600872": 0.0499999991,
+    "601058": 0.0499999963,
+    "601100": 0.0466117268,
+    "601727": 0.0017243533,
+    "603060": 0.0219071491,
+    "603380": 0.0041647603,
+    "603726": 0.0499999987
+  },
+  "signal_date": "2026-10-23",
+  "provenance": {
+    "tool": "tools/daily_signal.py",
+    "cache": ".scratch\\orchestrate\\merged_wide.parquet",
+    "industry_map": ".cache\\baostock\\industry_map.parquet",
+    "industry_neutralization": true,
+    "construction": "mvo",
+    "top_n": null,
+    "max_sector": 0.3,
+    "sector_cap_enforced": true,
+    "prev_weights": null,
+    "exclude_codes_file": ".scratch/orchestrate/st_codes_2026-10-23.txt",
+    "excluded_codes_count": 5,
+    "capital_cny": 2000000.0,
+    "max_weight": 0.05,
+    "max_turnover": 0.3,
+    "risk_aversion": 1.0,
+    "transaction_cost_bps": 20.0,
+    "turnover_penalty": 0.5,
+    "covariance": "ledoit_wolf",
+    "covariance_lookback": 252,
+    "ic_lookback": 252,
+    "ic_min_obs": 20,
+    "winsorize": [
+      0.01,
+      0.99
+    ],
+    "standardize": "zscore",
+    "returns_convention": "pct_chg/100 shift(-1) computed within the panel sliced to date <= as_of; the signal date's forward label is NaN and excluded from IC and covariance"
+  },
+  "diagnostics": {
+    "history_sessions": 2135,
+    "data_lag_days": 0,
+    "universe_assets": 295,
+    "candidates": 293,
+    "excluded_codes": [
+      "002168",
+      "002650",
+      "300419",
+      "603189",
+      "603825"
+    ],
+    "excluded_dropped": [
+      "002168",
+      "002650",
+      "300419",
+      "603189",
+      "603825"
+    ],
+    "n_holdings": 37,
+    "max_weight_actual": 0.0499999997,
+    "max_sector_weight": 0.1540524473,
+    "n_sector_cap_binding": 0,
+    "sector_cap": {
+      "max_sector_exposure": 0.3,
+      "enforced": true,
+      "sector_map_assets": 300,
+      "n_sectors_universe": 57,
+      "unknown_assets_universe": 1,
+      "n_sectors_holdings": 15,
+      "binding_sectors": [],
+      "sector_weights": {
+        "C14": 0.0499999991,
+        "C17": 0.0538529434,
+        "C26": 0.0047336803,
+        "C27": 0.1540524473,
+        "C29": 0.1211438795,
+        "C34": 0.0732563126,
+        "C35": 0.14069773619999998,
+        "C38": 0.055138026799999997,
+        "C39": 0.0309552382,
+        "D44": 0.1029511661,
+        "G54": 0.0497984736,
+        "I65": 0.0550956049,
+        "K70": 0.0364172426,
+        "M74": 0.0219071491,
+        "M75": 0.0499998764
+      }
+    },
+    "gross_weight": 0.9999997761,
+    "cash_weight": 2.2389999998484456e-07,
+    "turnover": 0.49999988805,
+    "turnover_definition": "one_sided = 0.5 * sum(|w - w_prev|)",
+    "first_build": true,
+    "min_reported_weight": 0.0001,
+    "pruned_weight": 2.2389999999999999e-07,
+    "factor_skipped": [],
+    "factor_ic": {
+      "lookback": 252,
+      "min_obs": 20,
+      "window": {
+        "start": "2025-10-09",
+        "end": "2026-10-22",
+        "n": 252,
+        "factor": "turnover20d"
+      },
+      "per_factor": {
+        "turnover20d": {
+          "mean_ic": -0.03896580865953061,
+          "n_obs": 252,
+          "window_start": "2025-10-09",
+          "window_end": "2026-10-22",
+          "weight": -1.0
+        }
+      }
+    },
+    "signal": {
+      "composite_min": -4.024517562240183,
+      "composite_max": 2.1027062721197813,
+      "composite_mean": -0.011765715117800406,
+      "alpha_convention": "cross-sectional percentile rank - 0.5 (MeanVarianceOptimizer input; composite z is the delivered signal)"
+    },
+    "covariance_assets": 297,
+    "covariance_sessions": 252,
+    "covariance_input_sessions": 2134,
+    "optimizer": {
+      "name": "MeanVarianceOptimizer",
+      "construction": "mvo",
+      "top_n": null,
+      "selected": null,
+      "fallback_count": 0,
+      "fallback_reason": null,
+      "received_sector_map": true
+    },
+    "warnings": [
+      "excluded 5 of 5 listed codes from candidates (--exclude-codes-file)",
+      "first build: one-sided turnover 0.5000 against a zero book exceeds the 0.3000 cap; the cap is not applied to a first build (nothing to trade from; the platform engine also passes prev_weights=None on its first rebalance)"
+    ]
+  }
+}

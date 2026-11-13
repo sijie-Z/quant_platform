@@ -1,7 +1,12 @@
 # Ablation Study #001: Factor Selection vs Equal-Weight Factor Aggregation
 
 > **日期**：2026-06-20
-> **状态**：已完成
+> **状态**：⚠️ **SUPERSEDED — 本报告的数字作废（2026-10-19 标注）**
+>
+> 本报告产出于 2026-09 诚实性清算之前。当时 `ma_convergence` 返回 `Series`，通过 pandas 的
+> 标签并集把整个截面变成 NaN，信号只有 0.69% 有值 —— 每一次回测实际都是等权买入持有。
+> 下方（尤其是第 132 行附近）报告的 `ma_convergence +0.0061 / +0.079` 属于该缺陷。
+> 需要这些数字请用修复后的代码重跑；不要引用本报告。见 Issue #60 / #54。
 > **实验 ID**：ABLATION-001
 
 ---

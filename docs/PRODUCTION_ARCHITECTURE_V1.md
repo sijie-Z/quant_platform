@@ -1,5 +1,11 @@
 # Production Architecture v1: 80d Reversal + Vol Filter
 
+> **STATUS: TARGET DESIGN — not implemented. See #78.**
+> Strategy constants match `trading/reversal_paper_trader.py:20-25`. The risk
+> overlay does not: code enforces 15% drawdown warning / 25% kill
+> (`risk/circuit_breaker.py:68-69`), not −30%; the §3.3 slippage formula has no
+> implementation. Treat §§3–5 as requirements, not current behavior.
+
 > 从 statistical edge → operational edge
 > 目标不是更高的 Sharpe，是在真实市场中活下来
 
@@ -55,7 +61,7 @@
 
 ---
 
-## 2. 策略参数（已锁定，不修改）
+## 2. 策略参数（设计目标；仅 `trading/reversal_paper_trader.py` 采用）
 
 | 参数 | 值 |
 |------|-----|
@@ -104,7 +110,7 @@ where:
 
 | 规则 | 阈值 | 触发动作 |
 |------|------|---------|
-| 最大回撤 | -30% (从峰值) | 停止交易, 全部平仓 |
+| 最大回撤 | -30% (从峰值，目标值；代码实际 15% 警告 / 25% kill，见 `risk/circuit_breaker.py:68-69`) | 停止交易, 全部平仓 |
 | 单票上限 | 5% | 建仓时强制限制 |
 | 行业集中度 | 30% | 建仓时检查 |
 

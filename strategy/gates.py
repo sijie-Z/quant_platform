@@ -15,8 +15,11 @@ Inspired by quawn's Strategy Evaluation Gates design.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
+
+from quant_platform.factors.evaluation import MIN_IC_OBSERVATIONS
 
 # ── Status Constants ──
 
@@ -38,20 +41,18 @@ class GateConfig:
     These are research diagnostics, not return guarantees.
     """
 
-    # IC quality
+    # IC quality. `ic_results` values come from `factors.evaluation.ic_summary`
+    # on a rank-IC series, so `mean_ic` is the cross-sectional rank IC.
     minimum_ic: float = 0.02
-    minimum_rank_ic: float = 0.02
-    minimum_icir: float = 0.0
-    minimum_factor_history_count: int = 3
+    minimum_icir: float = 0.2
+    minimum_factors_passing_ic: int = 3
 
     # Walk-forward
     minimum_walk_forward_folds: int = 3
     minimum_test_sharpe: float = 0.20
-    maximum_train_test_gap: float = 0.50
 
     # Data quality
     minimum_price_coverage: float = 0.80
-    minimum_fundamental_coverage: float = 0.30
 
     # Risk
     maximum_drawdown: float = 0.25
@@ -62,12 +63,6 @@ class GateConfig:
     # Complexity
     maximum_factor_count: int = 10
     maximum_parameter_count: int = 30
-
-    # Regime
-    minimum_regime_sample: int = 30
-
-    # Schema
-    reject_on_schema_error: bool = True
 
     @classmethod
     def from_dict(cls, data: dict | None) -> GateConfig:
@@ -91,21 +86,17 @@ class GateConfig:
     def to_dict(self) -> dict:
         return {
             "minimum_ic": self.minimum_ic,
-            "minimum_rank_ic": self.minimum_rank_ic,
             "minimum_icir": self.minimum_icir,
-            "minimum_factor_history_count": self.minimum_factor_history_count,
+            "minimum_factors_passing_ic": self.minimum_factors_passing_ic,
             "minimum_walk_forward_folds": self.minimum_walk_forward_folds,
             "minimum_test_sharpe": self.minimum_test_sharpe,
-            "maximum_train_test_gap": self.maximum_train_test_gap,
             "minimum_price_coverage": self.minimum_price_coverage,
-            "minimum_fundamental_coverage": self.minimum_fundamental_coverage,
             "maximum_drawdown": self.maximum_drawdown,
+            "kill_drawdown": self.kill_drawdown,
             "maximum_turnover": self.maximum_turnover,
             "maximum_cost_drag": self.maximum_cost_drag,
             "maximum_factor_count": self.maximum_factor_count,
             "maximum_parameter_count": self.maximum_parameter_count,
-            "minimum_regime_sample": self.minimum_regime_sample,
-            "reject_on_schema_error": self.reject_on_schema_error,
         }
 
 
@@ -191,11 +182,29 @@ def _overall_status(results: list[GateResult]) -> str:
     return PASS
 
 
+def _metric(stats: dict, key: str) -> float:
+    """Read a metric defensively: JSON round-trips can turn NaN into None."""
+    try:
+        value = float(stats.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) else 0.0
+
+
 def check_ic_quality(
     ic_results: dict[str, dict],
     config: GateConfig,
 ) -> GateResult:
-    """Check factor IC/ICIR against minimum thresholds."""
+    """Check factor IC/ICIR against minimum thresholds.
+
+    A threshold of 0 disables that criterion. The old default for
+    `minimum_icir` was 0, so `abs(icir) >= 0` was true for every factor and
+    the gate could never fail; it also reported factors as "passing the ICIR
+    gate" when no ICIR requirement was in force.
+
+    IC and ICIR are compared by absolute value: a factor with a stable
+    negative IC is usable through a negative weight in the alpha combination.
+    """
     if not ic_results:
         return GateResult(
             gate_name="ic_quality",
@@ -204,19 +213,68 @@ def check_ic_quality(
         )
 
     n_factors = len(ic_results)
-    n_above_ic = sum(1 for s in ic_results.values() if abs(s.get("mean_ic", 0)) >= config.minimum_ic)
-    n_above_icir = sum(1 for s in ic_results.values() if abs(s.get("icir", 0)) >= config.minimum_icir)
+
+    # No evidence is not evidence of a bad factor. When every factor reports
+    # fewer than `MIN_IC_OBSERVATIONS` evaluable cross-sections (the 30-stock
+    # universe used to yield n_obs=0 for every factor), `ic_summary` returns
+    # NaN metrics; judging those against ICIR=0.2 reported a misleading
+    # weak-IC FAIL. Only trigger this when every entry carries `n_obs`, so
+    # legacy result dicts without observation counts keep the old behaviour.
+    n_obs_values = []
+    for stats in ic_results.values():
+        try:
+            value = stats.get("n_obs")
+            n_obs_values.append(None if value is None else int(value))
+        except (AttributeError, TypeError, ValueError):
+            n_obs_values.append(None)
+
+    if n_obs_values and all(
+        value is not None and value < MIN_IC_OBSERVATIONS
+        for value in n_obs_values
+    ):
+        best_n_obs = max(n_obs_values)
+        return GateResult(
+            gate_name="ic_quality",
+            status=SKIPPED,
+            message=(
+                "Insufficient observations to evaluate IC: no factor has "
+                f"at least {MIN_IC_OBSERVATIONS} evaluable cross-sections "
+                f"(best n_obs={best_n_obs})"
+            ),
+            details={
+                "n_factors": n_factors,
+                "max_n_obs": best_n_obs,
+                "minimum_observations": MIN_IC_OBSERVATIONS,
+            },
+            current_value=best_n_obs,
+            threshold=MIN_IC_OBSERVATIONS,
+        )
+
+    icir_enabled = config.minimum_icir > 0
+
+    n_above_ic = sum(
+        1 for s in ic_results.values()
+        if abs(_metric(s, "mean_ic")) >= config.minimum_ic
+    )
+    n_above_icir = (
+        sum(
+            1 for s in ic_results.values()
+            if abs(_metric(s, "icir")) >= config.minimum_icir
+        )
+        if icir_enabled else 0
+    )
 
     details = {
         "n_factors": n_factors,
         "n_above_minimum_ic": n_above_ic,
         "n_above_minimum_icir": n_above_icir,
+        "icir_gate_enabled": icir_enabled,
     }
 
-    best_factor = max(ic_results, key=lambda k: abs(ic_results[k].get("icir", 0)))
-    best_icir = ic_results[best_factor].get("icir", 0)
+    best_factor = max(ic_results, key=lambda k: abs(_metric(ic_results[k], "icir")))
+    best_icir = _metric(ic_results[best_factor], "icir")
 
-    if n_above_icir < 1:
+    if icir_enabled and n_above_icir < 1:
         return GateResult(
             gate_name="ic_quality",
             status=FAIL,
@@ -226,20 +284,28 @@ def check_ic_quality(
             threshold=1,
         )
 
-    if n_above_ic < config.minimum_factor_history_count:
+    if n_above_ic < config.minimum_factors_passing_ic:
         return GateResult(
             gate_name="ic_quality",
             status=WARNING,
-            message=f"Only {n_above_ic}/{n_factors} factors meet minimum IC={config.minimum_ic}",
+            message=(
+                f"Only {n_above_ic}/{n_factors} factors meet minimum "
+                f"IC={config.minimum_ic}"
+            ),
             details=details,
             current_value=n_above_ic,
-            threshold=config.minimum_factor_history_count,
+            threshold=config.minimum_factors_passing_ic,
         )
 
+    icir_note = (
+        f"{n_above_icir}/{n_factors} factors pass ICIR gate. "
+        if icir_enabled
+        else "ICIR gate disabled (threshold 0). "
+    )
     return GateResult(
         gate_name="ic_quality",
         status=PASS,
-        message=f"{n_above_icir}/{n_factors} factors pass ICIR gate. Best: {best_factor} ({best_icir:.4f})",
+        message=f"{icir_note}Best: {best_factor} ({best_icir:.4f})",
         details=details,
     )
 
@@ -425,6 +491,97 @@ def check_data_coverage(
     )
 
 
+def count_assets_with_data(prices: Any, min_coverage: float = 0.5) -> tuple[int, int]:
+    """Return (universe size, number of assets with enough price history).
+
+    Both gate callers used to pass the same number for both arguments, which
+    made the coverage gate compare the universe with itself and always pass.
+    An asset counts as having data only when at least `min_coverage` of its
+    rows are non-null.
+    """
+    if prices is None or getattr(prices, "empty", True):
+        return 0, 0
+    coverage = prices.notna().mean()
+    return int(len(coverage)), int((coverage >= min_coverage).sum())
+
+
+def check_trading_costs(
+    backtest_summary: dict | None,
+    config: GateConfig,
+) -> GateResult:
+    """Check annual turnover and cost drag reported by the backtest.
+
+    Turnover is one-sided, the same convention as `PortfolioConstraints`.
+    Both limits were declared in `GateConfig` but nothing read them.
+    """
+    if not backtest_summary:
+        return GateResult(
+            gate_name="trading_costs",
+            status=SKIPPED,
+            message="No backtest results available",
+        )
+
+    def _finite(value):
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    turnover = _finite(backtest_summary.get("annual_turnover"))
+    cost_drag = _finite(backtest_summary.get("annual_cost_drag"))
+    if turnover is None and cost_drag is None:
+        return GateResult(
+            gate_name="trading_costs",
+            status=SKIPPED,
+            message="Backtest summary does not report turnover or cost drag",
+        )
+
+    details = {
+        "annual_turnover": round(float(turnover), 4) if turnover is not None else None,
+        "annual_cost_drag": round(float(cost_drag), 4) if cost_drag is not None else None,
+    }
+
+    if cost_drag is not None and cost_drag > config.maximum_cost_drag:
+        return GateResult(
+            gate_name="trading_costs",
+            status=FAIL,
+            message=(
+                f"Annual cost drag {cost_drag:.2%} exceeds limit "
+                f"{config.maximum_cost_drag:.2%}"
+            ),
+            details=details,
+            current_value=cost_drag,
+            threshold=config.maximum_cost_drag,
+        )
+
+    if turnover is not None and turnover > config.maximum_turnover:
+        return GateResult(
+            gate_name="trading_costs",
+            status=WARNING,
+            message=(
+                f"Annual turnover {turnover:.2f}x exceeds guideline "
+                f"{config.maximum_turnover:.2f}x"
+            ),
+            details=details,
+            current_value=turnover,
+            threshold=config.maximum_turnover,
+        )
+
+    return GateResult(
+        gate_name="trading_costs",
+        status=PASS,
+        message=(
+            f"Annual turnover {turnover:.2f}x, cost drag {cost_drag:.2%}"
+            if turnover is not None and cost_drag is not None
+            else "Trading costs within limits"
+        ),
+        details=details,
+    )
+
+
 # ── Gate Runner ──
 
 
@@ -451,6 +608,7 @@ class GateRunner:
         results.append(check_ic_quality(ic_results or {}, self.config))
         results.append(check_walk_forward(wf_results, self.config))
         results.append(check_drawdown_risk(backtest_summary, self.config))
+        results.append(check_trading_costs(backtest_summary, self.config))
         results.append(check_complexity(n_factors, n_params, self.config))
         results.append(check_data_coverage(n_assets_total, n_assets_with_data, self.config))
 
@@ -485,20 +643,19 @@ class GateRunner:
         wf_result: dict | None = None,
         n_factors: int = 0,
         n_params: int = 0,
+        n_assets_total: int = 0,
+        n_assets_with_data: int = 0,
     ) -> GateReport:
-        """Run gates using results from a full pipeline run."""
+        """Run gates using results from a full pipeline run.
+
+        Coverage must be supplied by the caller when known. It used to be
+        derived as `len(first_weights)` for both sides, which made the gate
+        compare a number with itself and always pass; when the universe size
+        is unknown the gate now reports SKIPPED instead.
+        """
         summary = None
         if backtest_result:
             summary = backtest_result.get("summary")
-
-        n_assets_total = 0
-        n_assets_with_data = 0
-        if backtest_result and "weights_history" in backtest_result:
-            wh = backtest_result["weights_history"]
-            if wh:
-                first_weights = next(iter(wh.values()))
-                n_assets_with_data = len(first_weights)
-                n_assets_total = n_assets_with_data
 
         return self.run(
             strategy_name=strategy_name,

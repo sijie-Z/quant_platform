@@ -117,6 +117,56 @@ class TestDataProviderPool:
         result = pool.get_prices("2022-01-01", "2022-12-31")
         assert result is not None
 
+    def test_cache_key_includes_kwargs(self):
+        """A cached close-price frame used to be served for a volume request."""
+        class FieldProvider(MockProvider):
+            def get_prices(self, start_date, end_date, **kwargs):
+                self.call_count += 1
+                return pd.DataFrame({"field": [str(kwargs.get("fields"))]})
+
+        provider = FieldProvider("fields")
+        pool = DataProviderPool(
+            providers={"fields": provider},
+            priorities={"fields": 1},
+        )
+
+        close = pool.get_prices("2021-01-01", "2021-12-31", fields=["close"])
+        volume = pool.get_prices("2021-01-01", "2021-12-31", fields=["volume"])
+
+        assert provider.call_count == 2
+        assert close["field"].iloc[0] != volume["field"].iloc[0]
+
+    def test_none_result_is_recorded_as_a_failure(self):
+        class NoneProvider(MockProvider):
+            def get_prices(self, start_date, end_date, **kwargs):
+                self.call_count += 1
+                return None
+
+        provider = NoneProvider("none")
+        pool = DataProviderPool(
+            providers={"none": provider},
+            priorities={"none": 1},
+        )
+
+        assert pool.get_prices("2021-01-01", "2021-12-31") is None
+
+        health = pool.health_check()["none"]
+        assert health["success_count"] == 0
+        assert health["failure_count"] == 1
+
+    def test_cached_frame_is_returned_as_a_copy(self):
+        provider = MockProvider("cached")
+        pool = DataProviderPool(
+            providers={"cached": provider},
+            priorities={"cached": 1},
+        )
+
+        first = pool.get_prices("2021-01-01", "2021-12-31")
+        first.iloc[0, 0] = -1
+
+        second = pool.get_prices("2021-01-01", "2021-12-31")
+        assert second.iloc[0, 0] == 100
+
     def test_cache(self):
         provider = MockProvider("cached")
         pool = DataProviderPool(

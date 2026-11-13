@@ -14,6 +14,7 @@ import pandas as pd
 
 from quant_platform.backtest.cost_model import CostModel
 from quant_platform.backtest.engine import BacktestEngine
+from quant_platform.data.pipeline import realized_returns
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger
 
@@ -65,8 +66,14 @@ class RegimeRouterStub:
 
         计算过去 signal_h 日累计收益 → 选择跌幅最大的股票.
         信号值范围 [-0.5, +0.5], 跌幅最大 → 正值 (超配).
+
+        ``returns`` 是 ``DataPipeline.returns`` 的前向收益约定
+        (t -> t+1): 在调仓日 t 收盘时 ``returns[t]`` 尚未发生. 这里先
+        shift(1) 转成已实现收益, 再滚动求和, 使 t 日信号只使用 t 日收盘
+        前已完成的收益 (因果性由 tests/test_strategy 的 prefix 测试锁定).
         """
-        past_ret = returns.rolling(signal_h, min_periods=signal_h).apply(
+        realized = realized_returns(returns)
+        past_ret = realized.rolling(signal_h, min_periods=signal_h).apply(
             lambda x: np.prod(1 + x) - 1 if len(x) == signal_h else np.nan,
             raw=True,
         )

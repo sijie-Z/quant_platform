@@ -1,5 +1,11 @@
 # 外部项目吸收笔记
 
+> **STATUS: HISTORICAL RECORD (2026-07). See #78.**
+> "Merged" is not "used": the audit confirmed the screener/config/KF/lookahead
+> items have real entry points, but the framework contracts listed here have
+> zero consumers. Treat this table as a record of what was absorbed, not as a
+> claim that the platform depends on it.
+
 ## 概述
 
 本文记录了从外部开源项目吸收的设计理念和具体实现。

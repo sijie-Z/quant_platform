@@ -7,12 +7,34 @@ services:
       - "8000:8000"
     environment:
       - TUSHARE_TOKEN=${TUSHARE_TOKEN:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - LOG_LEVEL=INFO
+      # The LLM analyzers call DeepSeek through the OpenAI-compatible SDK;
+      # OPENAI_API_KEY here did nothing because the code reads DEEPSEEK_API_KEY.
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      # Required: without a token every /api route is loopback-only, and a
+      # published container port is not loopback. Set this in .env.
+      - QUANT_API_TOKEN=${QUANT_API_TOKEN:?Set QUANT_API_TOKEN in .env before exposing port 8000}
+      # QMT trading password is env-first (execution.qmt.password is a
+      # development fallback only).
+      - QMT_PASSWORD=${QMT_PASSWORD:-}
+      # Log level is read at process start (restart-only semantics).
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TZ=Asia/Shanghai
     volumes:
+      # Trading book + audit trail + EOD markers + NAV + engine state.
+      # /app/data also contains provider caches written under data/cache.
+      - quant-state:/app/data
+      # quant-data keeps its historical name: it already holds results/ on
+      # existing deployments.
       - quant-data:/app/results
       - quant-cache:/app/.quant_cache
+      - quant-versions:/app/.quant_versions
+      - quant-baostock-cache:/app/.cache
+      - quant-agent-cache:/app/.agent_cache
+      - quant-sentiment-cache:/app/.sentiment_cache
     restart: unless-stopped
+    # Give the process time to stop the scheduler/engine, persist engine
+    # state and checkpoint SQLite WAL before SIGKILL (graceful-shutdown wave).
+    stop_grace_period: 30s
     healthcheck:
       # python:3.12-slim has no curl/wget — probe over the stdlib instead.
       test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"]
@@ -22,5 +44,10 @@ services:
       start_period: 40s
 
 volumes:
+  quant-state:
   quant-data:
   quant-cache:
+  quant-versions:
+  quant-baostock-cache:
+  quant-agent-cache:
+  quant-sentiment-cache:

@@ -57,7 +57,7 @@ const props = defineProps({
   modelValue: { type: String, default: 'dashboard' },
 })
 
-const emit = defineEmits(['update:modelValue', 'action', 'toast'])
+const emit = defineEmits(['update:modelValue', 'action', 'toast', 'open'])
 
 const open = ref(false)
 const query = ref('')
@@ -75,6 +75,7 @@ const commands = computed(() => [
   { id: 'factors',    icon: '≡', label: $t('nav.factors'),         hint: locale.value === 'zh-CN' ? '因子排名' : 'Factor IC rankings',      shortcut: '7', tab: 'factors' },
   { id: 'history',    icon: '⏱', label: $t('nav.history'),         hint: locale.value === 'zh-CN' ? '运行历史' : 'Run history',             shortcut: '8', tab: 'history' },
   { id: 'settings',   icon: '⚙', label: $t('nav.settings'),        hint: locale.value === 'zh-CN' ? '平台设置' : 'Platform configuration',  shortcut: '9', tab: 'settings' },
+  { id: 'monitor',    icon: '◎', label: $t('nav.monitor'),         hint: locale.value === 'zh-CN' ? '风控监控大屏' : 'Risk & TCA monitor',   shortcut: '0', tab: 'monitor' },
   { id: 'run',        icon: '▶', label: $t('terminal.runPipeline'),    hint: locale.value === 'zh-CN' ? '开始新回测' : 'Start a new backtest',    action: 'run' },
   { id: 'demo',       icon: '⚡', label: $t('terminal.demoBtn'),  hint: locale.value === 'zh-CN' ? '加载示例数据' : 'Load sample data',        action: 'demo' },
   { id: 'export',     icon: '☐', label: $t('terminal.exportBtn'),   hint: locale.value === 'zh-CN' ? '导出为 JSON' : 'Download as JSON',        action: 'export' },
@@ -96,6 +97,7 @@ watch(query, () => { selected.value = 0 })
 
 watch(open, async (v) => {
   if (v) {
+    emit('open')
     query.value = ''
     selected.value = 0
     await nextTick()
@@ -142,11 +144,12 @@ function onKeyDown(e) {
     e.preventDefault()
     toggle()
   }
-  // Number shortcuts when palette is closed
+  // Number shortcuts when palette is closed (0 selects the tenth view).
   if (!open.value && !e.metaKey && !e.ctrlKey && !e.altKey) {
-    const num = parseInt(e.key)
-    if (num >= 1 && num <= 9 && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'SELECT') {
-      const cmd = commands[num - 1]
+    const num = parseInt(e.key, 10)
+    const index = num === 0 ? 9 : num - 1
+    if (index >= 0 && index <= 9 && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'SELECT') {
+      const cmd = commands.value[index]
       if (cmd?.tab) {
         emit('update:modelValue', cmd.tab)
       }

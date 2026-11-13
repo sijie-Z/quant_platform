@@ -25,6 +25,7 @@ import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 
 setup_logging()
 logger = get_logger("rq5b")
@@ -33,7 +34,7 @@ logger = get_logger("rq5b")
 # Parameters
 # ---------------------------------------------------------------------------
 REAL_START = "2018-01-01"
-REAL_END = "2025-12-31"
+REAL_END = resolve_end_date()  # as-of resolved at run time
 INITIAL_CAPITAL = 10_000_000
 
 SIGNAL_HORIZONS = [5, 20, 40, 80, 120, 200]
@@ -229,8 +230,9 @@ def run():
     # ==================================================================
     out = Path("results")
     out.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(phase1_results).to_csv(out / "rq5b_phase1_signal80_scan.csv", index=False)
-    pd.DataFrame(matrix_results).to_csv(out / "rq5b_phase2_matrix.csv", index=False)
+    win = (str(returns.index.min().date()), str(returns.index.max().date()))
+    stamp_provenance(pd.DataFrame(phase1_results), *win).to_csv(out / "rq5b_phase1_signal80_scan.csv", index=False)
+    stamp_provenance(pd.DataFrame(matrix_results), *win).to_csv(out / "rq5b_phase2_matrix.csv", index=False)
 
     # Print raw data
     print()

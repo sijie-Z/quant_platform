@@ -149,6 +149,16 @@ class PortfolioStateMachine:
         """Register a hook to run when exiting a state."""
         self._exit_hooks.setdefault(state, []).append(hook)
 
+    def set_transition_callback(
+        self, callback: Callable[[StateTransition], None] | None,
+    ) -> None:
+        """Register an observer for successful transitions.
+
+        `AuditLog.log_state_change` existed but no production code ever
+        called it; the engine and API now register it here.
+        """
+        self._on_transition = callback
+
     def force_state(self, state: PortfolioState, reason: str = "forced"):
         """Force a state change (bypasses validation). Use for recovery."""
         old = self._state
@@ -157,6 +167,11 @@ class PortfolioStateMachine:
         record = StateTransition(from_state=old.value, to_state=state.value, reason=reason)
         self._history.append(record)
         logger.warning("FORCED state: %s → %s (%s)", old.value, state.value, reason)
+        if self._on_transition:
+            try:
+                self._on_transition(record)
+            except Exception as e:
+                logger.error("Transition callback failed: %s", e)
 
     def get_history(self, limit: int = 50) -> list[dict]:
         """Get transition history."""

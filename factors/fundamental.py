@@ -58,7 +58,10 @@ class PbRatio(BaseFactor):
         if financials is None:
             raise ValueError("Financial data required for pb_ratio")
         pb = financials["pb_ratio"].copy()
-        # Invert: higher factor = cheaper stock (book/price)
+        # Invert for alpha direction (higher = cheaper). Non-positive book
+        # value is not a cheap stock: -pb would turn it into a positive score
+        # and rank it above every real value name.
+        pb = pb.where(pb > 0)
         return -pb
 
 
@@ -80,8 +83,10 @@ class PeRatio(BaseFactor):
         if financials is None:
             raise ValueError("Financial data required for pe_ratio")
         pe = financials["pe_ratio"].copy()
-        # Handle negative earnings (PE is undefined)
-        pe = pe.clip(lower=1)  # Cap at 1 to avoid extreme negative values
+        # Loss-makers have no meaningful PE. Clipping it to 1 made -1 the
+        # highest score in the cross-section, so they ranked as the cheapest
+        # stocks; leave them out instead.
+        pe = pe.where(pe > 0)
         return -pe
 
 

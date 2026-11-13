@@ -30,6 +30,31 @@ class TestRealtimeQuote:
 
 
 class TestWebSocketQuoteProvider:
+    def test_eastmoney_parser_maps_latest_price_and_open_correctly(self):
+        """f2 is the latest price and f17 the open.
+
+        The parser read f17 as `price` and f16 (the low) as `open`, so every
+        consumer sized and valued trades at the day's opening print. f5 is
+        volume in 手 and is normalised to shares.
+        """
+        provider = object.__new__(WebSocketQuoteProvider)
+        provider._source = "eastmoney"
+
+        quotes = provider._parse_message({"data": [{
+            "f12": "600519", "f14": "贵州茅台",
+            "f2": 1324.97, "f3": 1.5, "f5": 123, "f6": 1000.0,
+            "f15": 1330.0, "f16": 1321.0, "f17": 1322.5, "f18": 1300.0,
+        }]})
+
+        q = quotes[0]
+        assert q.price == 1324.97
+        assert q.open == 1322.5
+        assert q.low == 1321.0
+        assert q.high == 1330.0
+        assert q.volume == 12_300  # 123 lots -> shares
+        assert q.source == "eastmoney"
+        assert q.simulated is False
+
     def test_init_requires_websocket(self):
         with patch("quant_platform.data.providers.websocket_provider.HAS_WEBSOCKET", False):
             with pytest.raises(ImportError, match="websocket-client"):

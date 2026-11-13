@@ -158,7 +158,9 @@ const sortableColumns = computed(() => [
 ])
 
 const positiveFactors = computed(() =>
-  (result.value?.factors || []).filter(f => Math.abs(Number(f.icir)) > 0.2).length
+  // The card is labelled "ICIR > 0.2"; the old `Math.abs` counted strongly
+  // negative factors in both the positive and negative cards.
+  (result.value?.factors || []).filter(f => Number(f.icir) > 0.2).length
 )
 
 const negativeFactors = computed(() =>

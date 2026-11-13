@@ -25,12 +25,13 @@ from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 
 setup_logging()
 logger = get_logger("rq6")
 
 REAL_START = "2018-01-01"
-REAL_END = "2025-12-31"
+REAL_END = resolve_end_date()  # as-of resolved at run time
 SIGNAL_H = 40  # 固定信号窗口 (发现 v3 的最佳反转信号)
 HORIZONS = [5, 10, 20, 30, 40, 60, 80, 120, 160]
 
@@ -111,7 +112,7 @@ def execution_backtest(signal, prices, returns, benchmark):
         "ann_ret": s.get("annual_return", 0),
         "mdd": s.get("max_drawdown", 0),
         "n_rebalances": s.get("n_rebalances", 0),
-        "turnover": s.get("turnover", s.get("avg_turnover", 0)),
+        "turnover": s.get("annual_turnover", np.nan),
     }
 
 
@@ -220,6 +221,7 @@ def scan():
     # 保存
     out = Path("results")
     out.mkdir(parents=True, exist_ok=True)
+    df = stamp_provenance(df, str(returns.index.min().date()), str(returns.index.max().date()))
     df.to_csv(out / "rq6_horizon_scan.csv", index=False)
     logger.info("Saved to results/rq6_horizon_scan.csv")
 

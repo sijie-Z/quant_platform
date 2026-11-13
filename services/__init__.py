@@ -1,5 +1,8 @@
 """Microservice skeletons for distributed deployment.
 
+STATUS: PROPOSAL (2026-10) — not imported by the main runtime (`app.py` and
+`main.py` never start these services). See docs/DEAD_CODE_STATUS.md / #77.
+
 Each service is a standalone process that communicates via MessageBus.
 
 Services:

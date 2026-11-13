@@ -19,29 +19,40 @@ matplotlib==3.8.4
 seaborn==0.13.2
 
 # Web
-fastapi==0.128.0
+fastapi==0.157.0
+starlette==1.9.0
 uvicorn==0.40.0
 pydantic==2.12.5
-python-multipart==0.0.6
+# 0.0.6 carried 9 HIGH advisories (ReDoS/boundary DoS; no Form/File endpoints
+# today, but the pin was stale). 0.0.32 is the installed, fixed line.
+python-multipart==0.0.32
 websocket-client==1.9.0
 httpx==0.28.1
+anyio>=4.15.1
+certifi>=2026.10.19
+urllib3>=2.8.0
 
 # ML
 # xgboost-cpu, not xgboost: the plain PyPI wheel hard-depends on
 # nvidia-nccl-cu12 (342 MB) on Linux x86_64. This platform is CPU-only, so
-# that dependency can never be used — it just bloats the Docker image and
+# that dependency can never be used -- it just bloats the Docker image and
 # adds ~350 MB of download to every CI install. Same version, same `xgboost`
 # module, same API.
 xgboost-cpu==2.1.4
-lightgbm==4.5.0
+# 4.5.0 has a HIGH RCE advisory (GHSA-2586-f3p4-hq84); fixed in 4.6.0.
+lightgbm==4.6.0
 shap==0.46.0
 
 # Config
 pyyaml==6.0.2
 python-dotenv==1.0.0
+# zoneinfo database: Windows has no system tz database and slim Linux images
+# may lack one, which would break the Asia/Shanghai market clock.
+tzdata==2026.2
 
 # Testing
 pytest==7.4.3
+pytest-timeout==2.4.0
 pytest-cov==7.1.0
 pytest-asyncio==0.21.2
 

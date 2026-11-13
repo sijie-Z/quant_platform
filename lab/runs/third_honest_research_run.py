@@ -27,8 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from quant_platform.factors.evaluation import ic_summary
 from quant_platform.lab.registry import DEFAULT_DB, RunStore
 from quant_platform.lab.reports import generate_report
+from quant_platform.utils.research_window import compact_date, resolve_end_date
 
 SLICE = "third_honest_research_run"
+MIN_IC_OBS = 20  # R5: below this the run has not been evaluated
 
 DATA_META = {
     "provider": "akshare", "adjust": "hfq", "adjust_basis": "ipo_date_per_stock",
@@ -48,8 +50,10 @@ def _txsym(c): return ("sh" if c.startswith(("60","68","9")) else "sz") + c
 
 def run() -> str:
     store = RunStore(DEFAULT_DB)
+    end_date = resolve_end_date()
+    data_meta = dict(DATA_META, requested_start="2021-01-01", requested_end=end_date)
     run_id = store.begin_run(SLICE, {
-        "slice": SLICE, "data_source": "akshare", "data_meta": DATA_META,
+        "slice": SLICE, "data_source": "akshare", "data_meta": data_meta,
         "universe_provider": UNIVERSE_META["provider"], "universe_meta": UNIVERSE_META,
         "factor": FACTOR_PARAMS["name"], "factor_params": FACTOR_PARAMS, "warnings": [],
     })
@@ -57,7 +61,7 @@ def run() -> str:
         codes = [str(c).zfill(6) for c in ak.index_stock_cons(symbol="000300").iloc[:, 0].tolist()]
         print(f"[{SLICE}] CSI300 members: {len(codes)}", flush=True)
 
-        start_s, end_s = "20210101", "20260523"
+        start_s, end_s = compact_date("2021-01-01"), compact_date(end_date)
         frames = {}
         for i, code in enumerate(codes):
             for _ in range(3):
@@ -76,6 +80,12 @@ def run() -> str:
         prices = pd.DataFrame(frames)
         prices.index.name = "date"
         print(f"[{SLICE}] price panel: {prices.shape}", flush=True)
+        if len(prices) == 0:
+            raise RuntimeError("price panel is empty")
+        data_meta["data_start"] = str(prices.index[0].date())
+        data_meta["data_end"] = str(prices.index[-1].date())
+        print(f"[{SLICE}] data window: {data_meta['data_start']} → "
+              f"{data_meta['data_end']} (requested end {end_date})", flush=True)
 
         # Low vol factor: negated 60d rolling std of daily returns
         rets = prices.pct_change(fill_method=None)
@@ -117,19 +127,33 @@ def run() -> str:
                      "observed_sharpe_proxy": ls_sr,
                      "note": "Do not read this as formal validation."},
             "bh_fdr": "n/a",
+            "data_start": data_meta["data_start"],
+            "data_end": data_meta["data_end"],
+            "requested_end": end_date,
         }
-        store.finish_run(run_id, status="success", evaluation=evaluation, report_path=None, warnings=[])
+        status = "success" if len(ic_series) >= MIN_IC_OBS else "failed"
+        status_reason = None if status == "success" else (
+            f"insufficient_ic_observations: n_ic_obs={len(ic_series)} < {MIN_IC_OBS}"
+        )
+        status_warnings = [status_reason] if status_reason else []
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=None, reason=status_reason,
+                         warnings=status_warnings, data_meta=data_meta)
         rp = generate_report(store.get_run(run_id), out_dir="data/reports")
-        store.finish_run(run_id, status="success", evaluation=evaluation, report_path=rp, warnings=[])
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=rp, reason=status_reason,
+                         warnings=status_warnings, data_meta=data_meta)
         print(f"[{SLICE}] SUCCESS run_id={run_id} IC={evaluation['ic_mean']} ICIR={evaluation['icir']} report={rp}", flush=True)
         return run_id
     except Exception as e:
         tb = traceback.format_exc()
         reason_text = f"{type(e).__name__}: {e}"
         store.finish_run(run_id, status="failed", reason=reason_text,
-                         warnings=[f"traceback_excerpt: {tb[-400:]}"])
+                         warnings=[f"traceback_excerpt: {tb[-400:]}"],
+                         data_meta=data_meta)
         rp = generate_report(store.get_run(run_id), out_dir="data/reports")
-        store.finish_run(run_id, status="failed", reason=reason_text, report_path=rp)
+        store.finish_run(run_id, status="failed", reason=reason_text,
+                         report_path=rp, data_meta=data_meta)
         print(f"[{SLICE}] FAILED run_id={run_id}: {e}", flush=True)
         raise
 

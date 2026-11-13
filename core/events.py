@@ -53,6 +53,7 @@ logger = get_logger(__name__)
 from quant_platform.core.event_bus_v2 import (  # noqa: E402
     AsyncEventBus,
 )
+from quant_platform.core.topic_matching import topic_matches  # noqa: E402
 
 # Type alias for event handlers
 EventHandler = Callable[[Any], None]
@@ -141,7 +142,7 @@ class LegacyEventBus:
         with self._lock:
             handlers = list(self._handlers.get(event.topic, []))
             for pattern, pattern_handlers in self._handlers.items():
-                if pattern.endswith('.*') and event.topic.startswith(pattern[:-2]) or pattern == '*':
+                if pattern != event.topic and topic_matches(event.topic, pattern):
                     handlers.extend(pattern_handlers)
 
         for handler in handlers:
@@ -162,8 +163,7 @@ class LegacyEventBus:
         with self._lock:
             events = self._history
             if topic:
-                events = [e for e in events if e.topic == topic or
-                          (topic.endswith('.*') and e.topic.startswith(topic[:-2]))]
+                events = [e for e in events if topic_matches(e.topic, topic)]
             return [e.to_dict() for e in events[-limit:]]
 
     def get_dead_letters(self) -> list[dict]:

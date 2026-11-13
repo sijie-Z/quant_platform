@@ -347,3 +347,21 @@ class TestBenchmark:
         assert result["n_orders"] == 1000
         assert result["total_trades"] >= 0
         assert result["throughput_orders_per_sec"] > 0
+
+
+class TestFilledMakerRetirement:
+    def test_filled_makers_are_removed_from_the_order_maps(self):
+        """Filled resting orders used to stay in _orders/_order_prices forever."""
+        book = OrderBook("SYM")
+        for i in range(100):
+            book.add_order(BookOrder(
+                f"m{i}", "SYM", Side.SELL, OrderType.LIMIT, 10.0, 100,
+                passive=True,
+            ))
+        taker = BookOrder("taker", "SYM", Side.BUY, OrderType.LIMIT, 10.0, 10_000)
+
+        trades = book.add_order(taker)
+
+        assert trades
+        assert book._orders == {}
+        assert book._order_prices == {}

@@ -106,21 +106,21 @@ class TestExpressionEvaluation:
         """ts_mean(close, 5) should compute 5-day moving average."""
         data = {"close": sample_prices}
         result = calculate_by_expression(data, "ts_mean(close, 5)")
-        expected = sample_prices.T.rolling(5, axis=1).mean().T
+        expected = sample_prices.rolling(5).mean()
         pd.testing.assert_frame_equal(result, expected, rtol=1e-10)
 
     def test_ts_sum(self, sample_prices):
         """ts_sum(close_pct, 21) should compute 21-day cumulative return."""
         data = {"close": sample_prices, "close_pct": sample_prices.pct_change(fill_method=None)}
         result = calculate_by_expression(data, "ts_sum(close_pct, 21)")
-        expected = sample_prices.pct_change(fill_method=None).T.rolling(21, axis=1).sum().T
+        expected = sample_prices.pct_change(fill_method=None).rolling(21).sum()
         pd.testing.assert_frame_equal(result, expected, rtol=1e-10)
 
     def test_ts_std(self, sample_prices):
         """ts_std(close_pct, 20) should compute 20-day volatility."""
         data = {"close_pct": sample_prices.pct_change(fill_method=None)}
         result = calculate_by_expression(data, "ts_std(close_pct, 20)")
-        expected = sample_prices.pct_change(fill_method=None).T.rolling(20, axis=1).std(ddof=0).T
+        expected = sample_prices.pct_change(fill_method=None).rolling(20).std(ddof=0)
         pd.testing.assert_frame_equal(result, expected, rtol=1e-8)
 
     def test_ts_delay(self, sample_prices):
@@ -142,8 +142,8 @@ class TestExpressionEvaluation:
         data = {"close": sample_prices}
         result_min = calculate_by_expression(data, "ts_min(close, 5)")
         result_max = calculate_by_expression(data, "ts_max(close, 5)")
-        expected_min = sample_prices.T.rolling(5, axis=1).min().T
-        expected_max = sample_prices.T.rolling(5, axis=1).max().T
+        expected_min = sample_prices.rolling(5).min()
+        expected_max = sample_prices.rolling(5).max()
         pd.testing.assert_frame_equal(result_min, expected_min, rtol=1e-10)
         pd.testing.assert_frame_equal(result_max, expected_max, rtol=1e-10)
 

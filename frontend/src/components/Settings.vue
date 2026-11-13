@@ -3,7 +3,7 @@
     <div class="section-header">
       <div>
         <div class="section-title">{{ locale === 'zh-CN' ? '设置' : 'Settings' }}</div>
-        <div class="section-subtitle">{{ locale === 'zh-CN' ? '配置平台参数和偏好设置' : 'Configure platform parameters and preferences' }}</div>
+        <div class="section-subtitle">{{ locale === 'zh-CN' ? '浏览器本地偏好（不会修改服务端配置）' : 'Browser-local preferences (does not change server config)' }}</div>
       </div>
     </div>
 
@@ -15,7 +15,7 @@
       <div class="settings-row">
         <div>
           <div class="settings-label">{{ locale === 'zh-CN' ? '后端地址' : 'Backend URL' }}</div>
-          <div class="text-xs text-dim mt-1">{{ locale === 'zh-CN' ? '用于流水线执行的API服务器地址' : 'API server endpoint for pipeline execution' }}</div>
+          <div class="text-xs text-dim mt-1">{{ locale === 'zh-CN' ? 'REST 请求与 WebSocket 都使用该地址；保存后立即生效，刷新页面后依然有效' : 'Used by REST requests and the status WebSocket; applies immediately and survives reloads' }}</div>
         </div>
         <div style="min-width:220px;">
           <input
@@ -24,20 +24,38 @@
             style="margin:0;padding:7px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--text-primary);font-size:13px;font-family:var(--font-mono);width:100%;"
             placeholder="/api"
           />
+          <div class="text-xs mt-1">
+            <span class="text-dim">{{ locale === 'zh-CN' ? '实际生效：' : 'Effective: ' }}</span>
+            <code class="effective-url">{{ effectiveApiBase }}</code>
+            <div v-if="!baseValid" class="text-red">{{ locale === 'zh-CN' ? '地址无效（需为 /path 或 http(s)://host），保存将被拒绝；当前回退为 /api' : 'Invalid URL (expected /path or http(s)://host); saving is blocked and /api is used' }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-label">{{ locale === 'zh-CN' ? 'API Token' : 'API Token' }}</div>
+          <div class="text-xs text-dim mt-1">{{ locale === 'zh-CN' ? '服务端 QUANT_API_TOKEN；仅保存在本浏览器，不会打包进前端' : 'Server QUANT_API_TOKEN; stored only in this browser, never baked into the bundle' }}</div>
+        </div>
+        <div style="min-width:220px;">
+          <input
+            v-model="apiToken"
+            type="password"
+            style="padding:7px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--text-primary);font-size:13px;font-family:var(--font-mono);width:100%;"
+            :placeholder="locale === 'zh-CN' ? '请输入API Token...' : 'Enter API token...'"
+          />
         </div>
       </div>
       <div class="settings-row">
         <div>
           <div class="settings-label">{{ locale === 'zh-CN' ? 'Tushare Token' : 'Tushare Token' }}</div>
-          <div class="text-xs text-dim mt-1">{{ locale === 'zh-CN' ? '获取实时A股数据所需Token（留空使用合成数据）' : 'Required for real A-share data (leave empty for synthetic)' }}</div>
+          <div class="text-xs text-dim mt-1">
+            {{ locale === 'zh-CN'
+              ? '由服务端环境变量 TUSHARE_TOKEN 配置（服务端读取，前端不可设置）；未配置时使用合成数据'
+              : 'Configured server-side via the TUSHARE_TOKEN environment variable (never settable from the browser); synthetic data is used when absent' }}
+          </div>
         </div>
         <div style="min-width:220px;">
-          <input
-            v-model="tushareToken"
-            type="password"
-            style="padding:7px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--text-primary);font-size:13px;font-family:var(--font-mono);width:100%;"
-            :placeholder="locale === 'zh-CN' ? '请输入Token...' : 'Enter token...'"
-          />
+          <div class="settings-value text-dim">TUSHARE_TOKEN <span aria-hidden="true">&#128274;</span></div>
         </div>
       </div>
     </div>
@@ -102,7 +120,7 @@
       </div>
       <div class="settings-row">
         <div class="settings-label">{{ locale === 'zh-CN' ? '因子数量' : 'Factors' }}</div>
-        <div class="settings-value">{{ locale === 'zh-CN' ? '15个（10个技术面 + 5个基本面）' : '15 (10 technical + 5 fundamental)' }}</div>
+        <div class="settings-value">{{ locale === 'zh-CN' ? '27 个已注册（默认启用 21 个）' : '27 registered (21 enabled by default)' }}</div>
       </div>
       <div class="settings-row">
         <div class="settings-label">{{ locale === 'zh-CN' ? '优化器' : 'Optimizers' }}</div>
@@ -110,7 +128,7 @@
       </div>
       <div class="settings-row">
         <div class="settings-label">{{ locale === 'zh-CN' ? '测试' : 'Tests' }}</div>
-        <div class="settings-value text-green">{{ locale === 'zh-CN' ? '105/105 通过' : '105/105 passing' }}</div>
+        <div class="settings-value text-green">{{ locale === 'zh-CN' ? '2,843 通过 / 3 跳过' : '2,843 passed / 3 skipped' }}</div>
       </div>
     </div>
 
@@ -133,22 +151,23 @@
     <div class="flex-between mt-4">
       <div></div>
       <button class="btn btn-primary" @click="saveSettings">
-        &#10003; {{ locale === 'zh-CN' ? '保存设置' : 'Save Settings' }}
+        &#10003; {{ locale === 'zh-CN' ? '保存本地偏好' : 'Save Local Preferences' }}
       </button>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useI18n } from '../i18n/index.js'
+import { getApiBase, normalizeApiBase, isValidApiBase } from '../api/index.js'
 
 const { $t, locale } = useI18n()
 
 const emit = defineEmits(['toast'])
 
-const apiBase = ref('/api')
-const tushareToken = ref('')
+const apiBase = ref(getApiBase())
+const apiToken = ref(localStorage.getItem('quant_api_token') || '')
 const defaults = reactive({
   n_stocks: 300,
   optimizer: 'mean_variance',
@@ -156,30 +175,57 @@ const defaults = reactive({
   rebalance_frequency: 'monthly',
 })
 
+const effectiveApiBase = computed(() => normalizeApiBase(apiBase.value))
+const baseValid = computed(() => isValidApiBase(apiBase.value))
+
 onMounted(() => {
   const saved = localStorage.getItem('quant_settings')
   if (saved) {
     try {
       const s = JSON.parse(saved)
       if (s.apiBase) apiBase.value = s.apiBase
-      if (s.tushareToken) tushareToken.value = s.tushareToken
+      if (s.apiToken) apiToken.value = s.apiToken
       if (s.defaults) Object.assign(defaults, s.defaults)
     } catch {}
   }
 })
 
 function saveSettings() {
+  if (!isValidApiBase(apiBase.value)) {
+    emit('toast', {
+      message: locale.value === 'zh-CN'
+        ? '后端地址无效：请填写 /api 或 http(s)://主机[:端口]'
+        : 'Invalid backend URL: use /api or http(s)://host[:port]',
+      type: 'error',
+    })
+    return
+  }
+  // Persist the normalized form so the effective URL is unambiguous. The
+  // axios request interceptor and the WebSocket factory read this at request/
+  // connect time, so both switch over without a rebuild.
+  const normalized = normalizeApiBase(apiBase.value)
+  apiBase.value = normalized
+  // The API token is stored under its own key so the axios/WS clients can
+  // read it at request time; putting it in the Vite env bakes it into the
+  // public bundle.
+  localStorage.setItem('quant_api_token', apiToken.value)
   localStorage.setItem('quant_settings', JSON.stringify({
-    apiBase: apiBase.value,
-    tushareToken: tushareToken.value,
+    apiBase: normalized,
+    // The token is intentionally NOT duplicated here; `quant_api_token` is the
+    // single key the axios/WS clients read.
     defaults: { ...defaults },
   }))
-  emit('toast', { message: locale.value === 'zh-CN' ? '设置已保存' : 'Settings saved', type: 'success' })
+  emit('toast', {
+    message: locale.value === 'zh-CN'
+      ? `已保存到本浏览器；后端地址 ${normalized} 已对之后的请求生效`
+      : `Saved in this browser; backend URL ${normalized} now applies to subsequent requests`,
+    type: 'success',
+  })
 }
 
 function exportConfig() {
   const data = {
-    apiBase: apiBase.value,
+    apiBase: effectiveApiBase.value,
     defaults: { ...defaults },
     exportedAt: new Date().toISOString(),
   }
@@ -195,6 +241,19 @@ function exportConfig() {
 
 function clearCache() {
   localStorage.removeItem('quant_settings')
-  emit('toast', { message: locale.value === 'zh-CN' ? '本地缓存已清除' : 'Local cache cleared', type: 'info' })
+  apiBase.value = getApiBase()
+  emit('toast', { message: locale.value === 'zh-CN' ? '本地缓存已清除，后端地址已恢复为 /api' : 'Local cache cleared; backend URL reset to /api', type: 'info' })
 }
 </script>
+
+<style scoped>
+.effective-url {
+  background: var(--bg-input);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+  word-break: break-all;
+}
+</style>

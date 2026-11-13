@@ -61,15 +61,31 @@ def monte_carlo_var(
     confidence: float = 0.95,
     horizon: int = 1,
     n_simulations: int = 100_000,
+    random_state: int | np.random.Generator | None = None,
 ) -> float:
     """Monte Carlo VaR.
 
     Fits a t-distribution (fatter tails than normal) to returns,
     then simulates n_simulations paths.
+
+    Args:
+        returns: Daily return series.
+        confidence: Confidence level (0.95 = 95% VaR).
+        horizon: Holding period in days.
+        n_simulations: Number of simulated draws.
+        random_state: Seed or ``numpy.random.Generator``. Pass a seed for
+            reproducible risk reports and stable tests; ``None`` keeps the
+            historical behaviour (fresh entropy on every call, which made two
+            runs on identical data differ by ~2e-4).
     """
-    # Fit t-distribution (better captures fat tails)
+    # Fit t-distribution (better captures fat tails). The MLE is
+    # deterministic, so only the simulation draw needs a controlled RNG.
     params = stats.t.fit(returns.dropna())
-    simulated = stats.t.rvs(*params, size=n_simulations)
+    if isinstance(random_state, np.random.Generator):
+        rng = random_state
+    else:
+        rng = np.random.default_rng(random_state)
+    simulated = stats.t.rvs(*params, size=n_simulations, random_state=rng)
 
     alpha = 1 - confidence
     daily_var = -np.percentile(simulated, alpha * 100)
@@ -99,12 +115,19 @@ def var_summary(
     returns: pd.Series,
     confidence: float = 0.95,
     horizon: int = 1,
+    random_state: int | np.random.Generator | None = None,
 ) -> dict:
-    """Compute all VaR/CVaR measures and return a summary dict."""
+    """Compute all VaR/CVaR measures and return a summary dict.
+
+    ``random_state`` is forwarded to :func:`monte_carlo_var` so a whole
+    summary can be reproduced from one seed.
+    """
     return {
         "historical_var": historical_var(returns, confidence, horizon),
         "parametric_var": parametric_var(returns, confidence, horizon),
-        "monte_carlo_var": monte_carlo_var(returns, confidence, horizon),
+        "monte_carlo_var": monte_carlo_var(
+            returns, confidence, horizon, random_state=random_state,
+        ),
         "historical_cvar": historical_cvar(returns, confidence, horizon),
         "confidence": confidence,
         "horizon_days": horizon,

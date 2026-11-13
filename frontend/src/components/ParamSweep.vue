@@ -99,7 +99,7 @@
                     :style="{ background: cellColor(hm.grid[freq]?.[n], hm.minS, hm.maxS), color: cellTextColor(hm.grid[freq]?.[n]) }"
                     class="heatmap-cell-value"
                   >
-                    {{ hm.grid[freq]?.[n] ?? '-' }}
+                    {{ displayCell(hm.grid[freq]?.[n]) }}
                   </td>
                 </tr>
               </tbody>
@@ -208,12 +208,19 @@ const heatmapData = computed(() => {
       grid[freq] = {}
       for (const n of nStocksList) {
         const row = table.value.find(r => r['Optimizer'] === opt && r['Frequency'] === freq && r['N Stocks'] === n)
-        grid[freq][n] = row ? parseFloat(row['Sharpe']) : null
+        // Failed rows carry the string "ERR"; parseFloat turns that into NaN,
+        // and `?? '-'` does not catch NaN, so the cell rendered "NaN".
+        const parsed = row ? parseFloat(row['Sharpe']) : null
+        grid[freq][n] = Number.isFinite(parsed) ? parsed : null
       }
     }
     return { optimizer: opt, frequencies, nStocksList, grid, minS, maxS }
   })
 })
+
+function displayCell(v) {
+  return Number.isFinite(v) ? v.toFixed(2) : '-'
+}
 
 function cellColor(v, minS, maxS) {
   if (v == null || isNaN(v)) return 'transparent'
@@ -245,7 +252,12 @@ async function runSweep() {
     table.value = res.table
     bestParams.value = res.best_params
     if (res.table.length) {
-      columns.value = Object.keys(res.table[0])
+      // Error rows omit metric keys. Deriving columns from row 0 collapsed
+      // the table to [Optimizer, Error] whenever the first combination
+      // failed, hiding successful later rows.
+      const keys = new Set()
+      for (const row of res.table) Object.keys(row).forEach(k => keys.add(k))
+      columns.value = [...keys]
     }
     emit('toast', { message: (locale.value === 'zh-CN' ? '扫描完成：' : 'Sweep complete: ') + res.table.length + (locale.value === 'zh-CN' ? '种组合' : ' combinations'), type: 'success' })
   } catch (e) {

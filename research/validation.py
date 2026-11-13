@@ -20,11 +20,17 @@ Reference:
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from statistics import NormalDist
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from quant_platform.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 logger = get_logger(__name__)
 
@@ -34,11 +40,21 @@ class DeflatedSharpeResult:
     """Result of a Deflated Sharpe Ratio test."""
     observed_sharpe: float
     expected_max_sharpe: float   # E[max SR under null]
-    deflated_p_value: float      # P(SR >= observed | null)
+    deflated_p_value: float      # P(SR >= observed | null), deflated for N trials
     num_trials: int              # Number of strategies tested
     skew: float                  # Return skewness
     kurtosis: float              # Return kurtosis (excess)
-    significant: bool            # p < significance_level
+    significant: bool            # Final decision: DSR *and* BH (batch) — see below
+    # One-sided p-value of the observed Sharpe against zero, WITHOUT the
+    # E[max SR] deflation. Used as the input to Benjamini-Hochberg in
+    # ``validate_factor_batch`` so the multiple-testing correction is applied
+    # once, not twice.
+    raw_p_value: float = 1.0
+    #: Whether the deflated p-value passes the significance level on its own.
+    dsr_significant: bool | None = None
+    #: Whether the raw p-value passes BH within the batch. ``None`` when no
+    #: batch correction was applied (single-factor use).
+    bh_significant: bool | None = None
 
 
 class FactorValidator:
@@ -65,6 +81,7 @@ class FactorValidator:
         returns: np.ndarray,
         num_trials: int = 1,
         expected_max_sharpe: float | None = None,
+        periods_per_year: float = 252.0,
     ) -> DeflatedSharpeResult:
         """Test if an observed Sharpe ratio is significant after accounting
         for multiple testing (the "deflated" Sharpe ratio).
@@ -79,15 +96,33 @@ class FactorValidator:
         2. Provide `expected_max_sharpe` directly (e.g., from bootstrap).
 
         Args:
-            returns: Array of strategy daily returns.
+            returns: Array of strategy periodic returns (daily by default).
             num_trials: Number of strategies/parameters tested (N).
-            expected_max_sharpe: Override for E[max SR] under null.
+            expected_max_sharpe: Override for E[max SR] under null. Pass an
+                **annualized** Sharpe; it is converted to per-period units
+                internally.
+            periods_per_year: Annualization basis for the returns. The old
+                implementation hardcoded 252, silently mis-annualizing
+                weekly or monthly series. Non-finite returns (inf) are
+                dropped together with NaN; an inf used to yield a silent
+                observed_sharpe=nan / p=1.0.
 
         Returns:
             DeflatedSharpeResult with p-value and significance flag.
         """
+        try:
+            periods_per_year = float(periods_per_year)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"periods_per_year must be a positive number, got {periods_per_year!r}"
+            ) from exc
+        if not math.isfinite(periods_per_year) or periods_per_year <= 0:
+            raise ValueError(
+                f"periods_per_year must be finite and > 0, got {periods_per_year!r}"
+            )
+
         returns = np.asarray(returns, dtype=float)
-        returns = returns[~np.isnan(returns)]
+        returns = returns[np.isfinite(returns)]
 
         if len(returns) < 20:
             logger.warning("Too few observations (%d) for reliable DSR test", len(returns))
@@ -99,6 +134,7 @@ class FactorValidator:
                 skew=0.0,
                 kurtosis=0.0,
                 significant=False,
+                dsr_significant=False,
             )
 
         n = len(returns)
@@ -114,48 +150,57 @@ class FactorValidator:
                 skew=0.0,
                 kurtosis=0.0,
                 significant=False,
+                dsr_significant=False,
             )
 
-        # Observed annualized Sharpe (assuming daily returns)
-        observed_sr = mu / sigma * math.sqrt(252)
+        # Work in per-period units. The old code compared an *annualized*
+        # Sharpe with the unit-variance order statistic sqrt(2 ln N) and
+        # plugged the annualized SR into a standard-error formula that
+        # expects a per-period one. The three terms were on different scales:
+        # a true annualized SR of 2.0 over 1260 days with N=10 came out at
+        # p=0.59, while a short-sample fluke could pass.
+        sr = mu / sigma
+        observed_sr = sr * math.sqrt(periods_per_year)
 
-        # Higher moments
+        # Higher moments (kurtosis is non-excess in the DSR formula)
         skew = float(((returns - mu) ** 3).mean() / (sigma ** 3))
         excess_kurt = float(((returns - mu) ** 4).mean() / (sigma ** 4) - 3)
+        kurt = excess_kurt + 3.0
 
-        # Expected max Sharpe under null (analytical approximation)
+        # Variance of the per-period Sharpe estimator (Lo 2002 / Bailey &
+        # López de Prado 2014, eq. for V[SR]).
+        var_sr = max(
+            0.0,
+            (1 - skew * sr + (kurt - 1) / 4 * sr ** 2) / max(n - 1, 1),
+        )
+        se_sr = math.sqrt(var_sr)
+
         if expected_max_sharpe is None:
-            # E[max(SR_1, ..., SR_N)] ≈ √(2 ln N) for iid standard normals
-            # More accurate with finite-sample and non-normality correction
             if num_trials <= 1:
                 e_max_sr = 0.0
             else:
-                e_max_sr = math.sqrt(2 * math.log(num_trials))
-                # Finite-sample correction (Bailey & López de Prado)
+                # E[max(SR_1..SR_N)] with the Gumbel approximation:
+                # sqrt(V[SR]) * ((1-gamma)*Phi^-1(1-1/N)
+                #                + gamma*Phi^-1(1-1/(N e)))
                 euler_mascheroni = 0.5772156649
-                e_max_sr -= euler_mascheroni / (2 * math.sqrt(2 * math.log(num_trials))) if num_trials > 1 else 0
+                nd = NormalDist()
+                e_max_sr = math.sqrt(var_sr) * (
+                    (1 - euler_mascheroni) * nd.inv_cdf(1 - 1 / num_trials)
+                    + euler_mascheroni * nd.inv_cdf(1 - 1 / (num_trials * math.e))
+                )
         else:
-            e_max_sr = expected_max_sharpe
-
-        # Compute deflated p-value: P(SR_observed | H0: SR = E[max SR])
-        # Using the Jobson & Korkie (1981) test statistic with
-        # non-normality correction (Bailey & López de Prado 2014)
-        # SR_hat ~ N(SR_true, (1 + 0.5*SR_true^2 - skew*SR_true + (kurt-3)/4*SR_true^2) / (n-1))
-        # Under H0: SR_true = E[max SR]
-
-        # Standard error of Sharpe ratio estimate
-        se_sr = math.sqrt(
-            (1 + 0.5 * observed_sr ** 2 - skew * observed_sr
-             + (excess_kurt) / 4 * observed_sr ** 2) / (n - 1)
-        )
+            # The override is documented as an annualized Sharpe.
+            e_max_sr = expected_max_sharpe / math.sqrt(periods_per_year)
 
         if se_sr < 1e-12:
-            deflated_p = 0.0 if observed_sr > e_max_sr else 1.0
+            raw_p = 0.0 if sr > 0 else 1.0
+            deflated_p = 0.0 if sr > e_max_sr else 1.0
         else:
-            # Z-test: is observed SR significantly above E[max SR]?
-            z = (observed_sr - e_max_sr) / se_sr
-            # One-sided p-value (we want SR > E[max SR])
+            # Z-test: is the per-period SR above E[max SR]?
+            z = (sr - e_max_sr) / se_sr
             deflated_p = _norm_sf(z)
+            # Same test against zero, without the multiple-trials deflation.
+            raw_p = _norm_sf(sr / se_sr)
 
         significant = deflated_p < self.significance_level
 
@@ -167,12 +212,14 @@ class FactorValidator:
 
         return DeflatedSharpeResult(
             observed_sharpe=round(observed_sr, 6),
-            expected_max_sharpe=round(e_max_sr, 6),
+            expected_max_sharpe=round(e_max_sr * math.sqrt(periods_per_year), 6),
             deflated_p_value=round(deflated_p, 6),
             num_trials=num_trials,
             skew=round(skew, 6),
             kurtosis=round(excess_kurt, 6),
             significant=significant,
+            raw_p_value=round(raw_p, 6),
+            dsr_significant=significant,
         )
 
     def multiple_testing_correction(
@@ -216,14 +263,27 @@ class FactorValidator:
     ) -> dict[str, DeflatedSharpeResult]:
         """Validate a batch of factors, applying multiple testing correction.
 
+        Multiple-testing policy: a factor is reported ``significant`` only
+        when **both** tests pass:
+
+        1. the DSR deflated p-value is below ``significance_level`` (the
+           effect survives the E[max SR] deflation), and
+        2. its raw one-sided p-value survives Benjamini-Hochberg within the
+           batch.
+
+        The old implementation set ``significant`` from the BH mask alone and
+        ignored the deflated p-value: a factor with raw_p=0.0319 but
+        deflated_p=0.0911 was returned as significant. ``deflated_p_value`` is
+        still reported as the effect-size adjustment, and the two components
+        are exposed separately as ``dsr_significant`` / ``bh_significant``.
+        With a single factor BH is a no-op and the DSR decision is used.
+
         Args:
             factor_returns: Dict of factor_name -> daily returns array.
             num_trials: Number of trials (defaults to len(factor_returns)).
 
         Returns:
-            Dict of factor_name -> DeflatedSharpeResult. Only factors that
-            pass both the DSR test and multiple testing correction are
-            marked as significant.
+            Dict of factor_name -> DeflatedSharpeResult.
         """
         if num_trials is None:
             num_trials = len(factor_returns)
@@ -235,22 +295,28 @@ class FactorValidator:
         for name, rets in factor_returns.items():
             result = self.deflated_sharpe_test(rets, num_trials=num_trials)
             results[name] = result
-            raw_p_values.append(result.deflated_p_value)
+            raw_p_values.append(result.raw_p_value)
             factor_names.append(name)
 
-        # Apply multiple testing correction
+        # Apply the multiple-testing correction once, to the raw p-values,
+        # and require the deflated p-value to pass as well.
         if len(raw_p_values) > 1:
             significant_mask = self.multiple_testing_correction(raw_p_values, method="bh")
             for i, name in enumerate(factor_names):
-                # Override significance with corrected result
+                prev = results[name]
+                dsr_sig = prev.deflated_p_value < self.significance_level
+                bh_sig = bool(significant_mask[i])
                 results[name] = DeflatedSharpeResult(
-                    observed_sharpe=results[name].observed_sharpe,
-                    expected_max_sharpe=results[name].expected_max_sharpe,
-                    deflated_p_value=results[name].deflated_p_value,
+                    observed_sharpe=prev.observed_sharpe,
+                    expected_max_sharpe=prev.expected_max_sharpe,
+                    deflated_p_value=prev.deflated_p_value,
                     num_trials=num_trials,
-                    skew=results[name].skew,
-                    kurtosis=results[name].kurtosis,
-                    significant=bool(significant_mask[i]),
+                    skew=prev.skew,
+                    kurtosis=prev.kurtosis,
+                    significant=bh_sig and dsr_sig,
+                    raw_p_value=prev.raw_p_value,
+                    dsr_significant=dsr_sig,
+                    bh_significant=bh_sig,
                 )
 
         n_significant = sum(1 for r in results.values() if r.significant)
@@ -260,6 +326,142 @@ class FactorValidator:
         )
 
         return results
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Walk-forward factor selection (CORE: importable by lab/tools)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _finite(value: Any) -> float:
+    """Coerce a metric to float without inventing a zero for missing data."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def select_walk_forward_factors(
+    ic_results: dict,
+    processed_factors: dict,
+    returns: pd.DataFrame,
+    *,
+    max_factors: int = 2,
+    significance_level: float = 0.05,
+) -> dict:
+    """Pick walk-forward factors after an IC t-test with BH-FDR control.
+
+    The old selector took the top ``max_factors`` by full-sample ``|ICIR|``
+    with no significance test, so a noise factor could reach the
+    walk-forward stage (and its OOS numbers were then selection-biased).
+
+    Per-factor significance is a two-sided t-test on the IC series,
+    approximated in the normal tail:
+
+        t = mean(IC) / std(IC) * sqrt(n) = ICIR * sqrt(n)
+
+    ``ic_results`` stores only scalar moments (mean/std/ICIR), not the IC
+    series or its length, so the very same Rank IC series is recomputed with
+    :func:`quant_platform.factors.evaluation.rank_ic` to obtain ``n``. This
+    is an approximation: the IC series is treated as iid (no autocorrelation
+    adjustment) and the t distribution is approximated by the normal one
+    (differences are negligible for the hundreds of daily ICs a real panel
+    produces). It is recorded as such in the returned detail.
+
+    Selection: among factors whose raw p-values survive Benjamini-Hochberg
+    at ``significance_level``, take the top ``max_factors`` by ``|ICIR|``.
+    If some survive but fewer than ``max_factors``, take all survivors. If
+    none survive, fall back to the old top-``|ICIR|`` selection and set
+    ``selection_warning`` — the fallback is explicit, never silent.
+
+    Returns a detail dict with ``method``, ``p_values``, ``n_obs``,
+    ``survivors``, ``selected``, ``fallback`` and ``selection_warning``.
+
+    Lives in the research (CORE) layer because lab/tools may not import the
+    live ``strategy`` package; ``strategy.research_validation`` re-exports it.
+    """
+    from quant_platform.factors.evaluation import rank_ic
+
+    validator = FactorValidator(significance_level=significance_level)
+    names = list(ic_results)
+    p_values: dict[str, float] = {}
+    n_obs: dict[str, int] = {}
+
+    for name in names:
+        factor = processed_factors.get(name)
+        if factor is None:
+            p_values[name] = 1.0
+            n_obs[name] = 0
+            continue
+        ic = rank_ic(factor, returns)
+        ic = ic[np.isfinite(np.asarray(ic, dtype=float))]
+        n = int(len(ic))
+        n_obs[name] = n
+        icir = _finite(ic_results[name].get("icir", float("nan")))
+        if n < 2 or not math.isfinite(icir):
+            p_values[name] = 1.0
+            continue
+        t_stat = icir * math.sqrt(n)
+        # Two-sided normal tail (selection uses |ICIR|, so sign does not
+        # matter). erfc(|t|/sqrt(2)) is P(|Z| >= |t|).
+        p_values[name] = min(1.0, math.erfc(abs(t_stat) / math.sqrt(2.0)))
+
+    if names:
+        mask = validator.multiple_testing_correction(
+            [p_values[n] for n in names], method="bh",
+        )
+        survivors = [n for n, ok in zip(names, mask, strict=True) if bool(ok)]
+    else:
+        survivors = []
+
+    selected = sorted(
+        survivors,
+        key=lambda n: abs(_finite(ic_results[n].get("icir", 0.0))),
+        reverse=True,
+    )[:max_factors]
+
+    fallback = False
+    selection_warning = None
+    if not selected and names:
+        fallback = True
+        selection_warning = (
+            "no factor survives BH-FDR; falling back to top-|ICIR|"
+        )
+        # Fallback keeps the original top-|ICIR| rule, but a factor whose
+        # ICIR is undefined (fewer than MIN_IC_OBSERVATIONS ICs, hence NaN)
+        # cannot be ranked and must not win by sort accident. If no factor
+        # has a finite ICIR at all, preserve the historical ordering so a
+        # short-sample run still walks forward exactly as it used to.
+        finite = [
+            (name, info) for name, info in ic_results.items()
+            if math.isfinite(_finite(info.get("icir", float("nan"))))
+        ]
+        if finite:
+            ranked = sorted(
+                finite, key=lambda item: abs(item[1]["icir"]), reverse=True,
+            )
+        else:
+            ranked = sorted(
+                ic_results.items(), key=lambda x: abs(x[1].get("icir", 0)),
+                reverse=True,
+            )
+        selected = [name for name, _ in ranked[:max_factors]]
+
+    return {
+        "method": "full-sample ICIR two-sided t-test + BH-FDR",
+        "significance_level": significance_level,
+        "p_value_method": (
+            "normal approximation to t = ICIR*sqrt(n_obs); n_obs is the "
+            "length of the recomputed Rank IC series; IC autocorrelation "
+            "is not modelled"
+        ),
+        "p_values": p_values,
+        "n_obs": n_obs,
+        "survivors": survivors,
+        "selected": selected,
+        "fallback": fallback,
+        "selection_warning": selection_warning,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -318,3 +520,101 @@ def _benjamini_hochberg(p_values: np.ndarray, alpha: float) -> np.ndarray:
     result[sorted_idx] = rejections_sorted
 
     return result
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Sweep-level validation (shared by /api/sweep and `main.py sweep`)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def validate_sweep_trials(
+    results: Mapping[str, np.ndarray],
+    periods_per_year: float = 252.0,
+    significance_level: float = 0.05,
+) -> dict:
+    """Validate a parameter sweep's trials with DSR plus BH-FDR.
+
+    Contract
+    --------
+    * ``results`` maps a configuration id to that configuration's periodic
+      return series. Only configurations that completed successfully should
+      be passed; ``N = len(results)`` is the number of trials.
+    * Every configuration is tested with
+      :meth:`FactorValidator.deflated_sharpe_test` at ``num_trials=N``, so the
+      expected maximum Sharpe is deflated for picking the best of N
+      independent trials (Bailey & López de Prado). The deflated p-value is
+      the probability of observing a Sharpe at least this high by chance
+      after that selection bias; it is reported as ``dsr_p``.
+    * The one-sided *raw* p-values (no deflation) feed a single
+      Benjamini-Hochberg correction at ``significance_level``; the resulting
+      mask is reported per configuration as ``bh_significant``.
+    * A configuration is ``significant`` only when both the DSR deflated
+      p-value and the BH-adjusted raw p-value pass -- the same policy as
+      :meth:`FactorValidator.validate_factor_batch`.
+    * ``best`` is the configuration with the highest observed (annualized)
+      Sharpe. It carries the same significance fields plus ``config`` so a
+      caller can tie the verdict back to the table row that was selected.
+
+    Returns
+    -------
+    dict with:
+      ``num_trials``: N
+      ``trials``: {config: {observed_sharpe, expected_max_sharpe, raw_p,
+      dsr_p, dsr_significant, bh_significant}}
+      ``best``: {config, observed, expected_max, deflated_p, raw_p,
+      significant, dsr_significant, bh_significant} or None when empty.
+      ``best`` is by ``observed_sharpe``; note that a series too short for
+      the DSR test reports ``observed_sharpe=0.0`` (the method's documented
+      short-circuit), so with only such series the pick is degenerate. The
+      API/CLI select their best row from the backtest table and only use
+      these entries for the verdict, not for selection.
+
+    Non-finite returns (NaN/inf) are dropped by ``deflated_sharpe_test``; a
+    series with fewer than 20 finite observations can never be significant
+    (p=1 by that method) and is reported that way rather than crashing.
+    """
+    validator = FactorValidator(significance_level=significance_level)
+    names = list(results)
+    num_trials = len(names)
+
+    raw_p_values: list[float] = []
+    trial_results: dict[str, DeflatedSharpeResult] = {}
+    for name in names:
+        series = np.asarray(results[name], dtype=float)
+        trial_results[name] = validator.deflated_sharpe_test(
+            series, num_trials=num_trials, periods_per_year=periods_per_year,
+        )
+        raw_p_values.append(trial_results[name].raw_p_value)
+
+    bh_mask = validator.multiple_testing_correction(raw_p_values, method="bh")
+
+    trials: dict[str, dict] = {}
+    for i, name in enumerate(names):
+        prev = trial_results[name]
+        dsr_sig = bool(prev.deflated_p_value < significance_level)
+        bh_sig = bool(bh_mask[i]) if num_trials else False
+        trials[name] = {
+            "observed_sharpe": prev.observed_sharpe,
+            "expected_max_sharpe": prev.expected_max_sharpe,
+            "raw_p": prev.raw_p_value,
+            "dsr_p": prev.deflated_p_value,
+            "dsr_significant": dsr_sig,
+            "bh_significant": bh_sig,
+        }
+
+    best = None
+    if names:
+        best_name = max(names, key=lambda n: trials[n]["observed_sharpe"])
+        entry = trials[best_name]
+        best = {
+            "config": best_name,
+            "observed": entry["observed_sharpe"],
+            "expected_max": entry["expected_max_sharpe"],
+            "deflated_p": entry["dsr_p"],
+            "raw_p": entry["raw_p"],
+            "significant": bool(entry["dsr_significant"] and entry["bh_significant"]),
+            "dsr_significant": entry["dsr_significant"],
+            "bh_significant": entry["bh_significant"],
+        }
+
+    return {"num_trials": num_trials, "trials": trials, "best": best}

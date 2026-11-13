@@ -1,6 +1,7 @@
 """Configuration schema validation using dataclasses."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -24,6 +25,16 @@ class DataConfig:
     start_date: str = "2021-01-01"
     end_date: str = "2025-12-31"
     frequency: str = "daily"
+    # A configured *real* provider that is unavailable must fail closed by
+    # default: silently substituting synthetic research data made a broken
+    # feed indistinguishable from production output. Set this (or pass
+    # `--allow-synthetic-fallback`) only for development.
+    allow_synthetic_fallback: bool = False
+    # Freshness gate (D32): a panel whose completion marker is more than this
+    # many *exchange sessions* behind the requested end is stale. Research
+    # runs warn; live/decisive runs fail closed. 3 sessions tolerates a
+    # weekend plus a T+1 publication lag.
+    max_staleness_days: int = 3
 
 
 @dataclass
@@ -39,7 +50,7 @@ class FactorProcessingConfig:
 
 @dataclass
 class AlphaConfig:
-    method: str = "icir_weighted"
+    method: str = "equal_weight"
     lookback: int = 252
     min_icir: float = 0.0
     tradability_gate: bool = False
@@ -53,6 +64,11 @@ class PortfolioConstraintsConfig:
     max_sector_exposure: float = 0.30
     max_turnover: float = 0.30
     lot_size: int = 100
+    # R8 cost-aware optimizer knobs. All default to 0 = disabled, so the
+    # default backtest path is unchanged.
+    transaction_cost_bps: float = 0.0   # one-way turnover cost in bp
+    turnover_penalty: float = 0.0       # quadratic (w - prev_w) penalty
+    max_participation: float = 0.0      # ADV participation cap, (0, 1] or 0
 
 
 @dataclass
@@ -80,7 +96,10 @@ class BacktestConfig:
 @dataclass
 class CostsConfig:
     commission: float = 0.0003
-    stamp_tax: float = 0.001
+    # None = follow the statutory sell-side schedule by trade date (0.1%
+    # before 2023-08-28, 0.05% from that date); an explicit value is a flat
+    # override. Flat 0.1% on a post-cut backtest overstated sell costs.
+    stamp_tax: float | None = None
     slippage: float = 0.001
     slippage_model: str = "impact"  # fixed, proportional, impact
     impact_model: str = "composite"  # composite, almgren_chriss, square_root
@@ -106,6 +125,32 @@ class OutputConfig:
     results_dir: str = "./results"
     save_plots: bool = True
     plot_format: str = "png"
+
+
+@dataclass
+class HoldoutConfig:
+    """Final-evaluation holdout window (ISO dates; empty = disabled).
+
+    The window is inclusive on both ends. Both dates must be set together and
+    ``start_date < end_date``. Validation lives in ``validate_config()``
+    (``utils/config.py``), not here: the config system's documented contract
+    is that ``load_config(validate=False)`` skips validation for synthetic /
+    partial configs (see ``utils/config.py``'s module docstring), and a
+    dataclass constructor cannot honour that flag. The constructor only
+    normalises ``None``/whitespace so empty means disabled.
+    """
+    start_date: str = ""
+    end_date: str = ""
+
+    def __post_init__(self) -> None:
+        self.start_date = "" if self.start_date is None else str(self.start_date).strip()
+        self.end_date = "" if self.end_date is None else str(self.end_date).strip()
+
+
+@dataclass
+class ResearchConfig:
+    """Research governance settings (the holdout window)."""
+    holdout: HoldoutConfig = field(default_factory=HoldoutConfig)
 
 
 @dataclass
@@ -176,6 +221,11 @@ class FactorsConfig:
     enabled_fundamentals: tuple[str, ...] = (
         "log_market_cap", "pb_ratio", "pe_ratio", "roe", "asset_growth",
     )
+    # Per-factor constructor parameters (`momentum_1m: {params: {period: 10}}`).
+    # They used to be dropped during parsing, so editing them changed nothing.
+    params: dict[str, dict] = field(default_factory=dict)
+    # `factors.processing`: winsorize / standardize / neutralize settings.
+    processing: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -189,6 +239,7 @@ class Config:
     costs: CostsConfig = field(default_factory=CostsConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
     instruments: list[InstrumentConfig] = field(default_factory=list)
     screener: ScreenerConfig = field(default_factory=ScreenerConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)

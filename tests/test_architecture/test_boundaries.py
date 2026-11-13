@@ -145,10 +145,11 @@ def _discover_layer(path: str) -> str | None:
     return None
 
 
-def test_all_layers_report_current_boundary_state():
-    """Informational test: prints current import topology.
+def report_current_boundary_state():
+    """Informational helper: prints current import topology.
 
-    Always passes. Use -v to see the output.
+    Deliberately not named `test_*`: it asserts nothing, and a "passing"
+    no-assert test inflates the suite. Run it directly when reviewing layers.
     """
     layers_found: dict[str, list[str]] = {}
     for layer_dir_name in PROTECTED:

@@ -111,3 +111,28 @@ class TestAlphaPipeline:
         assert isinstance(signal, pd.DataFrame)
         # At minimum, signal should not be NaN everywhere
         assert signal.notna().any().any()
+
+
+def test_near_tied_assets_rank_stably_under_floating_noise():
+    """The signal for one date must not depend on summation noise.
+
+    A full panel and the same panel truncated at date d produced combined
+    scores differing by ~1e-14. Rank normalization turned that into real
+    percentile differences for near-tied assets, so the lookahead detector
+    flagged the causal signal as biased. Ranking is now on scores rounded to
+    1e-12, far below any economic difference and far above the noise.
+    """
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    assets = ["A", "B", "C"]
+    base = pd.DataFrame(
+        [[0.1, 0.1 + 1e-15, 0.2]] * 3,
+        index=dates, columns=assets,
+    )
+    noisy = base.copy()
+    noisy.loc[:, "A"] += 2e-14
+
+    pipe = AlphaPipeline(method="equal_weight")
+    clean_signal = pipe.run({"f": base}, base)
+    noisy_signal = pipe.run({"f": noisy}, base)
+
+    pd.testing.assert_frame_equal(clean_signal, noisy_signal)

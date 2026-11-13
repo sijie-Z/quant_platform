@@ -18,6 +18,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from quant_platform.shared.symbols import symbol_code, symbol_exchange
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -51,6 +52,7 @@ class Quote:
     market_cap: float      # 总市值
     circulating_cap: float # 流通市值
     amplitude: float       # 振幅 %
+    price_basis: str = "raw"  # exchange quotes are traded CNY prices
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> dict:
@@ -62,7 +64,8 @@ class Quote:
             "prev_close": self.prev_close, "turnover_rate": self.turnover_rate,
             "pe_ratio": self.pe_ratio, "pb_ratio": self.pb_ratio,
             "market_cap": self.market_cap, "circulating_cap": self.circulating_cap,
-            "amplitude": self.amplitude, "timestamp": self.timestamp,
+            "amplitude": self.amplitude, "price_basis": self.price_basis,
+            "timestamp": self.timestamp,
         }
 
 
@@ -84,6 +87,18 @@ class RealTimeMarket:
         self._cache_ttl = cache_ttl
         self._snapshot_cache: pd.DataFrame | None = None
         self._snapshot_time: float = 0
+        self._snapshot_fetched_at: str = ""
+        self._snapshot_stale: bool = False
+
+    @property
+    def snapshot_fetched_at(self) -> str:
+        """When the cached snapshot was actually fetched from the exchange."""
+        return self._snapshot_fetched_at
+
+    @property
+    def snapshot_is_stale(self) -> bool:
+        """True when the last refresh failed and a cached frame is being served."""
+        return self._snapshot_stale
 
     def get_market_snapshot(self, force_refresh: bool = False) -> pd.DataFrame:
         """Get real-time snapshot of ALL A-shares (~5000 stocks).
@@ -102,12 +117,21 @@ class RealTimeMarket:
             df = ak.stock_zh_a_spot_em()
             self._snapshot_cache = df
             self._snapshot_time = now
+            self._snapshot_fetched_at = datetime.now().isoformat()
+            self._snapshot_stale = False
             logger.info("Market snapshot refreshed: %d stocks", len(df))
             return df
         except Exception as e:
             logger.error("Failed to get market snapshot: %s", e)
             if self._snapshot_cache is not None:
-                logger.warning("Returning stale cache")
+                # Serving the old frame is fine for resilience, but it must
+                # not be presented as a live quote: the API used to stamp the
+                # response with `datetime.now()` regardless of cache age.
+                self._snapshot_stale = True
+                logger.warning(
+                    "Returning stale market cache fetched at %s",
+                    self._snapshot_fetched_at or "unknown",
+                )
                 return self._snapshot_cache
             raise
 
@@ -115,20 +139,48 @@ class RealTimeMarket:
         """Get real-time quotes for specific stocks.
 
         Args:
-            codes: Stock codes without exchange suffix, e.g. ['600519', '000001']
+            codes: Symbols in any accepted form -- bare (``600519``),
+                prefix (``sz300001``) or canonical (``300001.SZ``).  The
+                AKShare snapshot keys on the bare six-digit code, so the
+                request is normalized before matching.  ``Quote.code`` keeps
+                the snapshot's native bare code (LiveTradingEngine and other
+                existing consumers key on that form); callers that need the
+                canonical label can run it through ``normalize_symbol``.
         """
         df = self.get_market_snapshot()
-        code_set = set(codes)
-
-        # Filter matching stocks
-        mask = df['代码'].isin(code_set)
+        # Map bare snapshot code -> requested exchanges (if explicit); the
+        # match uses the six-digit code so suffix/prefix inputs work without
+        # silently crossing exchanges for an explicitly labelled symbol.
+        wanted: dict[str, set[str] | None] = {}
+        for code in codes:
+            digits = symbol_code(code)
+            if digits is None:
+                continue
+            text = str(code).strip().upper()
+            explicit = None
+            for exchange in ("SH", "SZ", "BJ"):
+                if text.endswith(exchange) or text.startswith(exchange):
+                    explicit = exchange
+                    break
+            if digits not in wanted:
+                wanted[digits] = {explicit} if explicit else None
+            elif explicit and wanted[digits] is not None:
+                wanted[digits].add(explicit)
+        snapshot_codes = df['代码'].astype(str)
+        mask = snapshot_codes.isin(set(wanted))
         matched = df[mask]
 
         quotes = []
         for _, row in matched.iterrows():
             try:
+                row_code = str(row.get('代码', ''))
+                requested = wanted.get(symbol_code(row_code) or "")
+                if requested and symbol_exchange(row_code) not in requested:
+                    # An explicitly labelled request must not silently bind to
+                    # a same-numbered instrument on another exchange.
+                    continue
                 q = Quote(
-                    code=str(row.get('代码', '')),
+                    code=row_code,
                     name=str(row.get('名称', '')),
                     price=float(row.get('最新价', 0) or 0),
                     change_pct=float(row.get('涨跌幅', 0) or 0),
@@ -145,6 +197,10 @@ class RealTimeMarket:
                     market_cap=float(row.get('总市值', 0) or 0),
                     circulating_cap=float(row.get('流通市值', 0) or 0),
                     amplitude=float(row.get('振幅', 0) or 0),
+                    # The quote's time is when the snapshot was fetched, not
+                    # when this object was constructed: a cached frame must
+                    # not look like a fresh tick.
+                    timestamp=self._snapshot_fetched_at or datetime.now().isoformat(),
                 )
                 quotes.append(q)
             except (ValueError, TypeError) as e:
@@ -202,7 +258,7 @@ class RealTimeMarket:
         """
         try:
             df = ak.stock_zh_a_hist(
-                symbol=code, period=period,
+                symbol=symbol_code(code) or str(code), period=period,
                 start_date=start_date, end_date=end_date,
                 adjust=adjust,
             )

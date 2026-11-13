@@ -2,30 +2,61 @@
 
 Defines expected column names, dtypes, and validation helpers for the
 data pipeline to ensure data integrity at each stage.
+
+Contract (enforced at the provider boundary by :meth:`DataPipeline.run`):
+
+* Prices -- MultiIndex ``(date, asset)``, levels named ``date``/``asset``,
+  sorted, with at least :data:`REQUIRED_PRICE_COLUMNS`.  ``vwap``/``amount``
+  are optional because not every provider ships them.  ``volume`` is in
+  shares and ``turnover`` is a fraction (see the provider wave's contract);
+  the pipeline does not convert units.
+* Financials -- MultiIndex ``(date, asset)`` keyed to the first trading day
+  on/after ``publish_date``, with :data:`FINANCIAL_COLUMNS`.  An entirely
+  empty frame is legal (a provider may have no fundamentals); the pipeline
+  normalises it to the documented empty panel.  ``publish_date`` is expected
+  from conforming providers but is not required here because the PIT
+  accessor has a documented failure mode for providers that cannot supply it.
+* Metadata -- indexed by ``asset`` with :data:`REQUIRED_METADATA_COLUMNS`.
+  ``is_st`` may be absent or empty when the provider has no ST history; it
+  is deliberately not required and the pipeline warns instead of assuming
+  ``False``.
+
+Violations raise :class:`DataContractError` naming the provider, the dataset
+and the offending index level/column, so a provider bug fails at the
+boundary with an actionable message instead of a downstream ``KeyError``.
 """
 
 from __future__ import annotations
 
 import pandas as pd
 
-# Expected columns in price data
+# Columns every price provider must supply.  `vwap` and `amount` are
+# optional: Baostock/Postgres do not ship vwap, and neither synthetic nor
+# several real feeds ship amount.  Consumers already treat them as optional
+# (`_derive_suspensions` checks column presence; nothing indexes `amount`).
 PRICE_COLUMNS = [
     "open", "high", "low", "close", "volume",
-    "turnover", "adj_factor", "vwap",
+    "turnover", "adj_factor",
 ]
+OPTIONAL_PRICE_COLUMNS = ["vwap", "amount", "pct_chg"]
 
-# Expected columns in financial data
+# The column set consumed by the factor layer (`factors/fundamental.py`);
+# a provider missing any of these silently kills a factor, so it is a hard
+# contract violation.  Ratio names follow the repo convention
+# (`pb_ratio`/`pe_ratio`) rather than the provider-native `pb`/`pe`.
 FINANCIAL_COLUMNS = [
     "market_cap", "total_assets", "net_assets",
     "revenue", "net_profit", "roe", "pb_ratio",
     "pe_ratio", "asset_growth",
 ]
 
-# Expected columns in metadata
+# Columns the pipeline itself reads.  `is_st` may be absent/None when the
+# provider cannot supply ST history -- absence must not be read as "not ST".
 METADATA_COLUMNS = [
     "sector", "market_cap_group", "is_st",
     "listing_date", "delisting_date",
 ]
+REQUIRED_METADATA_COLUMNS = ["sector", "listing_date", "delisting_date"]
 
 # A-share industry sectors (for synthetic data)
 SECTORS = [
@@ -53,19 +84,144 @@ SECTOR_WEIGHTS = {
 }
 
 
-def validate_prices(df: pd.DataFrame) -> None:
-    """Validate price DataFrame has required columns and index."""
-    if not isinstance(df.index, pd.MultiIndex):
-        raise ValueError("Price data must have MultiIndex (date, asset)")
-    missing = set(PRICE_COLUMNS) - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing price columns: {missing}")
+class DataQualityError(ValueError):
+    """A provider output violates a documented data contract."""
 
 
-def validate_financials(df: pd.DataFrame) -> None:
-    """Validate financial DataFrame has required columns and index."""
+class DataContractError(DataQualityError):
+    """Structural contract violation (index levels, columns, dtypes)."""
+
+
+def provider_label(provider) -> str:
+    """Human-readable provider name for contract error messages."""
+    if provider is None:
+        return "provider"
+    cls_name = type(provider).__name__
+    name = getattr(provider, "provider_name", None) or getattr(provider, "name", None)
+    if name and str(name) != cls_name:
+        return f"{cls_name}({name})"
+    return cls_name
+
+
+def _require_multi_index(df: pd.DataFrame, kind: str, label: str) -> None:
     if not isinstance(df.index, pd.MultiIndex):
-        raise ValueError("Financial data must have MultiIndex (date, asset)")
-    missing = set(FINANCIAL_COLUMNS) - set(df.columns)
+        raise DataContractError(
+            f"{label}: {kind} data must have a MultiIndex (date, asset); "
+            f"got a {type(df.index).__name__} index"
+        )
+    names = list(df.index.names)
+    if names != ["date", "asset"]:
+        raise DataContractError(
+            f"{label}: {kind} index levels must be named ['date', 'asset']; "
+            f"got {names!r}"
+        )
+    if len(df.index):
+        date_level = df.index.get_level_values("date")
+        if not pd.api.types.is_datetime64_any_dtype(date_level):
+            raise DataContractError(
+                f"{label}: {kind} 'date' index level must be datetime64; "
+                f"got dtype {date_level.dtype}"
+            )
+
+
+def validate_prices(df: pd.DataFrame | None, provider=None) -> None:
+    """Validate a provider price frame against the shared contract.
+
+    Raises:
+        DataContractError: naming the provider and the violated
+            index/column, so a provider bug cannot surface later as an
+            unrelated ``KeyError``/``ValueError`` inside the pipeline.
+    """
+    label = provider_label(provider)
+    if df is None:
+        raise DataContractError(
+            f"{label}: get_prices() returned None; expected a DataFrame with "
+            "MultiIndex (date, asset)"
+        )
+    if not isinstance(df, pd.DataFrame):
+        raise DataContractError(
+            f"{label}: get_prices() returned {type(df).__name__}; expected "
+            "a pandas DataFrame"
+        )
+
+    _require_multi_index(df, "price", label)
+
+    missing = [c for c in PRICE_COLUMNS if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing financial columns: {missing}")
+        raise DataContractError(
+            f"{label}: price data is missing required column(s) {missing}; "
+            f"required {PRICE_COLUMNS}, optional {OPTIONAL_PRICE_COLUMNS}"
+        )
+
+    # Only the date level must be sorted: the pipeline unstacks by asset and
+    # reindexes columns, so asset order within a date is irrelevant, but
+    # `pct_change`/rolling consumers walk the date order.
+    dates = df.index.get_level_values("date")
+    if not dates.is_monotonic_increasing:
+        raise DataContractError(
+            f"{label}: price data 'date' index level is not sorted "
+            "(non-decreasing); return data sorted by date (df.sort_index() "
+            "sorts both levels and is always safe)"
+        )
+
+
+def validate_financials(df: pd.DataFrame | None, provider=None) -> None:
+    """Validate a provider financial frame against the shared contract.
+
+    An empty frame (including ``None``) is accepted: a provider may
+    legitimately have no fundamentals, and ``DataPipeline._align`` gives the
+    empty frame the documented ``(date, asset)`` MultiIndex.
+    """
+    label = provider_label(provider)
+    if df is None:
+        return
+    if not isinstance(df, pd.DataFrame):
+        raise DataContractError(
+            f"{label}: get_financials() returned {type(df).__name__}; "
+            "expected a pandas DataFrame"
+        )
+    if df.empty:
+        return
+
+    _require_multi_index(df, "financial", label)
+
+    missing = [c for c in FINANCIAL_COLUMNS if c not in df.columns]
+    if missing:
+        raise DataContractError(
+            f"{label}: financial data is missing required column(s) {missing}; "
+            f"required {FINANCIAL_COLUMNS}. Fundamental factors and "
+            "market-cap neutralisation read these columns directly."
+        )
+
+
+def validate_metadata(df: pd.DataFrame | None, provider=None) -> None:
+    """Validate a provider metadata frame against the shared contract.
+
+    ``is_st`` is intentionally optional: providers that cannot supply ST
+    history omit it (or leave it empty), and the pipeline must not read that
+    absence as "not ST".
+    """
+    label = provider_label(provider)
+    if df is None or not isinstance(df, pd.DataFrame):
+        raise DataContractError(
+            f"{label}: get_metadata() returned "
+            f"{type(df).__name__}; expected a DataFrame indexed by asset"
+        )
+    if df.empty:
+        raise DataContractError(
+            f"{label}: metadata is empty; cannot build a point-in-time "
+            "universe without listing/delisting information"
+        )
+    if df.index.name != "asset":
+        raise DataContractError(
+            f"{label}: metadata index must be named 'asset'; "
+            f"got index name {df.index.name!r}"
+        )
+
+    missing = [c for c in REQUIRED_METADATA_COLUMNS if c not in df.columns]
+    if missing:
+        raise DataContractError(
+            f"{label}: metadata is missing required column(s) {missing}; "
+            f"required {REQUIRED_METADATA_COLUMNS} "
+            "(is_st is optional when the provider has no ST history)"
+        )

@@ -35,7 +35,7 @@
           <div :class="['regime-badge-lg', `regime-badge-${regime.overall_regime}`]">
             {{ locale === 'zh-CN' ? (regime.overall_regime === 'risk_on' ? '风险偏好' : regime.overall_regime === 'risk_off' ? '风险规避' : regime.overall_regime === 'cautious' ? '谨慎' : '中性') : regime.overall_regime?.toUpperCase() }}
           </div>
-          <div class="regime-recommendation">{{ locale === 'zh-CN' ? (regime.recommendation === 'Full allocation to risk assets' ? '满仓风险资产' : regime.recommendation === 'Reduce risk exposure' ? '降低风险敞口' : regime.recommendation === 'Defensive positioning' ? '防御性配置' : regime.recommendation === 'Capital preservation' ? '资本保全是首要任务' : regime.recommendation) : regime.recommendation }}</div>
+          <div class="regime-recommendation">{{ locale === 'zh-CN' ? recommendationZh(regime.recommendation) : regime.recommendation }}</div>
         </div>
       </div>
 
@@ -85,15 +85,20 @@
         <div class="regime-panel">
           <div class="regime-panel-title">{{ locale === 'zh-CN' ? '相关性' : 'CORRELATION' }}</div>
           <div :class="['regime-badge', `corr-${regime.correlation?.regime}`]">
-            {{ locale === 'zh-CN' ? (regime.correlation?.regime === 'normal_correlation' ? '正常相关' : '压力相关') : regime.correlation?.regime?.replace('_', ' ')?.toUpperCase() }}
+            {{ regime.correlation?.available === false
+              ? (locale === 'zh-CN' ? '不可用' : 'N/A')
+              : (locale === 'zh-CN' ? (regime.correlation?.regime === 'normal_correlation' ? '正常相关' : '压力相关') : regime.correlation?.regime?.replace('_', ' ')?.toUpperCase()) }}
           </div>
-          <div class="regime-detail">
+          <div class="regime-detail" v-if="regime.correlation?.available !== false">
             <span>{{ locale === 'zh-CN' ? '平均相关性' : 'Avg Corr' }}</span>
             <span class="regime-mono">{{ regime.correlation?.avg_correlation?.toFixed(3) }}</span>
           </div>
-          <div class="regime-detail">
+          <div class="regime-detail" v-if="regime.correlation?.available !== false">
             <span>{{ locale === 'zh-CN' ? '资产数' : 'Assets' }}</span>
             <span class="regime-mono">{{ regime.correlation?.n_assets || 'N/A' }}</span>
+          </div>
+          <div class="regime-detail" v-else>
+            <span>{{ regime.correlation?.reason }}</span>
           </div>
         </div>
       </div>
@@ -127,6 +132,18 @@ const props = defineProps({ runId: { type: String, default: '' } })
 
 const loading = ref(false)
 const regime = ref(null)
+
+function recommendationZh(text) {
+  // Map the strings `quant_core/regime.py` actually emits. The old list
+  // matched labels that only the demo data used.
+  const map = {
+    'Reduce exposure, tighten stops, increase hedging': '降低风险敞口',
+    'Normal exposure with tighter risk limits': '保持敞口并收紧风控',
+    'Standard positioning': '标准配置',
+    'Full exposure, consider increasing factor bets': '满仓风险资产',
+  }
+  return map[text] || text
+}
 const historyChartRef = ref(null)
 let historyChart = null
 let resizeObs = null
