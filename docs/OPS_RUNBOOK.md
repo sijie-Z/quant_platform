@@ -261,7 +261,7 @@ python tools/forward_update.py
 - 台账：`docs/research/paper_track/forward_2026/`（EP+换手）与 `forward_2026_turnover/`（换手）；
 - 成本：佣金 0.03%（最低 5 元）、印花税按日期、平方根冲击；原始价由 `paper_track --raw-price-mode auto` 自动识别（新浪面板用 `amount/volume`）。
 
-**自动化**：桌面端 Scheduled 任务 `quant-forward-paper-daily`，工作日 16:20 运行；失败写入 `.scratch/orchestrate/forward_update_failures.log`。月末目标生成前会抓取当日 ST 名单并强制排除；快照或目标生成失败、任一台账子进程失败时，主脚本以非零状态退出（fail closed），不得把旧台账当成当日更新成功。若日志出现 `merged cache ends <旧日期> ... provider has not published the current close yet`，说明数据源尚未发布当日收盘数据（2026-10-26 15:20 的新浪日线即仍停在 10-23），等待下一次运行即可，不要手工伪造当日行或放宽检查。周末/节假日按最近交易日校验，月末 Friday 不会因周末运行而被跳过。个股与合并面板均先写临时文件再原子替换；**非空但落后于当日的响应同样视为失败并重试**，不得覆盖旧的好数据。目标/当前持仓资产刷新失败、月末任一资产刷新失败、或超过 5 只刷新失败时退出 2，不把混合日期缓存用于调仓、基准或台账。补生成历史月末时只使用该月末之前的权重，拒绝用未来权重链接。
+**自动化**：桌面端 Scheduled 任务 `quant-forward-paper-daily`，工作日 17:15 运行（新浪日线通常 16:30–17:30 陆续发布，过早在门禁处失败）、工作日 19:40 另有 `quant-forward-paper-fallback` 兜底（先查并发与台账日期，缺才补跑）；失败写入 `.scratch/orchestrate/forward_update_failures.log`。月末目标生成前会抓取当日 ST 名单并强制排除；快照或目标生成失败、任一台账子进程失败时，主脚本以非零状态退出（fail closed），不得把旧台账当成当日更新成功。若日志出现 `merged cache ends <旧日期> ... provider has not published the current close yet`，说明数据源尚未发布当日收盘数据（2026-10-26 15:20 的新浪日线即仍停在 10-23），等待下一次运行即可，不要手工伪造当日行或放宽检查。周末/节假日按最近交易日校验，月末 Friday 不会因周末运行而被跳过。个股与合并面板均先写临时文件再原子替换；**非空但落后于当日的响应同样视为失败并重试**，不得覆盖旧的好数据。目标/当前持仓资产刷新失败、月末任一资产刷新失败、或超过 5 只刷新失败时退出 2，不把混合日期缓存用于调仓、基准或台账。补生成历史月末时只使用该月末之前的权重，拒绝用未来权重链接。
 
 **v3.1 月末加固（2026-10-28）**：
 - **月末交易日开跑就先抓当日 ST 名单并落盘（在任何数据门禁之前）**。即使当天门禁失败退出 2，之后运行仍可用 `st_codes_<月末>.txt` 补生成目标；该文件只会由全量覆盖校验通过的抓取写入，不要删除 `.scratch/orchestrate/` 下的 `st_codes_*.txt`。
@@ -281,4 +281,4 @@ python tools/forward_realtime.py --interval 300 --count 12  # 每 5 分钟，共
 
 **首次运行前**：在 Scheduled 页点一次 “Run now” 预授权 Bash 等工具，否则可能停在权限确认。
 
-**已知限制**：宽池只含当前上市股票（幸存者偏差）；PE/PB 为半月频 ffill（≤3 周旧值）；行业映射静态；权重层面不取整手；这是模拟跟踪，不是实盘成交。
+**已知限制**：宽池只含当前上市股票（幸存者偏差）；PE/PB 为百度供应商不定期抽样（每只股票日期不同），由 v3.2 的每日刷新任务维持新鲜（中位 vintage 通常 0–2 天，见 `.scratch/valuation_baidu/vintage.json`）；行业映射静态；权重层面不取整手；这是模拟跟踪，不是实盘成交。台账 `nav.csv` 为**只追加**：`paper_track` 重建时逐行字节比对，历史行不一致即拒绝写入（v3.3，冻结清单 §11）；如确需修历史，先归档旧台账再显式重建。评估规则见 `docs/research/EVALUATION_SPEC_2026-11.md`（哈希冻结）。
