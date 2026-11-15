@@ -83,6 +83,22 @@ def test_official_book_uses_reference_price_for_missing_quote(realtime):
     assert result["complete"] is False
 
 
+def test_official_book_quotes_share_the_reference_basis(realtime):
+    """The book reference (amount/volume) and Sina quotes are both raw;
+    value = shares * quote must reproduce, not invent, a scale factor."""
+    book = {
+        "as_of": "2026-11-13", "cash": 0.0,
+        "positions_value": 1000.0,
+        "positions": [{"code": "000543", "value": 1000.0,
+                       "reference_price": 10.0, "shares": 100.0}],
+    }
+    spot = pd.DataFrame({
+        "latest": [11.0], "prev_close": [10.0], "return": [0.1],
+    }, index=["000543"])
+    result = realtime.book_snapshot(book, spot)
+    assert result["indicative_nav"] == pytest.approx(1100.0)
+
+
 def test_transient_snapshot_failure_does_not_end_session(realtime, tmp_path, monkeypatch):
     payload = {
         "timestamp": "2026-10-27T10:00:00",
@@ -133,6 +149,72 @@ def test_three_consecutive_snapshot_failures_stop_without_stale_output(
         realtime.main()
     assert not (tmp_path / "snapshots.csv").exists()
     assert len((tmp_path / "errors.log").read_text(encoding="utf-8").splitlines()) == 3
+
+
+def test_target_as_of_comes_from_target_payload(realtime):
+    weights = pd.Series({"000001": 0.5, "600000": 0.25})
+    weights.attrs["as_of"] = "2026-10-30"
+    weights.attrs["execution_status"] = "scheduled"
+    result = realtime.strategy_snapshot("turnover", weights, _spot(), 0.02)
+    assert result["target_as_of"] == "2026-10-30"
+    assert result["execution_status"] == "scheduled"
+
+
+def test_snapshot_labels_pending_target(realtime, tmp_path, monkeypatch):
+    name = "turnover"
+    (tmp_path / "summary.json").write_text(
+        '{"pending_targets":[{"as_of":"2026-11-30"}]}', encoding="utf-8",
+    )
+    monkeypatch.setitem(realtime.LEDGERS, name, tmp_path)
+    weights = pd.Series({"000001": 1.0})
+    weights.attrs["as_of"] = "2026-11-30"
+    monkeypatch.setattr(realtime, "load_targets", lambda: {name: weights})
+    monkeypatch.setattr(realtime, "load_book", lambda _name: None)
+    monkeypatch.setattr(
+        realtime, "spot_panel",
+        lambda: pd.DataFrame({"latest": [11.0], "prev_close": [10.0], "return": [0.1]},
+                             index=["000001"]),
+    )
+    monkeypatch.setattr(realtime, "STOCKS", tmp_path / "stocks")
+    result = realtime.snapshot()
+    assert result["strategies"][name]["target_as_of"] == "2026-11-30"
+    assert result["strategies"][name]["execution_status"] == "pending_execution"
+
+
+def test_snapshot_write_failure_is_retried_with_error_log(
+    realtime, tmp_path, monkeypatch,
+):
+    payload = {
+        "timestamp": "2026-10-27T10:00:00",
+        "universe": {"equal_weight_return": 0.01},
+        "strategies": {"turnover": {
+            "gross_return_since_previous_close": 0.02,
+            "indicative_nav_gross": 2_040_000.0,
+            "quoted_assets": 1, "complete": True,
+        }},
+    }
+    calls = {"snapshot": 0, "write": 0}
+
+    def snapshot():
+        calls["snapshot"] += 1
+        return payload
+
+    def flaky_write(_payload, _out_dir):
+        calls["write"] += 1
+        if calls["write"] == 1:
+            raise PermissionError("latest.json is locked")
+
+    monkeypatch.setattr(realtime, "snapshot", snapshot)
+    monkeypatch.setattr(realtime, "write_snapshot", flaky_write)
+    monkeypatch.setattr(realtime.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["forward_realtime.py", "--interval", "1", "--count", "2",
+         "--out-dir", str(tmp_path)],
+    )
+    realtime.main()
+    assert calls["write"] == 2
+    assert "PermissionError" in (tmp_path / "errors.log").read_text(encoding="utf-8")
 
 
 def test_snapshots_stay_in_scratch_and_append(realtime, tmp_path):

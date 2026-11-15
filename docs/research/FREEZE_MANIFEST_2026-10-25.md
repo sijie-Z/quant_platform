@@ -227,3 +227,18 @@
 **验证**：新增 2 项回归（陈旧估值月末→拒目标、保台账、退出 2；新鲜估值→正常生成目标）；`tests/test_tools/test_forward_update.py` 47 项通过；生产路径 `--skip-refetch` 集成运行 exit 0（11-13 台账逐字不变）。
 
 **哈希**：`tools/forward_update.py` → `481aa19dba8eaf6e`（freeze_guard 同步）。
+
+## 14. v3.6 —— 监控工具修正与守卫扩展（2026-11-16）
+
+**触发（残余审查）**：盘中实时监控与个人持仓监控各有一处会产出误导数字的缺陷，冻结守卫缺两项运行时依赖。
+
+**修复**：
+
+- `holdings_monitor.py`：缺行情的持仓不再按成本价伪造"零盈亏"计入总市值——改为明确排除，输出 `*_complete` 标志与 `missing_cost_cny`，并新增两条预警（缺行情清单、基金金额仍为存档值）。此前光伏 E 因新浪 ETF 列表缺报价被静默按成本计价。
+- `forward_realtime.py`：目标 `as_of` 不再硬编码 `2026-10-23`，改读目标文件与 summary 的 `pending_targets`，输出 `execution_status`（scheduled/pending_execution）；写快照失败计入连续失败计数（此前锁文件可中断整个会话不留错误日志）。
+- **价格基准核实（重要）**：逐一验证 book 的 `reference_price` == 当日成交额÷成交量（原始价），份额与价值同基准；新浪实时报价同为原始价——**两者同量纲，直接相乘正确**，无 6 倍缩放问题（审查 agent 的"hfq 缩放"质疑经真实数据证伪）。盘中参考与正式台账的关系已在代码注释中固化。
+- `freeze_guard.py`：FROZEN 扩至 22 项（新增 `utils/numba_accelerator.py`——被三个冻结文件运行时加载；`forward_realtime.py`；`holdings_monitor.py`）；新增"已钉目标文件消失"报警（删除/重建将不再静默）；修复误报（st_codes 等非 target 文件不参与缺失检查）。
+
+**验证**：新增 5 项回归（缺行情排除、基金存档预警、目标 as_of 透传、pending 标记、写失败计数），实时/持仓 13 项全过；守卫 22 项全绿；真实数据端到端：缺行情明确报出（光伏 E），盘中参考恢复正确量纲（−0.61% 而非 +589%）。
+
+**哈希**：`tools/forward_realtime.py` → `226bdcba5f0d2102`、`tools/holdings_monitor.py` → `1c6eefd55c9b3f3f`、`tools/freeze_guard.py` → `1cc8f49b3ed04ed4`（自引用哈希不入 FROZEN）。

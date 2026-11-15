@@ -34,6 +34,8 @@ def load_targets() -> dict[str, pd.Series]:
             raise RuntimeError(f"no active target for {name}")
         payload = json.loads(paths[-1].read_text(encoding="utf-8"))
         targets[name] = pd.Series(payload["weights"], dtype=float)
+        targets[name].attrs["as_of"] = payload.get("as_of") or paths[-1].stem[len("target_"):]
+        targets[name].attrs["path"] = paths[-1]
     return targets
 
 
@@ -80,7 +82,8 @@ def strategy_snapshot(name: str, weights: pd.Series, spot: pd.DataFrame,
     indicative_nav = 2_000_000.0 * (1.0 + gross_return)
     return {
         "basis": "target_weights",
-        "target_as_of": "2026-10-23",
+        "target_as_of": weights.attrs.get("as_of"),
+        "execution_status": weights.attrs.get("execution_status", "unknown"),
         "target_assets": int(len(weights)),
         "quoted_assets": int(valid.sum()),
         "missing_assets": missing,
@@ -95,8 +98,49 @@ def strategy_snapshot(name: str, weights: pd.Series, spot: pd.DataFrame,
     }
 
 
-def book_snapshot(book: dict, spot: pd.DataFrame) -> dict:
-    """Mark the actual official positions and cash to the latest quotes."""
+def load_hfq_scale(book: dict) -> dict[str, float]:
+    """Per-asset hfq scale: hfq close / raw close on the book date.
+
+    The official book stores reference prices on the same hfq basis used by
+    ``paper_track`` (for the Sina panel that is amount/volume, not the close),
+    while Sina's realtime quote is raw. Without a scale, an intraday
+    revaluation mixes the two bases and can be wrong by an order of
+    magnitude.
+    """
+    merged = ROOT / ".scratch" / "orchestrate" / "merged_wide.parquet"
+    if not merged.is_file():
+        return {}
+    panel = pd.read_parquet(merged).reset_index()
+    day = panel[panel["date"] == pd.Timestamp(book["as_of"])]
+    if day.empty:
+        return {}
+    scale = {}
+    for code, row in day.set_index("asset").iterrows():
+        volume = row.get("volume")
+        amount = row.get("amount")
+        close = row.get("close")
+        if not pd.notna(volume) or not pd.notna(amount) or not pd.notna(close):
+            continue
+        if float(volume) <= 0:
+            continue
+        raw = float(amount) / float(volume)
+        if raw > 0:
+            scale[str(code).zfill(6)] = float(close) / raw
+    return scale
+
+
+def book_snapshot(book: dict, spot: pd.DataFrame,
+                  hfq_scale: dict[str, float] | None = None) -> dict:
+    """Mark the actual official positions and cash to the latest quotes.
+
+    The book's ``reference_price`` is whatever raw-price basis ``paper_track``
+    used (for the Sina panel: amount/volume, verified equal to
+    ``value / shares`` on every position), and the book's share counts are
+    derived from that same basis. Sina's realtime quote is raw too, so the
+    bases already match and NO scaling is applied. ``hfq_scale`` is retained
+    as an explicit override: if the book ever moves to an hfq reference
+    basis, callers must supply the conversion or the revaluation is wrong.
+    """
     cash = float(book["cash"])
     positions_value = float(book.get(
         "positions_value",
@@ -114,6 +158,7 @@ def book_snapshot(book: dict, spot: pd.DataFrame) -> dict:
             shares = float(position["value"]) / reference
         latest = spot["latest"].get(code, float("nan"))
         if pd.notna(latest) and float(latest) > 0:
+            # Both the book reference and the Sina quote are raw-price basis.
             price = float(latest)
             quoted += 1
         else:
@@ -145,9 +190,19 @@ def snapshot() -> dict:
     )
     strategies = {}
     for name, weights in targets.items():
+        summary_path = LEDGERS[name] / "summary.json"
+        pending = False
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            pending = any(
+                target.get("as_of") == weights.attrs.get("as_of")
+                for target in summary.get("pending_targets", [])
+            )
+        weights.attrs["execution_status"] = "pending_execution" if pending else "scheduled"
         book = load_book(name)
+        weight_scale = load_hfq_scale(book) if book is not None else {}
         if book is not None:
-            strategies[name] = book_snapshot(book, spot)
+            strategies[name] = book_snapshot(book, spot, weight_scale)
         else:
             strategies[name] = strategy_snapshot(
                 name, weights, spot, benchmark_return,
@@ -218,6 +273,7 @@ def main() -> None:
     for index in range(iterations):
         try:
             payload = snapshot()
+            write_snapshot(payload, args.out_dir)
         except Exception as exc:  # noqa: BLE001
             consecutive_failures += 1
             log_snapshot_error(args.out_dir, exc, consecutive_failures)
@@ -228,7 +284,6 @@ def main() -> None:
                 ) from exc
         else:
             consecutive_failures = 0
-            write_snapshot(payload, args.out_dir)
             print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
         if index + 1 < iterations:
             time.sleep(args.interval)

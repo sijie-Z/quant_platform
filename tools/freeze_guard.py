@@ -31,6 +31,8 @@ FROZEN = {
     "tools/daily_signal.py": "ee4773925b1a7d5f",
     "tools/paper_track.py": "e7573cc0fef5d826",
     "tools/forward_update.py": "481aa19dba8eaf6e",
+    "tools/forward_realtime.py": "226bdcba5f0d2102",
+    "tools/holdings_monitor.py": "1c6eefd55c9b3f3f",
     "backtest/engine.py": "d937c3403d83c2fd",
     "backtest/cost_model.py": "18a71fb6cec9e2be",
     "portfolio/optimizers.py": "1e703bd95fd68a57",
@@ -40,6 +42,7 @@ FROZEN = {
     "factors/evaluation.py": "0a8c0dfb1d08878e",
     "backtest/metrics.py": "49399a9141d95171",
     "utils/exchange_calendar.py": "00260b954308468a",
+    "utils/numba_accelerator.py": "8000a2cf969e598a",
     "tools/fetch_valuation.py": "a286f5449fba5bc7",
     "docs/research/EVALUATION_SPEC_2026-11.md": "9983a97c4e00315e",
     "tools/forward_evaluation.py": "9b3aaf3dd193088e",
@@ -109,10 +112,12 @@ def main() -> int:
         if relative.startswith("docs/research/paper_track/forward_targets/")
     }
     pinned_targets.update(state.get("targets") or {})
+    discovered_targets: set[str] = set()
     new_targets = {}
     for directory in TARGET_DIRS:
         for path in sorted(directory.glob("target_*.json")):
             relative = path.relative_to(ROOT).as_posix()
+            discovered_targets.add(relative)
             actual = digest(path)
             as_of = path.stem[len("target_"):]
             pinned = pinned_targets.get(relative)
@@ -126,6 +131,12 @@ def main() -> int:
                 problems.append(f"unregistered historical target: {relative}")
             else:
                 new_targets[relative] = actual
+
+    for relative in sorted(
+        key for key in set(pinned_targets) - discovered_targets
+        if Path(key).name.startswith("target_")
+    ):
+        problems.append(f"pinned target is missing (deletion/regeneration risk): {relative}")
 
     new_state = {"targets": new_targets}
     for ledger in LEDGERS:
