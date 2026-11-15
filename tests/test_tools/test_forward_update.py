@@ -918,3 +918,88 @@ def test_st_snapshot_does_not_multiply_fetch_attempts(
     )
     assert forward_update.current_st_codes(pd.Timestamp.today()) is None
     assert calls["count"] == 2
+
+
+def test_month_end_valuation_gate_blocks_target_but_keeps_st_and_ledger(
+    forward_update, tmp_path, monkeypatch, capsys,
+):
+    strategy = _strategy_with_target(tmp_path, "2026-10-23")
+    monkeypatch.setattr(forward_update, "STRATEGIES", [strategy])
+    monkeypatch.setattr(sys, "argv", ["forward_update.py"])
+    monkeypatch.setattr(forward_update, "refetch", lambda: [])
+    monkeypatch.setattr(
+        forward_update, "rebuild", lambda: _merged("2026-11-30"),
+    )
+    monkeypatch.setattr(forward_update, "stale_cache_reason",
+                        lambda latest, today: None)
+    monkeypatch.setattr(
+        forward_update, "failed_refresh_reason",
+        lambda failed, strategies, latest, strict=None: None,
+    )
+    monkeypatch.setattr(forward_update, "is_month_end", lambda _latest: True)
+    monkeypatch.setattr(forward_update, "current_st_codes",
+                        lambda _latest: tmp_path / "st.txt")
+    monkeypatch.setattr(
+        forward_update, "valuation_vintage_days", lambda: 30,
+    )
+    commands = []
+
+    def signal_unexpected(cmd, **kwargs):
+        commands.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(forward_update.subprocess, "run", signal_unexpected)
+    tracked = []
+    monkeypatch.setattr(
+        forward_update, "track",
+        lambda strategy: tracked.append(strategy["name"]) or 0,
+    )
+    assert forward_update.main() == 2
+    assert commands == [], "a stale-valuation month-end must not build a target"
+    assert tracked == ["turnover"], "the ledger must still rebuild"
+    output = capsys.readouterr().out
+    assert "median valuation vintage 30d exceeds" in output
+
+
+def test_month_end_valuation_gate_passes_on_fresh_vintage(
+    forward_update, tmp_path, monkeypatch,
+):
+    strategy = _strategy_with_target(tmp_path, "2026-10-23")
+    strategy["ledger"] = tmp_path / "ledger"
+    monkeypatch.setattr(forward_update, "STRATEGIES", [strategy])
+    monkeypatch.setattr(sys, "argv", ["forward_update.py"])
+    monkeypatch.setattr(forward_update, "refetch", lambda: [])
+    monkeypatch.setattr(
+        forward_update, "rebuild", lambda: _merged("2026-11-30"),
+    )
+    monkeypatch.setattr(forward_update, "stale_cache_reason",
+                        lambda latest, today: None)
+    monkeypatch.setattr(
+        forward_update, "failed_refresh_reason",
+        lambda failed, strategies, latest, strict=None: None,
+    )
+    monkeypatch.setattr(forward_update, "is_month_end", lambda _latest: True)
+    monkeypatch.setattr(forward_update, "current_st_codes",
+                        lambda _latest: tmp_path / "st.txt")
+    monkeypatch.setattr(forward_update, "valuation_vintage_days", lambda: 2)
+    commands = []
+
+    def signal_success(cmd, **kwargs):
+        commands.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(forward_update.subprocess, "run", signal_success)
+    tracked = []
+    monkeypatch.setattr(
+        forward_update, "track",
+        lambda strategy: tracked.append(strategy["name"]) or 0,
+    )
+    assert forward_update.main() == 0
+    # The tmp schedule only holds 2026-10-23, so the run also catches up the
+    # overdue 2026-10-30 target with its dated PIT snapshot, then builds
+    # 2026-11-30 from the fresh-valuation snapshot. Both must pass the gate;
+    # the only subprocess calls are the two daily_signal target builds.
+    assert len(commands) == 2
+    as_ofs = [cmd[cmd.index("--as-of") + 1] for cmd in commands]
+    assert as_ofs == ["2026-10-30", "2026-11-30"]
+    assert tracked == ["turnover"]

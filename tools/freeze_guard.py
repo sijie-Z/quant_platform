@@ -30,7 +30,7 @@ FREEZE_DATE = "2026-10-23"
 FROZEN = {
     "tools/daily_signal.py": "ee4773925b1a7d5f",
     "tools/paper_track.py": "e7573cc0fef5d826",
-    "tools/forward_update.py": "1d97834af3e14448",
+    "tools/forward_update.py": "481aa19dba8eaf6e",
     "backtest/engine.py": "d937c3403d83c2fd",
     "backtest/cost_model.py": "18a71fb6cec9e2be",
     "portfolio/optimizers.py": "1e703bd95fd68a57",

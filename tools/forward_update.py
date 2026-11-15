@@ -603,6 +603,42 @@ def _generable_overdue(latest: pd.Timestamp) -> bool:
     return False
 
 
+VALUATION_MAX_VINTAGE_DAYS = 21
+
+
+def valuation_vintage_days() -> int | None:
+    """Median age (days) of the newest vendor valuation observation."""
+    vintage_file = ROOT / ".scratch" / "valuation_baidu" / "vintage.json"
+    if vintage_file.is_file():
+        try:
+            payload = json.loads(vintage_file.read_text(encoding="utf-8"))
+            median = payload.get("median_vintage_days")
+            if isinstance(median, (int, float)) and median >= 0:
+                return int(median)
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Fall back to reading the merged valuation store directly.
+    val = pd.read_parquet(VAL).reset_index()
+    val["date"] = pd.to_datetime(val["date"])
+    latest_obs = val["date"].max().date()
+    return (dt.date.today() - latest_obs).days
+
+
+def valuation_reason(latest: pd.Timestamp) -> str | None:
+    """Explain why stale valuations must block an EP month-end target."""
+    if not is_month_end(latest):
+        return None
+    vintage = valuation_vintage_days()
+    if vintage is None:
+        return ("valuation vintage unknown on a month-end session; refusing "
+                "to generate an EP target from possibly stale PE/PB")
+    if vintage > VALUATION_MAX_VINTAGE_DAYS:
+        return (f"median valuation vintage {vintage}d exceeds "
+                f"{VALUATION_MAX_VINTAGE_DAYS}d on a month-end session; "
+                "refusing to generate an EP target")
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-refetch", action="store_true")
@@ -633,6 +669,18 @@ def main():
             log(f"ERROR: {failed_reason}")
             return 2
     st_file = current_st_codes(latest) if is_month_end(latest) else None
+    valuation_block = valuation_reason(latest)
+    if valuation_block:
+        # The dated ST snapshot and the ledger rebuild must still happen:
+        # skipping forward_update entirely would lose this month's dated PIT
+        # ST file and permanently strand the month-end rebalance.
+        log(f"ERROR: {valuation_block}")
+        errors = []
+        for s in STRATEGIES:
+            rc = track(s)
+            if rc != 0:
+                errors.append(f"{s['name']}: paper_track exited {rc}")
+        return 2 if not errors else 1
     errors = []
     for s in STRATEGIES:
         try:
