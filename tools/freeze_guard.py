@@ -44,7 +44,7 @@ FROZEN = {
     "utils/exchange_calendar.py": "00260b954308468a",
     "utils/numba_accelerator.py": "8000a2cf969e598a",
     "tools/fetch_valuation.py": "a286f5449fba5bc7",
-    "docs/research/EVALUATION_SPEC_2026-11.md": "e85bb5c968417a99",
+    "docs/research/EVALUATION_SPEC_2026-11.md": "555055b96352c46f",
     "tools/forward_evaluation.py": "02883be224a6f4c3",
     ".cache/baostock/industry_map.parquet": "5da906a2e4bca0c0",
     "docs/research/paper_track/forward_targets/turnover/target_2026-10-23.json":
