@@ -206,6 +206,56 @@ def file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+def attribution_diagnostic(strategy_returns: pd.Series,
+                           bench_returns: pd.Series) -> dict:
+    """Pre-registered defensive-tilt vs alpha attribution (spec §10, 2026-11-16).
+
+    Regresses the strategy itself on the benchmark: beta is the strategy's
+    market beta, alpha is the intercept (annualized), and the beta-adjusted
+    cumulative excess is sum(strategy) − beta·sum(bench). Up/down capture
+    quantifies the tilt. Transparency diagnostic only: the retain/stop gate
+    (§5) is unchanged, but any alpha claim requires beta < 0.8 AND
+    NW t(alpha) >= 1.5 AND positive beta-adjusted excess; otherwise the
+    record reads "consistent with defensive tilt".
+    """
+    frame = pd.DataFrame({"strategy": strategy_returns, "bench": bench_returns}).dropna()
+    bench = frame["bench"]
+    strategy = frame["strategy"]
+    beta = float(np.cov(strategy, bench, ddof=1)[0, 1] / np.var(bench, ddof=1))
+    alpha_daily = float(strategy.mean() - beta * bench.mean())
+    se_mu, _ = newey_west_se(strategy - beta * bench)
+    t_alpha = alpha_daily / se_mu if se_mu > 0 else None
+    alpha_annual = (1.0 + alpha_daily) ** 252.0 - 1.0
+    up = bench > 0
+    down = bench < 0
+    up_capture = (
+        float(strategy[up].mean() / bench[up].mean())
+        if up.any() and bench[up].mean() != 0 else None
+    )
+    down_capture = (
+        float(strategy[down].mean() / bench[down].mean())
+        if down.any() and bench[down].mean() != 0 else None
+    )
+    beta_adjusted_excess = float((strategy - beta * bench).sum())
+    alpha_claim = (
+        beta < 0.8
+        and t_alpha is not None and t_alpha >= 1.5
+        and beta_adjusted_excess > 0
+    )
+    return {
+        "beta_vs_b1": beta,
+        "alpha_annualized_hac": alpha_annual,
+        "alpha_t_stat_hac": t_alpha,
+        "alpha_se_daily_hac": se_mu,
+        "up_capture_vs_b1": up_capture,
+        "down_capture_vs_b1": down_capture,
+        "beta_adjusted_cum_excess": beta_adjusted_excess,
+        "alpha_claim_allowed": bool(alpha_claim),
+        "interpretation": ("alpha claim permitted" if alpha_claim
+                           else "consistent with defensive tilt; alpha unproven"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.parse_args()
@@ -307,6 +357,21 @@ def main() -> int:
         "individual_pass_diagnostic": individual_pass,
         "joint_pass": (all(individual_pass.values()) if joint_required else None),
     }
+    # Pre-registered attribution diagnostic (spec §10, 2026-11-16): separate
+    # defensive tilt from alpha. The gate itself is unchanged.
+    report["tilt_attribution"] = {}
+    for name in STRATEGIES:
+        strategy_returns = pd.Series({
+            pd.Timestamp(row["date"]): row["strategy_return"]
+            for row in report["daily_series"][name]
+        })
+        bench_returns = pd.Series({
+            pd.Timestamp(row["date"]): row["b1_st_excluded_ew_return"]
+            for row in report["daily_series"][name]
+        })
+        report["tilt_attribution"][name] = attribution_diagnostic(
+            strategy_returns, bench_returns,
+        )
     report["disclaimer"] = (
         "通过门槛 ≠ 证明有效。样本短且 Sharpe 置信区间为 IID 近似，"
         "未校正序列相关；3个月节点仅诊断，不授权提前终止或调参。"

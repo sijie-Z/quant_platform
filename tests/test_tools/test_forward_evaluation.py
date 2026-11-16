@@ -142,3 +142,32 @@ def test_b1_rejects_missing_pit_st_observation(evaluation, tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match="PIT ST mask missing"):
         evaluation.b1_returns(pd.Timestamp("2026-10-26"), pd.Timestamp("2026-10-26"))
 
+
+
+def test_attribution_diagnostic_flags_defensive_tilt(evaluation):
+    # Strategy with beta 0.5 plus tiny noise: moves half as much as the
+    # benchmark, no alpha. (Pure 0.5*bench leaves a zero residual, and a
+    # zero-variance residual has no t-statistic by construction.)
+    rng = np.random.default_rng(7)
+    noise = rng.normal(0.0, 5e-4, 30)
+    noise = noise - noise.mean()  # zero-mean noise: alpha is exactly 0 up to beta estimation
+    bench = pd.Series([0.01, -0.02, 0.015, -0.01, 0.005, -0.015] * 5,
+                      index=pd.bdate_range("2026-10-26", periods=30))
+    strategy = bench * 0.5 + pd.Series(noise, index=bench.index)
+    result = evaluation.attribution_diagnostic(strategy, bench)
+    assert result["beta_vs_b1"] == pytest.approx(0.5, abs=0.02)
+    assert result["alpha_t_stat_hac"] is not None and abs(result["alpha_t_stat_hac"]) < 1.5
+    assert result["alpha_claim_allowed"] is False
+    assert "defensive tilt" in result["interpretation"]
+    assert result["down_capture_vs_b1"] == pytest.approx(0.5, abs=0.05)
+
+
+def test_attribution_diagnostic_permits_clear_alpha(evaluation):
+    bench = pd.Series([0.01, -0.02, 0.015, -0.01, 0.005, -0.015] * 8,
+                      index=pd.bdate_range("2026-10-26", periods=48))
+    strategy = bench * 0.5 + 0.004  # strong positive active return, low beta
+    result = evaluation.attribution_diagnostic(strategy, bench)
+    assert result["beta_vs_b1"] == pytest.approx(0.5, abs=1e-6)
+    assert result["alpha_t_stat_hac"] >= 1.5
+    assert result["beta_adjusted_cum_excess"] > 0
+    assert result["alpha_claim_allowed"] is True
