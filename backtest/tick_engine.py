@@ -53,6 +53,8 @@ from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+_NS_PER_DAY = 86_400 * 1_000_000_000
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Data Models
@@ -120,6 +122,8 @@ class BacktestConfig:
     commission_rate: float = 0.0003
     min_commission: float = 5.0
     stamp_tax_rate: float = 0.001  # Sell-side only
+    lot_size: int = 100  # Minimum trading unit (A-share: 100 shares)
+    t_plus: int = 1  # Shares bought on day t are sellable from t + t_plus
     max_position_pct: float = 0.05  # Max 5% per position
     max_order_size_pct: float = 0.01  # Max 1% of ADV per order
 
@@ -144,6 +148,10 @@ class Position:
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
     market_value: float = 0.0
+    # T+1 bookkeeping: shares bought during the current UTC day cannot be
+    # sold until the next one (B9).
+    today_bought_qty: int = 0
+    last_buy_day: int | None = None
 
     def update_price(self, price: float):
         if self.quantity > 0:
@@ -241,7 +249,10 @@ class TWAPAlgorithm(ExecutionAlgorithm):
             return []
 
         # Round to lot size
-        qty_per_slice = max(100, (qty_per_slice // 100) * 100)
+        lot = max(1, int(config.lot_size))
+        qty_per_slice = (qty_per_slice // lot) * lot
+        if qty_per_slice <= 0:
+            return []
 
         order = BookOrder(
             order_id=f"twap_{uuid.uuid4().hex[:8]}",
@@ -279,9 +290,10 @@ class VWAPAlgorithm(ExecutionAlgorithm):
         participation_qty = int(slice_volume * self.target_participation)
 
         # Cap at remaining quantity and participation limit
+        lot = max(1, int(config.lot_size))
         max_qty = int(current_tick.quantity * config.participation_rate_limit)
         qty = min(participation_qty, target_quantity, max_qty)
-        qty = max(100, (qty // 100) * 100)  # Round to lot
+        qty = (qty // lot) * lot  # Round down to a whole lot
 
         if qty <= 0:
             return []
@@ -478,13 +490,22 @@ class TickBacktester:
                 logger.debug("Position limit reached for %s", symbol)
                 return
 
-        # Check participation rate limit
-        max_qty = int(tick.volume * self.config.participation_rate_limit) if tick.volume > 0 else quantity
-        if quantity > max_qty:
-            quantity = max_qty
-
-        # Round to lot size
-        quantity = max(100, (quantity // 100) * 100)
+        # Round to a whole lot *before* applying the participation cap, so
+        # rounding cannot lift the order back above the cap (B9). The cap is
+        # then floored to a whole lot too; if it is below one lot the order
+        # cannot be executed at all.
+        lot = max(1, int(self.config.lot_size))
+        quantity = (quantity // lot) * lot
+        if tick.volume > 0:
+            max_qty = int(tick.volume * self.config.participation_rate_limit)
+            max_qty = (max_qty // lot) * lot
+            quantity = min(quantity, max_qty)
+        if quantity < lot:
+            logger.debug(
+                "Order for %s skipped: %d shares is below one %d-share lot "
+                "after the participation cap", symbol, quantity, lot,
+            )
+            return
 
         # Estimate market impact
         impact = self.impact_model.estimate(
@@ -525,40 +546,67 @@ class TickBacktester:
         elif order.status == BookOrderStatus.CANCELLED:
             self._orders_cancelled += 1
 
-    def _process_fill(self, trade: Trade, tick: Tick, impact: MarketImpact):
-        """Process a fill: update positions, cash, and log."""
+    def _process_fill(self, trade: Trade, tick: Tick, impact: MarketImpact) -> bool:
+        """Process a fill: update positions, cash, and log.
+
+        Only an *executed* fill touches the ledger (B9). The old code updated
+        commission/tax/volume and appended a trade even when the sell was
+        rejected for insufficient holdings. Sells also respect T+1: shares
+        bought on the current day cannot be sold until ``t_plus`` days later.
+
+        Returns:
+            True when the fill executed, False when it was rejected.
+        """
         symbol = trade.symbol
         price = trade.price
         qty = trade.quantity
         side = trade.aggressor_side
+        if qty <= 0:
+            return False
 
-        # Commission
-        notional = price * qty
-        commission = max(notional * self.config.commission_rate, self.config.min_commission)
-        tax = (notional * self.config.stamp_tax_rate) if side == Side.SELL else 0.0
-
-        # Update position
-        if symbol not in self.positions:
-            self.positions[symbol] = Position(symbol=symbol)
-
-        pos = self.positions[symbol]
+        day = int(tick.timestamp_ns) // _NS_PER_DAY
+        pos = self.positions.get(symbol)
 
         if side == Side.BUY:
-            # Buy: increase position
+            if pos is None:
+                pos = Position(symbol=symbol)
+                self.positions[symbol] = pos
+            if pos.last_buy_day != day:
+                pos.today_bought_qty = 0
             total_qty = pos.quantity + qty
-            if total_qty > 0:
-                pos.avg_cost = (pos.avg_cost * pos.quantity + price * qty) / total_qty
+            pos.avg_cost = (pos.avg_cost * pos.quantity + price * qty) / total_qty
             pos.quantity = total_qty
+            pos.today_bought_qty += qty
+            pos.last_buy_day = day
+        else:
+            if pos is None:
+                logger.debug("Rejected sell of %s: no position", symbol)
+                return False
+            sellable = pos.quantity
+            if self.config.t_plus > 0 and pos.last_buy_day == day:
+                sellable -= pos.today_bought_qty
+            if qty > sellable:
+                logger.debug(
+                    "Rejected sell of %d %s: only %d share(s) are sellable "
+                    "(T+%d)", qty, symbol, max(sellable, 0), self.config.t_plus,
+                )
+                return False
+
+        notional = price * qty
+        commission = max(
+            notional * self.config.commission_rate, self.config.min_commission,
+        )
+        tax = (notional * self.config.stamp_tax_rate) if side == Side.SELL else 0.0
+
+        if side == Side.BUY:
             self.capital -= notional + commission + tax
         else:
-            # Sell: decrease position
-            if pos.quantity >= qty:
-                realized = (price - pos.avg_cost) * qty
-                pos.realized_pnl += realized
-                pos.quantity -= qty
-                self.capital += notional - commission - tax
-                if pos.quantity <= 0:
-                    del self.positions[symbol]
+            realized = (price - pos.avg_cost) * qty
+            pos.realized_pnl += realized
+            pos.quantity -= qty
+            self.capital += notional - commission - tax
+            if pos.quantity <= 0:
+                del self.positions[symbol]
 
         # Track costs
         self._total_commission += commission
@@ -577,6 +625,7 @@ class TickBacktester:
             "tax": tax,
             "impact_bps": round(impact.total / price * 10000, 2) if price > 0 else 0,
         })
+        return True
 
     def _compute_equity(self, tick: Tick) -> float:
         """Compute current total equity."""

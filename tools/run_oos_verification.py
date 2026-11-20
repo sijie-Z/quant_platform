@@ -17,6 +17,7 @@ import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 
 setup_logging()
 logger = get_logger("oos")
@@ -29,7 +30,7 @@ VOL_THRESHOLD = 0.70
 
 def load():
     provider = BaostockDataProvider(cache_enabled=True)
-    pipeline = DataPipeline(provider=provider, start_date="2018-01-01", end_date="2025-12-31",
+    pipeline = DataPipeline(provider=provider, start_date="2018-01-01", end_date=resolve_end_date(),
                             exclude_st=True, exclude_suspended=True)
     pipeline.run()
     return pipeline.returns
@@ -91,11 +92,18 @@ def main():
     print("=" * 80)
 
     returns = load()
+    first_year = int(returns.index.min().year)
+    last_year = int(returns.index.max().year)
+    logger.info("Data window: %s → %s (requested end %s; split years are "
+                "protocol-frozen)", returns.index.min().date(),
+                returns.index.max().date(), resolve_end_date())
 
+    # The 2018-2021 / 2022-2025 split is the protocol-frozen R83 split; the
+    # "Full" row now labels the actual data span instead of claiming 2025.
     splits = [
         ("In-Sample (2018-2021)", returns["2018":"2021"]),
         ("OOS (2022-2025)",      returns["2022":"2025"]),
-        ("Full (2018-2025)",     returns),
+        (f"Full ({first_year}-{last_year})", returns),
     ]
 
     all_rows = []
@@ -147,7 +155,7 @@ def main():
     print()
     print("  逐年 Sharpe (裸策略 + vol filter):")
     print(f"  {'Year':<8} {'Raw_S':>8} {'Filt_S':>8} {'n':>4}")
-    for y in [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]:
+    for y in range(int(returns.index.min().year), int(returns.index.max().year) + 1):
         yr = returns[f"{y}-01-01":f"{y}-12-31"]
         if len(yr) < 100:
             continue
@@ -156,7 +164,9 @@ def main():
         print(f"  {y:<8} {sr['sharpe']:>8.4f} {sf['sharpe']:>8.4f} {sr['n']:>4d}")
 
     # ── 保存 ──
-    pd.DataFrame(all_rows).to_csv("results/oos_verification.csv", index=False)
+    out = Path("results")
+    out.mkdir(parents=True, exist_ok=True)
+    stamp_provenance(pd.DataFrame(all_rows), str(returns.index.min().date()), str(returns.index.max().date())).to_csv(out / "oos_verification.csv", index=False)
     print()
     print("  Saved to results/oos_verification.csv")
     print("=" * 80)

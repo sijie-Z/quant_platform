@@ -268,6 +268,113 @@ class TestTCAEngine:
         assert result.fill_duration_seconds == 1800.0
 
 
+class TestAnalyzeFromDataframe:
+    """Batch TCA must use the execution date's row, not the whole sample.
+
+    The old implementation used the full-sample mean as VWAP and the last
+    row as the close, i.e. a future function, and silently fell back to
+    zeros whenever the documented [vwap, close, volume] layout was used.
+    """
+
+    @pytest.fixture
+    def fills(self):
+        return pd.DataFrame([{
+            "order_id": "ORD001",
+            "price": 100.5,
+            "quantity": 1000,
+            "timestamp": "2024-03-04 10:00:00",
+        }])
+
+    @staticmethod
+    def _orders(**extra):
+        row = {
+            "order_id": "ORD001",
+            "ticker": "600519",
+            "side": "buy",
+            "quantity": 1000,
+            "decision_price": 100.0,
+            "arrival_price": 100.2,
+        }
+        row.update(extra)
+        return pd.DataFrame([row])
+
+    @staticmethod
+    def _prices_by_date():
+        return pd.DataFrame(
+            {
+                "vwap": [90.0, 200.0, 400.0],
+                "close": [91.0, 201.0, 401.0],
+                "volume": [1000, 1000, 1000],
+            },
+            index=pd.to_datetime(["2024-03-01", "2024-03-04", "2024-03-05"]),
+        )
+
+    def test_uses_the_execution_date_row_not_the_whole_sample(self, engine, fills):
+        prices = self._prices_by_date()
+        orders = self._orders(execution_date="2024-03-04")
+
+        result = engine.analyze_from_dataframe(orders, fills, prices)[0]
+
+        assert result.vwap_price == 200.0
+        assert result.close_price == 201.0
+        # The old code produced the full-sample mean / final row.
+        assert result.vwap_price != pytest.approx(prices["vwap"].mean())
+        assert result.close_price != 401.0
+
+    def test_recognizes_a_date_column_in_long_format(self, engine, fills):
+        prices = pd.DataFrame({
+            "ticker": ["600519", "600519", "000001"],
+            "date": ["2024-03-01", "2024-03-04", "2024-03-04"],
+            "vwap": [90.0, 200.0, 7.0],
+            "close": [91.0, 201.0, 8.0],
+            "volume": [1000, 1000, 1000],
+        })
+        orders = self._orders(date="2024-03-04")
+
+        result = engine.analyze_from_dataframe(orders, fills, prices)[0]
+
+        assert result.vwap_price == 200.0
+        assert result.close_price == 201.0
+
+    def test_missing_execution_date_raises(self, engine, fills):
+        with pytest.raises(ValueError, match="execution_date"):
+            engine.analyze_from_dataframe(
+                self._orders(), fills, self._prices_by_date(),
+            )
+
+    def test_unknown_execution_date_raises_instead_of_zero(self, engine, fills):
+        with pytest.raises((KeyError, ValueError), match="2024-03-06"):
+            engine.analyze_from_dataframe(
+                self._orders(execution_date="2024-03-06"),
+                fills,
+                self._prices_by_date(),
+            )
+
+    def test_unknown_ticker_raises_instead_of_zero(self, engine, fills):
+        prices = pd.DataFrame({
+            "ticker": ["600519"],
+            "date": ["2024-03-04"],
+            "vwap": [200.0],
+            "close": [201.0],
+        })
+        with pytest.raises((KeyError, ValueError), match="000001"):
+            engine.analyze_from_dataframe(
+                self._orders(ticker="000001", execution_date="2024-03-04"),
+                fills,
+                prices,
+            )
+
+    def test_non_positive_benchmark_raises_instead_of_zero(self, engine, fills):
+        prices = pd.DataFrame(
+            {"vwap": [float("nan")], "close": [101.0], "volume": [1000]},
+            index=pd.to_datetime(["2024-03-04"]),
+        )
+        with pytest.raises(ValueError, match="vwap"):
+            engine.analyze_from_dataframe(
+                self._orders(execution_date="2024-03-04"), fills, prices,
+            )
+
+
 class TestTCASummary:
     """Test TCA summarization."""
 

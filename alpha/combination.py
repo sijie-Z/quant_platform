@@ -203,28 +203,45 @@ def _build_row(
     weights: dict[str, float],
     date: pd.Timestamp,
 ) -> pd.Series | None:
-    """Build a single row of weighted factor values for one date."""
-    row = None
+    """Build a single row of weighted factor values for one date.
+
+    Missing factor values are filled with 0 -- the cross-sectional mean of a
+    z-scored factor -- and the denominator is the *fixed* sum of |weight|, not
+    the weight of the factors that happen to be present for each asset.
+
+    The previous mask-aware denominator renormalised per asset: an asset
+    missing the dominant factor had its remaining weight scaled back up to 1,
+    so under 0.8/0.2 weights it was scored on the 0.2 factor alone and could
+    outrank an asset that had both. A missing value must be neutral, not a
+    promotion.
+    """
+    total_abs = sum(
+        abs(weights.get(name, 0.0)) for name in aligned
+    )
+    if total_abs < 1e-10:
+        return None
+
+    numerator = None
+    has_values = False
     for name, factor in aligned.items():
         w = weights.get(name, 0.0)
         if abs(w) < 1e-10:
             continue
         if date not in factor.index:
+            # Its weight still counts in the fixed denominator: an absent
+            # factor is a zero, not an excuse to scale the rest up.
             continue
+        has_values = True
         vals = factor.loc[date]
-        if not vals.notna().any():
-            # A factor with nothing to say about this cross-section used to
-            # seed the sum with an all-NaN row, and NaN + x is NaN, so every
-            # other factor's values for the date were lost with it. Skipping
-            # it keeps the row's meaning: the weighted sum of what the factors
-            # actually have. Which factors were summed no longer depends on
-            # the order they happen to sit in the dict.
-            continue
-        if row is None:
-            row = vals * w
+        contribution = (vals * w).fillna(0.0)
+        if numerator is None:
+            numerator = contribution
         else:
-            row = row + vals * w
-    return row
+            numerator = numerator.add(contribution, fill_value=0.0)
+
+    if numerator is None or not has_values:
+        return None
+    return numerator / total_abs
 
 
 def _asset_universe(factors: dict[str, pd.DataFrame]) -> pd.Index:
@@ -306,21 +323,32 @@ def _weighted_sum(
     factors: dict[str, pd.DataFrame],
     weights: dict[str, float],
 ) -> pd.DataFrame:
-    """Compute weighted sum of factor values (static weights, all dates)."""
-    result = None
+    """Weighted factor average with a fixed denominator.
+
+    Missing cells are filled with 0 (the cross-sectional mean of a z-scored
+    factor) and the denominator is ``sum(abs(w))`` over the weighted factors,
+    identical for every asset. The old mask-aware denominator dropped a
+    missing factor from both numerator and denominator, so an asset missing a
+    heavily-weighted factor was renormalised onto the light factors and could
+    outrank a complete asset. Coverage must not change the scale.
+    """
+    total_abs = 0.0
+    numerator = None
     for name, df in factors.items():
         w = weights.get(name, 0.0)
         if abs(w) < 1e-10:
             continue
-        if result is None:
-            result = df * w
+        total_abs += abs(w)
+        contribution = (df * w).fillna(0.0)
+        if numerator is None:
+            numerator = contribution
         else:
-            result = result + df * w
+            numerator = numerator.add(contribution, fill_value=0.0)
 
-    if result is None:
+    if numerator is None or total_abs < 1e-10:
         raise ValueError("No valid factors to combine")
 
-    return result
+    return numerator / total_abs
 
 
 def combine_vote(

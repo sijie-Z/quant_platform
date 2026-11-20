@@ -2,37 +2,75 @@
 
 Usage:
     python monitoring/run_monitor.py
+
+Environment:
+    QUANT_MONITOR_START_DATE   data window start (default: 2018-01-01)
+    QUANT_MONITOR_END_DATE     data window end   (default: today, Asia/Shanghai)
+
+Exit code: 0 when no alerts, 1 when the data/strategy run failed, 2 when
+alerts were raised (so cron/CI can act on them).
 """
 
+from __future__ import annotations
+
+import logging
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root.parent))
-
-import logging
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
+from quant_platform.trading.reversal_paper_trader import ReversalPaperTrader
 
-from trading.reversal_paper_trader import ReversalPaperTrader
+# Paths are resolved from the repository root, never from the caller's cwd:
+# running the script from anywhere used to raise FileNotFoundError on
+# `results/monitor.log` at import time.
+_RESULTS_DIR = _project_root / "results"
+_LOG_FILE = _RESULTS_DIR / "monitor.log"
+_EXCHANGE_TZ = ZoneInfo("Asia/Shanghai")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(message)s',
-    handlers=[
-        logging.FileHandler('results/monitor.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
 BASELINE_SHARPE = 0.45
 BASELINE_ANN_RET = 0.11
 MAX_DRAWDOWN_ALERT = -0.30
+
+
+def _setup_logging() -> None:
+    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(message)s',
+        handlers=[
+            logging.FileHandler(_LOG_FILE, encoding='utf-8'),
+            logging.StreamHandler(),
+        ],
+    )
+
+
+def _data_window() -> tuple[str, str]:
+    """Data window: configurable via env, ending today by default."""
+    start = os.environ.get("QUANT_MONITOR_START_DATE") or "2018-01-01"
+    end = os.environ.get("QUANT_MONITOR_END_DATE")
+    if not end:
+        end = datetime.now(_EXCHANGE_TZ).strftime("%Y-%m-%d")
+    return start, end
+
+
+def _append_summary(summary: pd.DataFrame, path: Path | None = None) -> None:
+    """Append one summary row, writing the header only on first creation."""
+    summary_path = Path(path) if path is not None else _RESULTS_DIR / "monitor_summary.csv"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(
+        summary_path, mode="a", header=not summary_path.exists(), index=False,
+    )
 
 
 def check_regime_drift(returns):
@@ -54,20 +92,39 @@ def check_regime_drift(returns):
     return flags
 
 
-def main():
+def main() -> int:
+    _setup_logging()
+    start_date, end_date = _data_window()
+
     print("=" * 65)
     print("  alpha-v1.0 — 系统运行监控")
-    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"  {datetime.now(_EXCHANGE_TZ).strftime('%Y-%m-%d %H:%M')}")
     print("=" * 65)
 
     # 加载数据
-    logger.info("Loading data...")
-    provider = BaostockDataProvider(cache_enabled=True)
-    pipeline = DataPipeline(provider=provider, start_date='2018-01-01', end_date='2025-12-31',
-                            exclude_st=True, exclude_suspended=True)
-    pipeline.run()
-    returns = pipeline.returns
-    prices = pipeline.get_close()
+    logger.info("Loading data... (%s -> %s)", start_date, end_date)
+    try:
+        provider = BaostockDataProvider(cache_enabled=True)
+        pipeline = DataPipeline(
+            provider=provider, start_date=start_date, end_date=end_date,
+            exclude_st=True, exclude_suspended=True,
+        )
+        pipeline.run()
+        returns = pipeline.returns
+        # The paper trader books CNY fills/marks: use raw prices. get_close()
+        # is the adjusted research series and would mark the demo book at
+        # levels that never traded (D15). A legacy/test pipeline double that
+        # only exposes get_close() falls back to it (as the daemon does).
+        try:
+            prices = pipeline.get_raw_close()
+        except AttributeError:
+            prices = pipeline.get_close()
+        if returns is None or len(returns.index) == 0:
+            raise RuntimeError("data pipeline returned an empty panel")
+    except Exception as exc:
+        logger.error("ALERT: monitor data load failed: %s", exc)
+        print(f"  !! DATA ERROR: {exc}")
+        return 1
     logger.info("Data: %d days, %d assets", len(returns), len(returns.columns))
 
     # 运行策略
@@ -121,9 +178,10 @@ def main():
         print("\n  [OK] No alerts — system nominal")
 
     # ── 保存 ──
-    df.to_csv('results/monitor_equity.csv', index=False)
+    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(_RESULTS_DIR / "monitor_equity.csv", index=False)
     summary = pd.DataFrame([{
-        "date": datetime.now().strftime('%Y-%m-%d'),
+        "date": datetime.now(_EXCHANGE_TZ).strftime('%Y-%m-%d'),
         "sharpe": round(sharpe, 4),
         "ann_ret": round(ann_ret, 4),
         "mdd": round(mdd, 4),
@@ -131,10 +189,14 @@ def main():
         "n_trades": n_enter,
         "alerts": len(alerts),
     }])
-    summary.to_csv('results/monitor_summary.csv', index=False)
+    # Append history instead of overwriting the previous run's summary.
+    _append_summary(summary)
     logger.info("Monitor complete. %d alerts.", len(alerts))
     print()
 
+    # Machine-actionable exit status: an alert is a failure for cron.
+    return 2 if alerts else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

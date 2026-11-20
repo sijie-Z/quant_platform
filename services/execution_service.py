@@ -73,11 +73,16 @@ class ExecutionService(BaseService):
                 source=data.get("source", "strategy"),
             )
 
-            # Smart routing
+            # Smart routing. select_algorithm's signature is
+            # (order_quantity, avg_daily_volume, urgency, side); the old call
+            # passed `quantity`/`symbol` and raised TypeError on every order,
+            # which the broad except below turned into a false "rejected".
+            side = order.side.value if hasattr(order.side, "value") else str(order.side)
             self.smart_router.select_algorithm(
-                quantity=order.quantity,
-                symbol=order.symbol,
+                order_quantity=order.quantity,
+                avg_daily_volume=int(data.get("avg_daily_volume", 1_000_000)),
                 urgency=data.get("urgency", "normal"),
+                side=side,
             )
 
             # Submit to order book

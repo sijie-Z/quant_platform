@@ -27,7 +27,7 @@
     </div>
 
     <!-- Stability Summary -->
-    <div class="wf-summary" v-if="result">
+    <div class="wf-summary" v-if="result && result.available !== false">
       <div class="wf-card">
         <div class="wf-card-label">{{ locale === 'zh-CN' ? '折叠数' : 'Folds' }}</div>
         <div class="wf-card-value">{{ result.n_folds }}</div>
@@ -63,7 +63,7 @@
     </div>
 
     <!-- OOS Equity Chart -->
-    <div class="wf-chart-section" v-if="result">
+    <div class="wf-chart-section" v-if="result && result.available !== false">
       <div ref="oosChartRef" class="wf-chart"></div>
     </div>
 
@@ -104,10 +104,11 @@
     </div>
 
     <!-- Empty State -->
-    <div v-if="!result && !loading" class="wf-empty">
+    <div v-if="(!result || result.available === false) && !loading" class="wf-empty">
       <div class="wf-empty-icon">&#9878;</div>
       <h3>{{ locale === 'zh-CN' ? '滚动窗口验证' : 'Walk-Forward Validation' }}</h3>
-      <p>{{ locale === 'zh-CN' ? '请先运行流水线，然后通过样本外测试验证策略。这是避免过拟合的黄金标准。' : 'Run a pipeline first, then validate with out-of-sample testing. This is the gold standard for avoiding overfitting.' }}</p>
+      <p v-if="result && result.available === false">{{ result.reason }}</p>
+      <p v-else>{{ locale === 'zh-CN' ? '请先运行流水线，然后通过样本外测试验证策略。这是避免过拟合的黄金标准。' : 'Run a pipeline first, then validate with out-of-sample testing. This is the gold standard for avoiding overfitting.' }}</p>
     </div>
   </div>
 </template>
@@ -146,6 +147,10 @@ async function runWF() {
       test_period: testPeriod.value,
     })
     await nextTick()
+    if (result.value?.available === false) {
+      emit('toast', { message: result.value.reason || (locale.value === 'zh-CN' ? '滚动验证不可用' : 'Walk-forward unavailable'), type: 'error' })
+      return
+    }
     renderOOSChart()
     emit('toast', { message: locale.value === 'zh-CN' ? `滚动窗口验证：${result.value.n_folds}个折叠已完成` : `Walk-forward: ${result.value.n_folds} folds completed`, type: 'success' })
   } catch (e) {

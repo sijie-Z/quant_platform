@@ -21,6 +21,7 @@ env/
 
 # Cache
 .quant_cache/
+.quant_versions/
 .sentiment_cache/
 .pytest_cache/
 .agent_cache/
@@ -32,6 +33,10 @@ results/*.csv
 results/*.png
 results/*.pdf
 results/
+
+# SQLite runtime sidecars (WAL mode leaves these next to the database)
+*.db-wal
+*.db-shm
 
 # Coverage
 .coverage
@@ -72,3 +77,5 @@ baostock_run_err.log
 
 # Generated data
 frontend/data/
+
+.scratch/

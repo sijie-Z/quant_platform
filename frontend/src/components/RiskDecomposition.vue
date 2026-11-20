@@ -120,6 +120,10 @@ async function decompose() {
     result.value = await decomposeRisk({ run_id: props.runId })
     await nextTick()
     renderChart()
+    if (result.value?.available === false) {
+      emit('toast', { message: result.value.reason || (locale.value === 'zh-CN' ? '风险分解不可用' : 'Risk decomposition unavailable'), type: 'info' })
+      return
+    }
     emit('toast', { message: locale.value === 'zh-CN' ? '风险分解已完成' : 'Risk decomposition completed', type: 'success' })
   } catch (e) {
     emit('toast', { message: locale.value === 'zh-CN' ? `分解失败：${e.response?.data?.detail || e.message}` : `Decomposition failed: ${e.response?.data?.detail || e.message}`, type: 'error' })

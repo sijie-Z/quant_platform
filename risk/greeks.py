@@ -252,6 +252,9 @@ class GreeksCalculator:
         key = f"{position.symbol}_{position.option_type}_{position.strike}"
         self._positions[key] = position
         self._spots[position.underlying] = position.spot
+        # Without this every Greek stayed 0 until an unrelated spot update,
+        # so the delta/gamma limits never breached and auto-hedge never fired.
+        self._recompute_greeks(position)
 
     def remove_position(self, symbol: str, option_type: str, strike: float):
         """Remove an option position."""
@@ -370,8 +373,10 @@ class GreeksCalculator:
             if underlying_spot <= 0:
                 continue
 
-            # Shares needed to hedge this underlying's delta
-            shares = int(-delta * 100)  # Convert from per-share to shares
+            # `delta` is already a share-equivalent: pos_delta includes the
+            # position and the 100-share contract multiplier. Multiplying by
+            # 100 again produced 100x the required hedge.
+            shares = int(-delta)
             if abs(shares) >= 100:  # Minimum lot
                 side = "buy" if shares > 0 else "sell"
                 orders.append({

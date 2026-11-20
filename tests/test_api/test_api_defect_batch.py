@@ -39,7 +39,10 @@ class TestQualityReportIsJsonSafe:
 
         monitor = DataQualityMonitor()
         monitor.check_prices(prices)
-        monitor.check_returns(prices.pct_change(fill_method=None).dropna())
+        numeric = prices.select_dtypes(include=[np.number])
+        monitor.check_returns(
+            numeric.mask(numeric == 0).pct_change(fill_method=None).dropna()
+        )
         report = monitor.get_report()
 
         json.dumps(report)  # raises TypeError on numpy.bool_

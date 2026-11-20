@@ -129,6 +129,48 @@ class TestExportTradeLog:
         )
         assert result.n_records <= 4
 
+    def test_timezone_aware_records_are_not_dropped(self, exporter, store):
+        """A timestamp with a UTC offset used to raise TypeError when compared
+        with the naive export window; the except clause treated it as
+        unparseable and silently omitted the record from every export."""
+        store.save_trade({
+            "trade_id": "aware", "order_id": "o1", "code": "600519",
+            "side": "buy", "quantity": 100, "price": 100,
+            "executed_at": "2024-07-15T10:00:00+08:00",
+        })
+        store.save_trade({
+            "trade_id": "naive", "order_id": "o2", "code": "000001",
+            "side": "buy", "quantity": 100, "price": 10,
+            "executed_at": "2024-07-15T10:00:00",
+        })
+
+        result = exporter.export_trade_log(start="2024-07-01", end="2024-07-31")
+
+        assert result.n_records == 2
+
+    def test_store_applies_the_range_before_the_row_limit(self, store):
+        """The exporter used to fetch the newest 100k rows and filter after.
+
+        Once the book had more rows than that, an old date range returned an
+        empty file with n_records=0 and no error. Verify the range is in the
+        SQL, before LIMIT.
+        """
+        for trade_id, ts in (
+            ("old", "2023-06-15T10:00:00"),
+            ("new", "2024-06-15T10:00:00"),
+        ):
+            store.save_trade({
+                "trade_id": trade_id, "order_id": f"o-{trade_id}",
+                "code": "600519", "side": "buy", "quantity": 100,
+                "price": 100, "executed_at": ts,
+            })
+
+        rows = store.get_trades(
+            limit=1, start_date="2023-01-01", end_date="2023-12-31",
+        )
+
+        assert [r["trade_id"] for r in rows] == ["old"]
+
     def test_export_empty(self, exporter, store):
         result = exporter.export_trade_log(
             start="2024-01-01", end="2024-12-31",
@@ -226,6 +268,7 @@ class TestExportRiskLog:
         _seed_pnl(store, 3)
         result = exporter.export_risk_log(
             start="2024-01-01", end="2024-12-31", format="csv",
+            include_all_tenants=True,
         )
         assert os.path.exists(result.file_path)
         assert result.n_records == 3
@@ -234,6 +277,7 @@ class TestExportRiskLog:
         _seed_pnl(store, 3)
         result = exporter.export_risk_log(
             start="2024-01-01", end="2024-12-31", format="xlsx",
+            include_all_tenants=True,
         )
         assert os.path.exists(result.file_path)
         assert result.n_records == 3
@@ -242,6 +286,7 @@ class TestExportRiskLog:
         _seed_pnl(store, 1)
         result = exporter.export_risk_log(
             start="2024-01-01", end="2024-12-31", format="csv",
+            include_all_tenants=True,
         )
         with open(result.file_path, encoding="utf-8-sig") as f:
             reader = csv.reader(f)
@@ -251,6 +296,7 @@ class TestExportRiskLog:
     def test_risk_empty_export(self, exporter, store):
         result = exporter.export_risk_log(
             start="2024-01-01", end="2024-12-31",
+            include_all_tenants=True,
         )
         assert result.n_records == 0
 

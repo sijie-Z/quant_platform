@@ -81,12 +81,50 @@ def test_pipeline_volume(data_pipeline):
     assert (valid >= 0).all().all()
 
 
-def test_remove_long_suspensions_drops_asset():
+def test_remove_long_suspensions_keeps_history_around_a_gap():
+    """A long gap must not erase the asset's earlier (or later) history.
+
+    The old rule dropped the asset from the whole sample, so a 2024
+    suspension removed it from every 2021-2023 cross-section.
+    """
     dates = pd.date_range("2024-01-01", periods=6, freq="D")
     index = pd.MultiIndex.from_product([dates, ["A", "B"]], names=["date", "asset"])
     close = [1.0, 2.0, None, 11.0, None, 12.0,
              None, 13.0, None, 14.0, 15.0, 16.0]
     df = pd.DataFrame({"close": close}, index=index)
+
+    pipeline = DataPipeline.__new__(DataPipeline)
+    pipeline.max_suspension_days = 3
+    result = pipeline._remove_long_suspensions(df)
+
+    assert "A" in result.index.get_level_values("asset")
+    assert result.loc[(dates[0], "A"), "close"] == 1.0
+    assert result.loc[(dates[5], "A"), "close"] == 15.0
+    # The gap itself stays missing.
+    assert pd.isna(result.loc[(dates[2], "A"), "close"])
+
+
+def test_a_late_lister_is_not_dropped():
+    """Leading NaNs (pre-listing) used to count as a long suspension."""
+    dates = pd.date_range("2024-01-01", periods=8, freq="D")
+    index = pd.MultiIndex.from_product([dates, ["A", "B"]], names=["date", "asset"])
+    close = [1.0, 10.0] + [0.0, 10.0] * 4 + [0.5, 10.0] * 3
+    close[2:8] = [None] * 6  # A has no prices for the first six days
+    df = pd.DataFrame({"close": close}, index=index)
+
+    pipeline = DataPipeline.__new__(DataPipeline)
+    pipeline.max_suspension_days = 3
+    result = pipeline._remove_long_suspensions(df)
+
+    assert "A" in result.index.get_level_values("asset")
+
+
+def test_a_never_traded_asset_is_dropped():
+    dates = pd.date_range("2024-01-01", periods=4, freq="D")
+    index = pd.MultiIndex.from_product([dates, ["A", "B"]], names=["date", "asset"])
+    df = pd.DataFrame(
+        {"close": [None, 1.0, None, 2.0, None, 3.0, None, 4.0]}, index=index,
+    )
 
     pipeline = DataPipeline.__new__(DataPipeline)
     pipeline.max_suspension_days = 3

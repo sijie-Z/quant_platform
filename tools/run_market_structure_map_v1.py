@@ -23,15 +23,20 @@ import pandas as pd
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import (
+    resolve_end_date,
+    stamp_provenance,
+    year_windows,
+)
 
 setup_logging()
 logger = get_logger("msm1")
 
 REAL_START = "2018-01-01"
-REAL_END = "2025-12-31"
+REAL_END = resolve_end_date()  # as-of resolved at run time
 SIGNAL_HORIZONS = [5, 10, 20, 40, 60, 80, 120, 200]
 HOLDING_HORIZONS = [5, 10, 20, 40, 60, 80, 120, 200]
-YEAR_WINDOWS = [(str(y), f"{y}-01-01", f"{y}-12-31") for y in range(2018, 2026)]
+YEAR_WINDOWS = year_windows(2018, REAL_END)
 
 
 def load_data():
@@ -166,7 +171,7 @@ def run():
     print("=" * 100)
 
     print()
-    print("─── 1. 全周期 Sharpe 矩阵 (2018-2025) ───")
+    print(f"─── 1. 全周期 Sharpe 矩阵 (2018-{REAL_END[:4]}) ───")
     print()
     _sig_hold = "Sig\\Hold"  # hoisted: backslash inside an f-string expression needs Python 3.12+
     print(f"  {_sig_hold:>8}", end="")
@@ -260,9 +265,11 @@ def run():
     # ==================================================================
     out = Path("results")
     out.mkdir(parents=True, exist_ok=True)
+    df_all = stamp_provenance(df_all, str(returns.index.min().date()), str(returns.index.max().date()))
     df_all.to_csv(out / "msm1_full_matrix.csv", index=False)
     if df_roll is not None and len(df_roll) > 0:
-        pd.DataFrame(rolling_results).to_csv(out / "msm1_rolling_stability.csv", index=False)
+        df_roll_out = stamp_provenance(pd.DataFrame(rolling_results), str(returns.index.min().date()), str(returns.index.max().date()))
+        df_roll_out.to_csv(out / "msm1_rolling_stability.csv", index=False)
     logger.info("Results saved to results/msm1_*")
 
 

@@ -40,6 +40,18 @@ from quant_platform.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def default_volatility(returns: pd.DataFrame) -> pd.DataFrame:
+    """Causal daily volatility from the platform's forward-return panel.
+
+    ``returns[t]`` is the close(t)->close(t+1) return, so at execution day t
+    only rows up to t-1 are realized. The rolling window is therefore shifted
+    by one session before use; without the shift the impact model at day t
+    read a volatility that included day t's own (future) return. Missing
+    warm-up values fall back to the 2%/day default the estimator always used.
+    """
+    return returns.rolling(20, min_periods=5).std().shift(1).fillna(0.02)
+
+
 @dataclass
 class CapacityResult:
     """Capacity estimation result for a single AUM level."""
@@ -144,7 +156,10 @@ class CapacityEstimator:
             returns: (date x asset) daily returns.
             benchmark_returns: Benchmark daily returns for Sharpe calculation.
             aum_range: List of AUM levels to test. Default: [1M, 5M, 10M, 50M, 100M, 500M, 1B].
-            volatility: (date x asset) daily volatility. If None, estimated from returns.
+            volatility: (date x asset) daily volatility. If None, estimated
+                causally from ``returns`` (``rolling(20).std().shift(1)``:
+                row t uses only returns up to t-1). A caller-supplied panel
+                must already be causal -- the estimator does not shift it.
 
         Returns:
             CapacityCurve with results for each AUM level.
@@ -153,7 +168,7 @@ class CapacityEstimator:
             aum_range = [1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9]
 
         if volatility is None:
-            volatility = returns.rolling(20, min_periods=5).std().fillna(0.02)
+            volatility = default_volatility(returns)
 
         rebalance_dates = sorted(weights_history.keys())
         all_dates = returns.index.sort_values()
@@ -225,17 +240,28 @@ class CapacityEstimator:
         total_impact_bps = 0.0
         total_turnover = 0.0
 
-        rebalance_iter = iter(rebalance_dates)
-        next_rdate = next(rebalance_iter, None)
+        # Execute at the NEXT trading day's close, matching
+        # BacktestEngine._execution_schedule. Applying the target on the signal
+        # date itself captured the move the engine deliberately excludes.
+        schedule = []
+        for rdate in rebalance_dates:
+            later = all_dates[all_dates > rdate]
+            if len(later):
+                schedule.append((later[0], rdate))
+        schedule_idx = 0
 
         for date in all_dates:
-            if next_rdate is not None and date >= next_rdate:
+            day_cost_rate = 0.0
+            day_impact_rate = 0.0
+            if schedule_idx < len(schedule) and date >= schedule[schedule_idx][0]:
+                _exec_date, next_rdate = schedule[schedule_idx]
                 target_weights = weights_history.get(next_rdate, current_weights)
                 target_weights = target_weights.reindex(returns.columns, fill_value=0.0)
 
                 # Compute trade notional
                 trade_weights = target_weights - current_weights
                 trade_notional = trade_weights * capital
+                executed_weights = target_weights.copy()
 
                 # Apply participation rate cap
                 capped_impact = 0.0
@@ -253,60 +279,82 @@ class CapacityEstimator:
                             participation_rates.append(participation)
 
                             if participation > self.max_participation:
-                                # Cap the trade
+                                # Actually cap the trade: the old code only
+                                # recorded an impact number and still put the
+                                # full target into `current_weights`, so the
+                                # reported returns were identical at every AUM.
                                 capped_days += 1
                                 max_trade = vol_cny * self.max_participation
+                                scale = max_trade / trade_cny
+                                executed_weights[asset] = (
+                                    current_weights.get(asset, 0.0)
+                                    + trade_weights.get(asset, 0.0) * scale
+                                )
 
-                                # Extra impact cost for the capped portion
+                                # Extra impact cost for the deferred portion.
+                                # `impact.total` is a per-share cost, so it
+                                # must be multiplied by the share count; the
+                                # old code added it as if it were currency.
                                 excess = trade_cny - max_trade
                                 vol_val = volatility.loc[date].get(asset, 0.02) if date in volatility.index else 0.02
                                 price_val = prc.get(asset, 100)
+                                shares = int(excess / max(price_val, 1))
                                 impact = self.impact_model.estimate(
-                                    order_quantity=int(excess / max(price_val, 1)),
+                                    order_quantity=shares,
                                     market_volume=int(vol_cny / max(price_val, 1)),
                                     volatility=vol_val,
                                     price=price_val,
                                 )
-                                capped_impact += impact.total
+                                capped_impact += impact.total * shares
 
-                # Standard turnover cost
-                turnover = abs(trade_weights).sum() / 2
+                # Standard turnover cost on what was actually executed
+                executed_trade = executed_weights - current_weights
+                turnover = abs(executed_trade).sum() / 2
                 total_turnover += turnover
                 # Two-way traded value: compute_costs halves stamp tax on the
                 # assumption that half of its input is sells, so it needs
                 # buys + sells, not the one-sided turnover kept above.
                 cost_rate = self.cost_model.compute_costs(turnover * 2)
+                day_cost_rate = cost_rate
                 capital -= cost_rate * capital
 
                 # Extra impact cost
                 if capped_impact > 0 and capital > 0:
                     impact_bps = (capped_impact / capital) * 10000
                     total_impact_bps += impact_bps
+                    day_impact_rate = capped_impact / capital
                     capital -= capped_impact
 
-                current_weights = target_weights.copy()
-                next_rdate = next(rebalance_iter, None)
+                current_weights = executed_weights
+                schedule_idx += 1
 
-            # Daily P&L
+            # Daily P&L, with weights drifting between rebalances. Costs are
+            # liabilities of the day they are paid, so the reported return is
+            # net of them -- the old series was gross and the AUM curve was
+            # identical at every capital level.
             daily_ret_assets = returns.loc[date].reindex(current_weights.index, fill_value=0.0)
             portfolio_return = (current_weights * daily_ret_assets).sum()
-            daily_returns_list.append(portfolio_return)
-            capital = capital * (1 + portfolio_return)
+            net_return = portfolio_return - day_cost_rate - day_impact_rate
+            daily_returns_list.append(net_return)
+            capital = capital * (1 + net_return)
 
-        # Compute metrics
+            if current_weights.sum() > 1e-12:
+                growth = current_weights * (1.0 + daily_ret_assets.fillna(0.0))
+                cash_weight = max(0.0, 1.0 - float(current_weights.sum()))
+                total_value = float(growth.sum()) + cash_weight
+                if total_value > 1e-12:
+                    current_weights = growth / total_value
+
+        # Compute metrics with the same definitions as the backtest summary
         daily_returns = pd.Series(daily_returns_list, index=all_dates)
 
-        if len(daily_returns) > 0 and daily_returns.std() > 0:
-            ann_return = float(daily_returns.mean() * 252)
-            ann_vol = float(daily_returns.std() * math.sqrt(252))
-            sharpe = ann_return / ann_vol if ann_vol > 0 else 0
-            total_ret = float((1 + daily_returns).prod() - 1)
-            max_dd = float((daily_returns.cumsum() - daily_returns.cumsum().cummax()).min())
-        else:
-            ann_return = 0.0
-            sharpe = 0.0
-            total_ret = 0.0
-            max_dd = 0.0
+        from quant_platform.backtest.metrics import all_metrics
+
+        metrics = all_metrics(daily_returns)
+        ann_return = float(metrics.get("annual_return", 0.0))
+        sharpe = float(metrics.get("sharpe_ratio", 0.0))
+        total_ret = float(metrics.get("total_return", 0.0))
+        max_dd = float(metrics.get("max_drawdown", 0.0))
 
         avg_participation = float(np.mean(participation_rates)) if participation_rates else 0.0
         max_participation = float(np.max(participation_rates)) if participation_rates else 0.0

@@ -7,6 +7,7 @@ Protocol-frozen experiment: 哪些 Alpha 方向错了？
 只记录结果，不解释。
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from quant_platform.factors.registry import get_registry
 from quant_platform.factors.technical import register_all as register_technical
 from quant_platform.portfolio.constraints import PortfolioConstraints
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 
 setup_logging()
 logger = get_logger("rq2")
@@ -35,8 +37,10 @@ logger = get_logger("rq2")
 # ---------------------------------------------------------------------------
 ALPHA_STRENGTH = 0.06
 N_STOCKS = 500
+SEED = 42
 START_DATE = "2021-01-01"
-END_DATE = "2025-12-31"
+# Resolved at run time (QUANT_RESEARCH_END_DATE or today); never hardcoded.
+END_DATE = resolve_end_date()
 INITIAL_CAPITAL = 10_000_000
 
 TOP8_FACTORS = [
@@ -69,6 +73,7 @@ def load_data():
         n_stocks=N_STOCKS,
         start_date=START_DATE,
         end_date=END_DATE,
+        seed=SEED,
         embedded_alpha=True,
         alpha_strength=ALPHA_STRENGTH,
     )
@@ -113,11 +118,16 @@ def compute_all_factors(prices, returns, sector_map, turnover):
         except Exception as e:
             logger.warning("Factor %s failed: %s", name, e)
 
+    # Process with winsorize + standardize + SECTOR neutralization only.
+    # R79: market_cap=None disables market-cap neutralization; claimed
+    # otherwise in the old comments. Declared rather than silently changed
+    # because this experiment's protocol is frozen.
     processed = {}
     for name, factor in raw_factors.items():
         processed[name] = process_factor(factor, sector_map=sector_map, market_cap=None)
 
-    logger.info("Computed %d factors: %s", len(processed), list(processed.keys()))
+    logger.info("Computed %d factors: %s (sector-neutralized; market-cap "
+                "neutralization NOT applied: R79)", len(processed), list(processed.keys()))
     return processed
 
 
@@ -203,13 +213,27 @@ def extract_metrics(bt_results, signal_ic):
     """Extract protocol metrics from backtest results and IC."""
     summary = bt_results.get("summary", {})
     metrics = {
-        "IC":        signal_ic.get("mean_ic", 0),
-        "ICIR":      signal_ic.get("icir", 0),
-        "Sharpe":    summary.get("sharpe_ratio", 0),
-        "MDD":       summary.get("max_drawdown", 0),
-        "Turnover":  summary.get("avg_turnover", summary.get("turnover", 0)),
+        "IC":        signal_ic.get("mean_ic", np.nan),
+        "ICIR":      signal_ic.get("icir", np.nan),
+        "Sharpe":    summary.get("sharpe_ratio", np.nan),
+        "MDD":       summary.get("max_drawdown", np.nan),
+        # Engine key is annual_turnover; the old fallbacks never exist.
+        "Turnover":  summary.get("annual_turnover", np.nan),
+        "Status":    "ok",
+        "Error":     "",
     }
     return metrics
+
+
+def failed_metrics(signal_ic, exc):
+    """Metrics for a failed backtest: NaN, never a fake zero (R64)."""
+    return {
+        "IC": signal_ic.get("mean_ic", np.nan),
+        "ICIR": signal_ic.get("icir", np.nan),
+        "Sharpe": np.nan, "MDD": np.nan, "Turnover": np.nan,
+        "Status": "failed",
+        "Error": f"{type(exc).__name__}: {exc}",
+    }
 
 
 def print_results_table(results_list):
@@ -255,6 +279,9 @@ if __name__ == "__main__":
     # Load data
     logger.info("[1/4] Loading data...")
     prices, returns, benchmark, sector_map, turnover = load_data()
+    data_start = str(prices.index[0].date())
+    data_end = str(prices.index[-1].date())
+    logger.info("Data window: %s → %s (requested end %s)", data_start, data_end, END_DATE)
 
     # Compute factors
     logger.info("[2/4] Computing factors...")
@@ -285,8 +312,7 @@ if __name__ == "__main__":
             metrics = extract_metrics(bt_results, signal_ic)
         except Exception as e:
             logger.error("  Backtest failed: %s", e)
-            metrics = {"IC": signal_ic.get("mean_ic", 0), "ICIR": signal_ic.get("icir", 0),
-                       "Sharpe": 0, "MDD": 0, "Turnover": 0}
+            metrics = failed_metrics(signal_ic, e)
 
         metrics["Experiment"] = exp_name
         results_list.append(metrics)
@@ -306,8 +332,28 @@ if __name__ == "__main__":
     print("  === END RAW DATA: RQ2_RAW ===")
     print()
 
-    output_path = Path("results/rq2_cluster_sign_flip.csv")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df_raw = stamp_provenance(df_raw, data_start, data_end)
+    df_raw["provider"] = "synthetic"
+    df_raw["alpha_strength"] = ALPHA_STRENGTH
+    df_raw["seed"] = SEED
+    output_dir = _project_root / "results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "rq2_cluster_sign_flip.csv"
     df_raw.to_csv(output_path, index=False)
+    manifest = {
+        "script": "run_rq2_cluster_sign_flip.py",
+        "generated_at": pd.Timestamp.now("UTC").isoformat(),
+        "provider": "synthetic",
+        "seed": SEED,
+        "alpha_strength": ALPHA_STRENGTH,
+        "n_stocks": N_STOCKS,
+        "requested_end": END_DATE,
+        "data_start": data_start,
+        "data_end": data_end,
+        "artifacts": [output_path.name],
+    }
+    (output_dir / "rq2_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
     logger.info("Raw results saved to: %s", output_path)
     logger.info("RQ2 complete. Awaiting RQ3.")

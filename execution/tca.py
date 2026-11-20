@@ -337,6 +337,131 @@ class TCAEngine:
             participation_rate=round(participation, 6),
         )
 
+    #: Accepted order-execution date columns, in priority order.
+    _DATE_COLUMNS = ("execution_date", "date", "trade_date")
+
+    @staticmethod
+    def _execution_date(order: pd.Series) -> pd.Timestamp:
+        """Return the order's execution date.
+
+        The date must be explicit: the previous batch path implicitly used the
+        final row of the price frame as "the close", which is a future
+        function.
+        """
+        for column in TCAEngine._DATE_COLUMNS:
+            if column in order.index:
+                value = order[column]
+                if not pd.isna(value):
+                    return pd.Timestamp(value)
+        raise ValueError(
+            "orders_df must provide an execution date column "
+            f"(one of {list(TCAEngine._DATE_COLUMNS)}) for every order"
+        )
+
+    @staticmethod
+    def _benchmark_from_prices(
+        prices_df: pd.DataFrame,
+        ticker: str,
+        execution_date: pd.Timestamp,
+    ) -> tuple[float, float]:
+        """Return ``(vwap, close)`` for ``ticker`` on ``execution_date``.
+
+        Supported layouts:
+
+        * Long: columns include ``vwap`` and ``close``, optionally a
+          ``ticker``/``code`` column selecting the instrument, and the date
+          comes from an ``execution_date``/``date``/``trade_date`` column or
+          the index. A frame without a ticker column is treated as a
+          single-instrument price series.
+        * Wide with 2-level ``MultiIndex`` columns: one level holds the
+          ``vwap``/``close`` fields, the other the tickers; the index is the
+          date.
+
+        Raises:
+            ValueError: the layout is unsupported or the benchmark value is
+                missing/non-finite/non-positive.
+            KeyError: no row exists for ``ticker`` on ``execution_date``.
+        """
+        frame = prices_df
+        columns = frame.columns
+
+        if isinstance(columns, pd.MultiIndex):
+            if columns.nlevels != 2:
+                raise ValueError(
+                    "prices_df MultiIndex columns must have exactly 2 levels "
+                    "(field, ticker)"
+                )
+            field_level = None
+            for level in range(columns.nlevels):
+                values = columns.get_level_values(level)
+                if "vwap" in values and "close" in values:
+                    field_level = level
+                    break
+            if field_level is None:
+                raise ValueError(
+                    "prices_df MultiIndex columns must contain 'vwap' and "
+                    "'close' on one level"
+                )
+            ticker_level = 1 - field_level
+            if ticker not in columns.get_level_values(ticker_level):
+                raise KeyError(
+                    f"No price data for ticker {ticker!r} in prices_df"
+                )
+            sub = frame.xs(ticker, axis=1, level=ticker_level)
+            vwap_values = sub["vwap"]
+            close_values = sub["close"]
+            dates = pd.DatetimeIndex(frame.index)
+        else:
+            if "vwap" not in columns or "close" not in columns:
+                raise ValueError(
+                    "prices_df must contain 'vwap' and 'close' columns "
+                    "(optionally with a 'ticker'/'code' column); got "
+                    f"{list(columns)}"
+                )
+            sub = frame
+            ticker_column = next(
+                (c for c in ("ticker", "code") if c in frame.columns), None,
+            )
+            if ticker_column is not None:
+                sub = frame[frame[ticker_column] == ticker]
+                if sub.empty:
+                    raise KeyError(
+                        f"No price data for ticker {ticker!r} in prices_df"
+                    )
+
+            date_column = next(
+                (c for c in TCAEngine._DATE_COLUMNS if c in sub.columns), None,
+            )
+            if date_column is not None:
+                dates = pd.DatetimeIndex(pd.to_datetime(sub[date_column]))
+            else:
+                dates = pd.DatetimeIndex(pd.to_datetime(sub.index))
+            if len(dates) != len(sub):
+                raise ValueError(
+                    f"Could not align price dates for ticker {ticker!r}"
+                )
+            vwap_values = sub["vwap"]
+            close_values = sub["close"]
+
+        target = pd.Timestamp(execution_date).normalize()
+        matches = dates.normalize() == target
+        if not matches.any():
+            raise KeyError(
+                f"No price data for ticker {ticker!r} on {target.date()} "
+                "in prices_df"
+            )
+        row = int(np.flatnonzero(matches)[0])
+        vwap = float(vwap_values.iloc[row])
+        close = float(close_values.iloc[row])
+
+        for name, value in (("vwap", vwap), ("close", close)):
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"Invalid {name} for ticker {ticker!r} on "
+                    f"{target.date()}: {value!r}"
+                )
+        return vwap, close
+
     def analyze_from_dataframe(
         self,
         orders_df: pd.DataFrame,
@@ -345,14 +470,29 @@ class TCAEngine:
     ) -> list[TCAResult]:
         """Batch TCA analysis from DataFrames.
 
+        Every order must carry its execution date -- an ``execution_date``
+        column (preferred) or a ``date``/``trade_date`` column. Benchmarks
+        come from the price row for that date only. The previous version used
+        the full-sample mean as VWAP and the last row as the close (a future
+        function), and silently returned zeros for the documented
+        ``[vwap, close, volume]`` layout.
+
         Args:
-            orders_df: DataFrame with columns [order_id, ticker, side, quantity,
-                       decision_price, arrival_price, arrival_time].
-            fills_df: DataFrame with columns [order_id, price, quantity, timestamp].
-            prices_df: DataFrame with columns [ticker, vwap, close, volume] indexed by date.
+            orders_df: columns [order_id, ticker, side, quantity,
+                decision_price, arrival_price, execution_date]. ``date`` and
+                ``trade_date`` are accepted aliases for ``execution_date``.
+            fills_df: columns [order_id, price, quantity, timestamp].
+            prices_df: per-date benchmark prices; see
+                :meth:`_benchmark_from_prices` for the supported layouts. A
+                missing ticker/date/value raises instead of yielding 0.
 
         Returns:
             List of TCAResult.
+
+        Raises:
+            ValueError: an order has no execution date, or a benchmark value
+                is missing/non-finite/non-positive.
+            KeyError: no price row exists for the ticker/date pair.
         """
         results = []
 
@@ -366,13 +506,10 @@ class TCAEngine:
             fills_list = order_fills[["price", "quantity", "timestamp"]].to_dict("records")
 
             ticker = order["ticker"]
-            # Look up VWAP and close from prices
-            if ticker in prices_df.columns:
-                vwap = float(prices_df[ticker].mean())
-                close = float(prices_df[ticker].iloc[-1])
-            else:
-                vwap = 0.0
-                close = 0.0
+            execution_date = self._execution_date(order)
+            vwap, close = self._benchmark_from_prices(
+                prices_df, ticker, execution_date,
+            )
 
             result = self.analyze_order(
                 order_id=oid,

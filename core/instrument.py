@@ -17,6 +17,30 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+# Canonical symbol helpers live in `shared/` so the research core
+# (`data/pipeline.py` board limits) can use them without importing this live
+# module; they are re-exported here as the public instrument API.
+from quant_platform.shared.symbols import (
+    EXCHANGES,
+    infer_exchange,
+    normalize_symbol,
+    price_limit_threshold,
+    symbol_code,
+    symbol_exchange,
+)
+
+__all__ = [
+    "EXCHANGES",
+    "AssetUniverse",
+    "Instrument",
+    "InstrumentType",
+    "infer_exchange",
+    "normalize_symbol",
+    "price_limit_threshold",
+    "symbol_code",
+    "symbol_exchange",
+]
+
 
 class InstrumentType(StrEnum):
     """Supported asset classes."""
@@ -107,7 +131,13 @@ class Instrument:
         return self.notional(price, quantity) * rate
 
     def stamp_tax(self, price: float, quantity: int, side: str = "buy") -> float:
-        """Calculate stamp tax. Only applies to sell side for equities."""
+        """Calculate stamp tax. Only applies to sell side for equities.
+
+        Futures and options are always exempt, whatever `stamp_tax_rate`
+        says: the tax is a securities-transaction levy on cash equities.
+        """
+        if self.is_derivative:
+            return 0.0
         if side != "sell":
             return 0.0
         rate = self.stamp_tax_rate if self.stamp_tax_rate is not None else 0.001
@@ -115,17 +145,17 @@ class Instrument:
 
     @classmethod
     def stock(cls, symbol: str, exchange: str = "SSE") -> Instrument:
-        """Factory for A-share stock (default parameters)."""
-        # Determine price limit based on board
-        price_limit = 0.10
-        if symbol.startswith(("300", "301", "688")):
-            price_limit = 0.20  # 创业板/科创板 20%
+        """Factory for A-share stock (default parameters).
 
+        The price limit is taken from the normalized six-digit code, so
+        Beijing (``4``/``8``/``920``) names get 30% and prefix/suffix forms
+        get the correct board rule instead of the raw-label fallback.
+        """
         return cls(
             symbol=symbol, asset_type=InstrumentType.STOCK,
             exchange=exchange, multiplier=1.0, tick_size=0.01,
             lot_size=100, margin_rate=1.0, t_plus=1,
-            price_limit=price_limit,
+            price_limit=price_limit_threshold(symbol),
         )
 
     @classmethod
@@ -165,22 +195,39 @@ class Instrument:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Instrument:
-        """Create from config dict."""
+        """Create from config dict.
+
+        Missing keys fall back to defaults for the *declared* asset class.
+        Previously every missing key took the stock default, so a futures
+        contract read from config without explicit overrides got a 0.1%
+        stamp tax, a 100-contract lot size and T+1 settlement. Futures and
+        options trade in single contracts, settle T+0 and are stamp-tax
+        exempt; stocks/ETFs keep the A-share rules.
+        """
         at = data.get("asset_type", "stock")
         if isinstance(at, str):
             at = InstrumentType(at)
+        derivative = at in (InstrumentType.FUTURE, InstrumentType.OPTION)
+        if derivative:
+            default_stamp_tax: float | None = 0.0
+            default_lot_size = 1
+            default_t_plus = 0
+        else:
+            default_stamp_tax = None  # stamp_tax() then applies the A-share 0.1%
+            default_lot_size = 100
+            default_t_plus = 1
         return cls(
             symbol=data.get("symbol", ""),
             asset_type=at,
             exchange=data.get("exchange", "SSE"),
             multiplier=data.get("multiplier", 1.0),
             tick_size=data.get("tick_size", 0.01),
-            lot_size=data.get("lot_size", 100),
+            lot_size=data.get("lot_size", default_lot_size),
             margin_rate=data.get("margin_rate", 1.0),
             commission_rate=data.get("commission_rate"),
             commission_per_lot=data.get("commission_per_lot", 0.0),
-            stamp_tax_rate=data.get("stamp_tax_rate"),
-            t_plus=data.get("t_plus", 1),
+            stamp_tax_rate=data.get("stamp_tax_rate", default_stamp_tax),
+            t_plus=data.get("t_plus", default_t_plus),
             price_limit=data.get("price_limit", 0.10),
             underlying=data.get("underlying", ""),
             expiry=data.get("expiry", ""),
@@ -204,12 +251,49 @@ class AssetUniverse:
         self._instruments[instrument.symbol] = instrument
 
     def get(self, symbol: str) -> Instrument | None:
-        """Look up instrument by symbol. Returns None if not found."""
-        return self._instruments.get(symbol)
+        """Look up instrument by symbol. Returns None if not found.
+
+        Lookup accepts bare and canonical forms interchangeably: a broker
+        position keyed ``600519.SH`` still finds an instrument configured as
+        ``600519`` (and vice versa).  An *explicitly* labelled exchange is
+        never collapsed onto a same-numbered instrument on another exchange
+        (``000001.SH`` index vs ``000001.SZ`` stock); only a bare code may
+        fall back to a six-digit match.
+        """
+        inst = self._instruments.get(symbol)
+        if inst is not None:
+            return inst
+        canonical = normalize_symbol(symbol)
+        inst = self._instruments.get(canonical)
+        if inst is not None:
+            return inst
+        text = str(symbol).strip().upper()
+        explicit = text.endswith(EXCHANGES) or text.startswith(EXCHANGES)
+        code = symbol_code(symbol)
+        if code is not None:
+            request_exchange = (
+                symbol_exchange(symbol) if explicit else infer_exchange(code)
+            )
+            for registered, candidate in self._instruments.items():
+                if symbol_code(registered) != code:
+                    continue
+                registered_text = str(registered).strip().upper()
+                registered_explicit = (
+                    registered_text.endswith(EXCHANGES)
+                    or registered_text.startswith(EXCHANGES)
+                )
+                registered_exchange = (
+                    symbol_exchange(registered) if registered_explicit
+                    else infer_exchange(code)
+                )
+                if explicit and registered_exchange != request_exchange:
+                    continue
+                return candidate
+        return None
 
     def get_or_default(self, symbol: str) -> Instrument:
         """Look up instrument, falling back to stock defaults."""
-        inst = self._instruments.get(symbol)
+        inst = self.get(symbol)
         if inst is not None:
             return inst
         return Instrument.stock(symbol)

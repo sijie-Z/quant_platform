@@ -300,6 +300,73 @@ class TestInstrumentFromDict:
         assert inst.margin_rate == 1.0
 
 
+class TestFromDictAssetClassDefaults:
+    """Missing keys used to fall back to the stock defaults for every asset.
+
+    A futures contract read from config without explicit overrides got a
+    0.1% stamp tax (a securities levy futures do not pay), a 100-contract
+    lot size and T+1 settlement.
+    """
+
+    DOC_IF2406 = {
+        "symbol": "IF2406",
+        "asset_type": "future",
+        "exchange": "CFFEX",
+        "multiplier": 300,
+        "tick_size": 0.2,
+        "lot_size": 1,
+        "margin_rate": 0.12,
+        "commission_per_lot": 25.0,
+        "stamp_tax_rate": 0.0,
+        "t_plus": 0,
+    }
+
+    def test_the_documented_future_config_charges_per_contract(self):
+        inst = Instrument.from_dict(self.DOC_IF2406)
+
+        # 25 yuan per lot -- not a percentage of the 1,050,000 notional.
+        assert inst.commission(3500.0, 1) == 25.0
+        assert inst.stamp_tax(3500.0, 1, "sell") == 0.0
+        assert inst.t_plus == 0
+        assert inst.lot_size == 1
+
+    def test_a_partial_future_config_gets_derivative_defaults(self):
+        inst = Instrument.from_dict({
+            "symbol": "IF2406", "asset_type": "future",
+            "multiplier": 300, "commission_per_lot": 25.0,
+        })
+
+        assert inst.lot_size == 1
+        assert inst.t_plus == 0
+        assert inst.stamp_tax_rate == 0.0
+        assert inst.stamp_tax(3500.0, 1, "sell") == 0.0
+        assert inst.commission(3500.0, 1) == 25.0
+
+    def test_a_partial_option_config_gets_derivative_defaults(self):
+        inst = Instrument.from_dict({"symbol": "IO2406", "asset_type": "option"})
+
+        assert inst.lot_size == 1
+        assert inst.t_plus == 0
+        assert inst.stamp_tax_rate == 0.0
+
+    def test_derivatives_never_pay_stamp_tax_even_if_configured(self):
+        future = Instrument(symbol="IF2406", asset_type=InstrumentType.FUTURE,
+                            stamp_tax_rate=0.001)
+        assert future.stamp_tax(3500.0, 1, "sell") == 0.0
+
+        option = Instrument(symbol="IO2406", asset_type=InstrumentType.OPTION,
+                            stamp_tax_rate=0.001)
+        assert option.stamp_tax(100.0, 1, "sell") == 0.0
+
+    def test_stock_defaults_are_unchanged(self):
+        inst = Instrument.from_dict({"symbol": "600519", "asset_type": "stock"})
+
+        assert inst.lot_size == 100
+        assert inst.t_plus == 1
+        assert abs(inst.stamp_tax(100.0, 100, "sell") - 10.0) < 1e-9
+
+
+
 # ── AssetUniverse ──
 
 

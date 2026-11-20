@@ -3,6 +3,8 @@
 import numpy as np
 import pytest
 
+from quant_platform.execution.models import Order as ExecutionOrder
+from quant_platform.execution.models import OrderSide as ExecutionSide
 from quant_platform.execution.order_book import (
     BookOrder,
     OrderBook,
@@ -303,6 +305,70 @@ class TestL2Replay:
         assert len(depth["asks"]) > 0
 
 
+class TestSnapshotSeedingDoesNotSelfMatch:
+    """Regression for #61 (same class as BUG-13).
+
+    Seeding pushed both ladders through the matching engine, so on a locked
+    snapshot (best bid == best ask) the first seeded ask immediately traded
+    against the seeded bid: depth was destroyed and a print fabricated before
+    any participant order arrived.
+    """
+
+    def _seed(self, bids, asks):
+        pb = PaperBroker(latency=LatencyModel.ZERO, partial_fill_rate=0.0)
+        pb.seed_book_from_snapshot("600519", {
+            "timestamp": 1000, "bids": bids, "asks": asks,
+        })
+        return pb, pb._books["600519"]
+
+    def test_locked_snapshot_does_not_self_match(self):
+        _, book = self._seed(
+            bids=[[1800.0, 500], [1799.5, 300]],
+            asks=[[1800.0, 400], [1800.5, 200]],
+        )
+
+        assert book._total_trades == 0
+        assert book._total_volume == 0
+        assert book.best_bid == 1800.0
+        assert book.best_ask == 1800.0
+        assert book._bid_levels[1800.0].total_quantity == 500
+        assert book._ask_levels[1800.0].total_quantity == 400
+        depth = book.get_depth_snapshot(levels=5)
+        assert len(depth["bids"]) == 2
+        assert len(depth["asks"]) == 2
+
+    def test_crossed_snapshot_is_preserved_not_matched(self):
+        _, book = self._seed(bids=[[1800.5, 500]], asks=[[1800.0, 400]])
+
+        assert book._total_trades == 0
+        assert book._total_volume == 0
+        assert book.best_bid == 1800.5
+        assert book.best_ask == 1800.0
+        assert book._bid_levels[1800.5].total_quantity == 500
+        assert book._ask_levels[1800.0].total_quantity == 400
+
+    def test_incoming_orders_still_fill_against_seeded_levels(self):
+        pb, book = self._seed(
+            bids=[[1800.0, 500]],
+            asks=[[1800.0, 400]],
+        )
+
+        buy = pb.place_order(ExecutionOrder(
+            ticker="600519", side=ExecutionSide.BUY,
+            quantity=100, limit_price=1800.0,
+        ))
+        sell = pb.place_order(ExecutionOrder(
+            ticker="600519", side=ExecutionSide.SELL,
+            quantity=100, limit_price=1800.0,
+        ))
+
+        assert buy.filled_qty == 100
+        assert buy.fill_price == 1800.0
+        assert sell.filled_qty == 100
+        assert sell.fill_price == 1800.0
+        assert book._total_trades == 2
+
+
 # ── Latency Arbitrage Detection ──
 
 
@@ -372,65 +438,73 @@ class TestFillRecord:
         assert not fr.cancel_succeeded
 
 
-class TestPartialFillsScaleEveryTrade:
-    """`_simulate_partial_fill` is meant to fill 30-80% of what the book
-    would have matched. It scaled the first trade and left the rest.
+class TestPartialFillDoesNotRewriteBookState:
+    """Partial fills must be decided before the order enters the book.
 
-    The loop decremented its own scale factor as it went:
-
-        scale -= new_qty / trade.quantity
-
-    and since `new_qty` is `trade.quantity * scale`, that subtraction leaves
-    `scale` at ~0 after the first iteration, so every later trade collapsed to
-    the `max(1, ...)` floor.
+    `_simulate_partial_fill` let the book match the full aggressor, then
+    rewrote ``book_order.filled_quantity`` to a smaller number afterwards.
+    The resting remainder kept its pre-rewrite quantity, so a later sell
+    could trade against shares that had already been matched away, and the
+    book's own trade volume disagreed with the broker's fill records.
     """
 
-    SIZES = [1000, 1000, 1000, 500]
+    ASK_QTY = 400
 
     @staticmethod
-    def _trades(sizes):
-        return [
-            Trade(trade_id=f"t{i}", symbol="600519", price=10.0, quantity=qty,
-                  aggressor_side=BookSide.BUY, maker_order_id=f"m{i}",
-                  taker_order_id="o1")
-            for i, qty in enumerate(sizes)
-        ]
-
-    def _run(self, seed: int):
+    def _broker():
         broker = PaperBroker(initial_cash=10_000_000, partial_fill_rate=1.0)
-        broker._rng = np.random.default_rng(seed)
-        order = BookOrder(order_id="o1", symbol="600519", side=BookSide.BUY,
-                          order_type=BookOrderType.LIMIT, price=10.0,
-                          quantity=sum(self.SIZES))
-        return broker, order, broker._simulate_partial_fill(order, self._trades(self.SIZES))
+        broker._rng = np.random.default_rng(0)
+        return broker
 
-    @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
-    def test_the_fill_lands_in_the_intended_range(self, seed):
-        _, _, result = self._run(seed)
+    @classmethod
+    def _seed(cls, broker):
+        broker.seed_book_from_snapshot("600519", {
+            "timestamp": 1000,
+            "bids": [[9.99, 100_000]],
+            "asks": [[10.0, cls.ASK_QTY]],
+        })
+        return broker._books["600519"]
 
-        filled = sum(t.quantity for t in result)
-        total = sum(self.SIZES)
-        assert 0.30 * total <= filled <= 0.80 * total, (
-            f"filled {filled} of {total}, outside the 30-80% the method targets"
-        )
+    @staticmethod
+    def _order(side, quantity, price):
+        return Order(code="600519", side=side, order_type=OrderType.LIMIT,
+                     quantity=quantity, price=price)
 
-    @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
-    def test_later_trades_are_not_collapsed_to_one_share(self, seed):
-        _, _, result = self._run(seed)
+    def test_partial_fill_happens_before_the_book_match(self):
+        broker = self._broker()
+        self._seed(broker)
 
-        quantities = [t.quantity for t in result]
-        assert all(q > 1 for q in quantities), (
-            f"a trade was scaled to the floor: {quantities}"
-        )
+        record = broker.place_order(self._order(OrderSide.BUY, 1000, 10.0))
 
-    def test_no_trade_is_scaled_above_its_book_quantity(self):
-        _, _, result = self._run(0)
-
-        for original, scaled in zip(self._trades(self.SIZES), result, strict=True):
-            assert scaled.quantity <= original.quantity
-
-    def test_the_order_records_what_was_actually_filled(self):
-        broker, order, result = self._run(0)
-
-        assert order.filled_quantity == sum(t.quantity for t in result)
+        assert record.partial
+        # 30-80% of the 400 shares the book could actually have filled.
+        assert 0.30 * self.ASK_QTY <= record.filled_qty <= 0.80 * self.ASK_QTY
         assert broker.get_metrics().partial_fills == 1
+
+    def test_no_stale_resting_order_after_a_partial_fill(self):
+        broker = self._broker()
+        book = self._seed(broker)
+
+        buy = self._order(OrderSide.BUY, 1000, 10.0)
+        broker.place_order(buy)
+
+        # The shrunken order filled completely; nothing should be resting
+        # with a quantity the matching engine never actually saw.
+        assert book.get_order(buy.order_id) is None
+
+    def test_a_later_sell_cannot_trade_against_phantom_quantity(self):
+        broker = self._broker()
+        book = self._seed(broker)
+
+        buy_record = broker.place_order(self._order(OrderSide.BUY, 1000, 10.0))
+
+        broker._partial_fill_rate = 0.0  # keep the follow-up sell deterministic
+        sell_record = broker.place_order(self._order(OrderSide.SELL, 1000, 9.0))
+
+        assert sell_record.filled_qty == 1000  # deep bid at 9.99
+        # Every share printed by the book must correspond to a fill the
+        # broker reported. Rewriting filled_quantity broke this invariant.
+        assert book._total_volume == buy_record.filled_qty + sell_record.filled_qty
+        assert all(
+            level.total_quantity >= 0 for level in book._bid_levels.values()
+        )

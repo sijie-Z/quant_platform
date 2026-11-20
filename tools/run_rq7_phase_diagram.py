@@ -24,12 +24,14 @@ from quant_platform.backtest.metrics import all_metrics
 from quant_platform.data.pipeline import DataPipeline
 from quant_platform.data.providers.baostock_provider import BaostockDataProvider
 from quant_platform.utils.logging import get_logger, setup_logging
+from quant_platform.utils.research_window import resolve_end_date, stamp_provenance
 
 setup_logging()
 logger = get_logger("rq7")
 
 REAL_START = "2018-01-01"
-REAL_END = "2025-12-31"
+# Resolved at run time (QUANT_RESEARCH_END_DATE or today).
+REAL_END = resolve_end_date()
 
 FREQUENCIES = [1, 5, 10, 20, 40]   # sampling intervals in days
 HORIZONS = [5, 10, 20, 40, 80, 120, 160]  # holding periods
@@ -95,9 +97,14 @@ def run_cell(returns, freq_days, hold_days, select_pct=0.20):
             if len(selected) > 0:
                 assets = [asset_names[s] for s in selected]
                 w = np.ones(len(selected)) / len(selected)
+                # The signal at row i uses pipeline forward returns through i,
+                # which are only known at the close of i+1. Entry must be at
+                # i+1 and the hold window runs i+1 .. i+hold. Entering at i
+                # earned returns.values[i] -- the signal-day forward return
+                # that was still in the future when the signal was formed.
                 tranche = Tranche(
-                    entry_idx=i,
-                    exit_idx=min(i + hold_days, n_dates - 1),
+                    entry_idx=i + 1,
+                    exit_idx=min(i + 1 + hold_days, n_dates - 1),
                     assets=assets,
                     weights=w,
                 )
@@ -108,6 +115,8 @@ def run_cell(returns, freq_days, hold_days, select_pct=0.20):
             port_ret = 0.0
             total_weight = 0.0
             for t in active_tranches:
+                if i < t.entry_idx:
+                    continue  # decision made after this day's return
                 for j, asset in enumerate(t.assets):
                     col_idx = asset_names.index(asset)
                     ret_val = returns.values[i, col_idx]
@@ -127,7 +136,9 @@ def run_cell(returns, freq_days, hold_days, select_pct=0.20):
     ret_series = ret_series[first_date:]
 
     if len(ret_series) < 20:
-        return {"sharpe": np.nan, "ann_ret": 0, "mdd": 0, "turnover": 0, "n_positions": len(active_tranches)}
+        return {"sharpe": np.nan, "ann_ret": 0, "mdd": 0, "turnover": 0,
+                "n_positions": len(active_tranches),
+                "daily_returns": pd.Series(daily_returns, index=dates)}
 
     metrics = all_metrics(ret_series, None)
     # Turnover = positions per year
@@ -141,6 +152,8 @@ def run_cell(returns, freq_days, hold_days, select_pct=0.20):
         "turnover": turnover,
         "n_positions": n_positions_total,
         "n_days_active": int((ret_series != 0).sum()),
+        # Untrimmed daily stream, for causality tests.
+        "daily_returns": pd.Series(daily_returns, index=dates),
     }
 
 
@@ -190,7 +203,10 @@ def main():
     logger.info("=" * 60)
 
     returns, prices, benchmark = load()
+    data_start = str(returns.index.min().date())
+    data_end = str(returns.index.max().date())
     logger.info("%d days, %d assets", len(returns), len(returns.columns))
+    logger.info("Data window: %s → %s (requested end %s)", data_start, data_end, REAL_END)
 
     all_results = {}
     total_cells = len(FREQUENCIES) * len(HORIZONS)
@@ -260,7 +276,7 @@ def main():
     rows = []
     for (f_val, h_val), r in all_results.items():
         rows.append({"f": f_val, "H": h_val, **r})
-    df = pd.DataFrame(rows)
+    df = stamp_provenance(pd.DataFrame(rows), data_start, data_end)
     out = Path("results")
     out.mkdir(parents=True, exist_ok=True)
     df.to_csv(out / "rq7_phase_diagram.csv", index=False)
@@ -269,7 +285,9 @@ def main():
 
 def _save_intermediate(results):
     rows = [{"f": k[0], "H": k[1], **v} for k, v in results.items()]
-    pd.DataFrame(rows).to_csv("results/rq7_phase_diagram_intermediate.csv", index=False)
+    out = Path("results")
+    out.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out / "rq7_phase_diagram_intermediate.csv", index=False)
 
 
 if __name__ == "__main__":

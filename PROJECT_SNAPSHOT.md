@@ -1,10 +1,17 @@
 # 项目快照 — 可验证的量化研究与策略开发平台
 
+> ## ⛔ STATUS: SUPERSEDED（2026-10-20）
+>
+> 本快照生成于 **2026-06-20**，其中「MVO Audit 60/60 Success」「WalkForward 全通过」
+> 等数字早于 2026-09/10 的修复轮次，已作废；`docs/VALIDATION_REPORT.md` 同样已标注
+> SUPERSEDED。当前状态、第十轮加固内容与仍然存在的限制见 `docs/HANDOVER.md`。
+> 以下内容仅作历史存档。
+
 > **定位**：一个可验证（Verifiable）的 A 股多因子量化研究与策略开发平台。
 > 
 > 与普通"多因子平台"的区别：核心研究链路已通过系统性验证——Oracle Factor IC=1.0、Known Alpha Recovery、WalkForward、MVO Audit。
 >
-> 最后更新：2026-06-20
+> 最后更新：2026-06-20（历史；已 SUPERSEDED）
 
 ---
 
