@@ -39,6 +39,38 @@ BUCKETS = {
 TECH_BUCKETS = {"芯片/半导体", "AI/机器人", "5G/通信", "光伏", "纳指100"}
 
 
+def tencent_quote(code: str) -> dict | None:
+    """Independent quote source; covers ETFs akshare's Sina list misses.
+
+    Verified need: sh562970 (光伏ETF易方达) is absent from
+    ``fund_etf_category_sina`` but present on Tencent's endpoint, which
+    otherwise prices the whole portfolio correctly.
+    """
+    import urllib.request
+
+    try:
+        request = urllib.request.Request(
+            f"https://qt.gtimg.cn/q={code}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            text = response.read().decode("gbk", errors="replace")
+        parts = text.split("~")
+        if len(parts) < 8:
+            return None
+        price = float(parts[3])
+        prev = float(parts[4])
+        if price <= 0:
+            return None
+        return {
+            "price": price,
+            "prev": prev,
+            "pct": (price / prev - 1.0) * 100.0 if prev > 0 else None,
+        }
+    except Exception:  # noqa: BLE001 - a quote miss must not kill the run
+        return None
+
+
 def fetch_prices() -> dict[str, dict]:
     import akshare as ak
 
@@ -59,6 +91,19 @@ def fetch_prices() -> dict[str, dict]:
             "pct": pd.to_numeric(row.get("涨跌幅"), errors="coerce"),
             "prev": pd.to_numeric(row.get("昨收"), errors="coerce"),
         }
+    # Fill any position the two Sina tables missed from Tencent's quote API.
+    try:
+        data = json.loads(HOLDINGS.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return prices
+    for position in data.get("positions", []):
+        code = position["code"]
+        existing = prices.get(code)
+        if existing and pd.notna(existing.get("price")):
+            continue
+        fallback = tencent_quote(code)
+        if fallback is not None:
+            prices[code] = fallback
     return prices
 
 

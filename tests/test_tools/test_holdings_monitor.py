@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "tools" / "holdings_monitor.py"
@@ -53,3 +54,37 @@ def test_stale_fund_archive_is_flagged():
         {},
     )
     assert any("基金金额仍是 2026-10-29" in alert for alert in snapshot["alerts"])
+
+
+def test_tencent_quote_parses_and_fails_soft(monkeypatch):
+    import io
+
+    class FakeResponse:
+        def __init__(self, payload: bytes):
+            self.payload = payload
+
+        def read(self):
+            return self.payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(_request, timeout=10):
+        return FakeResponse(
+            "v_sh562970=\"1~光伏ETF易方达~562970~0.756~0.747~0.750~225133~\";".encode("gbk")
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    quote = monitor.tencent_quote("sh562970")
+    assert quote["price"] == 0.756
+    assert quote["prev"] == 0.747
+    assert quote["pct"] == pytest.approx((0.756 / 0.747 - 1) * 100, rel=1e-6)
+
+    def broken_urlopen(_request, timeout=10):
+        raise OSError("network down")
+
+    monkeypatch.setattr("urllib.request.urlopen", broken_urlopen)
+    assert monitor.tencent_quote("sh562970") is None

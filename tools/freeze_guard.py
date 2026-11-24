@@ -32,7 +32,7 @@ FROZEN = {
     "tools/paper_track.py": "e7573cc0fef5d826",
     "tools/forward_update.py": "481aa19dba8eaf6e",
     "tools/forward_realtime.py": "226bdcba5f0d2102",
-    "tools/holdings_monitor.py": "1c6eefd55c9b3f3f",
+    "tools/holdings_monitor.py": "b8eaa49a71f3ca80",
     "backtest/engine.py": "d937c3403d83c2fd",
     "backtest/cost_model.py": "18a71fb6cec9e2be",
     "portfolio/optimizers.py": "1e703bd95fd68a57",
