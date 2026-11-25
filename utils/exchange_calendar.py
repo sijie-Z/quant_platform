@@ -80,6 +80,18 @@ EXCHANGE_HOLIDAYS: frozenset[str] = frozenset({
     "2026-06-19",
     "2026-09-25",
     "2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07",
+    # 2027 (State Council notice 国办发明电〔2026〕10号, published 2026-11-05)
+    # Exchange closes on every weekday the notice designates as a holiday;
+    # 调休 weekend workdays remain non-trading because weekends are closed.
+    "2027-01-01",                                    # 元旦 Fri
+    "2027-02-05", "2027-02-08", "2027-02-09",        # 春节 Fri, Mon, Tue
+    "2027-02-10", "2027-02-11", "2027-02-12",        # 春节 Wed-Fri
+    "2027-04-05",                                    # 清明 Mon
+    "2027-05-03", "2027-05-04", "2027-05-05",        # 劳动节 Mon-Wed
+    "2027-06-09",                                    # 端午 Wed
+    "2027-09-15",                                    # 中秋 Wed
+    "2027-10-01", "2027-10-04", "2027-10-05",        # 国庆 Fri, Mon, Tue
+    "2027-10-06", "2027-10-07",                      # 国庆 Wed-Thu
 })
 
 

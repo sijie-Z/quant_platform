@@ -41,7 +41,7 @@ FROZEN = {
     "factors/processing.py": "467221452b51130b",
     "factors/evaluation.py": "0a8c0dfb1d08878e",
     "backtest/metrics.py": "49399a9141d95171",
-    "utils/exchange_calendar.py": "00260b954308468a",
+    "utils/exchange_calendar.py": "f9ac1b90b4ca4e3c",
     "utils/numba_accelerator.py": "8000a2cf969e598a",
     "tools/fetch_valuation.py": "a286f5449fba5bc7",
     "docs/research/EVALUATION_SPEC_2026-11.md": "555055b96352c46f",
