@@ -15,7 +15,7 @@
           <option value="icir_weighted">{{ locale === 'zh-CN' ? 'ICIR加权Alpha' : 'ICIR Alpha' }}</option>
         </select>
         <input v-model.number="newStrat.allocation_pct" type="number" min="0" max="1" step="0.05"
-          :placeholder="locale === 'zh-CN' ? '分配比例%' : 'Alloc %'" class="ms-input ms-input-sm" />
+          :placeholder="locale === 'zh-CN' ? '比例 0–1' : 'Alloc 0–1'" class="ms-input ms-input-sm" />
         <button class="ms-btn ms-btn-add" @click="addNew">{{ locale === 'zh-CN' ? '+ 添加' : '+ Add' }}</button>
       </div>
     </div>
@@ -71,7 +71,17 @@
             <td class="ms-name">{{ s.name }}</td>
             <td><span class="ms-tag">{{ shortOpt(s.optimizer) }}</span></td>
             <td><span class="ms-tag">{{ shortAlpha(s.alpha_method) }}</span></td>
-            <td class="mono">{{ (s.allocation_pct * 100).toFixed(1) }}%</td>
+            <td class="mono ms-alloc-cell">
+              <input
+                v-model.number="allocDraft[s.strategy_id]"
+                type="number"
+                min="0"
+                max="100"
+                step="0.5"
+                class="ms-input ms-alloc-input"
+                :aria-label="locale === 'zh-CN' ? '分配比例(%)' : 'Allocation (%)'"
+              />%
+            </td>
             <td class="mono">{{ fmtNum(s.capital_allocated) }}</td>
             <td class="mono">{{ fmtNum(s.current_value) }}</td>
             <td class="mono" :class="s.total_pnl >= 0 ? 'pos' : 'neg'">{{ fmtNum(s.total_pnl) }}</td>
@@ -83,10 +93,26 @@
             </td>
           </tr>
           <tr v-if="!strategies.length">
-            <td colspan="11" class="ms-empty">{{ locale === 'zh-CN' ? '尚未注册策略。请在上方添加。' : 'No strategies registered. Add one above.' }}</td>
+            <td colspan="11" class="ms-empty">{{ loading ? (locale === 'zh-CN' ? '正在加载策略...' : 'Loading strategies...') : (locale === 'zh-CN' ? '尚未注册策略。请在上方添加。' : 'No strategies registered. Add one above.') }}</td>
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <!-- Allocation editor: the backend applies a *full* weight map (omitted
+         strategies are zeroed, sum must be <= 1), so edits are collected for
+         every registered strategy and submitted together. -->
+    <div class="ms-alloc-bar" v-if="strategies.length">
+      <span class="ms-alloc-total" :class="{ over: !!allocError }">
+        {{ locale === 'zh-CN' ? '合计分配' : 'Total allocated' }}: {{ allocSum.toFixed(1) }}%
+      </span>
+      <span v-if="allocError" class="ms-alloc-error">{{ allocError }}</span>
+      <span v-else class="ms-alloc-hint">{{ locale === 'zh-CN' ? '按总资本的绝对比例提交完整权重表；未列出的策略将被归零' : 'Submits an absolute weight for every strategy; omitted ids are zeroed' }}</span>
+      <button
+        class="ms-btn ms-btn-apply"
+        @click="applyAllocation"
+        :disabled="!!allocError || allocating"
+      >{{ allocating ? (locale === 'zh-CN' ? '提交中...' : 'Applying...') : (locale === 'zh-CN' ? '应用分配' : 'Apply Allocation') }}</button>
     </div>
 
     <!-- Correlation Matrix -->
@@ -117,8 +143,16 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
-import { addStrategy, removeStrategy, listStrategies, getStrategyMetrics, getStrategyAlerts } from '../api/index.js'
+import { ref, reactive, computed, onMounted } from 'vue'
+import {
+  addStrategy,
+  removeStrategy,
+  listStrategies,
+  allocateCapital,
+  getStrategyMetrics,
+  getStrategyAlerts,
+  getApiErrorMessage,
+} from '../api/index.js'
 import { useI18n } from '../i18n/index.js'
 
 const { $t, locale } = useI18n()
@@ -128,6 +162,11 @@ const emit = defineEmits(['toast'])
 const strategies = ref([])
 const metrics = ref(null)
 const alerts = ref([])
+const loading = ref(false)
+const allocating = ref(false)
+// strategy_id -> allocation in percent (0-100), one entry per registered
+// strategy so the submitted map is always complete.
+const allocDraft = reactive({})
 
 const newStrat = reactive({
   name: '',
@@ -136,14 +175,94 @@ const newStrat = reactive({
   allocation_pct: 0.2,
 })
 
+const allocSum = computed(() => strategies.value.reduce((sum, s) => {
+  const v = Number(allocDraft[s.strategy_id])
+  return sum + (Number.isFinite(v) ? v : 0)
+}, 0))
+
+const allocError = computed(() => {
+  for (const s of strategies.value) {
+    const v = Number(allocDraft[s.strategy_id])
+    if (!Number.isFinite(v) || v < 0) {
+      return locale.value === 'zh-CN' ? '分配比例必须为非负数' : 'Allocation must be a non-negative number'
+    }
+  }
+  if (allocSum.value > 100 + 1e-7) {
+    return locale.value === 'zh-CN'
+      ? `合计 ${allocSum.value.toFixed(1)}% 超过 100%`
+      : `Total ${allocSum.value.toFixed(1)}% exceeds 100%`
+  }
+  return ''
+})
+
+function syncAllocDraft() {
+  const liveIds = new Set(strategies.value.map(s => s.strategy_id))
+  for (const id of Object.keys(allocDraft)) {
+    if (!liveIds.has(id)) delete allocDraft[id]
+  }
+  for (const s of strategies.value) {
+    allocDraft[s.strategy_id] = Number(((Number(s.allocation_pct) || 0) * 100).toFixed(2))
+  }
+}
+
 async function loadAll() {
+  loading.value = true
   try {
-    const [list, m, a] = await Promise.all([listStrategies(), getStrategyMetrics(), getStrategyAlerts()])
-    strategies.value = list.strategies || []
-    metrics.value = m
-    alerts.value = a.alerts || []
+    // One failing endpoint used to discard the other two successful responses
+    // and leave the table reading "No strategies registered".
+    const [list, m, a] = await Promise.allSettled([
+      listStrategies(), getStrategyMetrics(), getStrategyAlerts(),
+    ])
+    if (list.status === 'fulfilled') {
+      strategies.value = list.value.strategies || []
+      syncAllocDraft()
+    }
+    if (m.status === 'fulfilled') metrics.value = m.value
+    if (a.status === 'fulfilled') alerts.value = a.value.alerts || []
+    const failed = [list, m, a].filter(result => result.status === 'rejected')
+    if (failed.length) {
+      emit('toast', {
+        message: locale.value === 'zh-CN'
+          ? `部分策略数据加载失败（${failed.length}/3）`
+          : `Some strategy data failed to load (${failed.length}/3)`,
+        type: 'warning',
+      })
+    }
+  } finally {
+    loading.value = false
+  }
+}
+
+async function applyAllocation() {
+  if (allocError.value) {
+    emit('toast', { message: allocError.value, type: 'error' })
+    return
+  }
+  if (!strategies.value.length) return
+  allocating.value = true
+  try {
+    // Full-map semantics: include every strategy id. Values are absolute
+    // fractions of total_capital.
+    const weights = {}
+    for (const s of strategies.value) {
+      const pct = Number(allocDraft[s.strategy_id])
+      weights[s.strategy_id] = Math.max(0, pct) / 100
+    }
+    await allocateCapital(weights)
+    emit('toast', {
+      message: locale.value === 'zh-CN'
+        ? `已应用完整权重表（合计 ${allocSum.value.toFixed(1)}%）`
+        : `Full allocation applied (total ${allocSum.value.toFixed(1)}%)`,
+      type: 'success',
+    })
+    await loadAll()
   } catch (e) {
-    console.error(locale.value === 'zh-CN' ? '加载策略失败' : 'Failed to load strategies', e)
+    emit('toast', {
+      message: (locale.value === 'zh-CN' ? '资本分配失败: ' : 'Allocation failed: ') + getApiErrorMessage(e),
+      type: 'error',
+    })
+  } finally {
+    allocating.value = false
   }
 }
 
@@ -152,13 +271,30 @@ async function addNew() {
     emit('toast', { message: locale.value === 'zh-CN' ? '需要策略名称' : 'Strategy name required', type: 'error' })
     return
   }
+  const pct = Number(newStrat.allocation_pct)
+  if (!Number.isFinite(pct) || pct < 0) {
+    emit('toast', { message: locale.value === 'zh-CN' ? '分配比例必须为非负数' : 'Allocation must be a non-negative number', type: 'error' })
+    return
+  }
+  // The add endpoint does not validate the sum; reject >100% client-side so
+  // the table cannot claim six 20% strategies against one capital pool.
+  const used = strategies.value.reduce((sum, s) => sum + (Number(s.allocation_pct) || 0), 0)
+  // The server accepts sums up to 1.0 + 1e-9; mirror that tolerance exactly
+  // instead of a looser 100.0001% that would pass here and 422 there.
+  if (used + pct > 1 + 1e-9) {
+    const msg = locale.value === 'zh-CN'
+      ? `总分配将超过 100%（已用 ${(used * 100).toFixed(1)}%，本次 ${(pct * 100).toFixed(1)}%）`
+      : `Total allocation would exceed 100% (used ${(used * 100).toFixed(1)}%, new ${(pct * 100).toFixed(1)}%)`
+    emit('toast', { message: msg, type: 'error' })
+    return
+  }
   try {
     await addStrategy({ ...newStrat })
     emit('toast', { message: locale.value === 'zh-CN' ? `已添加策略：${newStrat.name}` : `Added strategy: ${newStrat.name}`, type: 'success' })
     newStrat.name = ''
     await loadAll()
   } catch (e) {
-    emit('toast', { message: locale.value === 'zh-CN' ? '添加策略失败' : 'Failed to add strategy', type: 'error' })
+    emit('toast', { message: (locale.value === 'zh-CN' ? '添加策略失败: ' : 'Failed to add strategy: ') + getApiErrorMessage(e), type: 'error' })
   }
 }
 
@@ -168,7 +304,7 @@ async function remove(sid) {
     emit('toast', { message: locale.value === 'zh-CN' ? '策略已移除' : 'Strategy removed', type: 'success' })
     await loadAll()
   } catch (e) {
-    emit('toast', { message: locale.value === 'zh-CN' ? '移除策略失败' : 'Failed to remove strategy', type: 'error' })
+    emit('toast', { message: (locale.value === 'zh-CN' ? '移除策略失败: ' : 'Failed to remove strategy: ') + getApiErrorMessage(e), type: 'error' })
   }
 }
 
@@ -265,4 +401,36 @@ defineExpose({ loadAll })
 .ms-alert-red { background: rgba(239,68,68,0.1); color: #ef4444; border: 1px solid rgba(239,68,68,0.2); }
 .ms-alert-orange { background: rgba(251,191,36,0.1); color: #fbbf24; border: 1px solid rgba(251,191,36,0.2); }
 .ms-alert-icon { font-weight: 700; }
+
+.ms-alloc-cell { white-space: nowrap; }
+.ms-alloc-input {
+  width: 64px;
+  min-width: 0;
+  max-width: 64px;
+  padding: 2px 6px;
+  font-size: 10px;
+  text-align: right;
+}
+.ms-alloc-bar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  background: var(--bg-card, #111827);
+  border: 1px solid var(--border, #1e2a3a);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 10px;
+}
+.ms-alloc-total { font-weight: 700; font-family: monospace; color: #22c55e; }
+.ms-alloc-total.over { color: #ef4444; }
+.ms-alloc-error { color: #ef4444; font-weight: 600; }
+.ms-alloc-hint { color: #6b7a8d; }
+.ms-btn-apply {
+  margin-left: auto;
+  background: #22c55e;
+  color: #0a0e17;
+}
+.ms-btn-apply:hover { background: #45d27e; }
+.ms-btn-apply:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>

@@ -128,7 +128,12 @@ async function runCompare() {
     })
     table.value = res.table
     if (res.table.length) {
-      columns.value = Object.keys(res.table[0])
+      // Error rows omit metric keys. Deriving columns from row 0 collapsed
+      // the table to [Optimizer, Error] whenever the first combination
+      // failed, hiding successful later rows.
+      const keys = new Set()
+      for (const row of res.table) Object.keys(row).forEach(k => keys.add(k))
+      columns.value = [...keys]
     }
     emit('toast', { message: (locale.value === 'zh-CN' ? '已对比' : 'Compared ') + res.table.length + (locale.value === 'zh-CN' ? '个策略' : ' strategies'), type: 'success' })
   } catch (e) {

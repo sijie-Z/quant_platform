@@ -71,4 +71,9 @@ def test_the_loop_is_captured_by_the_websocket_connection(client):
 
 def test_no_clients_means_no_error(client):
     """Publishing with nobody connected must be a no-op, not a crash."""
-    routes._on_bus_event(_Event("order.filled", {"code": "600519"}))
+    routes._ws_clients.clear()
+
+    result = routes._on_bus_event(_Event("order.filled", {"code": "600519"}))
+
+    assert result is None
+    assert routes._ws_clients == set()

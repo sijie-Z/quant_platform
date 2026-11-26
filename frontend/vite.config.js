@@ -9,6 +9,10 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
+        // The status stream connects to /api/ws; without ws:true the dev
+        // server rejected the upgrade and the dashboard silently fell back
+        // to polling.
+        ws: true,
       },
     },
   },

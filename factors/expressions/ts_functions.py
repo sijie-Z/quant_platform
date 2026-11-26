@@ -2,6 +2,11 @@
 
 Each function takes a DataProxy as the first argument and returns a DataProxy.
 Operations are applied per-asset (grouped by column in the date×asset matrix).
+
+The rolling calls used to transpose the frame and pass ``axis=1`` because old
+pandas only rolled along rows. pandas 3 removed the ``axis`` argument; rolling
+along axis 0 of the date×asset frame is the same time-direction operation and
+works on both 2.x and 3.x.
 """
 
 from __future__ import annotations
@@ -24,27 +29,27 @@ def ts_delta(feature: DataProxy, periods: int) -> DataProxy:
 
 def ts_mean(feature: DataProxy, window: int) -> DataProxy:
     """Rolling mean over window (per asset)."""
-    return DataProxy(feature.df.T.rolling(window, axis=1).mean().T)
+    return DataProxy(feature.df.rolling(window).mean())
 
 
 def ts_sum(feature: DataProxy, window: int) -> DataProxy:
     """Rolling sum over window (per asset)."""
-    return DataProxy(feature.df.T.rolling(window, axis=1).sum().T)
+    return DataProxy(feature.df.rolling(window).sum())
 
 
 def ts_std(feature: DataProxy, window: int) -> DataProxy:
     """Rolling standard deviation over window (per asset)."""
-    return DataProxy(feature.df.T.rolling(window, axis=1).std(ddof=0).T)
+    return DataProxy(feature.df.rolling(window).std(ddof=0))
 
 
 def ts_min(feature: DataProxy, window: int) -> DataProxy:
     """Rolling minimum over window (per asset)."""
-    return DataProxy(feature.df.T.rolling(window, axis=1).min().T)
+    return DataProxy(feature.df.rolling(window).min())
 
 
 def ts_max(feature: DataProxy, window: int) -> DataProxy:
     """Rolling maximum over window (per asset)."""
-    return DataProxy(feature.df.T.rolling(window, axis=1).max().T)
+    return DataProxy(feature.df.rolling(window).max())
 
 
 def ts_rank(feature: DataProxy, window: int) -> DataProxy:
@@ -52,15 +57,13 @@ def ts_rank(feature: DataProxy, window: int) -> DataProxy:
     def _rank(s: np.ndarray) -> float:
         return float(scipy_stats.percentileofscore(s, s[-1]) / 100)
 
-    result = feature.df.T.rolling(window, axis=1).apply(
-        _rank, raw=True
-    ).T
+    result = feature.df.rolling(window).apply(_rank, raw=True)
     return DataProxy(result)
 
 
 def ts_quantile(feature: DataProxy, window: int, q: float) -> DataProxy:
     """Rolling quantile over window."""
-    return DataProxy(feature.df.T.rolling(window, axis=1).quantile(q).T)
+    return DataProxy(feature.df.rolling(window).quantile(q))
 
 
 def ts_argmax(feature: DataProxy, window: int) -> DataProxy:
@@ -68,9 +71,7 @@ def ts_argmax(feature: DataProxy, window: int) -> DataProxy:
     def _argmax(s: np.ndarray) -> float:
         return float(np.argmax(s) + 1)
 
-    result = feature.df.T.rolling(window, axis=1).apply(
-        _argmax, raw=True
-    ).T
+    result = feature.df.rolling(window).apply(_argmax, raw=True)
     return DataProxy(result)
 
 
@@ -79,21 +80,19 @@ def ts_argmin(feature: DataProxy, window: int) -> DataProxy:
     def _argmin(s: np.ndarray) -> float:
         return float(np.argmin(s) + 1)
 
-    result = feature.df.T.rolling(window, axis=1).apply(
-        _argmin, raw=True
-    ).T
+    result = feature.df.rolling(window).apply(_argmin, raw=True)
     return DataProxy(result)
 
 
 def ts_corr(x: DataProxy, y: DataProxy, window: int) -> DataProxy:
     """Rolling correlation between x and y over window (per asset)."""
-    result = x.df.T.rolling(window, axis=1).corr(y.df.T).T
+    result = x.df.rolling(window).corr(y.df)
     return DataProxy(result)
 
 
 def ts_cov(x: DataProxy, y: DataProxy, window: int) -> DataProxy:
     """Rolling covariance between x and y over window (per asset)."""
-    result = x.df.T.rolling(window, axis=1).cov(y.df.T).T
+    result = x.df.rolling(window).cov(y.df)
     return DataProxy(result)
 
 
@@ -111,9 +110,7 @@ def ts_slope(feature: DataProxy, window: int) -> DataProxy:
         with np.errstate(invalid="ignore"):
             return float(np.polyfit(x[:len(y_clean)], y_clean, 1)[0])
 
-    result = feature.df.T.rolling(window, axis=1).apply(
-        _slope, raw=True
-    ).T
+    result = feature.df.rolling(window).apply(_slope, raw=True)
     return DataProxy(result)
 
 
@@ -135,18 +132,16 @@ def ts_rsquare(feature: DataProxy, window: int) -> DataProxy:
             ss_tot = float(np.sum((y_clean - np.mean(y_clean)) ** 2))
             return 1.0 - ss_res / ss_tot if ss_tot > 1e-10 else 0.0
 
-    result = feature.df.T.rolling(window, axis=1).apply(
-        _rsq, raw=True
-    ).T
+    result = feature.df.rolling(window).apply(_rsq, raw=True)
     return DataProxy(result)
 
 
 def ts_product(feature: DataProxy, window: int) -> DataProxy:
     """Rolling product over window (per asset)."""
-    result = feature.df.T.rolling(window, axis=1).apply(
+    result = feature.df.rolling(window).apply(
         lambda x: np.prod(x) if len(x) == window else np.nan,
         raw=True,
-    ).T
+    )
     return DataProxy(result)
 
 
@@ -160,9 +155,7 @@ def ts_decay_linear(feature: DataProxy, window: int) -> DataProxy:
             return np.nan
         return float(np.sum(s * weights))
 
-    result = feature.df.T.rolling(window, axis=1).apply(
-        _decay, raw=True
-    ).T
+    result = feature.df.rolling(window).apply(_decay, raw=True)
     return DataProxy(result)
 
 

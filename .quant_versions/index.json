@@ -215,5 +215,19 @@
     "description": "Run: alpha=equal_weight optimizer=mean_variance",
     "run_id": "",
     "config_hash": "faa9846f3834"
+  },
+  "v32": {
+    "id": "v32",
+    "timestamp": "2026-10-20T20:49:04",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "d3aaa4ea7faf",
+    "config_hash": "87b729e5393d"
+  },
+  "v33": {
+    "id": "v33",
+    "timestamp": "2026-10-20T20:52:53",
+    "description": "Run: alpha=equal_weight optimizer=mean_variance",
+    "run_id": "435a9843eee2",
+    "config_hash": "87b729e5393d"
   }
 }

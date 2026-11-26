@@ -388,6 +388,7 @@ class OrderBook:
                         order.status = BookOrderStatus.FILLED
                     else:
                         order.status = BookOrderStatus.PARTIALLY_FILLED
+                    self._retire_filled_maker(maker_order)
 
                 if level.is_empty:
                     self._remove_level(Side.SELL, best_ask)
@@ -422,11 +423,23 @@ class OrderBook:
                         order.status = BookOrderStatus.FILLED
                     else:
                         order.status = BookOrderStatus.PARTIALLY_FILLED
+                    self._retire_filled_maker(maker_order)
 
                 if level.is_empty:
                     self._remove_level(Side.BUY, best_bid)
 
         return trades
+
+    def _retire_filled_maker(self, maker_order: BookOrder) -> None:
+        """Drop a fully filled maker from the order maps.
+
+        `PriceLevel.reduce` pops it from the queue but the two dicts kept the
+        object forever, so a long paper-trading session leaked every filled
+        resting order.
+        """
+        if maker_order.remaining_quantity <= 0:
+            self._orders.pop(maker_order.order_id, None)
+            self._order_prices.pop(maker_order.order_id, None)
 
     def _insert(self, order: BookOrder):
         """Insert order into the book at its price level."""

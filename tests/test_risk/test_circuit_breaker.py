@@ -4,6 +4,7 @@ import pytest
 from quant_platform.risk.circuit_breaker import (
     BreachType,
     RiskLevel,
+    RiskLimits,
     RiskMonitor,
 )
 
@@ -159,3 +160,179 @@ class TestInstrumentKeyAliases:
         })
         assert approved is True
         assert breaches == []
+
+
+class TestDirectionAwareChecks:
+    """Sells reduce exposure and must not be blocked like buys."""
+
+    def _monitor(self, daily_pnl: float = 0.0) -> RiskMonitor:
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(
+            portfolio_value=10_000_000,
+            daily_pnl=daily_pnl,
+            positions={
+                "600519": {"value": 1_000_000, "weight": 0.10, "sector": "Tech"},
+            },
+            sector_weights={"Tech": 0.10},
+        )
+        return monitor
+
+    def test_selling_is_not_blocked_by_the_position_cap(self):
+        approved, breaches = self._monitor().check_pre_trade({
+            "ticker": "600519", "side": "sell", "quantity": 10_000, "price": 100,
+        })
+
+        assert approved is True
+        assert not any(b.breach_type == BreachType.POSITION_LIMIT for b in breaches)
+
+    def test_sell_is_allowed_after_a_daily_loss_breach(self):
+        approved, _ = self._monitor(daily_pnl=-400_000).check_pre_trade({
+            "ticker": "600519", "side": "sell", "quantity": 1_000, "price": 100,
+        })
+
+        assert approved is True
+
+    def test_kill_switch_still_allows_a_reducing_sell(self):
+        monitor = self._monitor()
+        monitor.kill_switch_active = True
+
+        approved, _ = monitor.check_pre_trade({
+            "ticker": "600519", "side": "sell", "quantity": 1_000, "price": 100,
+        })
+
+        assert approved is True
+
+    def test_sector_limit_includes_the_incoming_order(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(
+            portfolio_value=10_000_000,
+            daily_pnl=0,
+            positions={"NEW": {"value": 0, "weight": 0, "sector": "Tech"}},
+            sector_weights={"Tech": 0.29},
+        )
+
+        approved, breaches = monitor.check_pre_trade({
+            "ticker": "NEW", "side": "buy", "quantity": 5_000, "price": 100,
+        })
+
+        assert approved is False
+        assert any(b.breach_type == BreachType.SECTOR_LIMIT for b in breaches)
+
+
+class TestPortfolioUpdatesRunTheEquityBreakers:
+    """Breakdowns were evaluated only inside `check_pre_trade`.
+
+    A fully invested book can lose 30% without emitting a single order, so
+    the drawdown breaker never fired and the risk level stayed GREEN until
+    someone tried to trade.
+    """
+
+    def test_drawdown_beyond_the_kill_threshold_arms_the_switch(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+        monitor.update_portfolio_state(700_000, 0, {}, {})
+
+        assert monitor.kill_switch_active is True
+        assert monitor.get_status()["risk_level"] == RiskLevel.KILL.value
+
+    def test_daily_loss_sets_a_red_level(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+        monitor.update_portfolio_state(1_000_000, -40_000, {}, {})
+
+        assert monitor.get_status()["risk_level"] == RiskLevel.RED.value
+        assert monitor.kill_switch_active is False
+
+    def test_repeated_updates_do_not_flood_the_breach_log(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+        monitor.update_portfolio_state(700_000, 0, {}, {})
+        count = len(monitor.breaches)
+
+        monitor.update_portfolio_state(700_000, 0, {}, {})
+
+        assert len(monitor.breaches) == count
+
+
+class TestPendingOrdersShareTheSectorBudget:
+    def test_a_batch_of_buys_cannot_all_pass_the_sector_limit(self):
+        monitor = RiskMonitor()
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+        codes = [f"S{i}" for i in range(8)]
+        monitor.set_sector_map({code: "Tech" for code in codes})
+
+        approved_flags = []
+        for code in codes:
+            order = {
+                "ticker": code, "side": "buy", "quantity": 1_000, "price": 40.0,
+            }
+            approved, _ = monitor.check_pre_trade(order)
+            approved_flags.append(approved)
+            if approved:
+                monitor.project_order(order)
+
+        # 4% of equity each: seven orders reach 28%, the eighth would be 32%.
+        assert approved_flags[:7] == [True] * 7
+        assert approved_flags[7] is False
+
+    def test_unknown_sector_comes_from_the_sector_map(self):
+        monitor = RiskMonitor()
+        monitor.set_sector_map({"600519": "食品饮料"})
+
+        assert monitor._resolve_sector("600519") == "食品饮料"
+        assert monitor._resolve_sector("000001") == "Unknown"
+
+
+class TestDeclaredLimitsAreEnforced:
+    """`RiskLimits` declared these limits but no check read them."""
+
+    def test_total_position_count(self):
+        monitor = RiskMonitor(RiskLimits(max_total_positions=3))
+        monitor.update_portfolio_state(
+            portfolio_value=1_000_000, daily_pnl=0,
+            positions={
+                f"S{i}": {"value": 10_000, "weight": 0.01, "sector": "X"}
+                for i in range(3)
+            },
+            sector_weights={"X": 0.03},
+        )
+
+        approved, breaches = monitor.check_pre_trade({
+            "ticker": "NEW", "side": "buy", "quantity": 100, "price": 1.0,
+        })
+
+        assert approved is False
+        assert any(b.breach_type == BreachType.CONCENTRATION for b in breaches)
+
+    def test_gross_exposure(self):
+        monitor = RiskMonitor(RiskLimits(
+            max_gross_exposure=1.0, max_single_position_pct=0.20,
+        ))
+        monitor.update_portfolio_state(
+            portfolio_value=1_000_000, daily_pnl=0,
+            positions={"A": {"value": 950_000, "weight": 0.95, "sector": "X"}},
+            sector_weights={"X": 0.95},
+        )
+
+        approved, breaches = monitor.check_pre_trade({
+            "ticker": "B", "side": "buy", "quantity": 1_000, "price": 100.0,
+        })
+
+        assert approved is False
+        assert any(b.breach_type == BreachType.LEVERAGE for b in breaches)
+
+    def test_per_second_order_rate(self):
+        monitor = RiskMonitor(RiskLimits(
+            max_orders_per_second=2, max_orders_per_minute=1_000,
+        ))
+        monitor.update_portfolio_state(1_000_000, 0, {}, {})
+
+        approvals = [
+            monitor.check_pre_trade({
+                "ticker": "A", "side": "buy", "quantity": 100, "price": 1.0,
+            })[0]
+            for _ in range(3)
+        ]
+
+        assert approvals[:2] == [True, True]
+        assert approvals[2] is False

@@ -4,16 +4,23 @@
 在调仓日执行选股和买卖, 每日对持仓逐日盯市.
 
 每日输出: 净值曲线, 持仓明细, 交易记录.
+
+因果性约定 (与 DataPipeline 对齐):
+``DataPipeline.returns[t]`` 是 t -> t+1 的前向收益率, 在 t 日收盘时
+*尚未发生*。本模块在内部统一 shift(1) 转成已实现收益率 (realized),
+因此调仓日 t 的信号只使用 t 日收盘前已经完成的收益; 波动率阈值使用
+expanding 分位数 (只用截至 t 的历史), 不再使用全样本分位数。
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from quant_platform.data.pipeline import realized_returns
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +55,45 @@ class ReversalPaperTrader:
         self.equity_curve: list[dict] = []
 
     def load_data(self, returns: pd.DataFrame, prices: pd.DataFrame):
+        """Load the pipeline panels.
+
+        Args:
+            returns: forward returns ``returns[t] = close[t+1]/close[t]-1``
+                (the ``DataPipeline.returns`` convention).  The trader shifts
+                them internally; do not pre-shift.
+            prices: close prices used for execution/marking.
+        """
         self._returns = returns
         self._prices = prices
+
+    def compute_signals(
+        self, returns: pd.DataFrame, signal_h: int = SIGNAL_H
+    ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+        """Causal signal inputs: (past return, market vol, vol threshold).
+
+        All three frames are functions of data available at the close of each
+        date only:
+
+        * ``past_ret[t]``: compounded return over the ``signal_h`` sessions
+          *ending at t* (from the shifted, realized panel);
+        * ``market_vol[t]``: 20-day std of realized cross-sectional mean
+          returns through t;
+        * ``vol_thresh[t]``: expanding quantile of ``market_vol`` over values
+          up to and including t.  The old full-sample ``quantile`` used the
+          whole sample, i.e. future volatility, at every rebalance.
+
+        Truncating the input at any date therefore cannot change earlier
+        rows (covered by the causal-prefix regression test).
+        """
+        realized = realized_returns(returns)
+        market_vol = realized.mean(axis=1).rolling(20).std()
+        vol_thresh = market_vol.expanding(min_periods=20).quantile(
+            VOL_PERCENTILE
+        )
+        past_ret = realized.rolling(
+            signal_h, min_periods=signal_h
+        ).apply(compound, raw=True)
+        return past_ret, market_vol, vol_thresh
 
     def run(self):
         if self._returns is None or self._prices is None:
@@ -62,12 +106,13 @@ class ReversalPaperTrader:
         n_select = max(1, int(n_stocks * SELECT_PCT))
         cost = COST_BPS / 10000
 
-        # Vol filter
-        market_vol = returns.mean(axis=1).rolling(20).std()
-        vol_thresh = market_vol.quantile(VOL_PERCENTILE)
+        # Causal signal inputs: realized (shifted) returns and a trailing
+        # volatility quantile.  Using the raw forward panel here made
+        # rolling(H) "past return" include tomorrow's return.
+        past_ret, market_vol, vol_thresh = self.compute_signals(
+            returns, signal_h=SIGNAL_H
+        )
 
-        # 信号
-        past_ret = returns.rolling(SIGNAL_H, min_periods=SIGNAL_H).apply(compound, raw=True)
         rebal_dates = [dates[i] for i in range(HOLD_H, len(dates) - SIGNAL_H, HOLD_H)]
 
         # 持仓记录: {(entry_date, exit_date): {asset: (shares, entry_price)}}
@@ -90,7 +135,11 @@ class ReversalPaperTrader:
                 self.trades.append(Trade(date_str, "exit", n_stocks=len(h)))
 
             # ── Vol filter ──
-            if rdate in market_vol.index and market_vol[rdate] > vol_thresh:
+            if (
+                rdate in market_vol.index
+                and pd.notna(vol_thresh.get(rdate))
+                and market_vol[rdate] > vol_thresh[rdate]
+            ):
                 self.trades.append(Trade(date_str, "skip"))
                 self.equity_curve.append(self._snapshot(rdate, cash, holdings, prices))
                 continue

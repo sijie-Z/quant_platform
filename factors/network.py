@@ -75,6 +75,12 @@ class NetworkFactor(BaseFactor):
         damping: float = 0.85,
         name: str | None = None,
     ):
+        super().__init__({
+            "centrality_type": centrality_type,
+            "window": window,
+            "threshold": threshold,
+            "damping": damping,
+        })
         self._centrality_type = CentralityType(centrality_type)
         self._window = window
         self._threshold = threshold

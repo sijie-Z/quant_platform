@@ -12,11 +12,12 @@ Usage:
     from quant_platform.backtest.distributed import ParallelBacktester
 
     bt = ParallelBacktester(max_workers=4)
-    results = bt.run_sweep(
+    sweep = bt.run_sweep(
+        # Flat aliases ("optimizer", "n_stocks") or dotted config paths
+        # ("portfolio.covariance.method") are both accepted.
         param_grid={"optimizer": ["equal_weight", "mean_variance"], "n_stocks": [200, 300]},
-        base_config=config,
     )
-    best = bt.find_best(results, metric="sharpe_ratio")
+    best_params = sweep.best_params
 """
 
 from __future__ import annotations
@@ -26,9 +27,132 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
+import pandas as pd
+
+from quant_platform.backtest.metrics import (
+    all_metrics,
+    annualized_return,
+    annualized_volatility,
+    max_drawdown,
+    sharpe_ratio,
+)
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# Flat parameter names accepted by `run_sweep`, mapped to their real dotted
+# config paths. `param_grid={"optimizer": [...], "n_stocks": [...]}` is the
+# documented usage; applying those keys with `setattr` on the root Config used
+# to create dead attributes, so every sweep cell silently ran the same
+# configuration.
+PARAM_ALIASES: dict[str, str] = {
+    "optimizer": "portfolio.optimizer",
+    "n_stocks": "universe.n_stocks",
+    "alpha_method": "alpha.method",
+    "rebalance_frequency": "backtest.rebalance_frequency",
+    "benchmark": "backtest.benchmark",
+    "initial_capital": "backtest.initial_capital",
+    "covariance_method": "portfolio.covariance.method",
+    "max_weight": "portfolio.constraints.max_weight",
+    "max_turnover": "portfolio.constraints.max_turnover",
+    "commission": "costs.commission",
+    "stamp_tax": "costs.stamp_tax",
+    "slippage": "costs.slippage",
+    "slippage_model": "costs.slippage_model",
+}
+
+
+def _resolve_param_path(config, key: str) -> str:
+    """Resolve a sweep parameter name to a dotted path that exists on `config`.
+
+    Raises:
+        ValueError: if `key` is neither a known flat alias nor a dotted path
+            whose every segment exists on the config dataclasses.
+    """
+    path = PARAM_ALIASES.get(key, key)
+    if "." not in path:
+        raise ValueError(
+            f"Unknown sweep parameter {key!r}: use a flat alias "
+            f"({', '.join(sorted(PARAM_ALIASES))}) or a dotted config path "
+            "such as 'portfolio.optimizer'."
+        )
+    target = config
+    for part in path.split("."):
+        if not hasattr(target, part):
+            raise ValueError(
+                f"Unknown sweep parameter {key!r}: {path!r} does not exist "
+                f"on the configuration"
+            )
+        target = getattr(target, part)
+    return path
+
+
+def _apply_config_overrides(config, overrides: dict[str, Any]):
+    """Apply sweep overrides to a Config, resolving flat aliases first."""
+    for key, value in overrides.items():
+        path = _resolve_param_path(config, key)
+        target = config
+        parts = path.split(".")
+        for part in parts[:-1]:
+            target = getattr(target, part)
+        setattr(target, parts[-1], value)
+    return config
+
+
+def _compute_metrics(daily_returns: pd.Series) -> dict[str, float]:
+    """Summarise a worker's daily returns with the shared metric functions.
+
+    The worker used to divide annual return by annual volatility itself (no
+    risk-free rate, no zero-volatility guard) and to measure drawdown from the
+    first *return* rather than from inception, so sweep results were not
+    comparable with the main backtest. Everything now comes from
+    `quant_platform.backtest.metrics`; a series too short for `all_metrics`
+    (< 10 observations) still gets the five headline figures.
+    """
+    series = pd.Series(daily_returns, copy=True).dropna()
+    if series.empty:
+        return {
+            "total_return": 0.0,
+            "annual_return": 0.0,
+            "annual_volatility": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+        }
+    if len(series) < 2:
+        # Not enough observations for a volatility; avoid NaN propagating into
+        # sweep results and JSON responses.
+        return {
+            "total_return": round(float((1 + series).prod() - 1), 4),
+            "annual_return": 0.0,
+            "annual_volatility": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+        }
+    if not isinstance(series.index, pd.DatetimeIndex):
+        # `max_drawdown` labels its peak/trough with index values as dates;
+        # real backtest output always has a DatetimeIndex, but a plain Series
+        # would otherwise crash inside `all_metrics`.
+        series.index = pd.bdate_range("2000-01-03", periods=len(series))
+
+    summary = all_metrics(series)
+    if not summary:
+        mdd, _, _ = max_drawdown(series)
+        summary = {
+            "total_return": float((1 + series).prod() - 1),
+            "annual_return": annualized_return(series),
+            "annual_volatility": annualized_volatility(series),
+            "sharpe_ratio": sharpe_ratio(series),
+            "max_drawdown": mdd,
+        }
+
+    return {
+        "total_return": round(float(summary["total_return"]), 4),
+        "annual_return": round(float(summary["annual_return"]), 4),
+        "annual_volatility": round(float(summary["annual_volatility"]), 4),
+        "sharpe_ratio": round(float(summary["sharpe_ratio"]), 4),
+        "max_drawdown": round(float(summary["max_drawdown"]), 4),
+    }
 
 
 @dataclass
@@ -79,48 +203,42 @@ def _run_single_backtest(args: tuple) -> BacktestResult:
 
     try:
         # Import inside worker to avoid pickling issues
-        from quant_platform.main import _compute_factors, _generate_signal, _load_data, _run_backtest
+        from quant_platform.main import (
+            _compute_factors,
+            _execution_gates,
+            _generate_signal,
+            _load_data,
+            _run_backtest,
+        )
         from quant_platform.utils.config import load_config
 
-        # Merge config overrides
+        # Merge config overrides. `load_config()` returns dataclasses, not
+        # dicts. Flat aliases ("optimizer", "n_stocks") are mapped to their
+        # real config paths; every other key must be a dotted path that exists
+        # on the config (a typo used to become a dead attribute).
         config = load_config()
-        for key, value in config_overrides.items():
-            keys = key.split(".")
-            cfg_section = config
-            for k in keys[:-1]:
-                cfg_section = cfg_section.setdefault(k, {})
-            cfg_section[keys[-1]] = value
+        _apply_config_overrides(config, config_overrides)
 
-        # Run pipeline
-        data_result = _load_data(config)
-        factors_result = _compute_factors(data_result, config)
-        signal = _generate_signal(factors_result, config)
-        backtest_result = _run_backtest(signal, data_result, config)
+        # Run pipeline with the real helper signatures.
+        prices, returns, benchmark, metadata, financials, turnover = _load_data(config)
+        processed_factors, _ic_results, sector_map, fin_unstacked = _compute_factors(
+            prices, returns, financials, metadata, turnover, config=config,
+        )
+        signal = _generate_signal(config, processed_factors, returns)
+        backtest_result = _run_backtest(
+            config, signal, prices, returns, benchmark, sector_map,
+            fin_unstacked if fin_unstacked is not None else financials,
+            gates=_execution_gates(metadata),
+        )
 
-        # Extract key metrics
+        # Extract key metrics with the shared metric definitions, so sweep
+        # results use the same Sharpe/reporting conventions as the main
+        # backtest (risk-free rate, zero-vol guard, drawdown from inception).
         daily_returns = backtest_result.get("daily_returns")
         if daily_returns is not None:
-            import numpy as np
-
-            total_return = float((1 + daily_returns).prod() - 1)
-            ann_return = float((1 + total_return) ** (252 / max(len(daily_returns), 1)) - 1)
-            ann_vol = float(daily_returns.std() * np.sqrt(252))
-            sharpe = ann_return / ann_vol if ann_vol > 0 else 0
-
-            cum = (1 + daily_returns).cumprod()
-            running_max = cum.cummax()
-            drawdown = (cum - running_max) / running_max
-            max_dd = float(drawdown.min())
-
-            metrics = {
-                "total_return": round(total_return, 4),
-                "annual_return": round(ann_return, 4),
-                "annual_volatility": round(ann_vol, 4),
-                "sharpe_ratio": round(sharpe, 4),
-                "max_drawdown": round(max_dd, 4),
-            }
+            metrics = _compute_metrics(daily_returns)
         else:
-            metrics = {"total_return": 0, "sharpe_ratio": 0}
+            metrics = _compute_metrics(pd.Series(dtype=float))
 
         duration = time.perf_counter() - start
         return BacktestResult(
@@ -161,8 +279,14 @@ class ParallelBacktester:
         """Run parameter sweep in parallel.
 
         Args:
-            param_grid: dict of param_name -> list of values
+            param_grid: dict of param_name -> list of values. Names may be
+                flat aliases from `PARAM_ALIASES` (e.g. ``"optimizer"`` →
+                ``portfolio.optimizer``, ``"n_stocks"`` →
+                ``universe.n_stocks``) or dotted config paths such as
+                ``"portfolio.covariance.method"``. Unknown names raise
+                ``ValueError`` before any process is started.
             base_config_overrides: base config overrides applied to all runs
+                (same naming rules as `param_grid`).
             metric: metric to optimize (default: sharpe_ratio)
 
         Returns:
@@ -171,6 +295,14 @@ class ParallelBacktester:
         import itertools
 
         base_overrides = base_config_overrides or {}
+
+        # Fail fast on unknown parameter names. Inside the worker pool the
+        # ValueError would only surface as one failed cell per combination.
+        from quant_platform.utils.config import load_config
+
+        validation_config = load_config()
+        for key in {*param_grid, *base_overrides}:
+            _resolve_param_path(validation_config, key)
 
         # Generate all combinations
         param_names = list(param_grid.keys())

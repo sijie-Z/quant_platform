@@ -29,6 +29,8 @@ from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+TRADING_DAYS_PER_YEAR = 252
+
 
 class BlackLittermanModel:
     """Black-Litterman expected returns model.
@@ -36,12 +38,20 @@ class BlackLittermanModel:
     Combines market-implied prior returns with investor views to produce
     a posterior estimate of expected returns with lower estimation error.
 
+    Unit convention (all quantities are **daily** unless stated otherwise):
+    the covariance matrix is the daily covariance of returns (the same matrix
+    the optimizers use), and the prior/posterior expected returns are daily
+    expected total returns. ``risk_free_rate`` is quoted **annualised** and is
+    divided by 252 internally.
+
     Args:
-        cov_matrix: (asset × asset) covariance matrix of returns.
+        cov_matrix: (asset × asset) covariance matrix of **daily** returns.
         market_caps: Series or dict mapping asset → market capitalization.
-        risk_aversion: Market risk-aversion coefficient. If None, estimated
-            from market data using a 252-trading-day assumption.
-        risk_free_rate: Annual risk-free rate.
+        risk_aversion: Market risk-aversion coefficient δ. If None, estimated
+            as the annual equity risk premium (6%) divided by the annualised
+            market variance, which is unit-invariant (δ is dimensionless).
+        risk_free_rate: Annual risk-free rate (e.g. 0.02 = 2%). Converted to
+            a daily rate internally.
         tau: Scaling factor for prior covariance (default 0.05).
             Controls how strongly the prior is weighted relative to views.
         view_confidences: Dict mapping asset → confidence weight [0, 1]
@@ -82,32 +92,43 @@ class BlackLittermanModel:
         self.view_confidences = view_confidences or {}
 
     def _estimate_risk_aversion(self) -> float:
-        """Estimate risk aversion from excess return / variance.
+        """Estimate risk aversion δ = annual equity premium / annual variance.
 
-        Using a typical equity risk premium of ~6% and market variance
-        implied by the covariance matrix.
+        δ is dimensionless, so the premium and the variance must be measured
+        over the *same* horizon. The old code divided the annual 6% premium by
+        the *daily* market variance, producing a δ 252x too large; multiplying
+        that into the daily covariance made the prior ~6% per day. Annualising
+        the variance first (equivalently, using 0.06/252 with daily variance)
+        restores the intended ~6% per year.
         """
-        market_var = float(
+        market_var_daily = float(
             self.market_weights.values @ self.cov_matrix.values @ self.market_weights.values
         )
-        # Assume 6% equity risk premium as default
+        annual_market_var = market_var_daily * TRADING_DAYS_PER_YEAR
+        # Assume 6% annual equity risk premium as default
         equity_risk_premium = 0.06
-        ra = equity_risk_premium / max(market_var, 1e-6)
-        logger.info("Estimated risk aversion: %.2f (market var=%.4f)", ra, market_var)
+        ra = equity_risk_premium / max(annual_market_var, 1e-12)
+        logger.info(
+            "Estimated risk aversion: %.2f (annual market var=%.4f)",
+            ra, annual_market_var,
+        )
         return ra
 
     def _market_implied_prior(self) -> pd.Series:
         """Compute market-implied prior returns using reverse optimization.
 
-        Π = δ * Σ * w_mkt
+        Π = δ * Σ * w_mkt + r_f
 
-        This is the expected return that would make the market cap weights
-        optimal under mean-variance theory.
+        This is the daily expected total return that would make the market cap
+        weights optimal under mean-variance theory. Σ is the daily covariance
+        and the annual ``risk_free_rate`` is converted to a daily rate before
+        being added.
         """
+        rf_daily = self.risk_free_rate / TRADING_DAYS_PER_YEAR
         pi = (
             self.risk_aversion
             * self.cov_matrix.dot(self.market_weights)
-            + self.risk_free_rate
+            + rf_daily
         )
         return pi
 
@@ -118,8 +139,9 @@ class BlackLittermanModel:
         """Compute Black-Litterman posterior expected returns.
 
         Args:
-            views: Dict mapping asset → expected return view.
-                Only assets with views are updated; others keep prior.
+            views: Dict mapping asset → expected return view (daily, the same
+                unit as the prior). Only assets with views are updated;
+                others keep prior.
 
         Returns:
             Series of posterior expected returns (one per asset).
@@ -209,10 +231,12 @@ class BlackLittermanModel:
         a mean-variance optimizer produce?
 
         This is the inverse of the prior calculation:
-        w = (δ * Σ)⁻¹ * (Π - r_f)
+        w = (δ * Σ)⁻¹ * (Π - r_f), with the annual risk-free rate converted
+        to a daily rate (Π is a daily expected return).
         """
         sigma = self.cov_matrix.values
-        excess = self.prior.values - self.risk_free_rate
+        rf_daily = self.risk_free_rate / TRADING_DAYS_PER_YEAR
+        excess = self.prior.values - rf_daily
         inv_sigma = np.linalg.inv(sigma)
         w = inv_sigma @ excess / self.risk_aversion
         # Normalize to sum to 1

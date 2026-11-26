@@ -10,11 +10,13 @@ _START = datetime(2026, 1, 5, 9, 30)
 from quant_platform.execution.algorithms import (
     ExecutionPlan,
     IcebergAlgorithm,
+    PlanExecutor,
     SmartRouter,
     TWAPAlgorithm,
     VWAPAlgorithm,
 )
 from quant_platform.execution.models import Order, OrderSide
+from quant_platform.execution.oms import OrderManager
 
 
 def make_order(ticker="600519", side="buy", quantity=10000):
@@ -45,9 +47,25 @@ class TestTWAP:
         algo = TWAPAlgorithm(num_slices=3)
         order = make_order(quantity=1000)
         plan = algo.create_plan(order, start_time=datetime.now(), duration_minutes=60)
-        # 1000 / 3 = 333 remainder 1, so first slice gets 334
-        assert plan.slices[0].quantity == 334
-        assert plan.slices[1].quantity == 333
+        # 10 lots / 3 = 3 lots each; the extra lot goes to the first slice.
+        assert [s.quantity for s in plan.slices] == [400, 300, 300]
+
+    @pytest.mark.parametrize("quantity", [100, 250, 1000, 1050, 10_100])
+    def test_slices_are_whole_lots_never_exceeding_parent(self, quantity):
+        plan = TWAPAlgorithm(num_slices=7).create_plan(
+            make_order(quantity=quantity), start_time=_START,
+        )
+        quantities = [s.quantity for s in plan.slices]
+        # An odd-lot remainder cannot be bought, so it is left unallocated.
+        assert sum(quantities) == quantity - quantity % 100
+        assert all(q > 0 for q in quantities)
+        assert all(q % 100 == 0 for q in quantities)
+
+    def test_order_below_one_lot_produces_no_slices(self):
+        plan = TWAPAlgorithm(num_slices=5).create_plan(
+            make_order(quantity=50), start_time=_START,
+        )
+        assert plan.slices == []
 
 
 class TestVWAP:
@@ -82,6 +100,24 @@ class TestIceberg:
         plan = algo.create_plan(order, start_time=datetime.now(), duration_minutes=120)
         # Visible should be ~10% of total
         assert plan.slices[0].quantity <= 2000  # with jitter
+
+    @pytest.mark.parametrize("quantity", [1, 50, 99])
+    def test_below_one_lot_produces_no_slices(self, quantity):
+        plan = IcebergAlgorithm().create_plan(
+            make_order(quantity=quantity), start_time=_START,
+        )
+        assert plan.slices == []
+        assert plan.num_slices == 0
+
+    @pytest.mark.parametrize("quantity", [100, 150, 250, 500, 1000, 10_000])
+    def test_slice_count_and_quantities_are_consistent(self, quantity):
+        plan = IcebergAlgorithm().create_plan(
+            make_order(quantity=quantity), start_time=_START,
+        )
+        quantities = [slice_.quantity for slice_ in plan.slices]
+        assert plan.num_slices == len(plan.slices)
+        assert all(qty > 0 and qty % 100 == 0 for qty in quantities)
+        assert sum(quantities) == quantity - quantity % 100
 
 
 class TestSmartRouter:
@@ -152,3 +188,62 @@ class TestVWAPSliceQuantities:
         order = Order(ticker="600519", side=OrderSide.BUY, quantity=300)
         plan = VWAPAlgorithm(num_slices=10).create_plan(order, start_time=_START)
         assert sum(s.quantity for s in plan.slices) <= order.quantity
+
+
+class TestPlanExecutor:
+    """The algorithms used to produce plans that nothing ever executed."""
+
+    def test_buy_plan_moves_positions_and_cash(self):
+        oms = OrderManager(initial_cash=1_000_000.0)
+        plan = TWAPAlgorithm(num_slices=5).create_plan(
+            make_order(quantity=1000), start_time=_START,
+        )
+
+        report = PlanExecutor(oms).execute_plan(plan, price=10.0)
+
+        assert report.status == "completed"
+        assert report.filled_quantity == 1000
+        assert report.average_price == pytest.approx(10.0)
+        assert len(report.order_ids) == 5
+        assert report.rejects == []
+        assert oms.positions["600519"].quantity == 1000
+        # Bought today -> T+1 locked.
+        assert oms.positions["600519"].available == 0
+        # 1000 * 10 + five minimum commissions of 5.
+        assert oms.cash == pytest.approx(1_000_000.0 - 10_000.0 - 25.0)
+        assert all(order.status.value == "filled" for order in oms.orders.values())
+
+    def test_sell_plan_obeys_t_plus_one(self):
+        oms = OrderManager(initial_cash=1_000_000.0)
+        buy_plan = TWAPAlgorithm(num_slices=2).create_plan(
+            make_order(quantity=1000), start_time=_START,
+        )
+        assert PlanExecutor(oms).execute_plan(buy_plan, price=10.0).status == "completed"
+
+        sell_plan = TWAPAlgorithm(num_slices=2).create_plan(
+            make_order(side="sell", quantity=1000), start_time=_START,
+        )
+        same_day = PlanExecutor(oms).execute_plan(sell_plan, price=11.0)
+        assert same_day.status == "rejected"
+        assert same_day.filled_quantity == 0
+        assert all("T+1" in r["reason"] for r in same_day.rejects)
+        assert oms.positions["600519"].quantity == 1000
+
+        oms.new_trading_day()
+        next_day = PlanExecutor(oms).execute_plan(sell_plan, price=11.0)
+        assert next_day.status == "completed"
+        assert next_day.filled_quantity == 1000
+        assert oms.positions == {}
+
+    def test_missing_price_is_reported_not_raised(self):
+        oms = OrderManager(initial_cash=1_000_000.0)
+        plan = TWAPAlgorithm(num_slices=3).create_plan(
+            make_order(quantity=600), start_time=_START,
+        )
+
+        report = PlanExecutor(oms).execute_plan(plan)
+
+        assert report.status == "rejected"
+        assert report.filled_quantity == 0
+        assert len(report.rejects) == 3
+        assert oms.orders == {}

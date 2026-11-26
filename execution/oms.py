@@ -7,6 +7,8 @@ Supports A-share specific rules: T+1, stamp tax (sell-side only), lot sizes of 1
 from __future__ import annotations
 
 import json
+import math
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +35,37 @@ COMMISSION_RATE = 0.0003      # 0.03% per side
 MIN_COMMISSION = 5.0          # Minimum 5 RMB per trade
 STAMP_TAX_RATE = 0.001        # 0.1% sell-side only
 MIN_LOT = 100                 # 1 lot = 100 shares
+#: Bound the in-memory books: a long-running API process accepted orders
+#: forever and the blotter/snapshot lists were never pruned (the audit found
+#: 1,000 unthrottled orders accepted with no growth limit).
+MAX_ORDERS = 10_000
+MAX_SNAPSHOTS = 10_000
+MAX_FILLS_PER_ORDER = 1_000
+_PRUNE_RATIO = 0.9
+
+#: Bases that describe a return-generating (adjusted) series.  Cash, fills,
+#: commission and position marks are CNY amounts and must use raw prices.
+_ADJUSTED_PRICE_BASES = frozenset({"qfq", "hfq", "adjusted"})
+
+
+def require_raw_price_basis(
+    price_basis: str | None, *, context: str = "OMS marks/fills",
+) -> str:
+    """Validate that price inputs are raw (traded CNY) levels.
+
+    An explicitly adjusted basis is a hard error: dividing/multiplying shares
+    by an hfq level misstates cash and P&L (D15).  Unlabeled callers keep the
+    historical behaviour and are reported as ``"unknown"``; they must pass
+    ``"raw"`` to make the guarantee explicit.
+    """
+    text = str(price_basis or "").strip().lower()
+    if text in _ADJUSTED_PRICE_BASES:
+        raise ValueError(
+            f"{context} require raw (traded) CNY prices, got "
+            f"price_basis={text!r}. Adjusted levels are not tradeable; use a "
+            "broker/real-time quote or DataPipeline.get_raw_close()."
+        )
+    return text or "unknown"
 
 
 class OrderManager:
@@ -54,6 +87,13 @@ class OrderManager:
         self.positions: dict[str, Position] = {}
         self.blotter: list[Order] = []
         self.snapshots: list[PortfolioSnapshot] = []
+        # `fill_order` validates remaining quantity and cash and then mutates
+        # both. Two concurrent fills could both pass validation: a 100-share
+        # order accepted 60 + 60 and cash went negative.
+        self._lock = threading.RLock()
+        #: Basis of the most recent fill/mark prices. Cash and share counts
+        #: are CNY-denominated, so this must stay raw (D15).
+        self.price_basis: str = "raw"
 
     # ── Order Lifecycle ──
 
@@ -78,51 +118,90 @@ class OrderManager:
         # This checked `pos.quantity`, the full holding, so a buy and a sell in
         # the same session went through. `available` excludes today's purchases
         # and is released by `new_trading_day()`.
-        if side == "sell":
-            pos = self.positions.get(ticker)
-            available = pos.available if pos else 0
-            if available < quantity:
-                held = pos.quantity if pos else 0
+        #
+        # The check and the insert must be atomic: a fill from
+        # `smart_route_order`'s thread runs under the same RLock, so without
+        # it a sell could pass against `available` and interleave with a fill
+        # that empties the position.
+        with self._lock:
+            if side == "sell":
+                pos = self.positions.get(ticker)
+                available = pos.available if pos else 0
+                if available < quantity:
+                    held = pos.quantity if pos else 0
+                    raise ValueError(
+                        f"Insufficient sellable position: {ticker} has {available} "
+                        f"available today (holding {held}, of which "
+                        f"{held - available} was bought today and is T+1 locked), "
+                        f"trying to sell {quantity}"
+                    )
+
+            # Get tenant from context if available
+            tenant_id = "default"
+            if TenantContext is not None:
+                try:
+                    tenant_id = TenantContext.get_current().tenant_id
+                except Exception:
+                    pass
+
+            order = Order(
+                ticker=ticker,
+                tenant_id=tenant_id,
+                side=OrderSide(side),
+                order_type=OrderType(order_type),
+                quantity=quantity,
+                limit_price=limit_price,
+                status=OrderStatus.PENDING,
+                created_at=datetime.now().isoformat(),
+                strategy=strategy,
+                notes=notes,
+            )
+            self._prune_orders()
+            if len(self.orders) >= MAX_ORDERS:
                 raise ValueError(
-                    f"Insufficient sellable position: {ticker} has {available} "
-                    f"available today (holding {held}, of which "
-                    f"{held - available} was bought today and is T+1 locked), "
-                    f"trying to sell {quantity}"
+                    "order book is at its active-order cap; fill or cancel "
+                    "open orders before creating more"
                 )
-
-        # Get tenant from context if available
-        tenant_id = "default"
-        if TenantContext is not None:
-            try:
-                tenant_id = TenantContext.get_current().tenant_id
-            except Exception:
-                pass
-
-        order = Order(
-            ticker=ticker,
-            tenant_id=tenant_id,
-            side=OrderSide(side),
-            order_type=OrderType(order_type),
-            quantity=quantity,
-            limit_price=limit_price,
-            status=OrderStatus.PENDING,
-            created_at=datetime.now().isoformat(),
-            strategy=strategy,
-            notes=notes,
-        )
-        self.orders[order.order_id] = order
+            self.orders[order.order_id] = order
         logger.info("Created order %s: %s %s x%d @ %s",
                      order.order_id, side, ticker, quantity,
                      limit_price or "market")
         return order
 
+    def _prune_orders(self) -> None:
+        """Drop the oldest completed orders once the book exceeds the cap.
+
+        Active orders are never evicted (a client must still be able to fill
+        or cancel them). Called under ``self._lock``.
+        """
+        if len(self.blotter) > MAX_ORDERS:
+            self.blotter = self.blotter[-int(MAX_ORDERS * _PRUNE_RATIO):]
+        if len(self.orders) < MAX_ORDERS:
+            return
+        target = int(MAX_ORDERS * _PRUNE_RATIO)
+        removable = [
+            order_id
+            for order_id, order in self.orders.items()
+            if order.status in (
+                OrderStatus.FILLED,
+                OrderStatus.CANCELLED,
+                OrderStatus.REJECTED,
+                OrderStatus.EXPIRED,
+            )
+        ]
+        for order_id in removable[: max(0, len(self.orders) - target)]:
+            self.orders.pop(order_id, None)
+        if len(self.blotter) > target:
+            self.blotter = self.blotter[-target:]
+
     def submit_order(self, order_id: str) -> Order:
         """Submit order (PENDING -> SUBMITTED)."""
-        order = self.orders[order_id]
-        if order.status != OrderStatus.PENDING:
-            raise ValueError(f"Cannot submit order in {order.status} state")
-        order.status = OrderStatus.SUBMITTED
-        order.submitted_at = datetime.now().isoformat()
+        with self._lock:
+            order = self.orders[order_id]
+            if order.status != OrderStatus.PENDING:
+                raise ValueError(f"Cannot submit order in {order.status} state")
+            order.status = OrderStatus.SUBMITTED
+            order.submitted_at = datetime.now().isoformat()
         logger.info("Submitted order %s", order_id)
         return order
 
@@ -132,19 +211,92 @@ class OrderManager:
         price: float,
         quantity: int | None = None,
         commission: float | None = None,
+        price_basis: str = "raw",
     ) -> Order:
-        """Process a fill (partial or full)."""
+        """Process a fill atomically.
+
+        ``price`` must be a raw (traded) CNY price; an adjusted basis raises
+        before any cash/position mutation.
+        """
+        basis = require_raw_price_basis(price_basis, context="OMS fills")
+        with self._lock:
+            order = self._fill_order(order_id, price, quantity, commission)
+            self.price_basis = basis
+            self._prune_orders()
+            return order
+
+    def _fill_order(
+        self,
+        order_id: str,
+        price: float,
+        quantity: int | None = None,
+        commission: float | None = None,
+    ) -> Order:
+        """Process a fill (partial or full).
+
+        Raises:
+            ValueError: if the order is complete, the price is not a finite
+                positive number, or the requested quantity is not a finite
+                positive number. Validation happens before any cash or
+                position mutation.
+        """
         order = self.orders[order_id]
         if order.is_complete:
             raise ValueError(f"Order {order_id} is already {order.status}")
 
-        qty = quantity or order.remaining_quantity
+        # Validate before mutating anything. The HTTP layer refuses non-positive
+        # prices, but internal callers (SimulatedExchange, execution algorithms)
+        # go straight to the OMS; a NaN price used to produce a NaN commission
+        # and poison the whole book.
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid fill price: {price!r}") from None
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(f"Invalid fill price: {price!r}")
+
+        # `quantity or remaining` treated an explicit 0 as "fill everything".
+        qty = order.remaining_quantity if quantity is None else quantity
+        try:
+            qty_valid = math.isfinite(qty) and qty > 0
+        except TypeError:
+            qty_valid = False
+        if not qty_valid:
+            raise ValueError(f"Invalid fill quantity: {qty!r}")
+        if order.remaining_quantity <= 0:
+            raise ValueError(f"Order {order_id} has no remaining quantity")
+        if len(order.fills) >= MAX_FILLS_PER_ORDER:
+            raise ValueError(
+                f"Order {order_id} reached the {MAX_FILLS_PER_ORDER}-fill cap"
+            )
         qty = min(qty, order.remaining_quantity)
 
         # Calculate costs
         if commission is None:
             commission = max(price * qty * COMMISSION_RATE, MIN_COMMISSION)
         tax = (price * qty * STAMP_TAX_RATE) if order.side == OrderSide.SELL else 0.0
+
+        # Validate against the live book before mutating anything. Without
+        # these checks a buy could drive cash negative (the OMS then reports a
+        # lower equity than it can fund) and two sells could both pass
+        # creation against the same `available` shares, the second one raising
+        # KeyError after the first had already credited cash.
+        if order.side == OrderSide.SELL:
+            position = self.positions.get(order.ticker)
+            if position is None or position.available < qty:
+                held = position.quantity if position else 0
+                available = position.available if position else 0
+                raise ValueError(
+                    f"Insufficient sellable position: {order.ticker} has "
+                    f"{available} available today (holding {held}), "
+                    f"trying to sell {qty}"
+                )
+        else:
+            required = price * qty + commission + tax
+            if required > self.cash + 1e-9:
+                raise ValueError(
+                    f"Insufficient cash: need {required:.2f}, have {self.cash:.2f}"
+                )
 
         # Calculate slippage vs arrival price
         arrival_price = order.limit_price or price
@@ -182,11 +334,12 @@ class OrderManager:
 
     def cancel_order(self, order_id: str, reason: str = "") -> Order:
         """Cancel an order."""
-        order = self.orders[order_id]
-        if order.is_complete:
-            raise ValueError(f"Cannot cancel order in {order.status} state")
-        order.status = OrderStatus.CANCELLED
-        order.notes = f"{order.notes} | Cancelled: {reason}".strip(" | ")
+        with self._lock:
+            order = self.orders[order_id]
+            if order.is_complete:
+                raise ValueError(f"Cannot cancel order in {order.status} state")
+            order.status = OrderStatus.CANCELLED
+            order.notes = f"{order.notes} | Cancelled: {reason}".strip(" | ")
         logger.info("Cancelled order %s: %s", order_id, reason)
         return order
 
@@ -213,6 +366,12 @@ class OrderManager:
             if total_qty > 0:
                 pos.avg_cost = (pos.avg_cost * pos.quantity + cost) / total_qty
             pos.quantity = total_qty
+            # Mark to the fill price immediately. Without this, current_price
+            # and market_value stayed at zero until the next update_prices()
+            # call, so get_snapshot() right after a buy valued the position at
+            # nothing and reported the whole purchase as a loss.
+            pos.last_updated = fill.timestamp
+            pos.update_price(fill.price)
             # Today's purchase is T+1 locked: quantity grows, `available` does
             # not. `new_trading_day()` releases it.
 
@@ -229,6 +388,9 @@ class OrderManager:
             # Remove position if fully sold
             if pos.quantity <= 0:
                 del self.positions[ticker]
+            else:
+                pos.last_updated = fill.timestamp
+                pos.update_price(fill.price)
 
     def new_trading_day(self) -> None:
         """Roll the book: everything held overnight becomes sellable.
@@ -238,99 +400,148 @@ class OrderManager:
         `_trade_date_offset` field commented "For T+1 simulation" that nothing
         ever read, and no day-boundary method existed at all.
         """
-        for pos in self.positions.values():
-            pos.available = pos.quantity
+        with self._lock:
+            for pos in self.positions.values():
+                pos.available = pos.quantity
 
-    def update_prices(self, prices: dict[str, float]):
-        """Update all positions with current market prices."""
-        for ticker, pos in self.positions.items():
-            if ticker in prices:
-                pos.update_price(prices[ticker])
+    def update_prices(
+        self, prices: dict[str, float], price_basis: str = "raw",
+    ):
+        """Update all positions with current market prices (raw CNY only)."""
+        basis = require_raw_price_basis(
+            price_basis, context="OMS position marks",
+        )
+        with self._lock:
+            self.price_basis = basis
+            for ticker, pos in self.positions.items():
+                if ticker in prices:
+                    pos.update_price(prices[ticker])
 
     # ── Portfolio Analytics ──
 
     def get_snapshot(self) -> PortfolioSnapshot:
-        """Generate current portfolio snapshot."""
-        positions_value = sum(p.market_value for p in self.positions.values())
-        total_unrealized = sum(p.unrealized_pnl for p in self.positions.values())
-        total_realized = sum(p.realized_pnl for p in self.positions.values())
+        """Generate current portfolio snapshot.
 
-        total_value = self.cash + positions_value
-        daily_pnl = total_value - self.initial_cash
+        A position whose price has never been marked is valued at cost
+        (``avg_cost * quantity``) rather than zero, so an unmarked book does
+        not report the entire holding as a loss.
+        """
+        def marked_value(pos: Position) -> float:
+            if pos.current_price > 0:
+                return pos.market_value
+            return pos.avg_cost * pos.quantity
 
-        # Calculate weights
-        for pos in self.positions.values():
-            pos.weight = pos.market_value / total_value if total_value > 0 else 0
+        with self._lock:
+            positions_value = sum(marked_value(p) for p in self.positions.values())
+            total_unrealized = sum(p.unrealized_pnl for p in self.positions.values())
+            total_realized = sum(p.realized_pnl for p in self.positions.values())
 
-        snapshot = PortfolioSnapshot(
-            timestamp=datetime.now().isoformat(),
-            total_value=round(total_value, 2),
-            cash=round(self.cash, 2),
-            positions_value=round(positions_value, 2),
-            n_positions=len(self.positions),
-            total_unrealized_pnl=round(total_unrealized, 2),
-            total_realized_pnl=round(total_realized, 2),
-            daily_pnl=round(daily_pnl, 2),
-            positions=list(self.positions.values()),
-        )
-        self.snapshots.append(snapshot)
+            total_value = self.cash + positions_value
+            daily_pnl = total_value - self.initial_cash
+
+            # Calculate weights
+            for pos in self.positions.values():
+                value = marked_value(pos)
+                pos.weight = value / total_value if total_value > 0 else 0
+
+            snapshot = PortfolioSnapshot(
+                timestamp=datetime.now().isoformat(),
+                total_value=round(total_value, 2),
+                cash=round(self.cash, 2),
+                positions_value=round(positions_value, 2),
+                n_positions=len(self.positions),
+                total_unrealized_pnl=round(total_unrealized, 2),
+                total_realized_pnl=round(total_realized, 2),
+                daily_pnl=round(daily_pnl, 2),
+                positions=list(self.positions.values()),
+            )
+            self.snapshots.append(snapshot)
+            # `/api/oms/positions` and `/api/risk/status` call this on every poll;
+            # without a cap the list grew for the life of the process.
+            if len(self.snapshots) > 1_000:
+                self.snapshots = self.snapshots[-500:]
         return snapshot
 
-    def get_order_blotter(self, tenant_id: str = "") -> list[dict]:
-        """Get all orders as a list of dicts, optionally filtered by tenant."""
+    def get_order_blotter(self, tenant_id: str = "", limit: int = 500) -> list[dict]:
+        """Get orders as a list of dicts, optionally filtered by tenant.
+
+        This used to iterate `self.blotter`, which only receives orders once
+        they are complete (filled/cancelled/rejected). Pending, submitted and
+        partially filled orders were invisible to `/api/oms/blotter` even
+        though they existed and had already moved cash or positions.
+
+        `limit` bounds the response: the OMS book is never pruned, so the
+        blotter used to return every order ever created.
+        """
+        try:
+            limit = max(0, int(limit))
+        except (TypeError, ValueError):
+            limit = 500
         result = []
-        for order in self.blotter:
-            if tenant_id and order.tenant_id != tenant_id:
-                continue
-            result.append({
-                "order_id": order.order_id,
-                "tenant_id": order.tenant_id,
-                "ticker": order.ticker,
-                "side": order.side.value,
-                "type": order.order_type.value,
-                "quantity": order.quantity,
-                "avg_fill_price": round(order.avg_fill_price, 2),
-                "filled_quantity": order.filled_quantity,
-                "commission": order.total_commission,
-                "tax": order.total_tax,
-                "slippage": order.total_slippage,
-                "status": order.status.value,
-                "created_at": order.created_at,
-                "filled_at": order.filled_at,
-                "strategy": order.strategy,
-            })
+        with self._lock:
+            for order in sorted(
+                self.orders.values(), key=lambda o: o.created_at, reverse=True,
+            ):
+                if tenant_id and order.tenant_id != tenant_id:
+                    continue
+                result.append({
+                    "order_id": order.order_id,
+                    "tenant_id": order.tenant_id,
+                    "ticker": order.ticker,
+                    "side": order.side.value,
+                    "type": order.order_type.value,
+                    "quantity": order.quantity,
+                    "remaining_quantity": max(
+                        0, order.quantity - order.filled_quantity,
+                    ),
+                    "avg_fill_price": round(order.avg_fill_price, 2),
+                    "filled_quantity": order.filled_quantity,
+                    "commission": order.total_commission,
+                    "tax": order.total_tax,
+                    "slippage": order.total_slippage,
+                    "status": order.status.value,
+                    "created_at": order.created_at,
+                    "filled_at": order.filled_at,
+                    "strategy": order.strategy,
+                })
+                if len(result) >= limit:
+                    break
         return result
 
     def get_trade_cost_analysis(self) -> dict:
         """Compute TCA metrics across all filled orders."""
-        if not self.blotter:
-            return {}
+        with self._lock:
+            if not self.blotter:
+                return {}
 
-        total_commission = sum(o.total_commission for o in self.blotter)
-        total_tax = sum(o.total_tax for o in self.blotter)
-        total_slippage = sum(o.total_slippage for o in self.blotter)
-        total_volume = sum(
-            o.avg_fill_price * o.filled_quantity for o in self.blotter
-        )
+            total_commission = sum(o.total_commission for o in self.blotter)
+            total_tax = sum(o.total_tax for o in self.blotter)
+            total_slippage = sum(o.total_slippage for o in self.blotter)
+            total_volume = sum(
+                o.avg_fill_price * o.filled_quantity for o in self.blotter
+            )
 
-        buy_orders = [o for o in self.blotter if o.side == OrderSide.BUY]
-        sell_orders = [o for o in self.blotter if o.side == OrderSide.SELL]
+            buy_orders = [o for o in self.blotter if o.side == OrderSide.BUY]
+            sell_orders = [o for o in self.blotter if o.side == OrderSide.SELL]
 
-        return {
-            "total_orders": len(self.blotter),
-            "buy_orders": len(buy_orders),
-            "sell_orders": len(sell_orders),
-            "total_commission": round(total_commission, 2),
-            "total_tax": round(total_tax, 2),
-            "total_slippage": round(total_slippage, 2),
-            "total_volume": round(total_volume, 2),
-            "cost_bps": round(
-                (total_commission + total_tax + total_slippage) / total_volume * 10000, 2
-            ) if total_volume > 0 else 0,
-            "avg_order_size": round(
-                total_volume / len(self.blotter), 0
-            ) if self.blotter else 0,
-        }
+            return {
+                "total_orders": len(self.blotter),
+                "buy_orders": len(buy_orders),
+                "sell_orders": len(sell_orders),
+                "total_commission": round(total_commission, 2),
+                "total_tax": round(total_tax, 2),
+                "total_slippage": round(total_slippage, 2),
+                "total_volume": round(total_volume, 2),
+                "cost_bps": round(
+                    (total_commission + total_tax + total_slippage) / total_volume * 10000, 2
+                ) if total_volume > 0 else 0,
+                "avg_order_size": round(
+                    total_volume / len(self.blotter), 0
+                ) if self.blotter else 0,
+                # Fill prices are raw CNY levels; consumers can tell this
+                # apart from an adjusted research panel (D15).
+                "price_basis": self.price_basis,
+            }
 
     # ── Persistence ──
 
@@ -378,8 +589,11 @@ class SimulatedExchange:
     def set_order_manager(self, om: OrderManager):
         self.order_manager = om
 
-    def update_market(self, prices: dict[str, float]):
-        """Update market prices."""
+    def update_market(self, prices: dict[str, float], price_basis: str = "raw"):
+        """Update market prices (raw traded CNY levels only)."""
+        require_raw_price_basis(
+            price_basis, context="SimulatedExchange marks/fills",
+        )
         self.current_prices.update(prices)
         for ticker, price in prices.items():
             if ticker not in self.price_history:
@@ -401,25 +615,62 @@ class SimulatedExchange:
                 order.notes = f"No market data for {order.ticker}"
                 continue
 
+            # Never match against an unusable print: NaN/inf would poison the
+            # fill price (and every downstream P&L), <=0 is not a price. Skip
+            # the order rather than filling or rejecting it on bad data.
+            try:
+                market_price = float(price)
+            except (TypeError, ValueError):
+                logger.warning("Skipping %s: non-numeric market price %r",
+                               order.ticker, price)
+                continue
+            if not math.isfinite(market_price) or market_price <= 0:
+                logger.warning("Skipping %s: invalid market price %r",
+                               order.ticker, price)
+                continue
+
             # Apply slippage model
             if order.order_type == OrderType.MARKET:
                 # Market orders get ~5bps slippage
                 slippage_factor = 1.0005 if order.side == OrderSide.BUY else 0.9995
-                fill_price = round(price * slippage_factor, 2)
+                fill_price = round(market_price * slippage_factor, 2)
             elif order.order_type == OrderType.LIMIT:
-                if order.side == OrderSide.BUY and order.limit_price < price:
-                    continue  # Limit not reached
-                if order.side == OrderSide.SELL and order.limit_price > price:
+                try:
+                    limit_price = float(order.limit_price)
+                except (TypeError, ValueError):
+                    logger.warning("Skipping %s: invalid limit price %r",
+                                   order.ticker, order.limit_price)
                     continue
-                fill_price = order.limit_price
+                if not math.isfinite(limit_price) or limit_price <= 0:
+                    logger.warning("Skipping %s: invalid limit price %r",
+                                   order.ticker, order.limit_price)
+                    continue
+                if order.side == OrderSide.BUY and limit_price < market_price:
+                    continue  # Limit not reached
+                if order.side == OrderSide.SELL and limit_price > market_price:
+                    continue
+                # When executable, the trade prints at the better of the two:
+                # a buy never pays above the market, a sell never receives less.
+                fill_price = (
+                    min(limit_price, market_price)
+                    if order.side == OrderSide.BUY
+                    else max(limit_price, market_price)
+                )
             else:
-                fill_price = price
+                fill_price = market_price
+
+            if not math.isfinite(fill_price) or fill_price <= 0:
+                logger.warning("Skipping %s: computed fill price %r",
+                               order.ticker, fill_price)
+                continue
 
             self.order_manager.fill_order(order.order_id, fill_price)
 
-    def simulate_trading_day(self, prices: dict[str, float]):
-        """Simulate a full trading day."""
-        self.update_market(prices)
+    def simulate_trading_day(
+        self, prices: dict[str, float], price_basis: str = "raw",
+    ):
+        """Simulate a full trading day (raw CNY prices only)."""
+        self.update_market(prices, price_basis=price_basis)
         if self.order_manager:
-            self.order_manager.update_prices(prices)
+            self.order_manager.update_prices(prices, price_basis=price_basis)
         self.match_orders()

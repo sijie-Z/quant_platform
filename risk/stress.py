@@ -45,15 +45,22 @@ STRESS_SCENARIOS = {
 def run_stress_test(
     portfolio_returns: pd.Series,
     scenario_name: str = "2015_ashare_crash",
+    n_paths: int = 200,
 ) -> dict:
     """Simulate portfolio impact under a stress scenario.
 
-    Extrapolates from historical volatility to estimate P&L impact
-    under the scenario's shock assumptions.
+    ``market_shock`` is treated as the **cumulative** market move over the
+    scenario window (the old code divided it by the duration but then added it
+    to the daily mean, which compounded it back to roughly the full shock --
+    and a "2015 crash" could come out positive). Multiple paths are simulated
+    and the median/worst reported; a single seeded draw was not a risk
+    estimate. ``correlation_shock`` and ``liquidity_shock`` are scenario
+    metadata only: this is a single-series model and does not apply them.
 
     Args:
         portfolio_returns: Historical daily portfolio returns.
         scenario_name: Key in STRESS_SCENARIOS.
+        n_paths: Number of simulated paths.
 
     Returns:
         Dict with scenario details and estimated impact.
@@ -63,29 +70,33 @@ def run_stress_test(
         raise ValueError(f"Unknown scenario: {scenario_name}. "
                          f"Available: {list(STRESS_SCENARIOS.keys())}")
 
-    daily_vol = portfolio_returns.std()
-    daily_mean = portfolio_returns.mean()
-
-    # Stressed parameters
+    daily_vol = float(portfolio_returns.std())
+    days = scenario["duration_days"]
     shocked_vol = daily_vol * scenario["vol_shock"]
-    shocked_mean = daily_mean + scenario["market_shock"] / scenario["duration_days"]
+    daily_drift = np.log1p(scenario["market_shock"]) / days
 
-    # Simulate the stressed period
-    np.random.seed(12345)
-    shocked_returns = np.random.normal(
-        shocked_mean, shocked_vol, size=scenario["duration_days"]
-    )
+    rng = np.random.default_rng(12345)
+    # Log returns: the drift is log1p(shock)/days, so compounding must happen
+    # in log space or the horizon itself introduces a small bias.
+    simulated = rng.normal(daily_drift, max(shocked_vol, 0.0), size=(n_paths, days))
+    wealth = np.exp(np.cumsum(simulated, axis=1))
+    with_inception = np.concatenate([np.ones((n_paths, 1)), wealth], axis=1)
+    running_max = np.maximum.accumulate(with_inception, axis=1)
+    drawdowns = with_inception / running_max - 1
 
-    cumulative_return = (1 + shocked_returns).prod() - 1
-    max_cumulative_loss = (1 + shocked_returns).cumprod().min() - 1
+    cumulative = wealth[:, -1] - 1
+    per_path_dd = drawdowns.min(axis=1)
 
     return {
         "scenario": scenario["name"],
-        "duration_days": scenario["duration_days"],
+        "duration_days": days,
         "market_shock": scenario["market_shock"],
         "vol_multiplier": scenario["vol_shock"],
-        "estimated_cumulative_return": cumulative_return,
-        "estimated_max_drawdown": max_cumulative_loss,
+        "n_paths": n_paths,
+        "estimated_cumulative_return": float(np.median(cumulative)),
+        "estimated_max_drawdown": float(np.median(per_path_dd)),
+        "worst_cumulative_return": float(cumulative.min()),
+        "worst_max_drawdown": float(per_path_dd.min()),
     }
 
 

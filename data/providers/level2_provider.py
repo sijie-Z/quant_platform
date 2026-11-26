@@ -209,7 +209,7 @@ class Level2DataProvider:
             "buy_volume": buy_volume,
             "sell_volume": sell_volume,
             "net_flow": buy_volume - sell_volume,
-            "buy_pct": round(buy_volume / total * 100, 2) if total > 0 else 50,
+            "buy_pct": round(buy_volume / total * 100, 2) if total > 0 else 0.0,
         }
 
     def get_all_books(self) -> dict[str, OrderBookSnapshot]:
@@ -245,6 +245,8 @@ class Level2DataProvider:
                 "books_cached": len(self._books),
                 "total_ticks": sum(len(t) for t in self._ticks.values()),
                 "running": self._running,
+                "simulated": True,
+                "source": "simulated",
             }
 
     # ── Simulation ──

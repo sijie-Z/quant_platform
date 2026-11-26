@@ -47,9 +47,27 @@ def _prices(seed=3, n_cycles=5):
     return out
 
 
+def _seed_history(runner, n_sessions=30, seed=99):
+    """Give the shared composite a causal price history.
+
+    Signals are no longer invented from a seeded RNG when history is short:
+    symbols without ``MIN_HISTORY`` observations are excluded, so a test that
+    expects trading must supply a real (past) history first.
+    """
+    rng = np.random.default_rng(seed)
+    base = {c: 100.0 + i * 10 for i, c in enumerate(CODES)}
+    history = {c: [] for c in CODES}
+    for _ in range(n_sessions):
+        base = {c: p * (1 + rng.normal(0, 0.01)) for c, p in base.items()}
+        for code, price in base.items():
+            history[code].append(price)
+    runner.set_price_history(history)
+
+
 class TestEquityIncludesPositions:
     def test_market_value_is_not_zero_after_buying(self, runner):
         prices = _prices()
+        _seed_history(runner)
         runner.run_once(date="2026-01-05", prices=prices[0])
 
         acct = runner._broker.get_account()
@@ -59,6 +77,7 @@ class TestEquityIncludesPositions:
         )
 
     def test_total_equity_is_cash_plus_positions(self, runner):
+        _seed_history(runner)
         for i, px in enumerate(_prices()):
             runner.run_once(date=f"2026-01-{i + 5:02d}", prices=px)
 
@@ -71,6 +90,7 @@ class TestEquityIncludesPositions:
         """Buying stock is not a loss. Before the fix, equity equalled cash, so
         each cycle's purchases showed up as a drawdown."""
         prices = _prices()
+        _seed_history(runner)
         runner.run_once(date="2026-01-05", prices=prices[0])
         acct = runner._broker.get_account()
 
@@ -98,6 +118,7 @@ class TestRebalanceDoesNotReBuy:
     N_CYCLES = 12
 
     def _run(self, runner, n_cycles):
+        _seed_history(runner)
         for i, px in enumerate(_prices(n_cycles=n_cycles)):
             runner.run_once(date=f"2026-01-{i + 5:02d}", prices=px)
 
@@ -118,3 +139,13 @@ class TestRebalanceDoesNotReBuy:
             assert weight < 0.10, (
                 f"{pos.code} is {weight:.1%} of the book; the target is 4%"
             )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_risk_monitor(monkeypatch):
+    """See tests/test_trading/test_live_runner.py: per-module isolation of
+    the shared monitor's order-rate window."""
+    import quant_platform.trading.live_runner as live_runner_mod
+    from quant_platform.risk.circuit_breaker import RiskMonitor
+
+    monkeypatch.setattr(live_runner_mod, "get_risk_monitor", lambda: RiskMonitor())

@@ -84,7 +84,16 @@ class AlphaPipeline:
         else:
             raise ValueError(f"Unknown combination method: {self.method}")
 
-        # Cross-sectional rank normalization
+        # Cross-sectional rank normalization.
+        #
+        # Round first: the combined score for a given date must not depend on
+        # how many later rows the panel happens to contain. Summation order
+        # differed by ~1e-14 between a full panel and the same panel truncated
+        # at that date, which flipped near-tied assets and changed their
+        # percentile ranks -- the lookahead detector flagged its own causal
+        # signal as biased. 1e-12 is far below any real cross-sectional
+        # difference and far above the summation noise.
+        raw = raw.round(12)
         signal = raw.rank(axis=1, pct=True, na_option="keep")
         # Center to [-0.5, 0.5] range
         signal = signal - 0.5

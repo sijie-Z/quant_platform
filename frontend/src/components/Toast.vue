@@ -39,11 +39,22 @@ function showToast(message, type = 'info', duration = 3500) {
 function toast(message) { showToast(message, 'info') }
 function toastSuccess(message) { showToast(message, 'success') }
 function toastError(message) { showToast(message, 'error', 5000) }
+function toastWarning(message) { showToast(message, 'warning', 5000) }
 
-defineExpose({ toast, toastSuccess, toastError })
+defineExpose({ toast, toastSuccess, toastError, toastWarning })
 </script>
 
 <style scoped>
+.toast-warning {
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  color: var(--orange, #fbbf24);
+}
+
+.toast-warning .toast-icon {
+  color: var(--orange, #fbbf24);
+}
+
 .toast-icon {
   font-size: 14px;
   font-weight: 700;

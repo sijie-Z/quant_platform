@@ -14,13 +14,31 @@ SimulatedBroker uses a real Limit Order Book (LOB) with:
 
 from __future__ import annotations
 
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import StrEnum
 from typing import Any
+from zoneinfo import ZoneInfo
 
+import pandas as pd
+
+from quant_platform.data.providers.base import (
+    empty_corporate_actions,
+    normalize_corporate_actions,
+)
+from quant_platform.execution.models import (
+    Fill as ExecutionFill,
+)
+from quant_platform.execution.models import (
+    Order as ExecutionOrder,
+)
+from quant_platform.execution.models import (
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from quant_platform.execution.order_book import (
     BookOrder,
     OrderBook,
@@ -31,33 +49,21 @@ from quant_platform.execution.order_book import (
 from quant_platform.execution.order_book import (
     Side as BookSide,
 )
+from quant_platform.shared.symbols import normalize_symbol, price_limit_threshold
 from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-class OrderSide(StrEnum):
-    BUY = "buy"
-    SELL = "sell"
-
-
-class OrderType(StrEnum):
-    LIMIT = "limit"
-    MARKET = "market"
-
-
-class OrderStatus(StrEnum):
-    PENDING = "pending"
-    SUBMITTED = "submitted"
-    PARTIAL = "partial"
-    FILLED = "filled"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
-
-
 @dataclass
-class Order:
-    """A trade order."""
+class BrokerOrder:
+    """Broker-layer order DTO.
+
+    This is the wire shape used by SimulatedBroker/QMTBroker. The canonical
+    domain model is `quant_platform.execution.models.Order`. Both used to be
+    called `Order`, so a function signature could not say which contract it
+    expected; use the conversion methods at the layer boundary (issue #74).
+    """
     order_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     code: str = ""               # e.g. '600519'
     side: OrderSide = OrderSide.BUY
@@ -75,6 +81,58 @@ class Order:
     broker_order_id: str = ""
     error_msg: str = ""
 
+    def to_execution_order(self) -> ExecutionOrder:
+        """Convert this broker DTO to the canonical OMS model."""
+        order = ExecutionOrder(
+            order_id=self.order_id,
+            ticker=self.code,
+            side=OrderSide(self.side.value),
+            order_type=OrderType(self.order_type.value),
+            quantity=self.quantity,
+            limit_price=self.price if self.price > 0 else None,
+            status=OrderStatus(self.status.value),
+            created_at=self.created_at,
+            notes=self.error_msg,
+        )
+        if self.filled_quantity > 0:
+            order.fills.append(ExecutionFill(
+                timestamp=self.updated_at,
+                price=self.filled_price,
+                quantity=self.filled_quantity,
+                commission=self.commission,
+                tax=self.tax,
+                slippage=self.slippage,
+            ))
+        return order
+
+    @classmethod
+    def from_execution_order(
+        cls, order: ExecutionOrder, **overrides: Any,
+    ) -> BrokerOrder:
+        """Build a broker DTO from the canonical OMS model."""
+        broker_order = cls(
+            order_id=order.order_id,
+            code=order.ticker,
+            side=OrderSide(order.side.value),
+            order_type=OrderType(order.order_type.value),
+            quantity=order.quantity,
+            price=order.limit_price or 0.0,
+            filled_quantity=order.filled_quantity,
+            filled_price=order.avg_fill_price,
+            status=OrderStatus(order.status.value),
+            commission=order.total_commission,
+            tax=order.total_tax,
+            slippage=order.total_slippage,
+            created_at=order.created_at or datetime.now().isoformat(),
+            updated_at=(
+                order.filled_at or order.submitted_at or datetime.now().isoformat()
+            ),
+            error_msg=order.notes,
+        )
+        for key, value in overrides.items():
+            setattr(broker_order, key, value)
+        return broker_order
+
     def to_dict(self) -> dict:
         return {
             "order_id": self.order_id, "code": self.code,
@@ -86,6 +144,11 @@ class Order:
             "created_at": self.created_at, "updated_at": self.updated_at,
             "error_msg": self.error_msg,
         }
+
+
+# Backward-compatible name. New code should use `BrokerOrder` so the layer is
+# explicit and `execution.models.Order` stays the single domain model.
+Order = BrokerOrder
 
 
 @dataclass
@@ -128,6 +191,11 @@ class Position:
 class BrokerInterface(ABC):
     """Abstract broker interface."""
 
+    #: True only for brokers that maintain the paper book locally.  Real
+    #: brokers (QMT/XTP) perform corporate actions on the broker side; a
+    #: local share/dividend adjustment would double-count them.
+    supports_corporate_actions: bool = False
+
     @abstractmethod
     def connect(self) -> bool:
         """Connect to broker. Returns True if successful."""
@@ -141,8 +209,13 @@ class BrokerInterface(ABC):
         """Cancel a pending order."""
 
     @abstractmethod
-    def get_positions(self) -> list[Position]:
-        """Get current positions."""
+    def get_positions(self) -> list[Position] | None:
+        """Get current positions.
+
+        ``None`` means the query failed and the book state is unknown; an
+        empty list means a confirmed flat account. Callers must not treat an
+        unknown result as "no positions" (D6).
+        """
 
     @abstractmethod
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
@@ -151,6 +224,16 @@ class BrokerInterface(ABC):
     @abstractmethod
     def get_account(self) -> dict:
         """Get account info (cash, equity, etc.)."""
+
+    def new_trading_day(self, date: str | None = None) -> None:
+        """Release T+1 locks for a new trading day.
+
+        Default no-op: brokers that settle remotely (QMT/XTP) need no local
+        rollover -- and must not apply corporate actions locally either.
+        SimulatedBroker overrides it, and the live engine calls it on every
+        calendar-date change.
+        """
+        return None
 
 
 class SimulatedBroker(BrokerInterface):
@@ -166,7 +249,26 @@ class SimulatedBroker(BrokerInterface):
     - Falls back to A-share defaults if no instrument found (backward compatible)
     """
 
-    def __init__(self, initial_cash: float = 1_000_000, asset_universe=None):
+    #: Paper book: corporate actions are applied locally on the ex-date.
+    supports_corporate_actions = True
+
+    def __init__(
+        self,
+        initial_cash: float = 1_000_000,
+        asset_universe=None,
+        cash_dividend_tax_rate: float = 0.0,
+    ):
+        # D1: `place_order` is a check-then-act sequence over `_cash` and
+        # `_positions` (validate available shares/cash, then mutate). FastAPI
+        # serves sync endpoints on a thread pool and `engine.manual_order`
+        # bypasses the engine's `_cycle_lock`, so two concurrent sells both
+        # passed the availability check and credited cash twice, and two
+        # concurrent first buys of a new symbol overwrote each other's
+        # position (get()-then-assign). Holding an RLock across the whole
+        # check-and-mutate makes fills serialized and atomic. RLock (not
+        # Lock) because account getters may be called from code already
+        # inside a locked section.
+        self._lock = threading.RLock()
         self._cash = initial_cash
         self._initial_cash = initial_cash
         self._positions: dict[str, Position] = {}
@@ -181,6 +283,26 @@ class SimulatedBroker(BrokerInterface):
         # Real order books per symbol
         self._order_books: dict[str, OrderBook] = {}
         self._market_prices: dict[str, float] = {}
+
+        # Corporate actions (paper only).  `cash_dividend_tax_rate` is the
+        # documented withholding rate applied to gross cash dividends; the
+        # default 0 credits the full declared amount (the contract's
+        # `cash_per_share` is pre-tax).  Markers are keyed on
+        # `(canonical_asset, ex_date)` so a replayed day never double-applies,
+        # and can be persisted through a Store (see
+        # `configure_corporate_action_persistence`) to survive a restart.
+        self._cash_dividend_tax_rate = max(0.0, float(cash_dividend_tax_rate))
+        self._corporate_actions: pd.DataFrame = empty_corporate_actions()
+        self._applied_corporate_actions: set[tuple[str, str]] = set()
+        self._corporate_action_events: list[dict[str, Any]] = []
+        self._cash_ledger: list[dict[str, Any]] = []
+        self._ca_store: Any = None
+        self._ca_state_key: str = ""
+        self._exchange_date: str = ""
+        #: Post-split reference prices used to reject a stale pre-split quote
+        #: (a suspended ex-date feeds the previous raw close, which would
+        #: value doubled shares at the old level).  See update_market_prices.
+        self._split_price_guards: dict[str, dict[str, Any]] = {}
 
     def _get_or_create_book(self, symbol: str, price: float) -> OrderBook:
         """Get or create an order book for a symbol, seeded with liquidity."""
@@ -239,7 +361,8 @@ class SimulatedBroker(BrokerInterface):
             book.add_order(bid_order)
 
     def connect(self) -> bool:
-        self._connected = True
+        with self._lock:
+            self._connected = True
         logger.info("SimulatedBroker connected (LOB matching). Cash: %.2f", self._cash)
         return True
 
@@ -299,11 +422,47 @@ class SimulatedBroker(BrokerInterface):
         return 0
 
     def place_order(self, order: Order) -> Order:
-        """Submit order to the real order book for price-time priority matching."""
+        """Submit order to the real order book for price-time priority matching.
+
+        The entire method runs under `self._lock`: the availability checks,
+        the LOB matching and the cash/position mutation must be one atomic
+        step, or concurrent orders act on the same snapshot of the book
+        (D1). Callers therefore never observe a fill whose cash and shares
+        disagree.
+        """
+        with self._lock:
+            return self._place_order_locked(order)
+
+    def _place_order_locked(self, order: Order) -> Order:
         if not self._connected:
             order.status = OrderStatus.REJECTED
             order.error_msg = "Not connected"
             return order
+
+        # Market orders arrive with price 0. Without a reference price the
+        # affordability check asked for 0 shares and rejected every market
+        # buy; the book and slippage also need a reference.
+        if order.order_type == OrderType.MARKET and order.price <= 0:
+            reference = self._market_prices.get(order.code, 0.0)
+            book = self._order_books.get(order.code)
+            if reference <= 0 and book is not None:
+                depth = book.get_depth_snapshot(levels=1)
+                if depth.get("asks"):
+                    first = depth["asks"][0]
+                    reference = float(
+                        first["price"] if isinstance(first, dict) else first[0]
+                    )
+                elif depth.get("bids"):
+                    first = depth["bids"][0]
+                    reference = float(
+                        first["price"] if isinstance(first, dict) else first[0]
+                    )
+            if reference <= 0:
+                order.status = OrderStatus.REJECTED
+                order.error_msg = "No reference price for market order"
+                self._orders.append(order)
+                return order
+            order.price = reference
 
         # Validate lot size (per-instrument)
         lot_size = self._get_lot_size(order.code)
@@ -367,6 +526,13 @@ class SimulatedBroker(BrokerInterface):
             total_filled += trade.quantity
             total_value += trade.price * trade.quantity
 
+        # IOC semantics: the broker reports a rejection or partial fill, so
+        # the unfilled remainder must not rest in the book. Leaving it there
+        # let a later order trade against a sell the broker had already
+        # reported as rejected, minting shares.
+        if total_filled < order.quantity:
+            book.cancel_order(order.order_id)
+
         if total_filled == 0:
             # No liquidity — IOC-style: cancel
             order.status = OrderStatus.REJECTED
@@ -422,6 +588,10 @@ class SimulatedBroker(BrokerInterface):
             pos.update_price(avg_fill_price)
             self._today_bought.add(order.code)
         else:  # SELL
+            # The availability check above and this mutation are inside the
+            # same `_lock`, so the position cannot have been removed by a
+            # concurrent fill in between (the old unlocked code raised
+            # KeyError *after* crediting cash here).
             self._cash += total_value - commission - tax
             pos = self._positions[order.code]
             pos.quantity -= total_filled
@@ -430,6 +600,9 @@ class SimulatedBroker(BrokerInterface):
             pos.update_price(avg_fill_price)
             if pos.quantity <= 0:
                 del self._positions[order.code]
+                self._split_price_guards.pop(
+                    normalize_symbol(order.code), None,
+                )
 
         # Fill the order
         order.filled_quantity = total_filled
@@ -447,38 +620,42 @@ class SimulatedBroker(BrokerInterface):
         return order
 
     def cancel_order(self, order_id: str) -> bool:
-        for o in self._orders:
-            if o.order_id == order_id and o.status == OrderStatus.PENDING:
-                o.status = OrderStatus.CANCELLED
-                # Cancel in the order book too
-                for book in self._order_books.values():
-                    book.cancel_order(order_id)
-                return True
-        return False
+        with self._lock:
+            for o in self._orders:
+                if o.order_id == order_id and o.status == OrderStatus.PENDING:
+                    o.status = OrderStatus.CANCELLED
+                    # Cancel in the order book too
+                    for book in self._order_books.values():
+                        book.cancel_order(order_id)
+                    return True
+            return False
 
     def get_positions(self) -> list[Position]:
-        return list(self._positions.values())
+        with self._lock:
+            return list(self._positions.values())
 
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
-        if status:
-            return [o for o in self._orders if o.status == status]
-        return self._orders
+        with self._lock:
+            if status:
+                return [o for o in self._orders if o.status == status]
+            return list(self._orders)
 
     def get_account(self) -> dict:
-        market_value = sum(p.market_value for p in self._positions.values())
-        total_equity = self._cash + market_value
-        total_pnl = total_equity - self._initial_cash
-        return {
-            "cash": round(self._cash, 2),
-            "market_value": round(market_value, 2),
-            "total_equity": round(total_equity, 2),
-            "initial_cash": self._initial_cash,
-            "total_pnl": round(total_pnl, 2),
-            "total_pnl_pct": round(total_pnl / self._initial_cash, 4),
-            "n_positions": len(self._positions),
-            "connected": self._connected,
-            "broker": "simulated_lob",
-        }
+        with self._lock:
+            market_value = sum(p.market_value for p in self._positions.values())
+            total_equity = self._cash + market_value
+            total_pnl = total_equity - self._initial_cash
+            return {
+                "cash": round(self._cash, 2),
+                "market_value": round(market_value, 2),
+                "total_equity": round(total_equity, 2),
+                "initial_cash": self._initial_cash,
+                "total_pnl": round(total_pnl, 2),
+                "total_pnl_pct": round(total_pnl / self._initial_cash, 4),
+                "n_positions": len(self._positions),
+                "connected": self._connected,
+                "broker": "simulated_lob",
+            }
 
     def get_book_snapshot(self, symbol: str) -> dict | None:
         """Get order book snapshot for a symbol."""
@@ -495,17 +672,432 @@ class SimulatedBroker(BrokerInterface):
         return None
 
     def update_market_prices(self, prices: dict[str, float]):
-        """Update position prices from real-time market data."""
-        self._market_prices.update(prices)
-        for code, pos in self._positions.items():
-            if code in prices:
-                pos.update_price(prices[code])
+        """Update position prices and refresh synthetic book liquidity.
 
-    def new_trading_day(self):
-        """Reset T+1 restrictions. Call at start of each trading day."""
-        self._today_bought.clear()
-        for pos in self._positions.values():
-            pos.available = pos.quantity
+        A quote for a symbol whose split was just applied is validated
+        against the post-split reference: a move larger than the board's
+        daily limit is impossible as a real one-day return and is, in
+        practice, the *pre-split* stale close a suspended stock keeps
+        feeding.  Such a quote is ignored (the action-adjusted mark and the
+        reseeded ladder stay in place) until a plausible post-split quote
+        arrives, so a split on a suspended day cannot double the position's
+        market value.
+        """
+        with self._lock:
+            accepted: dict[str, float] = {}
+            for code, price in prices.items():
+                guard = self._split_price_guards.get(normalize_symbol(code))
+                if guard is not None and price and price > 0:
+                    limit = price_limit_threshold(normalize_symbol(code))
+                    expected = float(guard["expected"])
+                    if expected > 0 and price > expected * (1 + limit + 1e-9):
+                        logger.warning(
+                            "Ignoring implausible post-split quote for %s: "
+                            "%.4f vs post-split reference %.4f (ratio %.2f, "
+                            "ex-date %s); keeping the adjusted mark",
+                            code, price, expected, guard["ratio"],
+                            guard["ex_date"],
+                        )
+                        continue
+                    self._split_price_guards.pop(normalize_symbol(code), None)
+                accepted[code] = price
+
+            self._market_prices.update(accepted)
+            for code, pos in self._positions.items():
+                if code in accepted:
+                    pos.update_price(accepted[code])
+
+            # Re-seed the market-maker quotes around the new reference price.
+            # The book was seeded once, so a limit order at the *new* market price
+            # could fill against stale quotes from the old one (phantom profit).
+            for code, price in accepted.items():
+                book = self._order_books.get(code)
+                if book is None or not price or price <= 0:
+                    continue
+                for order_id, resting in list(getattr(book, "_orders", {}).items()):
+                    if getattr(resting, "source", "") == "market_maker":
+                        book.cancel_order(order_id)
+                self._seed_book(book, code, float(price))
+
+    def new_trading_day(self, date: str | None = None):
+        """Reset T+1 restrictions and apply the day's corporate actions.
+
+        ``date`` (``YYYY-MM-DD``) advances the paper exchange day: every
+        action with ``ex_date <= date`` that has not been applied yet is
+        applied exactly once, before the session starts.  Callers that only
+        want the legacy T+1 rollover may omit it.
+        """
+        with self._lock:
+            self._today_bought.clear()
+            for pos in self._positions.values():
+                pos.available = pos.quantity
+        if date is None:
+            return []
+        self._exchange_date = pd.Timestamp(date).normalize().date().isoformat()
+        return self.apply_corporate_actions(ex_date=self._exchange_date)
+
+    # ── Corporate actions (paper book only) ──
+
+    def set_corporate_actions(self, actions) -> int:
+        """Replace the paper book's pending corporate-action feed.
+
+        ``actions`` follows the provider contract
+        ``(ex_date, asset, kind, cash_per_share, split_ratio)``.  Nothing is
+        applied until :meth:`apply_corporate_actions` (or a dated
+        :meth:`new_trading_day`) runs, and already-applied ``(asset, ex_date)``
+        markers are honoured.  Returns the number of actions loaded.
+        """
+        frame = normalize_corporate_actions(actions)
+        with self._lock:
+            self._corporate_actions = frame
+        return len(frame)
+
+    def configure_corporate_action_persistence(
+        self, store, strategy_id: str = "paper_corporate_actions",
+    ) -> None:
+        """Persist applied ``(asset, ex_date)`` markers in a Store.
+
+        The store is any object exposing ``get_engine_state(key)`` /
+        ``save_engine_state(state, key)`` (``core.store.Store``).  Markers are
+        unioned with any already-loaded state, so wiring several times (or
+        reconnecting after a restart) can never un-apply an action.
+        """
+        self._ca_store = store
+        self._ca_state_key = str(strategy_id)
+        self._load_corporate_action_markers()
+
+    def _load_corporate_action_markers(self) -> None:
+        if self._ca_store is None or not self._ca_state_key:
+            return
+        try:
+            state = self._ca_store.get_engine_state(self._ca_state_key) or {}
+        except Exception as exc:  # persistence is best effort
+            logger.warning("Could not load corporate-action markers: %s", exc)
+            return
+        applied = state.get("applied", []) if isinstance(state, dict) else []
+        for item in applied:
+            try:
+                asset, date_text = item
+                self._applied_corporate_actions.add(
+                    (normalize_symbol(asset), str(date_text))
+                )
+            except (TypeError, ValueError):
+                continue
+
+    def _save_corporate_action_markers(self) -> None:
+        if self._ca_store is None or not self._ca_state_key:
+            return
+        payload = {
+            "version": 1,
+            "applied": sorted(
+                [asset, date_text]
+                for asset, date_text in self._applied_corporate_actions
+            ),
+        }
+        try:
+            self._ca_store.save_engine_state(payload, self._ca_state_key)
+        except Exception as exc:  # never let bookkeeping block trading
+            logger.warning("Could not persist corporate-action markers: %s", exc)
+
+    def get_applied_corporate_actions(self) -> list[tuple[str, str]]:
+        """Applied ``(asset, ex_date)`` markers, sorted."""
+        with self._lock:
+            return sorted(self._applied_corporate_actions)
+
+    def get_corporate_action_events(self) -> list[dict[str, Any]]:
+        """Audit records of every action applied to this book."""
+        with self._lock:
+            return [dict(event) for event in self._corporate_action_events]
+
+    def get_cash_ledger(self) -> list[dict[str, Any]]:
+        """Cash entries generated by corporate actions (dividends)."""
+        with self._lock:
+            return [dict(entry) for entry in self._cash_ledger]
+
+    @staticmethod
+    def _action_order(kind: str) -> int:
+        # Cash before split on a combined ex-date: the dividend is declared
+        # per pre-split share, so it must use the pre-split quantity.
+        return 0 if kind == "cash" else 1
+
+    def apply_corporate_actions(
+        self,
+        actions=None,
+        ex_date: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Apply pending split/cash actions exactly once.
+
+        Args:
+            actions: Optional frame overriding the stored feed.
+            ex_date: Apply only actions with ``ex_date <= ex_date`` (the
+                exchange day being advanced to).  ``None`` applies every
+                loaded action.
+
+        Returns:
+            One audit dict per ``(asset, ex_date)`` event applied to a held
+            position (a combined cash+split event is one dict with two
+            components).
+            Replays are no-ops: markers are checked under the book lock and
+            persisted after each batch.  A split scales quantity *and*
+            availability by the ratio, divides the average cost and the
+            current mark (market value unchanged); a cash dividend credits
+            ``quantity * cash_per_share * (1 - tax)`` to cash, adds it to the
+            position's realised P&L, and reduces the cached mark by the
+            per-share amount so NAV stays continuous if no fresh quote has
+            arrived yet.  T+1 convention: split-added shares inherit the
+            availability of the shares they came from (on the ex-date the
+            engine has already rolled the day, so an overnight holding's
+            whole post-split quantity is sellable).
+        """
+        with self._lock:
+            frame = (
+                self._corporate_actions if actions is None
+                else normalize_corporate_actions(actions)
+            )
+            if frame is None or frame.empty:
+                return []
+            cutoff = (
+                pd.Timestamp(ex_date).normalize() if ex_date is not None else None
+            )
+            rows = frame.copy()
+            rows["_order"] = rows["kind"].map(self._action_order).fillna(2)
+            rows = rows.sort_values(
+                ["ex_date", "asset", "_order"], kind="stable",
+            )
+            applied: list[dict[str, Any]] = []
+            markers_changed = False
+            # One marker per (asset, ex_date) *event*: a combined 送转+派息
+            # arrives as two rows sharing the key and both components must be
+            # applied before the marker is recorded.
+            for (group_date, group_asset), group in rows.groupby(
+                ["ex_date", "asset"], sort=False,
+            ):
+                action_date = pd.Timestamp(group_date).normalize()
+                if cutoff is not None and action_date > cutoff:
+                    continue
+                marker = (
+                    normalize_symbol(group_asset),
+                    action_date.date().isoformat(),
+                )
+                if marker in self._applied_corporate_actions:
+                    continue
+                event = self._apply_action_group(marker, group)
+                # The marker covers "evaluated on this ex-date", including a
+                # zero holding: entitlement is fixed on the ex-date, so a
+                # position restored later must not receive the action again.
+                self._applied_corporate_actions.add(marker)
+                markers_changed = True
+                if event is not None:
+                    self._corporate_action_events.append(event)
+                    applied.append(event)
+            if markers_changed:
+                self._save_corporate_action_markers()
+            return applied
+
+    def _find_position(self, asset: str) -> Position | None:
+        for key, pos in self._positions.items():
+            if normalize_symbol(key) == asset:
+                return pos
+        return None
+
+    def _find_market_price_key(self, asset: str) -> str | None:
+        for key in self._market_prices:
+            if normalize_symbol(key) == asset:
+                return key
+        return None
+
+    def _find_book_key(self, asset: str) -> str | None:
+        for key in self._order_books:
+            if normalize_symbol(key) == asset:
+                return key
+        return None
+
+    def _remark(self, asset: str, pos: Position | None, new_price: float) -> None:
+        """Update the cached mark/order book after an action-adjusted price."""
+        new_price = float(new_price)
+        if pos is not None:
+            pos.update_price(new_price)
+        price_key = self._find_market_price_key(asset)
+        if price_key is not None:
+            self._market_prices[price_key] = new_price
+        book_key = self._find_book_key(asset)
+        if book_key is not None and new_price > 0:
+            # The resting market-maker ladder was seeded at the pre-action
+            # price.  A sell at the new (post-split) level would otherwise
+            # trade against a stale bid at the old level and mint cash.
+            book = self._order_books[book_key]
+            for order_id, resting in list(getattr(book, "_orders", {}).items()):
+                if getattr(resting, "source", "") == "market_maker":
+                    book.cancel_order(order_id)
+            self._seed_book(book, book_key, new_price)
+
+    def _apply_action_group(
+        self, marker: tuple[str, str], group: pd.DataFrame,
+    ) -> dict[str, Any] | None:
+        """Apply every component sharing one ``(asset, ex_date)`` marker.
+
+        Cash components run first on the pre-split quantity (a 送转+派息
+        dividend is declared per pre-split share), then splits scale the
+        position.  One audit event covers the whole group.
+        """
+        asset = marker[0]
+        pos = self._find_position(asset)
+        quantity_before = int(pos.quantity) if pos is not None else 0
+        quantity_after = quantity_before
+        avg_cost_after = pos.avg_cost if pos is not None else 0.0
+        cash_total = 0.0
+        tax_total = 0.0
+        cash_per_share_total = 0.0
+        split_ratio_total = 1.0
+        components: list[dict[str, Any]] = []
+        timestamp = datetime.now().isoformat()
+
+        # ── cash components first (pre-split entitlement) ──
+        for _, row in group.iterrows():
+            if str(row["kind"]) != "cash":
+                continue
+            cash_per_share = float(row["cash_per_share"])
+            if not (cash_per_share > 0):
+                continue
+            gross = quantity_before * cash_per_share
+            tax = gross * self._cash_dividend_tax_rate
+            net = gross - tax
+            cash_total += net
+            tax_total += tax
+            cash_per_share_total += cash_per_share
+            components.append({
+                "kind": "cash",
+                "cash_per_share": cash_per_share,
+                "cash_delta": net,
+                "tax": tax,
+            })
+            if quantity_before > 0:
+                if pos is not None:
+                    pos.realized_pnl += net
+                    if pos.current_price > 0:
+                        # Estimate of the ex-dividend mark; the next quote
+                        # (`update_market_prices`) overwrites it with the real
+                        # raw close, which already carries the drop.
+                        self._remark(
+                            asset, pos,
+                            max(pos.current_price - cash_per_share, 0.0),
+                        )
+                self._cash_ledger.append({
+                    "date": marker[1],
+                    "asset": asset,
+                    "kind": "cash_dividend",
+                    "quantity": quantity_before,
+                    "cash_per_share": cash_per_share,
+                    "tax": round(tax, 6),
+                    "cash_delta": round(net, 6),
+                    "description": (
+                        f"{quantity_before} shares x {cash_per_share}/share"
+                    ),
+                    "timestamp": timestamp,
+                })
+        if quantity_before > 0 and cash_total:
+            self._cash += cash_total
+
+        # ── split components ──
+        for _, row in group.iterrows():
+            if str(row["kind"]) != "split":
+                continue
+            ratio = float(row["split_ratio"])
+            if not (ratio > 0) or ratio == 1.0:
+                continue
+            split_ratio_total *= ratio
+            components.append({"kind": "split", "split_ratio": ratio})
+            if pos is not None:
+                new_quantity = int(round(pos.quantity * ratio))
+                pos.quantity = new_quantity
+                # Split-added shares inherit the original shares' T+1 lock.
+                pos.available = min(
+                    new_quantity,
+                    int(round(pos.available * ratio)),
+                )
+                pos.avg_cost = (
+                    pos.avg_cost / ratio if pos.avg_cost > 0 else 0.0
+                )
+                if pos.current_price > 0:
+                    pre_price = pos.current_price
+                    self._remark(asset, pos, pre_price / ratio)
+                    self._split_price_guards[asset] = {
+                        "expected": pre_price / ratio,
+                        "pre": pre_price,
+                        "ratio": ratio,
+                        "ex_date": marker[1],
+                    }
+                quantity_after = new_quantity
+                avg_cost_after = pos.avg_cost
+
+        if not components:
+            return None
+        kinds = sorted({component["kind"] for component in components})
+        event: dict[str, Any] = {
+            "date": marker[1],
+            "asset": asset,
+            "kind": "+".join(kinds),
+            "quantity_before": quantity_before,
+            "quantity_after": quantity_after,
+            "cash_delta": cash_total,
+            "tax": tax_total,
+            "cash_per_share": cash_per_share_total,
+            "split_ratio": split_ratio_total,
+            "components": components,
+            "timestamp": timestamp,
+        }
+        if pos is not None:
+            event["avg_cost_after"] = avg_cost_after
+        self._publish_event("corporate_action", event)
+        return event
+
+    def _publish_event(self, topic: str, data: dict[str, Any]) -> None:
+        try:
+            from quant_platform.core.events import get_event_bus
+
+            get_event_bus().publish(topic, data, source="simulated_broker")
+        except Exception:  # monitoring must never break the book
+            pass
+
+    def restore_positions(self, rows: list[dict], cash: float | None = None) -> None:
+        """Rebuild the in-memory account from persisted rows (D4 restart).
+
+        A paper/SimulatedBroker process restart starts from a fresh book, but
+        the Store still records the open positions and (via engine_state) the
+        cash balance. Without this method the engine's pre-flight position-sync
+        check refused to start on every restart with open positions. Real
+        brokers (QMT/XTP) do not implement this: their account is the source of
+        truth and must never be overwritten from local records.
+
+        `available` is restored as of the last snapshot so a same-day restart
+        keeps today's T+1 lock (the engine separately persists the exchange
+        trading date for D7).
+        """
+        with self._lock:
+            self._positions.clear()
+            self._split_price_guards.clear()
+            for row in rows or []:
+                code = str(row.get("code") or row.get("ticker") or "")
+                quantity = int(row.get("quantity", 0) or 0)
+                if not code or quantity <= 0:
+                    continue
+                available = row.get("available", quantity)
+                try:
+                    available = int(available)
+                except (TypeError, ValueError):
+                    available = quantity
+                pos = Position(
+                    code=code,
+                    name=str(row.get("name", "") or ""),
+                    quantity=quantity,
+                    available=max(0, min(available, quantity)),
+                    avg_cost=float(row.get("avg_cost", 0.0) or 0.0),
+                    realized_pnl=float(row.get("realized_pnl", 0.0) or 0.0),
+                )
+                pos.update_price(float(row.get("current_price", 0.0) or 0.0))
+                self._positions[code] = pos
+            if cash is not None:
+                self._cash = float(cash)
 
 
 class QMTBroker(BrokerInterface):
@@ -518,19 +1110,40 @@ class QMTBroker(BrokerInterface):
     - Full callback chain: on_fill / on_cancel / on_error / on_disconnected
     - EventBus integration: every fill publishes ``qmt.fill`` and ``order.filled``
     - Password from env ``QMT_PASSWORD`` — never in config files
-    - Graceful degradation: unavailable orders/positions return empty lists
-    - Automatic reconnection on disconnect (with backoff)
+    - Lazy reconnection: ``on_disconnected`` only flips state and logs; the
+      next order/query call reconnects with exponential backoff
+      (``max_reconnect_attempts`` connect attempts, waiting 1s, 2s, 4s, ...
+      between retries). If every attempt fails, ``BrokerConnectionError`` is
+      raised — order submission fails closed and ``order_stock`` is never
+      called while the broker is unreachable.
+    - Broker reconciliation: after a successful lazy reconnect, and on
+      ``get_orders`` at most once per ``resync_ttl`` seconds (an explicit
+      ``connect()`` invalidates the TTL), the broker's ``query_stock_orders``
+      / ``query_stock_trades`` are merged into the local order book
+      (idempotent, keyed by broker order id). Read paths fail loud when the
+      broker cannot be reached, and degrade to the in-memory book (with a
+      warning) when only the resync query fails.
 
     Architecture::
 
         LiveRunner ─> QMTBroker ──TCP──> miniQMT/client ──> 国金券商
                          │
                          ├── _xt_trader (order_stock / cancel / query)
+                         ├── xtdata.get_full_tick (fresh quotes for live runs)
                          ├── Callback → update Order objects → EventBus
-                         └── Fallback → SimulatedBroker on connection failure
+                         ├── _ensure_connected → lazy reconnect + resync
+                         └── connect() == False → hard failure (no simulated fallback)
 
     Supported brokers: 国金证券, 华鑫证券, 国盛证券, 东方财富 etc.
     """
+
+    class BrokerConnectionError(RuntimeError):
+        """QMT is unreachable after all lazy-reconnect attempts failed.
+
+        Raised from ``place_order`` / ``cancel_order`` / the query entry
+        points. Order submission fails closed: no ``order_stock`` call is
+        made when this error is raised.
+        """
 
     def __init__(
         self,
@@ -540,6 +1153,11 @@ class QMTBroker(BrokerInterface):
         mode: str = "sim",
         data_server: str = "",
         initial_cash: float = 10_000_000,
+        max_reconnect_attempts: int = 3,
+        reconnect_backoff: float = 1.0,
+        resync_ttl: float = 2.0,
+        sleep_fn: Any = None,
+        clock_fn: Any = None,
     ):
         """Initialize QMT broker.
 
@@ -551,6 +1169,17 @@ class QMTBroker(BrokerInterface):
             data_server: Market data server (host:port). Defaults to same as server.
             initial_cash: Notional initial capital (fallback when QMT account
                           query fails; the broker reports QMT's real balance).
+            max_reconnect_attempts: Connect attempts per lazy reconnect
+                          (>= 1). Waits double between retries.
+            reconnect_backoff: Base backoff in seconds; the wait before retry
+                          *k* is ``reconnect_backoff * 2 ** (k - 1)``
+                          (1s, 2s, 4s, ... by default).
+            resync_ttl: Minimum seconds between broker order/trade re-queries
+                          from ``get_orders`` (avoids one broker round-trip
+                          per poll).
+            sleep_fn: Injectable sleep callable (tests pass a no-op so retry
+                          backoff does not really wait).
+            clock_fn: Injectable monotonic clock for the TTL (tests control it).
         """
         self._account_id = account
         self._server = server
@@ -558,6 +1187,15 @@ class QMTBroker(BrokerInterface):
         self._mode = mode
         self._data_server = data_server or server
         self._initial_cash = initial_cash
+        self._max_reconnect_attempts = max(1, int(max_reconnect_attempts))
+        self._reconnect_backoff = max(0.0, float(reconnect_backoff))
+        self._resync_ttl = max(0.0, float(resync_ttl))
+        if sleep_fn is None or clock_fn is None:
+            import time as _time
+            sleep_fn = sleep_fn or _time.sleep
+            clock_fn = clock_fn or _time.monotonic
+        self._sleep_fn = sleep_fn
+        self._clock_fn = clock_fn
 
         self._trader: Any = None
         self._account: Any = None
@@ -565,10 +1203,34 @@ class QMTBroker(BrokerInterface):
         self._connected = False
         self._session_id: int = 0
         self._orders: list[Order] = []
+        # QMT reports the same execution through two channels: XtOrder carries
+        # a cumulative filled quantity/average price, while XtTrade carries an
+        # incremental execution. Keep both kinds of evidence separately so
+        # reconciling them never adds the same shares twice. Execution entries
+        # are keyed by the broker's traded_id and therefore survive repeated
+        # callbacks and query_stock_trades resyncs.
+        self._order_fill_snapshots: dict[str, dict[str, Any]] = {}
+        self._order_executions: dict[str, dict[str, tuple[int, float]]] = {}
         self._positions: dict[str, Position] = {}
         self._cash: float = initial_cash
         self._frozen_cash: float = 0.0
         self._market_value: float = 0.0
+        #: Monotonic time of the last successful broker order/trade resync.
+        self._last_resync_at: float | None = None
+        self._last_resync_ok = False
+        #: Serializes resync so concurrent get_orders calls cannot both
+        #: append the same unknown broker order (check-then-act on _orders).
+        self._resync_lock = threading.Lock()
+        #: Serializes lazy reconnects: two threads polling a dead link must
+        #: not each create a trader session.
+        self._reconnect_lock = threading.Lock()
+        #: Thread-local re-entrancy guard. connect() calls
+        #: _update_account_snapshot() -> get_account() -> _ensure_connected(),
+        #: and an on_disconnected callback racing that window flips
+        #: `_connected` back to False before the inner check. A plain Lock
+        #: would then deadlock on the thread that already owns it; the inner
+        #: call raises instead and lets the outer attempt retry.
+        self._reconnect_state = threading.local()
 
         # Resolve password: explicit arg > env var
         if not self._password:
@@ -605,6 +1267,11 @@ class QMTBroker(BrokerInterface):
             return False
 
         try:
+            # A retry (or manual reconnect) must not leak the previous trader
+            # session into miniQMT: stop it before opening a new one. Until
+            # the new session is confirmed, the broker is disconnected.
+            self._stop_quiescent_trader()
+            self._connected = False
             self._session_id = int(datetime.now().timestamp() % 2147483647)
             self._trader = self._XtQuantTrader(self._server, self._session_id)
             self._account = self._StockAccount(self._account_id, "STOCK")
@@ -629,7 +1296,14 @@ class QMTBroker(BrokerInterface):
                     })
 
                 def on_order_stock_async_response(self_cb, response):
-                    broker_ref._on_async_response(response)
+                    # Placement ACK only; it carries no lifecycle status.
+                    broker_ref._on_async_ack(response)
+
+                def on_stock_order(self_cb, xt_order):
+                    broker_ref._on_order_update(xt_order)
+
+                def on_stock_trade(self_cb, xt_trade):
+                    broker_ref._on_trade(xt_trade)
 
             self._trader.register_callback(_QMTCallback())
             self._trader.start()
@@ -649,6 +1323,11 @@ class QMTBroker(BrokerInterface):
 
             if result == 0:
                 self._connected = True
+                # A fresh session invalidates the resync TTL: the next
+                # get_orders must reconcile against this connection (also
+                # covers explicit connect() calls made outside the lazy path).
+                self._last_resync_at = None
+                self._last_resync_ok = False
                 # Subscribe to account updates
                 try:
                     self._trader.subscribe(self._account)
@@ -656,43 +1335,453 @@ class QMTBroker(BrokerInterface):
                     pass
                 logger.info("QMT connected. Account: %s, Server: %s, Mode: %s",
                           self._account_id, self._server, self._mode)
-                self._update_account_snapshot()
-                return True
+                # Hold the re-entrancy guard while snapshotting: if the link
+                # drops inside this window, get_account() must not start a
+                # nested lazy reconnect inside connect() itself.
+                previous_active = getattr(self._reconnect_state, "active", False)
+                self._reconnect_state.active = True
+                try:
+                    if self._connected:
+                        self._update_account_snapshot()
+                finally:
+                    self._reconnect_state.active = previous_active
+                if self._connected:
+                    return True
+                logger.warning(
+                    "QMT link dropped during connect (session %d); reporting failure",
+                    self._session_id,
+                )
+                self._stop_quiescent_trader()
+                return False
 
             logger.error("QMT connect returned: %s", result)
+            self._stop_quiescent_trader()
             return False
 
         except Exception as e:
             logger.error("QMT connection error: %s", e)
             self._connected = False
+            self._stop_quiescent_trader()
             return False
+
+    def _stop_quiescent_trader(self) -> None:
+        """Best-effort stop and release of the current trader session."""
+        trader = self._trader
+        self._trader = None
+        if trader is not None:
+            try:
+                trader.stop()
+            except Exception:
+                pass
 
     def disconnect(self) -> bool:
-        """Gracefully disconnect from QMT."""
+        """Gracefully disconnect from QMT.
+
+        Local state is always cleared; the return value reports whether the
+        trader session stopped without raising (the old behaviour returned
+        False on a stop error but kept claiming to be connected).
+        """
+        ok = True
+        trader = self._trader
+        self._trader = None
         try:
-            if self._trader:
-                self._trader.stop()
-            self._connected = False
-            logger.info("QMT disconnected")
-            return True
+            if trader is not None:
+                trader.stop()
         except Exception as e:
             logger.error("QMT disconnect error: %s", e)
-            return False
+            ok = False
+        self._connected = False
+        if ok:
+            logger.info("QMT disconnected")
+        return ok
+
+    # ── Lazy reconnect & broker reconciliation ──
+
+    def _ensure_connected(self) -> None:
+        """Reconnect on demand, or raise ``BrokerConnectionError``.
+
+        ``on_disconnected`` only flips ``_connected`` and logs; every order
+        and query entry point calls this first. A healthy link returns
+        immediately. Otherwise it makes at most ``max_reconnect_attempts``
+        calls to ``connect(blocking=True)``, waiting
+        ``reconnect_backoff * 2 ** (k - 1)`` seconds before retry *k*
+        (1s, 2s, 4s, ... by default). The waits go through the injected
+        ``sleep_fn`` so tests never actually wait.
+
+        After a successful reconnect the broker book is reconciled via
+        ``_resync_from_broker`` (a failed resync only warns — the connection
+        to the order gateway is what matters for the next operation). When
+        every attempt fails this raises ``BrokerConnectionError``; callers
+        must not place, cancel or report state as if the broker answered.
+        """
+        if self._connected:
+            return
+
+        if getattr(self._reconnect_state, "active", False):
+            # Re-entered from connect()'s own callback chain (post-connect
+            # account snapshot) after on_disconnected flipped the flag.
+            # Blocking on the reconnect lock this thread already owns would
+            # deadlock; report failure and let the outer attempt retry.
+            raise self.BrokerConnectionError(
+                "QMT reconnect re-entered from its own connect() callback chain"
+            )
+
+        with self._reconnect_lock:
+            if self._connected:
+                return
+            self._reconnect_state.active = True
+            try:
+                self._reconnect_locked()
+            finally:
+                self._reconnect_state.active = False
+
+    def _reconnect_locked(self) -> None:
+        """Body of ``_ensure_connected``; caller holds ``_reconnect_lock``."""
+        logger.warning(
+            "QMT link is down — attempting lazy reconnect (up to %d attempts)",
+            self._max_reconnect_attempts,
+        )
+        last_error: Exception | None = None
+        for attempt in range(self._max_reconnect_attempts):
+            if attempt > 0:
+                delay = self._reconnect_backoff * (2 ** (attempt - 1))
+                if delay > 0:
+                    logger.warning(
+                        "QMT reconnect backoff %.2fs before attempt %d/%d",
+                        delay, attempt + 1, self._max_reconnect_attempts,
+                    )
+                    self._sleep_fn(delay)
+            try:
+                # connect() catches its own errors, but a mock/subclass may
+                # raise; either way the attempt failed.
+                connected = bool(self.connect(blocking=True))
+            except Exception as e:
+                last_error = e
+                connected = False
+            if connected and self._connected:
+                logger.info("QMT reconnected after %d attempt(s)", attempt + 1)
+                # Reserve the TTL slot before reconciling: if the resync
+                # query fails here, get_orders must not immediately retry the
+                # same broken endpoint on entry (one attempt per TTL).
+                self._last_resync_at = self._clock_fn()
+                try:
+                    self._resync_from_broker()
+                except Exception as e:
+                    logger.warning("QMT post-reconnect resync failed: %s", e)
+                return
+
+        raise self.BrokerConnectionError(
+            "QMT reconnect failed after "
+            f"{self._max_reconnect_attempts} attempt(s); refusing to trade"
+            + (f" (last error: {last_error})" if last_error is not None else "")
+        )
+
+    @staticmethod
+    def _as_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _as_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _created_at_from_broker(raw_time: Any) -> str | None:
+        """Normalize a broker ``order_time`` (epoch seconds or string)."""
+        if isinstance(raw_time, (int, float)) and raw_time > 0:
+            try:
+                return datetime.fromtimestamp(float(raw_time)).isoformat()
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(raw_time, str) and raw_time.strip():
+            return raw_time
+        return None
+
+    def _resync_from_broker(self) -> bool:
+        """Rebuild today's order book from the broker; cross-check fills.
+
+        ``query_stock_orders(account)`` is authoritative for the current
+        trading day: tracked orders are updated in place and orders this
+        process has never seen (submitted before a restart, or missed by
+        callbacks) are appended. Matching is by broker order id, so running
+        it twice never duplicates an order.
+
+        ``query_stock_trades(account)`` is then used only to cross-check
+        cumulative filled volume: it can raise a stale ``filled_quantity``
+        (never above the order quantity) but never invents a fill or flips
+        an order's status. When the trade endpoint or its fields are
+        unavailable a warning is logged and the order-query values stand.
+
+        Any order-query failure leaves the in-memory book untouched. A
+        trade-query failure only skips the cross-check; the order merge from
+        the same call is kept. Returns True only when the order query itself
+        succeeded.
+        """
+        from quant_platform.trading.qmt_utils import qmt_order_to_dict
+
+        with self._resync_lock:
+            try:
+                raw_orders = self._trader.query_stock_orders(self._account)
+            except Exception as e:
+                logger.warning(
+                    "QMT resync: query_stock_orders failed: %s — serving cached orders",
+                    e,
+                )
+                return False
+            if raw_orders is None:
+                logger.warning(
+                    "QMT resync: query_stock_orders returned no result — "
+                    "serving cached orders",
+                )
+                return False
+            try:
+                broker_orders = list(raw_orders)
+            except TypeError as e:
+                logger.warning(
+                    "QMT resync: query_stock_orders returned a non-iterable "
+                    "(%s) — serving cached orders", e,
+                )
+                return False
+
+            seen: set[str] = set()
+            for raw in broker_orders:
+                d = qmt_order_to_dict(raw)
+                broker_id = str(d.get("order_id", "") or "")
+                if not broker_id or broker_id in seen:
+                    continue
+                seen.add(broker_id)
+                self._merge_broker_order(d, broker_id)
+
+            self._cross_check_filled_with_trades()
+            return True
+
+    def _merge_broker_order(self, d: dict, broker_id: str) -> None:
+        """Update one tracked order or append an unknown broker order.
+
+        Caller holds ``_resync_lock``. Updates follow the callback path's
+        monotonic rules (no terminal downgrade, no shrinking fills) because
+        the same snapshot can race a callback.
+        """
+        from quant_platform.trading.qmt_utils import (
+            from_qmt_code,
+            from_qmt_order_type,
+            from_qmt_price_type,
+            qmt_status_to_internal,
+        )
+
+        status = OrderStatus.PENDING
+        raw_status = d.get("order_status")
+        if raw_status is not None:
+            try:
+                status = qmt_status_to_internal(int(raw_status))
+            except (TypeError, ValueError):
+                status = OrderStatus.PENDING
+        traded = self._as_int(d.get("traded_volume"), 0)
+        traded_price = self._as_float(d.get("traded_price"), 0.0)
+
+        # order_stock carries the durable local intent in strategy_name. A
+        # timeout leaves a pending local order without a broker id; the next
+        # broker query adopts that original order instead of appending a new
+        # one (and instead of allowing a retry to create a second order).
+        strategy_name = str(d.get("strategy_name") or "")
+        if strategy_name.startswith("quant_platform:"):
+            intent_id = strategy_name.split(":", 1)[1]
+            for order in self._orders:
+                if order.order_id == intent_id and not order.broker_order_id:
+                    order.broker_order_id = broker_id
+                    order.error_msg = ""
+                    logger.info(
+                        "QMT resync matched submission-unknown local order %s "
+                        "to broker order %s", intent_id, broker_id,
+                    )
+                    break
+
+        for order in self._orders:
+            if str(order.broker_order_id) != broker_id:
+                continue
+            if order.status not in self._TERMINAL_STATUSES:
+                if order.status == OrderStatus.PARTIAL and status in (
+                        OrderStatus.PENDING, OrderStatus.SUBMITTED):
+                    pass  # never demote a partially filled order
+                elif (order.status == OrderStatus.SUBMITTED
+                        and status == OrderStatus.PENDING):
+                    # Stale pre-report snapshot (UNREPORTED/WAIT_REPORTING)
+                    # from a query that raced the callback; demoting would
+                    # make cancel_order refuse a live order.
+                    pass
+                else:
+                    order.status = status
+            self._record_order_fill_snapshot(order, traded, traded_price)
+            order.updated_at = datetime.now().isoformat()
+            return
+
+        # Unknown order: submitted before this process started (or missed by
+        # the callback chain). Rebuild it from the broker snapshot.
+        if strategy_name.startswith("quant_platform:"):
+            duplicate = next(
+                (o for o in self._orders if o.order_id == intent_id), None,
+            )
+            if duplicate is not None:
+                logger.warning(
+                    "QMT resync: local intent %s already tracked; refusing a "
+                    "duplicate entry for broker order %s", intent_id, broker_id,
+                )
+                return
+        quantity = self._as_int(d.get("order_volume"), 0)
+        order = Order(
+            code=from_qmt_code(str(d.get("code", "") or "")),
+            side=from_qmt_order_type(d.get("order_type")),
+            order_type=from_qmt_price_type(d.get("price_type")),
+            quantity=quantity,
+            price=self._as_float(d.get("price"), 0.0),
+            filled_quantity=min(traded, quantity) if quantity > 0 else traded,
+            filled_price=traded_price,
+            status=status,
+            broker_order_id=broker_id,
+        )
+        if strategy_name.startswith("quant_platform:"):
+            # Preserve the durable local intent so a racing exception handler
+            # can adopt this recovered entry instead of appending a duplicate.
+            order.order_id = intent_id
+        status_msg = str(d.get("status_msg", "") or "")
+        if status_msg:
+            order.error_msg = status_msg
+        created_at = self._created_at_from_broker(d.get("order_time"))
+        if created_at:
+            order.created_at = created_at
+        self._record_order_fill_snapshot(order, traded, traded_price)
+        self._orders.append(order)
+        logger.info(
+            "QMT resync: recovered broker order %s (%s %s x%d, status=%s)",
+            broker_id, order.side.value, order.code, order.quantity,
+            order.status.value,
+        )
+
+    def _cross_check_filled_with_trades(self) -> None:
+        """Merge unique ``query_stock_trades`` executions into order fills.
+
+        The trade endpoint shares the callback execution ledger, keyed by
+        broker ``traded_id``: repeated resyncs and callback/query overlap are
+        therefore idempotent, and multi-price executions produce a VWAP.
+        Trades never create orders, lower fills, or change lifecycle status.
+        The preceding cumulative order-query snapshot remains the fallback
+        for rows without a traded_id, because such rows cannot be deduplicated
+        safely across polls. Any query/parsing failure warns and leaves the
+        order-query values in place.
+        """
+        from quant_platform.trading.qmt_utils import qmt_trade_to_dict
+
+        try:
+            raw_trades = self._trader.query_stock_trades(self._account)
+        except Exception as e:
+            logger.warning(
+                "QMT resync: query_stock_trades failed: %s — "
+                "filled volume not cross-checked", e,
+            )
+            return
+        if raw_trades is None:
+            logger.warning(
+                "QMT resync: query_stock_trades returned no result — "
+                "filled volume not cross-checked",
+            )
+            return
+        try:
+            trades = list(raw_trades)
+        except TypeError as e:
+            logger.warning(
+                "QMT resync: query_stock_trades returned a non-iterable "
+                "(%s) — filled volume not cross-checked", e,
+            )
+            return
+
+        orders_by_broker_id = {
+            str(order.broker_order_id): order for order in self._orders
+            if str(order.broker_order_id or "")
+        }
+        for raw in trades:
+            d = qmt_trade_to_dict(raw)
+            broker_id = str(d.get("order_id", "") or "")
+            order = orders_by_broker_id.get(broker_id)
+            if order is None:
+                continue
+            trade_id = str(d.get("trade_id", "") or "")
+            if not trade_id:
+                logger.warning(
+                    "QMT resync: trade for order %s has no traded_id; "
+                    "keeping the cumulative order-query fill snapshot",
+                    broker_id,
+                )
+                continue
+            volume = self._as_int(d.get("quantity", d.get("volume")), 0)
+            if volume <= 0:
+                continue
+            price = self._as_float(d.get("price"), 0.0)
+            if self._record_unique_execution(order, trade_id, volume, price):
+                order.updated_at = datetime.now().isoformat()
+
+    def _maybe_resync(self) -> bool:
+        """Refresh the order book from the broker at most once per TTL.
+
+        The TTL also rate-limits failed attempts. The return value tells
+        order-generation callers whether the current book is authoritative;
+        display callers may still use the in-memory cache after a failure.
+        """
+        now = self._clock_fn()
+        last = self._last_resync_at
+        if last is not None and (now - last) < self._resync_ttl:
+            return getattr(self, "_last_resync_ok", False)
+        self._last_resync_at = now
+        try:
+            self._last_resync_ok = self._resync_from_broker()
+        except Exception as e:
+            self._last_resync_ok = False
+            logger.warning(
+                "QMT resync failed unexpectedly: %s — serving cached orders", e,
+            )
+        return self._last_resync_ok
 
     # ── Order lifecycle ──
+
+    #: Statuses after which no further broker callback may change the order.
+    _TERMINAL_STATUSES = frozenset({
+        OrderStatus.FILLED,
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
+        OrderStatus.EXPIRED,
+    })
 
     def place_order(self, order: Order) -> Order:
         """Submit an order to QMT.
 
+        Lazy reconnect runs first (``_ensure_connected``). When the broker is
+        unreachable this raises ``BrokerConnectionError`` and
+        ``order_stock`` is never called — order submission fails closed.
+        A resync failure after a *successful* reconnect does not block the
+        order: the order gateway is reachable, only the reconciliation query
+        failed.
+
         Converts internal Order to xtquant params, submits, and tracks.
         The order status will be updated asynchronously via callbacks.
-        """
-        if not self._connected:
-            order.status = OrderStatus.REJECTED
-            order.error_msg = "QMT not connected"
-            self._orders.append(order)
-            return order
 
+        ``order_stock`` returns a broker order id, or an error code <= 0 on
+        failure. A non-positive result is a rejection: storing it as
+        ``broker_order_id`` marked the order SUBMITTED even though QMT never
+        accepted it, and no callback could ever arrive for it.
+
+        Returns the tracked order. If a concurrent resync recovered the same
+        broker order before this call appended it, the returned instance is
+        that recovered (already tracked) order rather than the argument, so
+        callers must use the return value — as the engine and live runner
+        already do.
+        """
+        self._ensure_connected()
+
+        submission_started = False
         try:
             from quant_platform.trading.qmt_utils import to_qmt_code, to_qmt_order_type, to_qmt_price_type
 
@@ -705,20 +1794,56 @@ class QMTBroker(BrokerInterface):
             if order.order_type == OrderType.MARKET:
                 price = 0.0  # QMT uses 0 for market orders
 
+            submission_started = True
             broker_id = self._trader.order_stock(
                 account=self._account,
                 stock_code=stock_code,
                 order_type=xt_order_type,
                 order_volume=order.quantity,
-                strategy_name="quant_platform",
+                strategy_name=f"quant_platform:{order.order_id}",
                 price_type=xt_price_type,
                 price=price,
             )
 
+            try:
+                accepted = broker_id is not None and int(broker_id) > 0
+            except (TypeError, ValueError):
+                accepted = False
+
+            if not accepted:
+                order.status = OrderStatus.REJECTED
+                order.error_msg = f"QMT order_stock rejected (broker_id={broker_id!r})"
+                order.updated_at = datetime.now().isoformat()
+                with self._resync_lock:
+                    self._orders.append(order)
+                logger.error("QMT order_stock rejected: %s %s %d@%.2f (broker_id=%r)",
+                             order.side.value, order.code, order.quantity,
+                             order.price, broker_id)
+                return order
+
             order.broker_order_id = str(broker_id)
             order.status = OrderStatus.SUBMITTED
             order.updated_at = datetime.now().isoformat()
-            self._orders.append(order)
+            with self._resync_lock:
+                # A concurrent resync can recover this broker order between
+                # order_stock() returning and this append (query_stock_orders
+                # already lists it). Appending would create two entries for
+                # one broker id, and callbacks/resync only update the first,
+                # leaving the caller's order permanently stale. Keep the
+                # single tracked entry and return it instead.
+                tracked = next(
+                    (o for o in self._orders
+                     if str(o.broker_order_id) == order.broker_order_id),
+                    None,
+                )
+                if tracked is not None and tracked is not order:
+                    logger.info(
+                        "QMT order %s already recovered by a concurrent "
+                        "resync; not duplicating", broker_id,
+                    )
+                    order = tracked
+                else:
+                    self._orders.append(order)
 
             logger.info("QMT order: %s %s %d@%.2f (qmt_id=%s)",
                       order.side.value, order.code, order.quantity,
@@ -726,28 +1851,65 @@ class QMTBroker(BrokerInterface):
             return order
 
         except Exception as e:
-            order.status = OrderStatus.REJECTED
-            order.error_msg = str(e)
+            # Once order_stock has been entered, an exception can mean the
+            # broker accepted the order but the response was lost. Recording
+            # that as a definite rejection invites a duplicate retry. Keep the
+            # intent pending and reconcile it by its embedded local order id.
             order.updated_at = datetime.now().isoformat()
-            self._orders.append(order)
+            with self._resync_lock:
+                # A resync can recover the broker order between order_stock()
+                # raising and this handler. It uses the same local intent id;
+                # never append a second PENDING entry for that recovered order.
+                tracked = next(
+                    (o for o in self._orders if o.order_id == order.order_id),
+                    None,
+                )
+                if tracked is not None and tracked is not order:
+                    order = tracked
+                else:
+                    order.status = (
+                        OrderStatus.PENDING if submission_started
+                        else OrderStatus.REJECTED
+                    )
+                    order.error_msg = (
+                        f"QMT submission outcome UNKNOWN; reconcile before retry: {e}"
+                        if submission_started else str(e)
+                    )
+                    order.updated_at = datetime.now().isoformat()
+                    if tracked is None:
+                        self._orders.append(order)
             logger.error("QMT place_order error: %s", e)
             return order
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a submitted order.
 
-        Returns True if the cancel request was sent successfully.
-        The actual cancellation is confirmed asynchronously via callback.
+        Reconnects first (``BrokerConnectionError`` when the broker cannot be
+        reached — cancelling blind would report success without a broker
+        acknowledgement). Returns True if the cancel request was sent
+        successfully. The actual cancellation is confirmed asynchronously via
+        callback.
         """
-        if not self._connected:
-            return False
+        self._ensure_connected()
 
         for o in self._orders:
             if o.order_id == order_id and o.broker_order_id:
                 if o.status not in (OrderStatus.SUBMITTED, OrderStatus.PARTIAL):
                     return False
                 try:
-                    self._trader.cancel_order_stock(self._account, int(o.broker_order_id))
+                    result = self._trader.cancel_order_stock(
+                        self._account, int(o.broker_order_id),
+                    )
+                    # xtquant returns 0 on success and a non-zero error code
+                    # when the exchange/broker refuses the cancellation. The
+                    # old code never looked at the return value and reported
+                    # every request as success.
+                    if result != 0:
+                        logger.error(
+                            "QMT cancel rejected: %s (qmt_id=%s, result=%s)",
+                            order_id, o.broker_order_id, result,
+                        )
+                        return False
                     logger.info("QMT cancel requested: %s (qmt_id=%s)", order_id, o.broker_order_id)
                     return True
                 except Exception as e:
@@ -757,50 +1919,95 @@ class QMTBroker(BrokerInterface):
 
     # ── Queries ──
 
-    def get_positions(self) -> list[Position]:
+    def get_positions(self) -> list[Position] | None:
         """Query current positions from QMT.
 
-        Returns empty list if disconnected or query fails.
+        Reconnects first; when the broker stays unreachable this raises
+        ``BrokerConnectionError`` (fail loud: a fabricated flat book is more
+        dangerous than an error).
+
+        Returns **None** when the query fails or the terminal answers with no
+        result. None means "unknown": a cached book is display-only and must
+        never be mistaken for a confirmed flat account. Treating a failed
+        query as ``[]`` made the engine buy a duplicate stake and prune the
+        persisted book (D6).
         """
-        if not self._connected:
-            return list(self._positions.values())
+        self._ensure_connected()
 
         try:
             from quant_platform.trading.qmt_utils import from_qmt_code, qmt_position_to_dict
 
             raw = self._trader.query_stock_positions(self._account)
-            positions: list[Position] = []
+            if raw is None:
+                logger.error("QMT query positions returned no result; reporting UNKNOWN")
+                return None
 
-            if raw is not None:
-                for p in raw:
-                    code = from_qmt_code(qmt_position_to_dict(p).get("code", ""))
-                    d = qmt_position_to_dict(p)
-                    pos = Position(
-                        code=code,
-                        quantity=d.get("volume", 0),
-                        available=d.get("can_use_volume", 0),
-                        avg_cost=d.get("avg_price", 0.0),
-                        market_value=d.get("market_value", 0.0),
-                    )
-                    self._positions[code] = pos
-                    positions.append(pos)
+            positions: list[Position] = []
+            for p in raw:
+                code = from_qmt_code(qmt_position_to_dict(p).get("code", ""))
+                d = qmt_position_to_dict(p)
+                pos = Position(
+                    code=code,
+                    quantity=d.get("volume", 0),
+                    available=d.get("can_use_volume", 0),
+                    avg_cost=d.get("avg_price", 0.0),
+                    market_value=d.get("market_value", 0.0),
+                )
+                self._positions[code] = pos
+                positions.append(pos)
 
             return positions
 
         except Exception as e:
-            logger.error("QMT query positions failed: %s", e)
-            return list(self._positions.values())
+            logger.error("QMT query positions failed: %s; reporting UNKNOWN", e)
+            return None
 
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
+        """Return tracked orders, refreshed from the broker at most per TTL.
+
+        Entry point for lazy reconnect: a down link is re-established first
+        (``BrokerConnectionError`` when that fails — a read path must not
+        silently serve a stale book as if it were the broker's answer).
+
+        Once connected, the broker's order/trade books are reconciled into
+        memory at most once per ``resync_ttl`` seconds (default 2s), so a
+        polling caller does not hit QMT on every call. While resyncs keep
+        succeeding, the in-memory book is at most ``resync_ttl`` seconds old;
+        while the broker query keeps failing, the TTL only rate-limits the
+        retries and the returned book is the last successfully merged
+        snapshot (that staleness is what the warning signals). If the resync
+        query itself fails, a warning is logged and the current in-memory
+        list is returned unchanged (read-path degradation).
+        """
+        self._ensure_connected()
+        self._maybe_resync()
         if status:
             return [o for o in self._orders if o.status == status]
+        return list(self._orders)
+
+    def get_orders_authoritative(self) -> list[Order] | None:
+        """Return the order book only when its latest resync succeeded.
+
+        Display callers may use ``get_orders`` and its last-known cache. Order
+        generation must instead distinguish a real empty book from an
+        unreachable broker, otherwise an open order can be duplicated after a
+        restart or query outage.
+        """
+        self._ensure_connected()
+        if not self._maybe_resync():
+            return None
         return list(self._orders)
 
     def get_account(self) -> dict:
         """Get account balance from QMT.
 
-        Falls back to internal cash tracking if query fails.
+        Reconnects first; when the broker stays unreachable this raises
+        ``BrokerConnectionError``. Asset or position query failures also
+        raise: cached cash/positions are display-only and cannot be used for
+        sizing or reconciliation as if they were authoritative.
         """
+        self._ensure_connected()
+
         base = {
             "connected": self._connected,
             "broker": "qmt",
@@ -808,38 +2015,31 @@ class QMTBroker(BrokerInterface):
             "account_id": self._account_id,
         }
 
-        if not self._connected:
-            return {**base, "cash": self._initial_cash, "total_equity": self._initial_cash}
-
         try:
             asset = self._trader.query_stock_asset(self._account)
-            if asset is not None:
-                cash = getattr(asset, "cash", 0.0) or getattr(asset, "enable_balance", 0.0)
-                market_value = getattr(asset, "market_value", 0.0)
-                total = getattr(asset, "total_asset", cash + market_value)
-                self._cash = cash
-                self._market_value = market_value
-                return {
-                    **base,
-                    "cash": round(cash, 2),
-                    "market_value": round(market_value, 2),
-                    "total_equity": round(total, 2),
-                    "initial_cash": self._initial_cash,
-                    "total_pnl": round(total - self._initial_cash, 2),
-                    "n_positions": len(self.get_positions()),
-                }
-
         except Exception as e:
-            logger.warning("QMT account query failed: %s", e)
+            raise self.BrokerConnectionError(
+                f"QMT account query failed: {e}"
+            ) from e
+        if asset is None:
+            raise self.BrokerConnectionError(
+                "QMT account query returned no result; account state UNKNOWN"
+            )
 
-        # Fallback
+        cash = getattr(asset, "cash", 0.0) or getattr(asset, "enable_balance", 0.0)
+        market_value = getattr(asset, "market_value", 0.0)
+        total = getattr(asset, "total_asset", cash + market_value)
         positions = self.get_positions()
-        mkt_val = sum(p.market_value for p in positions)
-        total = self._cash + mkt_val
+        if positions is None:
+            raise self.BrokerConnectionError(
+                "QMT position query failed; account state UNKNOWN"
+            )
+        self._cash = cash
+        self._market_value = market_value
         return {
             **base,
-            "cash": round(self._cash, 2),
-            "market_value": round(mkt_val, 2),
+            "cash": round(cash, 2),
+            "market_value": round(market_value, 2),
             "total_equity": round(total, 2),
             "initial_cash": self._initial_cash,
             "total_pnl": round(total - self._initial_cash, 2),
@@ -848,25 +2048,375 @@ class QMTBroker(BrokerInterface):
 
     # ── Internals ──
 
-    def _on_async_response(self, response: Any) -> None:
-        """Handle async order response from QMT (fill / status update).
+    @staticmethod
+    def _qmt_quote_age_seconds(timetag: Any, now: datetime | None = None) -> float | None:
+        """Age of a QMT tick in seconds, or None when it cannot be validated.
 
-        Called by the QMT callback thread. Updates the tracked Order
-        and publishes events to EventBus.
+        Calendar-form QMT values are exchange-local (Asia/Shanghai), never
+        interpreted in the host's timezone. ``now`` is an explicit test hook.
         """
+        if timetag is None:
+            return None
+        try:
+            shanghai = ZoneInfo("Asia/Shanghai")
+            if isinstance(timetag, (int, float)):
+                text = str(int(timetag))
+            else:
+                text = str(timetag).strip()
+            if not text:
+                return None
+            if text.isdigit() and len(text) >= 14 and text.startswith("20"):
+                quoted_at = datetime.strptime(
+                    text[:14], "%Y%m%d%H%M%S",
+                ).replace(tzinfo=shanghai)
+                current = now or datetime.now(shanghai)
+                if current.tzinfo is None:
+                    current = current.replace(tzinfo=shanghai)
+                return (current - quoted_at).total_seconds()
+            if text.replace(".", "", 1).isdigit():
+                epoch = float(text)
+                if epoch > 1e12:
+                    epoch /= 1000.0
+                if epoch <= 0:
+                    return None
+                current_ts = (now.timestamp() if now is not None
+                              else datetime.now().timestamp())
+                return current_ts - epoch
+            quoted_at = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if quoted_at.tzinfo is None:
+                quoted_at = quoted_at.replace(tzinfo=shanghai)
+            current = now or datetime.now(quoted_at.tzinfo)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=quoted_at.tzinfo)
+            return (current - quoted_at).total_seconds()
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    def get_quotes(self, codes: list[str]) -> dict[str, float]:
+        """Fetch fresh last prices for ``codes`` from QMT market data.
+
+        This is the quote feed a live run must use. Returns an empty mapping
+        when xtdata is unavailable, the query fails, or ticks have no valid
+        recent ``timetag`` -- the caller must treat that as "no fresh quote"
+        and skip the cycle rather than inventing a price.
+        """
+        if not codes:
+            return {}
+        try:
+            from xtquant import xtdata
+
+            from quant_platform.trading.qmt_utils import to_qmt_code
+
+            qmt_codes = [to_qmt_code(code) for code in codes]
+            ticks = xtdata.get_full_tick(qmt_codes) or {}
+            prices: dict[str, float] = {}
+            for original, qmt_code in zip(codes, qmt_codes, strict=False):
+                tick = ticks.get(qmt_code)
+                if not tick:
+                    continue
+                raw_price = (
+                    tick.get("lastPrice") if isinstance(tick, dict)
+                    else getattr(tick, "lastPrice", None)
+                )
+                timetag = (
+                    tick.get("timetag", tick.get("time")) if isinstance(tick, dict)
+                    else getattr(tick, "timetag", getattr(tick, "time", None))
+                )
+                age = self._qmt_quote_age_seconds(timetag)
+                if age is None or age > 120.0 or age < -60.0:
+                    logger.warning(
+                        "Dropping stale/undated QMT tick for %s: %r",
+                        qmt_code, timetag,
+                    )
+                    continue
+                try:
+                    price = float(raw_price)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    prices[original] = price
+            return prices
+        except Exception as e:
+            logger.warning("QMT quote query failed: %s", e)
+            return {}
+
+    def _on_async_ack(self, response: Any) -> None:
+        """Handle the placement ACK.
+
+        `on_order_stock_async_response` reports the broker id, not a fill.
+        The old handler parsed it as a status update, mapped the missing
+        status to 0/PENDING and downgraded a fresh SUBMITTED order.
+        """
+        d = response if isinstance(response, dict) else {}
+        order_id = d.get("order_id", getattr(response, "order_id", ""))
+        if order_id:
+            logger.debug("QMT placement ACK: %s", order_id)
+            self._publish_event("qmt.order_ack", {"order_id": str(order_id)})
+
+    def _fill_tracking_for(
+        self, broker_order_id: str,
+    ) -> tuple[dict[str, Any], dict[str, tuple[int, float]]]:
+        """Return the cumulative-snapshot and unique-execution state.
+
+        A few embedded callers/tests construct QMTBroker with ``__new__``;
+        lazy initialization keeps the callback boundary compatible with them.
+        """
+        snapshots = getattr(self, "_order_fill_snapshots", None)
+        if snapshots is None:
+            snapshots = self._order_fill_snapshots = {}
+        executions = getattr(self, "_order_executions", None)
+        if executions is None:
+            executions = self._order_executions = {}
+        return (
+            snapshots.setdefault(
+                broker_order_id, {"quantity": 0, "price": 0.0},
+            ),
+            executions.setdefault(broker_order_id, {}),
+        )
+
+    def _refresh_order_fill_accounting(self, order: Order) -> None:
+        """Merge cumulative order evidence with unique trade executions.
+
+        Quantity is the maximum of the previous quantity, the latest
+        cumulative XtOrder snapshot and the sum of unique XtTrade executions
+        (capped at the order quantity). The two broker channels describe the
+        same fills and must never be added together.
+
+        When unique executions explain the whole filled quantity, their
+        quantity-weighted average is the fill price. If some executions were
+        missed, the cumulative XtOrder average covers more shares and takes
+        precedence. Existing/known prices are retained as a fallback when
+        neither source covers the full quantity; a partial print is never
+        presented as the VWAP of the whole order.
+        """
+        broker_order_id = str(order.broker_order_id or "")
+        if not broker_order_id:
+            return
+        snapshot, executions = self._fill_tracking_for(broker_order_id)
+        current = max(0, int(order.filled_quantity or 0))
+        snapshot_quantity = max(0, int(snapshot.get("quantity", 0) or 0))
+        execution_quantity = sum(
+            max(0, int(quantity)) for quantity, _price in executions.values()
+        )
+        filled = max(current, snapshot_quantity, execution_quantity)
+        if order.quantity > 0:
+            filled = min(filled, int(order.quantity))
+
+        execution_value = sum(
+            quantity * price
+            for quantity, price in executions.values()
+            if quantity > 0 and price > 0
+        )
+        priced_execution_quantity = sum(
+            quantity for quantity, price in executions.values()
+            if quantity > 0 and price > 0
+        )
+        all_executions_priced = (
+            execution_quantity > 0
+            and priced_execution_quantity == execution_quantity
+        )
+        execution_vwap = (
+            execution_value / priced_execution_quantity
+            if priced_execution_quantity > 0 else 0.0
+        )
+        snapshot_price = float(snapshot.get("price", 0.0) or 0.0)
+        current_price = float(order.filled_price or 0.0)
+
+        if execution_quantity >= filled and all_executions_priced:
+            filled_price = execution_value / execution_quantity
+        elif (
+            snapshot_quantity >= filled and snapshot_quantity > 0
+            and snapshot_price > 0
+        ):
+            filled_price = snapshot_price
+        elif filled == current and current_price > 0:
+            filled_price = current_price
+        elif snapshot_quantity > 0 and snapshot_price > 0:
+            # Incomplete trade coverage: this is the broker's cumulative
+            # average for the snapshot quantity, not a latest-print guess.
+            filled_price = snapshot_price
+        elif execution_vwap > 0:
+            filled_price = execution_vwap
+        else:
+            filled_price = current_price
+
+        order.filled_quantity = filled
+        if filled > 0 and filled_price > 0:
+            order.filled_price = filled_price
+
+    def _record_order_fill_snapshot(
+        self, order: Order, traded_volume: int, traded_price: float,
+    ) -> None:
+        """Record a monotonic XtOrder cumulative fill snapshot."""
+        broker_order_id = str(order.broker_order_id or "")
+        if not broker_order_id:
+            return
+        snapshot, _executions = self._fill_tracking_for(broker_order_id)
+        traded = max(0, int(traded_volume or 0))
+        if order.quantity > 0:
+            traded = min(traded, int(order.quantity))
+        previous = int(snapshot.get("quantity", 0) or 0)
+        if traded < previous:
+            return  # stale cumulative snapshot: never shrink quantity/price
+        if traded == previous:
+            if traded > 0 and traded_price > 0:
+                snapshot["price"] = float(traded_price)
+        else:
+            snapshot["quantity"] = traded
+            # A previous average does not describe newly added executions.
+            snapshot["price"] = (
+                float(traded_price)
+                if traded > 0 and traded_price > 0 else 0.0
+            )
+        self._refresh_order_fill_accounting(order)
+
+    def _record_unique_execution(
+        self, order: Order, trade_id: str, volume: int, price: float,
+    ) -> bool:
+        """Add one broker trade id; return False for an already-seen id."""
+        broker_order_id = str(order.broker_order_id or "")
+        if not broker_order_id or not trade_id:
+            return False
+        _snapshot, executions = self._fill_tracking_for(broker_order_id)
+        if trade_id in executions:
+            return False
+        executions[trade_id] = (
+            int(volume), float(price) if price > 0 else 0.0,
+        )
+        self._refresh_order_fill_accounting(order)
+        return True
+
+    def _on_order_update(self, xt_order: Any) -> None:
+        """Apply an XtOrder status update to the tracked order.
+
+        Callbacks can arrive out of order: a late ``ORDER_PART_SUCC`` snapshot
+        after ``ORDER_SUCCEEDED``, or a stale ``ORDER_REPORTED`` after a
+        partial fill. Terminal states must never be downgraded, partial fills
+        must never fall back to PENDING/SUBMITTED, and the cumulative traded
+        volume must not shrink.
+        """
+        from quant_platform.trading.qmt_utils import qmt_status_to_internal
+
+        broker_order_id = str(getattr(xt_order, "order_id", ""))
+        status_code = getattr(xt_order, "order_status", None)
+        if status_code is None:
+            return
+        status = qmt_status_to_internal(int(status_code))
+        traded = int(getattr(xt_order, "traded_volume", 0) or 0)
+        traded_price = float(getattr(xt_order, "traded_price", 0) or 0)
+
+        for order in self._orders:
+            if str(order.broker_order_id) == broker_order_id:
+                if order.status in self._TERMINAL_STATUSES:
+                    if (order.status == OrderStatus.CANCELLED
+                            and traded > int(order.filled_quantity or 0)):
+                        # A partially cancelled order can still have late
+                        # executions. Only the broker's larger cumulative
+                        # snapshot may raise the fill; lifecycle stays closed.
+                        self._record_order_fill_snapshot(
+                            order, traded, traded_price,
+                        )
+                        order.updated_at = datetime.now().isoformat()
+                        self._publish_event("qmt.order_update", order.to_dict())
+                    else:
+                        logger.debug(
+                            "Ignoring stale QMT update %s for terminal order %s (%s)",
+                            status.value, order.order_id, order.status.value,
+                        )
+                    break
+                if (order.status == OrderStatus.PARTIAL
+                        and status in (OrderStatus.PENDING, OrderStatus.SUBMITTED)):
+                    logger.debug(
+                        "Ignoring stale QMT update %s for partially filled order %s",
+                        status.value, order.order_id,
+                    )
+                    break
+                if (order.status == OrderStatus.SUBMITTED
+                        and status == OrderStatus.PENDING):
+                    # UNREPORTED/WAIT_REPORTING arriving after a REPORTED
+                    # callback is a stale pre-report snapshot; demoting it
+                    # would make cancel_order refuse a live order.
+                    logger.debug(
+                        "Ignoring stale QMT update %s for submitted order %s",
+                        status.value, order.order_id,
+                    )
+                    break
+                order.status = status
+                self._record_order_fill_snapshot(order, traded, traded_price)
+                order.updated_at = datetime.now().isoformat()
+                self._publish_event("qmt.order_update", order.to_dict())
+                break
+
+    def _on_trade(self, xt_trade: Any) -> None:
+        """Apply one uniquely identified XtTrade execution.
+
+        ``traded_id`` is mandatory for incremental accounting. Without it a
+        repeated callback cannot be distinguished from a new execution, so
+        the conservative fallback is to leave quantity/price unchanged and
+        rely on the cumulative XtOrder callback or the next broker resync.
+        """
+        broker_order_id = str(getattr(xt_trade, "order_id", ""))
+        trade_id = str(
+            getattr(xt_trade, "traded_id", "")
+            or getattr(xt_trade, "trade_id", "")
+            or ""
+        )
+        volume = int(
+            getattr(xt_trade, "traded_volume", 0)
+            or getattr(xt_trade, "volume", 0)
+            or 0
+        )
+        price = float(
+            getattr(xt_trade, "traded_price", 0)
+            or getattr(xt_trade, "price", 0)
+            or 0
+        )
+        if volume <= 0:
+            return
+
+        for order in self._orders:
+            if str(order.broker_order_id) == broker_order_id:
+                if not trade_id:
+                    logger.warning(
+                        "QMT trade for order %s has no traded_id; refusing "
+                        "non-idempotent incremental accounting and waiting "
+                        "for the cumulative order snapshot/resync",
+                        broker_order_id,
+                    )
+                    return
+                if not self._record_unique_execution(
+                    order, trade_id, volume, price,
+                ):
+                    return  # duplicate broker execution report
+                if order.status not in self._TERMINAL_STATUSES:
+                    order.status = (
+                        OrderStatus.FILLED
+                        if order.filled_quantity >= order.quantity
+                        else OrderStatus.PARTIAL
+                    )
+                # A late print may add quantity to a partially cancelled
+                # order, but it must not resurrect its terminal lifecycle.
+                order.updated_at = datetime.now().isoformat()
+                self._publish_event("qmt.trade", order.to_dict())
+                break
+
+    def _on_async_response(self, response: Any) -> None:
+        """Handle an async order response carrying a status (legacy hook)."""
         try:
             from quant_platform.trading.qmt_utils import (
-                from_qmt_code,
                 qmt_status_to_internal,
                 qmt_trade_to_dict,
             )
 
             d = qmt_trade_to_dict(response)
+            if "status" not in d and "order_status" not in d:
+                # Placement ACK without lifecycle information: do not touch
+                # the order's status.
+                return
             qmt_order_id = str(d.get("order_id", ""))
             qmt_status = d.get("status", d.get("order_status", 0))
             filled_qty = d.get("filled_quantity", d.get("volume", 0))
             filled_price = d.get("filled_price", d.get("price", 0.0))
-            from_qmt_code(d.get("code", ""))
 
             new_status = qmt_status_to_internal(int(qmt_status) if qmt_status else 0)
 
@@ -891,8 +2441,11 @@ class QMTBroker(BrokerInterface):
 
     def _update_order_status(self, broker_order_id: str, status: OrderStatus, error_msg: str = "") -> None:
         """Update an order's status (e.g. on error callback)."""
+        target = str(broker_order_id)
         for o in self._orders:
-            if o.broker_order_id == broker_order_id:
+            # xtquant reports integer ids while broker_order_id is stored as
+            # a string; comparing raw values never matched.
+            if str(o.broker_order_id) == target or str(o.order_id) == target:
                 o.status = status
                 o.error_msg = error_msg
                 o.updated_at = datetime.now().isoformat()
@@ -1058,7 +2611,13 @@ class XTPBroker(BrokerInterface):
             logger.error("XTP Cancel failed: %s", e)
             return False
 
-    def get_positions(self) -> list[Position]:
+    def get_positions(self) -> list[Position] | None:
+        """Query positions. Returns None when the query itself failed.
+
+        An exception used to be reported as `[]` ("flat"), which could make a
+        caller size duplicate exposure (D6). Unknown and empty are now
+        distinguishable.
+        """
         if not self._connected:
             return []
         try:
@@ -1086,7 +2645,7 @@ class XTPBroker(BrokerInterface):
             return positions
         except Exception as e:
             logger.error("XTP Query positions failed: %s", e)
-            return []
+            return None
 
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
         if status:

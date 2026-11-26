@@ -1,0 +1,158 @@
+{
+  "as_of": "2026-10-23",
+  "data_end": "2026-10-23",
+  "factors": [
+    "turnover20d"
+  ],
+  "weights": {
+    "000543": 0.0373709781,
+    "000631": 0.0214004529,
+    "000755": 0.03589776,
+    "000801": 0.0044530865,
+    "000883": 0.0499999999,
+    "000948": 0.0233870017,
+    "001256": 0.0038311669,
+    "002025": 0.0034981825,
+    "002168": 0.0499999999,
+    "002262": 0.0499999999,
+    "002508": 0.0499999999,
+    "002650": 0.0499999999,
+    "002698": 0.0278685348,
+    "002920": 0.0086579838,
+    "003018": 0.0094522311,
+    "003035": 0.0499999997,
+    "300105": 0.0044961822,
+    "300419": 0.0322192323,
+    "300559": 0.0283656988,
+    "300636": 0.0441116615,
+    "300888": 0.0402685721,
+    "301236": 0.0005554002,
+    "301356": 0.0056319491,
+    "600094": 0.0021559926,
+    "600388": 0.0483883297,
+    "600436": 0.05,
+    "600579": 0.0218298137,
+    "600817": 0.0499999998,
+    "600872": 0.0499999998,
+    "601058": 0.0499999868,
+    "601100": 0.0341609572,
+    "603060": 0.0129253229,
+    "603189": 0.0010870274,
+    "603380": 0.0017118297,
+    "603726": 0.0415298024,
+    "603825": 0.0047448323
+  },
+  "signal_date": "2026-10-23",
+  "provenance": {
+    "tool": "tools/daily_signal.py",
+    "cache": ".scratch\\orchestrate\\merged_wide.parquet",
+    "industry_map": ".cache\\baostock\\industry_map.parquet",
+    "industry_neutralization": true,
+    "construction": "mvo",
+    "top_n": null,
+    "max_sector": 0.3,
+    "sector_cap_enforced": true,
+    "prev_weights": null,
+    "capital_cny": 2000000.0,
+    "max_weight": 0.05,
+    "max_turnover": 0.3,
+    "risk_aversion": 1.0,
+    "transaction_cost_bps": 20.0,
+    "turnover_penalty": 0.5,
+    "covariance": "ledoit_wolf",
+    "covariance_lookback": 252,
+    "ic_lookback": 252,
+    "ic_min_obs": 20,
+    "winsorize": [
+      0.01,
+      0.99
+    ],
+    "standardize": "zscore",
+    "returns_convention": "pct_chg/100 shift(-1) computed within the panel sliced to date <= as_of; the signal date's forward label is NaN and excluded from IC and covariance"
+  },
+  "diagnostics": {
+    "history_sessions": 2135,
+    "data_lag_days": 0,
+    "universe_assets": 300,
+    "candidates": 298,
+    "n_holdings": 36,
+    "max_weight_actual": 0.05,
+    "max_sector_weight": 0.1441116614,
+    "n_sector_cap_binding": 0,
+    "sector_cap": {
+      "max_sector_exposure": 0.3,
+      "enforced": true,
+      "sector_map_assets": 300,
+      "n_sectors_universe": 57,
+      "unknown_assets_universe": 1,
+      "n_sectors_holdings": 15,
+      "binding_sectors": [],
+      "sector_weights": {
+        "C14": 0.09999999970000001,
+        "C17": 0.0402685721,
+        "C27": 0.1441116614,
+        "C29": 0.10661396940000001,
+        "C34": 0.062029492000000006,
+        "C35": 0.1240493101,
+        "C38": 0.104496182,
+        "C39": 0.0183210825,
+        "D44": 0.087370978,
+        "G54": 0.03589776,
+        "I65": 0.08561436039999999,
+        "K70": 0.0235564455,
+        "L72": 0.0047448323,
+        "M74": 0.0129253229,
+        "M75": 0.0499999997
+      }
+    },
+    "gross_weight": 0.999999968,
+    "cash_weight": 3.199999998315661e-08,
+    "turnover": 0.499999984,
+    "turnover_definition": "one_sided = 0.5 * sum(|w - w_prev|)",
+    "first_build": true,
+    "min_reported_weight": 0.0001,
+    "pruned_weight": 3.2e-08,
+    "factor_skipped": [],
+    "factor_ic": {
+      "lookback": 252,
+      "min_obs": 20,
+      "window": {
+        "start": "2025-10-09",
+        "end": "2026-10-22",
+        "n": 252,
+        "factor": "turnover20d"
+      },
+      "per_factor": {
+        "turnover20d": {
+          "mean_ic": -0.03896580865953061,
+          "n_obs": 252,
+          "window_start": "2025-10-09",
+          "window_end": "2026-10-22",
+          "weight": -1.0
+        }
+      }
+    },
+    "signal": {
+      "composite_min": -4.024517562240183,
+      "composite_max": 2.1027062721197813,
+      "composite_mean": 2.6183380594179865e-15,
+      "alpha_convention": "cross-sectional percentile rank - 0.5 (MeanVarianceOptimizer input; composite z is the delivered signal)"
+    },
+    "covariance_assets": 297,
+    "covariance_sessions": 252,
+    "covariance_input_sessions": 2134,
+    "optimizer": {
+      "name": "MeanVarianceOptimizer",
+      "construction": "mvo",
+      "top_n": null,
+      "selected": null,
+      "fallback_count": 0,
+      "fallback_reason": null,
+      "received_sector_map": true
+    },
+    "warnings": [
+      "first build: one-sided turnover 0.5000 against a zero book exceeds the 0.3000 cap; the cap is not applied to a first build (nothing to trade from; the platform engine also passes prev_weights=None on its first rebalance)"
+    ]
+  },
+  "disclaimer": "paper tracking only; style-tilt demo, not validated alpha"
+}

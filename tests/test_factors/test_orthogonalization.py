@@ -267,3 +267,20 @@ class TestEdgeCases:
         assert isinstance(result.correlation_after, pd.DataFrame)
         assert result.correlation_before.shape == (3, 3)
         assert result.correlation_after.shape == (3, 3)
+
+
+def test_disjoint_nan_patterns_align_on_the_common_assets(correlated_factors):
+    """Independent dropna() calls used to line up DIFFERENT assets."""
+    factors = {name: frame.copy() for name, frame in correlated_factors.items()}
+    factors["momentum"].iloc[:, :3] = np.nan
+    factors["value"].iloc[:, -3:] = np.nan
+
+    result = orthogonalize_factors(factors, method="gram_schmidt")
+
+    for date in result["momentum"].index[:10]:
+        pair = pd.concat(
+            [result["momentum"].loc[date], result["value"].loc[date]],
+            axis=1, keys=["momentum", "value"],
+        ).dropna()
+        assert len(pair) >= 40
+        assert abs(pair["momentum"].corr(pair["value"])) < 1e-6

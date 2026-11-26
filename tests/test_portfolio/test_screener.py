@@ -390,8 +390,3 @@ class TestScreenerIntegration:
         """Screener should handle None config gracefully."""
         screener = FactorScreener(None)
         assert screener.config.enabled is False
-
-    @pytest.mark.skip(reason="Requires full pipeline — run manually")
-    def test_with_full_pipeline(self):
-        """Placeholder for full pipeline integration test."""
-        pass

@@ -1,85 +1,79 @@
-"""Regression tests for the two fabricated analysis endpoints (BUG-45).
+"""Regression tests for the two analysis endpoints (BUG-45).
 
-`/api/analysis/ic-decay` manufactured an exponential decay curve from each
-factor's mean IC plus noise, with the half-life derived from the same constant.
-`/api/analysis/correlation` built a random matrix, including a rule that made
-factors whose names contain "momentum" correlate with each other by
-construction. Neither read any data. They are the same defect as BUG-24 --
-in-sample or invented numbers presented as measurements -- on two more panels.
+`/api/analysis/ic-decay` once manufactured an exponential decay curve from
+each factor's mean IC plus noise, and `/api/analysis/correlation` built a
+random matrix (including a rule that made factors whose names contain
+"momentum" correlate by construction). Both now compute from the research
+context's processed factor panel and forward returns.
+
+`test_endpoint_wiring.py` covers the full request path; this module keeps the
+source-level and panel-level guards that the original defect motivated.
 """
 
 import inspect
 import re
 from pathlib import Path
 
-import pytest
-
 from quant_platform.api import routes
-from quant_platform.api.routes import get_factor_correlation, get_ic_decay
+from tests.test_api.research_helpers import make_context
 
 
-@pytest.mark.asyncio
-async def test_ic_decay_reports_unavailable():
-    out = await get_ic_decay()
-    assert out["available"] is False
-    assert out["factors"] == [], "an IC decay curve was invented"
-    assert "factor panel" in out["reason"]
+class TestICDecayIsMeasured:
+    def test_ic_decay_reports_real_values(self, prices, returns, sample_factor):
+        context = make_context(
+            prices, returns, {"momentum": sample_factor},
+        )
+        out = routes._compute_ic_decay(context)
+
+        assert out["available"] is True
+        assert out["horizons"] == [1, 5, 10, 20]
+        assert len(out["factors"]) == 1
+        points = out["factors"][0]["points"]
+        assert [p["horizon"] for p in points] == [1, 5, 10, 20]
+        assert all(p["n"] > 0 for p in points)
+        assert any(p["ic"] != 0.0 for p in points)
 
 
-@pytest.mark.asyncio
-async def test_correlation_reports_unavailable():
-    out = await get_factor_correlation()
-    assert out["available"] is False
-    assert out["names"] == []
-    assert out["matrix"] == [], "a correlation matrix was invented"
-    assert "panel" in out["reason"]
+class TestCorrelationIsMeasured:
+    def test_correlation_reports_a_real_matrix(self, prices, returns, sample_factor):
+        factors = {
+            "momentum": sample_factor,
+            "volatility": returns.rolling(20).std(),
+        }
+        context = make_context(prices, returns, factors)
+        out = routes._compute_factor_correlation(context)
+
+        assert out["available"] is True
+        assert out["names"] == ["momentum", "volatility"]
+        matrix = out["matrix"]
+        assert len(matrix) == 2 and len(matrix[0]) == 2
+        assert matrix[0][0] == 1.0 and matrix[1][1] == 1.0
+        assert matrix[0][1] == matrix[1][0]
+        assert -1.0 <= matrix[0][1] <= 1.0
 
 
 class TestTheFabricationIsGone:
-    """Source-level assertions, because the fabricated values were internally
+    """Source-level assertions, because fabricated values were internally
     consistent and would pass any test written against their output."""
 
     def test_ic_decay_no_longer_computes_a_decay_curve(self):
-        body = inspect.getsource(get_ic_decay)
-        assert "np.exp" not in body.split('"""')[2], "the decay curve is back"
+        body = inspect.getsource(routes._compute_ic_decay)
+        assert "np.exp" not in body, "the decay curve is back"
+        assert "random" not in body, "noise is back"
 
     def test_correlation_no_longer_randomises(self):
-        body = inspect.getsource(get_factor_correlation)
-        # Skip the docstring, which quotes the removed code.
-        code = body.split('"""')[2]
-        assert "random" not in code, "the random matrix is back"
-        assert "momentum" not in code, "the hand-tuned momentum rule is back"
-
-    def test_response_shapes_are_preserved_for_the_panels(self):
-        """Both front-end panels guard on length; a missing key breaks them,
-        an empty list renders nothing."""
-        import asyncio
-
-        decay = asyncio.run(get_ic_decay())
-        corr = asyncio.run(get_factor_correlation())
-        assert set(decay) >= {"available", "reason", "factors"}
-        assert set(corr) >= {"available", "reason", "names", "matrix"}
+        body = inspect.getsource(routes._compute_factor_correlation)
+        assert "random" not in body, "the random matrix is back"
+        assert "momentum" not in body, "the hand-tuned momentum rule is back"
 
 
 class TestThePanelsDoNotFabricate:
-    """Fixing the endpoints was not enough to stop these two numbers.
-
-    Both were *also* generated in the browser, and the panels never called the
-    API at all. `ICDecay.vue` rebuilt `Math.exp(-lag * 0.15) * baseIC` with the
-    base IC chosen by substring-matching the factor name, and
-    `FactorCorrelation.vue` rebuilt the seeded random matrix including the
-    "momentum factors correlate" rule. Removing the generators server-side
-    would have left the panels drawing the same fiction from the client.
-    """
+    """The endpoints are not the only place the fiction lived: both panels
+    rebuilt the same numbers in the browser and never called the API."""
 
     COMPONENTS = Path(__file__).resolve().parents[2] / "frontend" / "src" / "components"
 
     def _code(self, name: str) -> str:
-        """Component source with comments removed.
-
-        The explanatory comments quote the expressions that were deleted, so a
-        naive `in` check matches the prose explaining their removal.
-        """
         src = (self.COMPONENTS / name).read_text(encoding="utf-8")
         src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
         src = re.sub(r"<!--.*?-->", "", src, flags=re.DOTALL)

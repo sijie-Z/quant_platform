@@ -20,6 +20,57 @@ from quant_platform.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Columns that hold a price level. Volume, turnover and adj_factor are numeric
+# but are not prices: their jumps are normal and must not be read as price
+# anomalies.
+PRICE_FIELDS = ("open", "high", "low", "close", "vwap")
+
+
+def _price_panel(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalise provider input into a date-indexed, per-asset wide frame.
+
+    The monitor was written for a date x asset wide frame, but
+    ``/api/data/quality`` without a ``run_id`` feeds it the raw provider panel
+    with a ``(date, asset)`` MultiIndex and OHLCV field columns. Running
+    ``pct_change`` down that frame compares one stock's close with the next
+    stock's close (and with the next day), fabricating tens of thousands of
+    "anomalies"; ``index[-1]`` is a ``(date, asset)`` tuple, so freshness never
+    failed.
+
+    A MultiIndex panel is therefore unstacked to date x (field, asset) columns:
+    each column is a single asset's (or asset/field's) time series, and all
+    pandas time-series operations (pct_change, diff, ffill) stay within it.
+    Only price fields are kept when the panel carries them.
+    """
+    if not isinstance(frame.index, pd.MultiIndex):
+        return frame
+
+    if frame.columns.nlevels > 1:
+        # Already unstacked (e.g. (field, asset) columns); nothing to do.
+        return frame
+
+    if "asset" in frame.index.names:
+        asset_level: str | int = "asset"
+    elif frame.index.nlevels == 2:
+        asset_level = frame.index.nlevels - 1
+    else:
+        return frame
+
+    price_cols = [c for c in PRICE_FIELDS if c in frame.columns]
+    if price_cols:
+        values = frame[price_cols]
+    else:
+        values = frame.select_dtypes(include=[np.number])
+    if values.shape[1] == 0:
+        return frame
+
+    try:
+        return values.unstack(asset_level)
+    except ValueError:
+        # Duplicate (date, asset) labels cannot be unstacked; leave the input
+        # as-is rather than turning a quality report into a crash.
+        return frame
+
 
 class DataQualityCheck:
     """A single data quality check result."""
@@ -63,8 +114,13 @@ class DataQualityMonitor:
         self.checks: list[DataQualityCheck] = []
 
     def check_prices(self, prices: pd.DataFrame) -> list[DataQualityCheck]:
-        """Run all price data quality checks."""
+        """Run all price data quality checks.
+
+        Accepts either a date x asset wide frame or a raw ``(date, asset)``
+        provider panel (see ``_price_panel``).
+        """
         self.checks = []
+        prices = _price_panel(prices)
 
         self._check_missing_data(prices)
         self._check_nan_rate(prices)
@@ -76,7 +132,11 @@ class DataQualityMonitor:
         return self.checks
 
     def check_returns(self, returns: pd.DataFrame) -> list[DataQualityCheck]:
-        """Run return data quality checks."""
+        """Run return data quality checks.
+
+        Accepts the same two layouts as ``check_prices``.
+        """
+        returns = _price_panel(returns)
         self._check_extreme_returns(returns)
         self._check_return_distribution(returns)
         return self.checks
@@ -96,8 +156,13 @@ class DataQualityMonitor:
             details={"missing_pct": missing_pct, "missing_cells": int(missing_cells)},
         ))
 
-        # Per-stock missing rates
-        stock_missing = prices.isna().mean()
+        # Per-stock missing rates. A MultiIndex (field, asset) frame is
+        # averaged over its price fields so the details still name stocks.
+        missing = prices.isna()
+        if isinstance(prices.columns, pd.MultiIndex):
+            stock_missing = missing.T.groupby(level=1).mean().mean(axis=1)
+        else:
+            stock_missing = missing.mean()
         bad_stocks = stock_missing[stock_missing > self.max_missing_pct * 2]
         if len(bad_stocks) > 0:
             self.checks.append(DataQualityCheck(
@@ -123,11 +188,21 @@ class DataQualityMonitor:
         ))
 
     def _check_price_anomalies(self, prices: pd.DataFrame):
-        """Check for anomalous price movements."""
-        pct_changes = prices.pct_change().abs()
+        """Check for anomalous price movements.
+
+        Only price *levels* are differenced. Volume, turnover and adj_factor
+        are not prices -- their jumps are normal -- and a raw (date, asset)
+        panel must first be turned into per-asset columns, otherwise the
+        percentage change compares one stock with the next.
+        """
+        # Zero is a missing quote, not an infinite return: pandas 3 raises on
+        # the division instead of returning inf. Only numeric columns are
+        # price series (the panel also carries boolean mask columns).
+        numeric = prices.select_dtypes(include=[np.number])
+        pct_changes = numeric.mask(numeric == 0).pct_change(fill_method=None).abs()
         anomalies = pct_changes > self.max_daily_move
 
-        n_anomalies = anomalies.sum().sum()
+        n_anomalies = int(anomalies.sum().sum())
         passed = n_anomalies == 0
 
         if n_anomalies > 0:
@@ -138,7 +213,10 @@ class DataQualityMonitor:
                 passed=passed,
                 severity="error" if n_anomalies > 10 else "warn",
                 message=f"{n_anomalies} price movements exceed {self.max_daily_move:.0%}",
-                details={"worst_stocks": worst.head(5).to_dict()},
+                details={
+                    "n_anomalies": n_anomalies,
+                    "worst_stocks": worst.head(5).to_dict(),
+                },
             ))
         else:
             self.checks.append(DataQualityCheck(
@@ -146,13 +224,25 @@ class DataQualityMonitor:
                 passed=True,
                 severity="info",
                 message="No anomalous price movements detected",
+                details={"n_anomalies": 0},
             ))
 
     def _check_stale_prices(self, prices: pd.DataFrame):
-        """Check for stale (flat) prices indicating data issues."""
+        """Check for stale (flat) prices indicating data issues.
+
+        When the frame carries several price fields, staleness is judged on
+        close only: a flat close is the signal, while repeated opens/highs are
+        not.
+        """
+        frame = prices
+        if isinstance(prices.columns, pd.MultiIndex):
+            fields = prices.columns.get_level_values(0)
+            if "close" in fields:
+                frame = prices["close"]
+
         stale_counts = {}
-        for col in prices.columns:
-            series = prices[col].dropna()
+        for col in frame.columns:
+            series = frame[col].dropna()
             if len(series) < 2:
                 continue
             # Count consecutive equal values
@@ -178,7 +268,13 @@ class DataQualityMonitor:
         ))
 
     def _check_data_freshness(self, prices: pd.DataFrame):
-        """Check if data is fresh (last date is recent)."""
+        """Check if data is fresh (last date is recent).
+
+        A ``(date, asset)`` MultiIndex makes ``index[-1]`` a tuple, which has
+        no ``.date()``; the old code then reported ``days_old = 0`` and the
+        check could never fail. The date level's maximum is the real last
+        observation.
+        """
         if len(prices) == 0:
             self.checks.append(DataQualityCheck(
                 name="freshness", passed=False, severity="critical",
@@ -186,11 +282,17 @@ class DataQualityMonitor:
             ))
             return
 
-        last_date = prices.index[-1]
-        if hasattr(last_date, 'date'):
-            days_old = (pd.Timestamp.now().date() - last_date.date()).days
+        if isinstance(prices.index, pd.MultiIndex):
+            last_date = prices.index.get_level_values(0).max()
         else:
-            days_old = 0
+            last_date = prices.index[-1]
+
+        try:
+            last_ts = pd.Timestamp(last_date).normalize()
+            days_old = (pd.Timestamp.now().normalize() - last_ts).days
+        except (TypeError, ValueError):
+            last_ts = None
+            days_old = 10**6  # An unparseable date is certainly not fresh
 
         passed = days_old <= 3  # Allow 3 days for weekends/holidays
         self.checks.append(DataQualityCheck(
@@ -203,7 +305,8 @@ class DataQualityMonitor:
 
     def _check_price_monotonicity(self, prices: pd.DataFrame):
         """Check that prices are non-negative."""
-        negative = (prices < 0).sum().sum()
+        numeric = prices.select_dtypes(include=[np.number])
+        negative = int((numeric < 0).sum().sum())
         passed = negative == 0
         self.checks.append(DataQualityCheck(
             name="price_monotonicity",

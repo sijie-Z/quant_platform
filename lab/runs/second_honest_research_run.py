@@ -16,7 +16,9 @@ Trust metadata (identical structure, different adjust/completeness caveats):
     - data_meta.trust_warning = ["quarterly_point_in_time"]
     - universe_meta.pit = False, same survivorship caveat as run 1
 
-Run:  .venv/Scripts/python.exe run_slice.py  (or direct import)
+Run:  python -m lab.runs.second_honest_research_run  (or direct import).
+      run_slice.py runs the FIRST honest run only; it does not invoke this
+      script.
 """
 
 from __future__ import annotations
@@ -36,18 +38,29 @@ import akshare as ak  # noqa: E402
 from quant_platform.factors.evaluation import ic_summary  # noqa: E402
 from quant_platform.lab.registry import DEFAULT_DB, RunStore  # noqa: E402
 from quant_platform.lab.reports import generate_report  # noqa: E402
+from quant_platform.utils.research_window import resolve_end_date  # noqa: E402
 
 SLICE = "second_honest_research_run"
+MIN_IC_OBS = 20  # R5: below this the run has not been evaluated
 
 # ---- Trust metadata (same structure as first run) ---------------------------
 DATA_META = {
     "provider": "akshare",
     "adjust": "none",  # financial data, no OHLCV adjustment needed
-    "basis": "fiscal_year_end",
+    # Canonical key is `adjust_basis` (the first/third runs used it; this run
+    # used `basis`, so a cross-run query could not find it).
+    "adjust_basis": "statutory_publication_deadline",
     "cross_sectional_use": True,
     "interface": "stock_financial_analysis_indicator",
-    "trust_warning": ["quarterly_point_in_time", "no_pe_ttm_precision"],
-    "description": "AkShare quarterly financial indicators; ROE from latest fiscal year",
+    "trust_warning": [
+        "publication_deadline_not_actual_announcement_date",
+        "no_pe_ttm_precision",
+    ],
+    "description": (
+        "AkShare quarterly financial indicators; ROE dated at the statutory "
+        "publication deadline (annual/Q1 Apr 30, interim Aug 31, Q3 Oct 31), "
+        "not the fiscal period end"
+    ),
 }
 UNIVERSE_META = {
     "provider": "CurrentConstituentUniverseProvider",
@@ -98,12 +111,36 @@ def _fetch_prices_for_fwd(
     return panel
 
 
+def _report_available_date(period_end: pd.Timestamp) -> pd.Timestamp:
+    """Conservative statutory publication deadline for a fiscal period.
+
+    `日期` from the indicator endpoint is the *period end*, not the
+    announcement date. Carrying ROE forward from 2023-12-31 made the FY2023
+    report visible on 2024-01-01 although annual reports are due by
+    April 30, i.e. up to four months of look-ahead in every IC and Sharpe.
+    These deadlines are the CSRC limits: annual and Q1 by April 30, interim
+    by August 31, Q3 by October 31.
+    """
+    month = period_end.month
+    if month == 12:
+        return pd.Timestamp(year=period_end.year + 1, month=4, day=30)
+    if month == 3:
+        return pd.Timestamp(year=period_end.year, month=4, day=30)
+    if month == 6:
+        return pd.Timestamp(year=period_end.year, month=8, day=31)
+    if month == 9:
+        return pd.Timestamp(year=period_end.year, month=10, day=31)
+    # Unknown frequency: do not let it become visible before 60 days.
+    return period_end + pd.Timedelta(days=60)
+
+
 def _fetch_roe_scores(codes: list[str]) -> pd.DataFrame:
-    """Build a (date x asset) ROE factor panel.
+    """Build a (date x asset) ROE factor panel, point-in-time.
 
     AkShare's stock_financial_analysis_indicator returns quarterly records
-    with the latest '净资产收益率(%)' per quarter. We group by fiscal-year-end
-    date and carry forward the latest reported ROE until the next report.
+    with the latest '净资产收益率(%)' per quarter. Each record is dated at its
+    statutory publication deadline (see `_report_available_date`) and is
+    carried forward from that date only.
 
     Returns date (pd.Timestamp) x asset (code) DataFrame.
     """
@@ -117,15 +154,18 @@ def _fetch_roe_scores(codes: list[str]) -> pd.DataFrame:
                 )
                 if df is None or df.empty or roe_col not in df.columns:
                     break
-                # '日期' column holds reporting-date end
+                # '日期' column holds the fiscal period end; map it to when the
+                # report can actually be known.
                 sub = df[["日期", roe_col]].rename(
-                    columns={"日期": "date", roe_col: "roe"}
+                    columns={"日期": "period_end", roe_col: "roe"}
                 )
-                sub["date"] = pd.to_datetime(sub["date"])
+                sub["period_end"] = pd.to_datetime(sub["period_end"])
                 sub["roe"] = pd.to_numeric(sub["roe"], errors="coerce")
-                sub = sub.dropna(subset=["roe"])
+                sub = sub.dropna(subset=["roe", "period_end"])
+                sub["date"] = sub["period_end"].map(_report_available_date)
+                sub = sub.sort_values("period_end")
                 sub["code"] = code
-                records.append(sub)
+                records.append(sub[["date", "roe", "code"]])
                 break
             except Exception:
                 time_module.sleep(1)
@@ -136,10 +176,9 @@ def _fetch_roe_scores(codes: list[str]) -> pd.DataFrame:
         return pd.DataFrame()
 
     stacked = pd.concat(records, ignore_index=True)
-    # Sort and forward-fill: for every date, the latest reported ROE is used
-    stacked = stacked.sort_values(["code", "date"])
-    stacked["roe"] = stacked.groupby("code")["roe"].ffill()
-    # Build wide panel
+    # Build wide panel keyed on availability dates. When two reports become
+    # available on the same day (annual + Q1 on April 30), `last` keeps the
+    # one with the later period end, which is the newer information.
     panel = stacked.pivot_table(
         index="date", columns="code", values="roe", aggfunc="last"
     )
@@ -150,10 +189,12 @@ def _fetch_roe_scores(codes: list[str]) -> pd.DataFrame:
 
 def run() -> str:
     store = RunStore(DEFAULT_DB)
+    end = resolve_end_date()
+    data_meta = dict(DATA_META, requested_start="2021-01-01", requested_end=end)
     inputs = {
         "slice": SLICE,
         "data_source": "akshare",
-        "data_meta": DATA_META,
+        "data_meta": data_meta,
         "universe_provider": UNIVERSE_META["provider"],
         "universe_meta": UNIVERSE_META,
         "factor": FACTOR_PARAMS["name"],
@@ -166,12 +207,16 @@ def run() -> str:
         codes = _fetch_csi300_members()
         print(f"[{SLICE}] CSI300 members: {len(codes)}", flush=True)
 
-        start, end = "2021-01-01", "2026-05-23"
+        start = "2021-01-01"
         t0 = time_module.time()
         prices = _fetch_prices_for_fwd(codes, start, end)
         print(f"[{SLICE}] price panel: {prices.shape} (t={time_module.time() - t0:.0f}s)", flush=True)
         if prices.shape[1] < 50:
             raise RuntimeError(f"price panel too narrow: {prices.shape}")
+        data_meta["data_start"] = str(prices.index[0].date())
+        data_meta["data_end"] = str(prices.index[-1].date())
+        print(f"[{SLICE}] data window: {data_meta['data_start']} → "
+              f"{data_meta['data_end']} (requested end {end})", flush=True)
 
         t1 = time_module.time()
         roe_panel = _fetch_roe_scores(codes)
@@ -241,14 +286,24 @@ def run() -> str:
                 "note": "Do not read this as formal validation. Run more factors first.",
             },
             "bh_fdr": "n/a (single factor; BH-FDR requires multiple factors)",
+            "data_start": data_meta["data_start"],
+            "data_end": data_meta["data_end"],
+            "requested_end": end,
         }
 
-        store.finish_run(run_id, status="success", evaluation=evaluation,
-                         report_path=None, warnings=[])
+        status = "success" if len(ic_series) >= MIN_IC_OBS else "failed"
+        status_reason = None if status == "success" else (
+            f"insufficient_ic_observations: n_ic_obs={len(ic_series)} < {MIN_IC_OBS}"
+        )
+        status_warnings = [status_reason] if status_reason else []
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=None, reason=status_reason,
+                         warnings=status_warnings, data_meta=data_meta)
         final_run = store.get_run(run_id)
         report_path = generate_report(final_run, out_dir="data/reports")
-        store.finish_run(run_id, status="success", evaluation=evaluation,
-                         report_path=report_path, warnings=[])
+        store.finish_run(run_id, status=status, evaluation=evaluation,
+                         report_path=report_path, reason=status_reason,
+                         warnings=status_warnings, data_meta=data_meta)
 
         print(f"[{SLICE}] SUCCESS run_id={run_id}", flush=True)
         print(f"[{SLICE}] IC={evaluation.get('ic_mean')} ICIR={evaluation.get('icir')}", flush=True)
@@ -260,9 +315,11 @@ def run() -> str:
         tb = traceback.format_exc()
         reason = f"{type(e).__name__}: {e}"
         store.finish_run(run_id, status="failed", reason=reason,
-                         warnings=[f"traceback_excerpt: {tb[-400:]}"])
+                         warnings=[f"traceback_excerpt: {tb[-400:]}"],
+                         data_meta=data_meta)
         report_path = generate_report(store.get_run(run_id), out_dir="data/reports")
-        store.finish_run(run_id, status="failed", reason=reason, report_path=report_path)
+        store.finish_run(run_id, status="failed", reason=reason,
+                         report_path=report_path, data_meta=data_meta)
         print(f"[{SLICE}] FAILED (recorded) run_id={run_id}: {e}", flush=True)
         print(f"[{SLICE}] failure report: {report_path}", flush=True)
         raise

@@ -74,14 +74,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install -e ./packages/quant_core
-          pip install -e .
+          pip install -e ./packages/quant_core --no-deps
+          pip install -e . --no-deps
 
-      # The repo root *is* the quant_platform package; putting its parent on
-      # PYTHONPATH is what makes `import quant_platform` resolve. Depends on
-      # the checkout directory being named `quant_platform`.
-      - name: Make quant_platform importable
-        run: echo "PYTHONPATH=$GITHUB_WORKSPACE/.." >> "$GITHUB_ENV"
+      # The editable install now maps `quant_platform` to the repo root. No
+      # PYTHONPATH shim: that would reintroduce the second import identity
+      # (`data.x` vs `quant_platform.data.x`, issue #69).
+      - name: Verify a single package identity
+        run: |
+          python -c "import sys; import quant_platform.data.providers.synthetic as m; assert 'data' not in sys.modules, 'flat identity is back'; print(m.__name__)"
 
       - name: Run tests
         run: |

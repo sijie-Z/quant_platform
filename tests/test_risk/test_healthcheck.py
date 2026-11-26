@@ -37,36 +37,45 @@ class MockBroker:
 class MockRiskMonitor:
     """Mock risk monitor for testing."""
 
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, status=None):
         self._fail = fail
+        self._status = status if status is not None else {
+            "risk_level": "green",
+            "kill_switch": False,
+            "limits": {"max_single_position": 0.05},
+        }
 
     def get_status(self):
         if self._fail:
             raise RuntimeError("Risk monitor not initialized")
-        return {"level": "GREEN", "kill_switch": False}
+        return self._status
 
 
 class TestHealthCheckPass:
     """Tests where all checks pass."""
 
     def test_all_pass_no_broker(self):
-        """With no broker configured, all checks should pass (skip)."""
+        """With nothing configured, checks are SKIP (not a vacuous PASS)."""
         bus = EventBus()
         health = HealthCheck(event_bus=bus)
         report = health.run_all_sync()
 
         assert report.overall_passed is True
         assert len(report.failed_checks) == 0
-        assert all(r.status == CheckStatus.PASS for r in report.results)
+        assert all(r.status == CheckStatus.SKIP for r in report.results)
 
     def test_all_pass_with_broker(self):
-        """With a healthy broker, all checks should pass."""
+        """With a healthy broker, unconfigured checks SKIP and pass overall."""
         bus = EventBus()
         broker = MockBroker(cash=500_000)
         health = HealthCheck(event_bus=bus, broker=broker)
         report = health.run_all_sync()
 
         assert report.overall_passed is True
+        by_name = {r.name: r.status for r in report.results}
+        assert by_name["account_balance"] == CheckStatus.PASS
+        assert by_name["order_routing"] == CheckStatus.PASS
+        assert by_name["data_connection"] == CheckStatus.SKIP
 
     def test_all_pass_with_risk_monitor(self):
         """With a healthy risk monitor, all checks should pass."""
@@ -128,6 +137,42 @@ class TestHealthCheckFail:
             health.run_all_sync()
 
         assert "risk_limits" in str(exc_info.value)
+
+
+class TestPositionSync:
+    """The check used to return `positions is not None` and never compared
+    the broker book with the local/Store book."""
+
+    class _Pos:
+        def __init__(self, code, quantity):
+            self.code = code
+            self.quantity = quantity
+
+    def test_matching_books_pass(self):
+        broker = MockBroker(positions=[self._Pos("600519", 100)])
+        health = HealthCheck(
+            broker=broker,
+            local_positions=[{"code": "600519", "quantity": 100}],
+        )
+        assert health._check_position_sync() is True
+
+    def test_quantity_mismatch_fails(self):
+        broker = MockBroker(positions=[self._Pos("600519", 100)])
+        health = HealthCheck(
+            broker=broker,
+            local_positions=[{"code": "600519", "quantity": 200}],
+        )
+        assert health._check_position_sync() is False
+
+    def test_missing_local_name_fails(self):
+        broker = MockBroker(positions=[
+            self._Pos("600519", 100), self._Pos("000001", 200),
+        ])
+        health = HealthCheck(
+            broker=broker,
+            local_positions=[{"code": "600519", "quantity": 100}],
+        )
+        assert health._check_position_sync() is False
 
 
 class TestEventBusIntegration:
@@ -235,3 +280,96 @@ class TestHealthCheckReport:
             r.status == CheckStatus.PASS for r in report.results
         )
         assert report.overall_passed is False
+
+
+class TestUnconfiguredAndErrorSemantics:
+    """S9: unconfigured checks must SKIP, ERROR must count as a failure, and
+    missing account cash must not silently pass a configured minimum."""
+
+    def test_unconfigured_checks_are_skip_not_pass(self):
+        health = HealthCheck(event_bus=EventBus())
+        report = health.run_all_sync()
+
+        assert {r.name for r in report.results} == {
+            "data_connection", "account_balance", "position_sync",
+            "order_routing", "risk_limits",
+        }
+        assert all(r.status == CheckStatus.SKIP for r in report.results)
+        assert report.to_dict()["skipped_count"] == 5
+        assert report.to_dict()["passed_count"] == 0
+
+    def test_position_sync_without_local_book_is_skip(self):
+        broker = MockBroker(cash=500_000)
+        health = HealthCheck(event_bus=EventBus(), broker=broker)
+
+        result = health._evaluate_position_sync()
+
+        assert result.status == CheckStatus.SKIP
+
+    def test_missing_cash_fails_a_configured_minimum(self):
+        class NoCashBroker:
+            def get_account(self):
+                return {"total_equity": 1_000_000}
+
+            def get_positions(self):
+                return []
+
+        health = HealthCheck(
+            event_bus=EventBus(), broker=NoCashBroker(), min_cash=10_000,
+        )
+        with pytest.raises(SystemBlockError) as exc_info:
+            health.run_all_sync()
+        assert "account_balance" in str(exc_info.value)
+
+    def test_missing_cash_passes_when_min_cash_is_explicitly_zero(self):
+        class NoCashBroker:
+            def get_account(self):
+                return {"total_equity": 1_000_000}
+
+            def get_positions(self):
+                return []
+
+        health = HealthCheck(
+            event_bus=EventBus(), broker=NoCashBroker(), min_cash=0,
+        )
+        assert health._evaluate_account_balance().status == CheckStatus.PASS
+
+    def test_risk_limits_missing_keys_fail(self):
+        risk = MockRiskMonitor(status={"risk_level": "green"})
+
+        health = HealthCheck(event_bus=EventBus(), risk_monitor=risk)
+        result = health._evaluate_risk_limits()
+
+        assert result.status == CheckStatus.FAIL
+        assert "kill_switch" in result.message
+        assert "limits" in result.message
+
+    def test_empty_risk_status_fails(self):
+        risk = MockRiskMonitor(status={})
+
+        result = HealthCheck(
+            event_bus=EventBus(), risk_monitor=risk,
+        )._evaluate_risk_limits()
+
+        assert result.status == CheckStatus.FAIL
+
+    def test_error_results_count_as_failures(self):
+        report = HealthCheckReport(results=[
+            CheckResult(name="a", status=CheckStatus.PASS),
+            CheckResult(name="b", status=CheckStatus.ERROR, message="boom"),
+        ])
+
+        assert [r.name for r in report.failed_checks] == ["b"]
+        assert report.to_dict()["failed_count"] == 1
+
+    def test_an_raising_check_reports_error_and_blocks(self):
+        class ExplodingBroker:
+            def get_account(self):
+                raise ConnectionError("down")
+
+            def get_positions(self):
+                raise ConnectionError("down")
+
+        health = HealthCheck(event_bus=EventBus(), broker=ExplodingBroker())
+        with pytest.raises(SystemBlockError):
+            health.run_all_sync()

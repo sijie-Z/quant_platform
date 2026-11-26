@@ -25,6 +25,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Market hours are Asia/Shanghai wall-clock times. The base image is UTC, so
+# without this the scheduler would open the session at 17:30 Beijing and stay
+# closed during the real session.
+ENV TZ=Asia/Shanghai
+
 COPY requirements.txt .
 # Cache mount keeps pip's wheel cache across builds, so a retry after a
 # network hiccup only re-fetches the package that failed. The cache lives
@@ -45,12 +50,6 @@ RUN pip install -e . --no-deps
 
 # Prebuilt dashboard from stage 1
 COPY --from=frontend /frontend/dist ./frontend/dist
-
-# Symlink so `import quant_platform` resolves in any context:
-# WORKDIR=/app, but the package is named quant_platform, so we make
-# /quant_platform → /app available via PYTHONPATH=/.
-RUN ln -sf /app /quant_platform
-ENV PYTHONPATH=/:/app
 
 # ---------------------------------------------------------------------------
 # Drop privileges. Only the paths the application actually writes to are
@@ -81,4 +80,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"
 
-CMD ["python", "main.py", "web"]
+CMD ["python", "-m", "quant_platform.main", "web", "--host", "0.0.0.0"]

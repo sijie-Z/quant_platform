@@ -1,5 +1,10 @@
 # MiQi / quant_platform Architecture v2
 
+> **STATUS: PROPOSAL — not implemented. See #73.**
+> Only `main.py factor <name>` is currently true; `live/` and `prod/` do not
+> exist. The enforced boundary is `tests/test_architecture/test_core_boundaries.py`,
+> not import-linter. The ten-claim audit is in `docs/HANDOVER.md` §四.
+
 > 这是本仓库的架构决策页，不是讨论日志。后续所有 PR、重构、拆分都以这一页为判断标准。
 
 ## 1. Vision
@@ -34,7 +39,7 @@ Data -> Research -> Portfolio -> Backtest -> Execution -> Risk -> Monitoring
 - `live/`（交易平台）：依赖 `core/` 的公开接口，不反向依赖。
 - `lab/`（研究笔记）：只依赖 `core/`。
 - AI 是横切能力：允许调用各 Capability，但不允许被 Capability 反向耦合。
-- 跨层依赖由 import-linter 强制，违反即 CI 红。
+- 跨层依赖由 `tests/test_architecture/test_core_boundaries.py` 强制（CI 通过 `pytest tests/` 运行），不是 import-linter。
 
 ## 4. Runtime
 
@@ -47,6 +52,9 @@ Data -> Research -> Portfolio -> Backtest -> Execution -> Risk -> Monitoring
 ## 5. Repository Layout
 
 当前阶段：**一个仓库，三层边界，先不物理拆分**。
+
+> **现实（2026-10）**：`live/` 和 `prod/` 不存在；仓库的 `core/` 是 EventBus/Store/StateMachine，
+> 不是下面所说的“研究内核”；`data/` 是纳入 git 的源代码，不是运行时数据。下面是目标布局，不是现状。
 
 ```text
 quant_platform/
@@ -71,11 +79,11 @@ quant_platform/
 5. core 包化：live/lab 改为依赖安装版 core
 6. 全部绿后，再物理拆成 quant-core / quant-lab / quant-live
 
-## 原则（ADR 摘要）
+## 原则（设计意图；ADR 目录不存在，见 #73）
 
 - Principle 1：Truth First。数据调整方式、PIT 状态、偏差必须机器可读记录。
 - Principle 2：Point-in-time。任何回测数据必须声明可用日期，禁止静默用未来数据。
 - Principle 3：Knowledge compounds。研究运行、参数、评估全部进 Registry，可跨 run 查询。
 - Principle 4：Protocol over Implementation。接口先锁，实现可换。
-- ADR-0003：Single Live Runner。OMS、风控、实盘引擎各只有一条主实现。
-- ADR-0004：Protocol Before Plugin。新实现必须实现已有协议，不新增平行接口。
+- ADR-0003：Single Live Runner。OMS、风控、实盘引擎各只有一条主实现。**（当前不成立，见 #73/#74）**
+- ADR-0004：Protocol Before Plugin。新实现必须实现已有协议，不新增平行接口。**（当前不成立，见 #73/#74）**

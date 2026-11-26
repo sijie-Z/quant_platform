@@ -83,7 +83,7 @@ class TestTheVectorizedWindowMatchesTheLoop:
             m = market_ret.reindex(x.index).values
             if len(y) < window or np.std(m) < 1e-10:
                 return np.nan
-            beta = np.cov(y, m)[0, 1] / np.var(m)
+            beta = np.cov(y, m)[0, 1] / np.var(m, ddof=1)
             return float(np.std(y - beta * m, ddof=2))
 
         return ret.rolling(window).apply(_rolling_ivol, raw=False)

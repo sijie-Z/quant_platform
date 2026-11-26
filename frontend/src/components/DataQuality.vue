@@ -5,16 +5,23 @@
         <span v-if="loading" class="dq-spinner"></span>
         <span v-else>{{ locale === 'zh-CN' ? '运行质量检查' : 'Run Quality Check' }}</span>
       </button>
-      <span class="dq-status" v-if="report">
+      <span class="dq-status" v-if="report && !report.error">
         <span :class="report.overall_status === 'PASS' ? 'dq-pass' : 'dq-fail'">
           {{ report.overall_status === 'PASS' ? (locale === 'zh-CN' ? '通过' : 'PASS') : (locale === 'zh-CN' ? '失败' : 'FAIL') }}
         </span>
         <span class="dq-rate">{{ locale === 'zh-CN' ? `${(report.pass_rate * 100).toFixed(0)}% 通过率` : `${(report.pass_rate * 100).toFixed(0)}% pass rate` }}</span>
+        <span v-if="report.source === 'synthetic_demo'" class="dq-rate">
+          {{ locale === 'zh-CN' ? '（演示数据）' : '(demo data)' }}
+        </span>
       </span>
     </div>
 
+    <div v-if="report && report.error" class="dq-empty">
+      {{ locale === 'zh-CN' ? `质量检查失败：${report.error}` : `Quality check failed: ${report.error}` }}
+    </div>
+
     <!-- Summary Cards -->
-    <div class="dq-summary" v-if="report">
+    <div class="dq-summary" v-if="report && !report.error">
       <div class="dq-card">
         <div class="dq-card-label">{{ locale === 'zh-CN' ? '总检查项' : 'Total Checks' }}</div>
         <div class="dq-card-val">{{ report.total_checks }}</div>
@@ -34,7 +41,7 @@
     </div>
 
     <!-- Check Details -->
-    <div class="dq-checks" v-if="report">
+    <div class="dq-checks" v-if="report && !report.error">
       <div v-for="c in report.checks" :key="c.name" class="dq-check" :class="c.passed ? 'dq-check-pass' : 'dq-check-fail'">
         <div class="dq-check-head">
           <span class="dq-check-icon">{{ c.passed ? '&#10003;' : '&#10007;' }}</span>
